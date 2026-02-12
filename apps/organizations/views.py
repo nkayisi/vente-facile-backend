@@ -1,0 +1,701 @@
+"""
+ViewSets DRF pour l'app Organizations.
+"""
+import secrets
+from rest_framework import viewsets, status, filters
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from django_filters.rest_framework import DjangoFilterBackend
+from django.utils import timezone
+from datetime import timedelta
+
+from apps.core.api_mixins import TenantViewSetMixin, AuditMixin
+from apps.core.api_permissions import (
+    IsTenantMember, IsTenantAdmin, IsTenantOwner, HasActiveSubscription
+)
+from apps.core.services import OrganizationService, PermissionService
+from .models import Organization, OrganizationMembership, Branch, OrganizationInvitation
+from .serializers import (
+    OrganizationListSerializer, OrganizationDetailSerializer,
+    OrganizationCreateSerializer, OrganizationUpdateSerializer,
+    OrganizationMembershipSerializer, MembershipCreateSerializer, MembershipUpdateSerializer,
+    BranchListSerializer, BranchDetailSerializer, BranchCreateSerializer,
+    OrganizationInvitationSerializer, InvitationCreateSerializer
+)
+
+
+# =============================================================================
+# ORGANIZATION VIEWSET
+# =============================================================================
+
+class OrganizationViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet pour la gestion des organisations.
+    
+    Endpoints:
+    - GET /organizations/ : Liste des organisations de l'utilisateur
+    - POST /organizations/ : Créer une organisation
+    - GET /organizations/{id}/ : Détail d'une organisation
+    - PUT/PATCH /organizations/{id}/ : Modifier une organisation
+    - DELETE /organizations/{id}/ : Supprimer une organisation
+    - POST /organizations/{id}/switch/ : Changer d'organisation active
+    """
+    
+    queryset = Organization.objects.all()
+    permission_classes = [IsAuthenticated]
+    filter_backends = [filters.SearchFilter]
+    search_fields = ['name']
+
+    def get_queryset(self):
+        """Retourne uniquement les organisations de l'utilisateur."""
+        return Organization.objects.filter(
+            memberships__user=self.request.user,
+            memberships__is_active=True,
+            is_deleted=False
+        ).distinct()
+
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return OrganizationListSerializer
+        elif self.action == 'create':
+            return OrganizationCreateSerializer
+        elif self.action in ['update', 'partial_update']:
+            return OrganizationUpdateSerializer
+        return OrganizationDetailSerializer
+
+    def get_permissions(self):
+        if self.action in ['update', 'partial_update']:
+            return [IsAuthenticated(), IsTenantAdmin()]
+        elif self.action == 'destroy':
+            return [IsAuthenticated(), IsTenantOwner()]
+        return super().get_permissions()
+
+    def perform_create(self, serializer):
+        """Crée une organisation avec l'utilisateur comme owner."""
+        data = serializer.validated_data
+        organization = OrganizationService.create_organization(
+            user=self.request.user,
+            name=data['name'],
+            business_type=data.get('business_type', 'boutique'),
+            **{k: v for k, v in data.items() if k not in ['name', 'business_type']}
+        )
+        serializer.instance = organization
+
+    def perform_destroy(self, instance):
+        """Soft delete de l'organisation."""
+        instance.soft_delete()
+
+    @action(detail=True, methods=['post'])
+    def switch(self, request, pk=None):
+        """Change l'organisation active de l'utilisateur."""
+        organization = self.get_object()
+        
+        # Vérifier que l'utilisateur est membre
+        if not request.user.memberships.filter(
+            organization=organization,
+            is_active=True
+        ).exists():
+            return Response(
+                {'error': 'Vous n\'êtes pas membre de cette organisation'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        request.user.active_organization = organization
+        request.user.save(update_fields=['active_organization'])
+        
+        return Response({
+            'message': 'Organisation active changée',
+            'organization': OrganizationDetailSerializer(organization).data
+        })
+
+    @action(detail=True, methods=['get'])
+    def stats(self, request, pk=None):
+        """Statistiques de l'organisation."""
+        organization = self.get_object()
+        
+        from apps.products.models import Product
+        from apps.contacts.models import Customer, Supplier
+        from apps.sales.models import Sale
+        from django.db.models import Sum, Count
+        
+        today = timezone.now().date()
+        month_start = today.replace(day=1)
+        
+        stats = {
+            'products': Product.objects.filter(
+                organization=organization, is_deleted=False
+            ).count(),
+            'customers': Customer.objects.filter(
+                organization=organization, is_deleted=False
+            ).count(),
+            'suppliers': Supplier.objects.filter(
+                organization=organization, is_deleted=False
+            ).count(),
+            'members': organization.memberships.filter(is_active=True).count(),
+            'branches': organization.branches.filter(is_deleted=False).count(),
+            'sales_today': Sale.objects.filter(
+                organization=organization,
+                status='completed',
+                sale_date__date=today
+            ).aggregate(
+                count=Count('id'),
+                total=Sum('total')
+            ),
+            'sales_month': Sale.objects.filter(
+                organization=organization,
+                status='completed',
+                sale_date__date__gte=month_start
+            ).aggregate(
+                count=Count('id'),
+                total=Sum('total')
+            )
+        }
+        
+        return Response(stats)
+
+    @action(detail=True, methods=['get'])
+    def dashboard(self, request, pk=None):
+        """Statistiques complètes pour le dashboard avec données d'évolution."""
+        from django.db.models import Sum, Count, Avg, F
+        from django.db.models.functions import TruncDate, TruncWeek, TruncMonth
+        from decimal import Decimal
+        from apps.products.models import Product
+        from apps.contacts.models import Customer, Supplier
+        from apps.sales.models import Sale, SaleItem, Payment
+        from apps.inventory.models import Stock
+        
+        organization = self.get_object()
+        period = request.query_params.get('period', 'month')  # day, week, month, year
+        
+        today = timezone.now().date()
+        
+        # Définir les périodes
+        if period == 'day':
+            current_start = today
+            previous_start = today - timedelta(days=1)
+            previous_end = today - timedelta(days=1)
+            chart_days = 24  # heures
+        elif period == 'week':
+            current_start = today - timedelta(days=6)
+            previous_start = today - timedelta(days=13)
+            previous_end = today - timedelta(days=7)
+            chart_days = 7
+        elif period == 'year':
+            current_start = today.replace(month=1, day=1)
+            previous_start = (today.replace(month=1, day=1) - timedelta(days=365)).replace(month=1, day=1)
+            previous_end = today.replace(month=1, day=1) - timedelta(days=1)
+            chart_days = 12  # mois
+        else:  # month
+            current_start = today.replace(day=1)
+            if today.month == 1:
+                previous_start = today.replace(year=today.year-1, month=12, day=1)
+            else:
+                previous_start = today.replace(month=today.month-1, day=1)
+            previous_end = current_start - timedelta(days=1)
+            chart_days = 30
+        
+        # Ventes période actuelle
+        current_sales = Sale.objects.filter(
+            organization=organization,
+            status='completed',
+            is_deleted=False,
+            sale_date__date__gte=current_start,
+            sale_date__date__lte=today
+        )
+        
+        current_stats = current_sales.aggregate(
+            total_sales=Sum('total'),
+            total_cost=Sum(F('items__cost_price') * F('items__quantity')),
+            count=Count('id'),
+            units_sold=Sum('items__quantity')
+        )
+        
+        # Ventes période précédente
+        previous_sales = Sale.objects.filter(
+            organization=organization,
+            status='completed',
+            is_deleted=False,
+            sale_date__date__gte=previous_start,
+            sale_date__date__lte=previous_end
+        )
+        
+        previous_stats = previous_sales.aggregate(
+            total_sales=Sum('total'),
+            count=Count('id'),
+            units_sold=Sum('items__quantity')
+        )
+        
+        # Calcul des variations
+        def calc_variation(current, previous):
+            if not previous or previous == 0:
+                return 100 if current else 0
+            return round(((current - previous) / previous) * 100, 1)
+        
+        current_total = current_stats['total_sales'] or Decimal('0')
+        previous_total = previous_stats['total_sales'] or Decimal('0')
+        current_count = current_stats['count'] or 0
+        previous_count = previous_stats['count'] or 0
+        current_units = current_stats['units_sold'] or 0
+        previous_units = previous_stats['units_sold'] or 0
+        current_cost = current_stats['total_cost'] or Decimal('0')
+        gross_profit = current_total - current_cost
+        
+        # Clients
+        total_customers = Customer.objects.filter(
+            organization=organization, is_deleted=False
+        ).count()
+        
+        new_customers_current = Customer.objects.filter(
+            organization=organization,
+            is_deleted=False,
+            created_at__date__gte=current_start
+        ).count()
+        
+        new_customers_previous = Customer.objects.filter(
+            organization=organization,
+            is_deleted=False,
+            created_at__date__gte=previous_start,
+            created_at__date__lte=previous_end
+        ).count()
+        
+        # Données pour le graphique d'évolution des ventes
+        if period == 'year':
+            # Grouper par mois
+            sales_evolution = current_sales.annotate(
+                period=TruncMonth('sale_date')
+            ).values('period').annotate(
+                total=Sum('total'),
+                count=Count('id')
+            ).order_by('period')
+        elif period == 'week' or period == 'month':
+            # Grouper par jour
+            sales_evolution = current_sales.annotate(
+                period=TruncDate('sale_date')
+            ).values('period').annotate(
+                total=Sum('total'),
+                count=Count('id')
+            ).order_by('period')
+        else:
+            # Jour: grouper par heure (simplifié en jour)
+            sales_evolution = current_sales.annotate(
+                period=TruncDate('sale_date')
+            ).values('period').annotate(
+                total=Sum('total'),
+                count=Count('id')
+            ).order_by('period')
+        
+        # Formater les données d'évolution
+        evolution_data = []
+        for item in sales_evolution:
+            evolution_data.append({
+                'date': item['period'].isoformat() if item['period'] else None,
+                'total': str(item['total'] or 0),
+                'count': item['count'] or 0
+            })
+        
+        # Top produits vendus
+        top_products = SaleItem.objects.filter(
+            sale__in=current_sales
+        ).values(
+            'product__id', 'product__name', 'product__sku'
+        ).annotate(
+            quantity_sold=Sum('quantity'),
+            total_revenue=Sum('total')
+        ).order_by('-quantity_sold')[:10]
+        
+        # Ventes par méthode de paiement
+        by_payment_method = Payment.objects.filter(
+            sale__in=current_sales,
+            status='completed'
+        ).values('payment_method__name').annotate(
+            total=Sum('amount'),
+            count=Count('id')
+        ).order_by('-total')
+        
+        # Stock bas
+        low_stock_count = Stock.objects.filter(
+            organization=organization,
+            quantity__lte=F('product__reorder_point'),
+            product__track_inventory=True,
+            product__is_deleted=False
+        ).count()
+        
+        # Stock total value
+        stock_records = Stock.objects.filter(
+            organization=organization,
+            product__is_deleted=False
+        ).select_related('product')
+        stock_value = sum(
+            s.quantity * (s.avg_cost if s.avg_cost > 0 else (s.product.cost_price or 0))
+            for s in stock_records
+        )
+        
+        return Response({
+            'cards': {
+                'total_sales': {
+                    'value': str(current_total),
+                    'variation': calc_variation(float(current_total), float(previous_total)),
+                    'previous': str(previous_total)
+                },
+                'total_customers': {
+                    'value': total_customers,
+                    'new_count': new_customers_current,
+                    'variation': calc_variation(new_customers_current, new_customers_previous)
+                },
+                'units_sold': {
+                    'value': current_units,
+                    'variation': calc_variation(current_units, previous_units),
+                    'previous': previous_units
+                },
+                'gross_profit': {
+                    'value': str(gross_profit),
+                    'margin': round((float(gross_profit) / float(current_total) * 100), 1) if current_total > 0 else 0
+                }
+            },
+            'charts': {
+                'sales_evolution': evolution_data,
+                'by_payment_method': [
+                    {'name': p['payment_method__name'] or 'Non défini', 'value': str(p['total']), 'count': p['count']}
+                    for p in by_payment_method
+                ],
+                'top_products': [
+                    {
+                        'id': str(p['product__id']),
+                        'name': p['product__name'],
+                        'sku': p['product__sku'],
+                        'quantity': p['quantity_sold'],
+                        'revenue': str(p['total_revenue'])
+                    }
+                    for p in top_products
+                ]
+            },
+            'inventory': {
+                'low_stock_count': low_stock_count,
+                'stock_value': str(stock_value)
+            },
+            'period': period,
+            'date_range': {
+                'start': current_start.isoformat(),
+                'end': today.isoformat()
+            }
+        })
+
+
+# =============================================================================
+# MEMBERSHIP VIEWSET
+# =============================================================================
+
+class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
+    """
+    ViewSet pour la gestion des membres d'organisation.
+    
+    Endpoints:
+    - GET /memberships/ : Liste des membres
+    - POST /memberships/ : Ajouter un membre (par email)
+    - GET /memberships/{id}/ : Détail d'un membre
+    - PUT/PATCH /memberships/{id}/ : Modifier le rôle
+    - DELETE /memberships/{id}/ : Retirer un membre
+    """
+    
+    queryset = OrganizationMembership.objects.all()
+    permission_classes = [IsAuthenticated, IsTenantMember]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ['role', 'is_active']
+    search_fields = ['user__email', 'user__first_name', 'user__last_name']
+    ordering = ['user__email']
+    
+    select_related_fields = ['user', 'organization', 'invited_by']
+    
+    role_permissions = {
+        'list': ['owner', 'admin', 'manager'],
+        'retrieve': ['owner', 'admin', 'manager'],
+        'create': ['owner', 'admin'],
+        'update': ['owner', 'admin'],
+        'partial_update': ['owner', 'admin'],
+        'destroy': ['owner'],
+    }
+
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return MembershipCreateSerializer
+        elif self.action in ['update', 'partial_update']:
+            return MembershipUpdateSerializer
+        return OrganizationMembershipSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        organization = self.get_organization()
+        if organization:
+            queryset = queryset.filter(organization=organization)
+        return queryset
+
+    def create(self, request, *args, **kwargs):
+        """Ajoute un membre par email."""
+        serializer = MembershipCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        organization = self.get_organization()
+        email = serializer.validated_data['email']
+        role = serializer.validated_data['role']
+        
+        # Vérifier les limites d'abonnement
+        from apps.core.services import SubscriptionService
+        if not SubscriptionService.can_add_user(organization):
+            return Response(
+                {'error': 'Limite d\'utilisateurs atteinte pour votre abonnement'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Chercher l'utilisateur
+        from apps.users.models import User
+        user = User.objects.filter(email=email).first()
+        
+        if user:
+            # Ajouter directement si l'utilisateur existe
+            membership = OrganizationService.add_member(
+                organization=organization,
+                user=user,
+                role=role,
+                invited_by=request.user
+            )
+            return Response(
+                OrganizationMembershipSerializer(membership).data,
+                status=status.HTTP_201_CREATED
+            )
+        else:
+            # Créer une invitation
+            invitation = OrganizationInvitation.objects.create(
+                organization=organization,
+                email=email,
+                role=role,
+                token=secrets.token_urlsafe(32),
+                invited_by=request.user,
+                expires_at=timezone.now() + timedelta(days=7)
+            )
+            
+            # TODO: Envoyer l'email d'invitation
+            
+            return Response({
+                'message': 'Invitation envoyée',
+                'invitation': OrganizationInvitationSerializer(invitation).data
+            }, status=status.HTTP_201_CREATED)
+
+    def update(self, request, *args, **kwargs):
+        """Met à jour le rôle d'un membre."""
+        membership = self.get_object()
+        
+        # Empêcher de modifier le owner
+        if membership.role == 'owner':
+            return Response(
+                {'error': 'Impossible de modifier le propriétaire'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        serializer = MembershipUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        new_role = serializer.validated_data.get('role', membership.role)
+        is_active = serializer.validated_data.get('is_active', membership.is_active)
+        
+        # Mettre à jour les permissions
+        PermissionService.remove_all_permissions(membership.user, membership.organization)
+        
+        membership.role = new_role
+        membership.is_active = is_active
+        membership.save()
+        
+        if is_active:
+            PermissionService.assign_role_permissions(
+                membership.user, membership.organization, new_role
+            )
+        
+        return Response(OrganizationMembershipSerializer(membership).data)
+
+    def destroy(self, request, *args, **kwargs):
+        """Retire un membre de l'organisation."""
+        membership = self.get_object()
+        
+        # Empêcher de retirer le owner
+        if membership.role == 'owner':
+            return Response(
+                {'error': 'Impossible de retirer le propriétaire'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Empêcher de se retirer soi-même
+        if membership.user == request.user:
+            return Response(
+                {'error': 'Vous ne pouvez pas vous retirer vous-même'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        OrganizationService.remove_member(membership.organization, membership.user)
+        
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# =============================================================================
+# BRANCH VIEWSET
+# =============================================================================
+
+class BranchViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
+    """
+    ViewSet pour la gestion des branches/succursales.
+    
+    Endpoints:
+    - GET /branches/ : Liste des branches
+    - POST /branches/ : Créer une branche
+    - GET /branches/{id}/ : Détail d'une branche
+    - PUT/PATCH /branches/{id}/ : Modifier une branche
+    - DELETE /branches/{id}/ : Supprimer une branche
+    """
+    
+    queryset = Branch.objects.all()
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ['is_active', 'is_main']
+    search_fields = ['name', 'code', 'city']
+    ordering = ['name']
+    
+    select_related_fields = ['manager']
+    
+    role_permissions = {
+        'list': ['owner', 'admin', 'manager', 'cashier', 'stock_keeper', 'accountant', 'viewer'],
+        'retrieve': ['owner', 'admin', 'manager', 'cashier', 'stock_keeper', 'accountant', 'viewer'],
+        'create': ['owner', 'admin'],
+        'update': ['owner', 'admin'],
+        'partial_update': ['owner', 'admin'],
+        'destroy': ['owner', 'admin'],
+    }
+
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return BranchListSerializer
+        elif self.action in ['create', 'update', 'partial_update']:
+            return BranchCreateSerializer
+        return BranchDetailSerializer
+
+    def perform_create(self, serializer):
+        """Vérifie les limites d'abonnement avant création."""
+        organization = self.get_organization()
+        
+        from apps.core.services import SubscriptionService
+        if not SubscriptionService.can_add_branch(organization):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied(
+                'Limite de branches atteinte pour votre abonnement'
+            )
+        
+        serializer.save(organization=organization)
+
+
+# =============================================================================
+# INVITATION VIEWSET
+# =============================================================================
+
+class OrganizationInvitationViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
+    """
+    ViewSet pour la gestion des invitations.
+    
+    Endpoints:
+    - GET /invitations/ : Liste des invitations
+    - POST /invitations/ : Créer une invitation
+    - DELETE /invitations/{id}/ : Annuler une invitation
+    - POST /invitations/{id}/resend/ : Renvoyer une invitation
+    """
+    
+    queryset = OrganizationInvitation.objects.all()
+    permission_classes = [IsAuthenticated, IsTenantMember]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ['status', 'role']
+    search_fields = ['email']
+    ordering = ['-created_at']
+    
+    select_related_fields = ['organization', 'invited_by']
+    
+    role_permissions = {
+        'list': ['owner', 'admin'],
+        'retrieve': ['owner', 'admin'],
+        'create': ['owner', 'admin'],
+        'destroy': ['owner', 'admin'],
+        'resend': ['owner', 'admin'],
+    }
+
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return InvitationCreateSerializer
+        return OrganizationInvitationSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        organization = self.get_organization()
+        if organization:
+            queryset = queryset.filter(organization=organization)
+        return queryset
+
+    def create(self, request, *args, **kwargs):
+        """Crée une nouvelle invitation."""
+        serializer = InvitationCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        organization = self.get_organization()
+        email = serializer.validated_data['email']
+        role = serializer.validated_data['role']
+        
+        # Vérifier si déjà membre
+        from apps.users.models import User
+        user = User.objects.filter(email=email).first()
+        if user and organization.memberships.filter(user=user, is_active=True).exists():
+            return Response(
+                {'error': 'Cet utilisateur est déjà membre'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Vérifier si invitation en cours
+        existing = OrganizationInvitation.objects.filter(
+            organization=organization,
+            email=email,
+            status='pending'
+        ).first()
+        
+        if existing:
+            return Response(
+                {'error': 'Une invitation est déjà en cours pour cet email'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        invitation = OrganizationInvitation.objects.create(
+            organization=organization,
+            email=email,
+            role=role,
+            token=secrets.token_urlsafe(32),
+            invited_by=request.user,
+            expires_at=timezone.now() + timedelta(days=7)
+        )
+        
+        # TODO: Envoyer l'email
+        
+        return Response(
+            OrganizationInvitationSerializer(invitation).data,
+            status=status.HTTP_201_CREATED
+        )
+
+    @action(detail=True, methods=['post'])
+    def resend(self, request, pk=None):
+        """Renvoie une invitation."""
+        invitation = self.get_object()
+        
+        if invitation.status != 'pending':
+            return Response(
+                {'error': 'Cette invitation n\'est plus en attente'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Prolonger l'expiration
+        invitation.expires_at = timezone.now() + timedelta(days=7)
+        invitation.save()
+        
+        # TODO: Renvoyer l'email
+        
+        return Response({'message': 'Invitation renvoyée'})
