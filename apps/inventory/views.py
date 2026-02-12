@@ -6,7 +6,8 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
-from django.db.models import Sum, F
+from django.db import models as db_models
+from django.db.models import Sum, F, Q
 from django.db import transaction
 from django.utils import timezone
 from decimal import Decimal
@@ -17,7 +18,8 @@ from apps.core.api_permissions import (
 )
 from .models import (
     Warehouse, StockLocation, Stock, StockBatch, StockMovement,
-    StockTransfer, StockTransferItem, StockAdjustment, StockAdjustmentItem
+    StockTransfer, StockTransferItem, StockAdjustment, StockAdjustmentItem,
+    InventorySession, InventoryCount
 )
 from .serializers import (
     WarehouseListSerializer, WarehouseDetailSerializer, WarehouseCreateSerializer,
@@ -26,7 +28,9 @@ from .serializers import (
     StockBatchSerializer,
     StockMovementListSerializer, StockMovementDetailSerializer, StockMovementCreateSerializer,
     StockTransferListSerializer, StockTransferDetailSerializer, StockTransferCreateSerializer,
-    StockAdjustmentListSerializer, StockAdjustmentDetailSerializer, StockAdjustmentCreateSerializer
+    StockAdjustmentListSerializer, StockAdjustmentDetailSerializer, StockAdjustmentCreateSerializer,
+    InventorySessionListSerializer, InventorySessionDetailSerializer, InventorySessionCreateSerializer,
+    InventoryCountSerializer
 )
 
 
@@ -746,3 +750,392 @@ class StockAdjustmentViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewS
         adjustment.save()
         
         return Response({'status': 'rejected'})
+
+
+# =============================================================================
+# INVENTORY SESSION VIEWSET
+# =============================================================================
+
+class InventorySessionViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
+    """
+    ViewSet pour la gestion des sessions d'inventaire.
+    
+    Endpoints:
+    - GET    /inventory-sessions/                    : Liste des sessions
+    - POST   /inventory-sessions/                    : Créer une session (brouillon)
+    - GET    /inventory-sessions/{id}/               : Détail d'une session
+    - DELETE /inventory-sessions/{id}/               : Supprimer (brouillon uniquement)
+    - POST   /inventory-sessions/{id}/start/         : Démarrer (verrouille le stock, génère les lignes)
+    - POST   /inventory-sessions/{id}/count/         : Enregistrer les comptages
+    - POST   /inventory-sessions/{id}/submit/        : Soumettre pour révision
+    - POST   /inventory-sessions/{id}/validate/      : Valider et appliquer les ajustements
+    - POST   /inventory-sessions/{id}/cancel/        : Annuler (déverrouille le stock)
+    - GET    /inventory-sessions/{id}/counts/        : Liste des lignes de comptage
+    - GET    /inventory-sessions/{id}/print-data/    : Données pour impression
+    """
+    
+    queryset = InventorySession.objects.all()
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, TenantObjectPermission]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ['status', 'scope_type', 'warehouse']
+    search_fields = ['reference', 'name']
+    ordering = ['-created_at']
+    
+    select_related_fields = ['warehouse', 'created_by', 'validated_by']
+    prefetch_related_fields = ['categories', 'products']
+    
+    role_permissions = {
+        'list': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant'],
+        'retrieve': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant'],
+        'create': ['owner', 'admin', 'manager', 'stock_keeper'],
+        'destroy': ['owner', 'admin'],
+        'start': ['owner', 'admin', 'manager', 'stock_keeper'],
+        'count': ['owner', 'admin', 'manager', 'stock_keeper'],
+        'submit': ['owner', 'admin', 'manager', 'stock_keeper'],
+        'validate': ['owner', 'admin', 'manager'],
+        'cancel': ['owner', 'admin', 'manager'],
+        'counts': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant'],
+        'print_data': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant'],
+    }
+
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return InventorySessionListSerializer
+        elif self.action == 'create':
+            return InventorySessionCreateSerializer
+        return InventorySessionDetailSerializer
+
+    def destroy(self, request, *args, **kwargs):
+        session = self.get_object()
+        if session.status != 'draft':
+            return Response(
+                {'error': 'Seules les sessions en brouillon peuvent être supprimées'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        return super().destroy(request, *args, **kwargs)
+
+    def _get_target_products(self, session):
+        """Retourne les produits ciblés par la session selon son scope."""
+        from apps.products.models import Product
+        
+        organization = session.organization
+        base_qs = Product.objects.filter(
+            organization=organization,
+            is_active=True,
+            track_inventory=True,
+        )
+        
+        if session.scope_type == 'category':
+            category_ids = list(session.categories.values_list('id', flat=True))
+            if category_ids:
+                base_qs = base_qs.filter(category_id__in=category_ids)
+        elif session.scope_type == 'product':
+            product_ids = list(session.products.values_list('id', flat=True))
+            if product_ids:
+                base_qs = base_qs.filter(id__in=product_ids)
+        
+        return base_qs
+
+    @action(detail=True, methods=['post'])
+    def start(self, request, pk=None):
+        """
+        Démarre une session d'inventaire :
+        1. Verrouille le stock des produits ciblés dans l'entrepôt
+        2. Prend un snapshot du stock actuel
+        3. Génère les lignes de comptage (InventoryCount)
+        """
+        session = self.get_object()
+        
+        if session.status != 'draft':
+            return Response(
+                {'error': 'Seules les sessions en brouillon peuvent être démarrées'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        with transaction.atomic():
+            products = self._get_target_products(session)
+            
+            # Generate count lines with stock snapshot
+            count_objects = []
+            for product in products:
+                stock = Stock.objects.filter(
+                    organization=session.organization,
+                    product=product,
+                    warehouse=session.warehouse,
+                    variant=None,
+                ).first()
+                
+                current_qty = stock.quantity if stock else Decimal('0.000')
+                unit_cost = Decimal('0.00')
+                if stock and stock.avg_cost > 0:
+                    unit_cost = stock.avg_cost
+                elif product.cost_price:
+                    unit_cost = product.cost_price
+                
+                count_objects.append(InventoryCount(
+                    organization=session.organization,
+                    session=session,
+                    product=product,
+                    variant=None,
+                    quantity_expected=current_qty,
+                    unit_cost=unit_cost,
+                ))
+            
+            InventoryCount.objects.bulk_create(count_objects)
+            
+            # Lock stock
+            session.status = 'in_progress'
+            session.is_stock_locked = True
+            session.started_at = timezone.now()
+            session.save()
+        
+        serializer = InventorySessionDetailSerializer(session)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'])
+    def count(self, request, pk=None):
+        """
+        Enregistre les comptages pour une ou plusieurs lignes.
+        
+        Body: { "counts": [{ "id": "<count_id>", "quantity_counted": 10, "notes": "" }, ...] }
+        """
+        session = self.get_object()
+        
+        if session.status != 'in_progress':
+            return Response(
+                {'error': "L'inventaire doit être en cours pour enregistrer des comptages"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        counts_data = request.data.get('counts', [])
+        if not counts_data:
+            return Response(
+                {'error': 'Aucun comptage fourni'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        updated_ids = []
+        with transaction.atomic():
+            for item in counts_data:
+                count_id = item.get('id')
+                quantity_counted = item.get('quantity_counted')
+                notes = item.get('notes', '')
+                
+                if count_id is None or quantity_counted is None:
+                    continue
+                
+                try:
+                    count = InventoryCount.objects.select_for_update().get(
+                        id=count_id,
+                        session=session,
+                    )
+                    count.quantity_counted = Decimal(str(quantity_counted))
+                    count.is_counted = True
+                    count.counted_by = request.user
+                    count.counted_at = timezone.now()
+                    if notes:
+                        count.notes = notes
+                    count.save()
+                    updated_ids.append(str(count.id))
+                except InventoryCount.DoesNotExist:
+                    continue
+        
+        return Response({
+            'status': 'counted',
+            'updated_count': len(updated_ids),
+            'updated_ids': updated_ids,
+        })
+
+    @action(detail=True, methods=['post'])
+    def submit(self, request, pk=None):
+        """Soumet la session pour révision après le comptage."""
+        session = self.get_object()
+        
+        if session.status != 'in_progress':
+            return Response(
+                {'error': "Seules les sessions en cours peuvent être soumises"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Check that all items have been counted
+        uncounted = session.counts.filter(is_counted=False).count()
+        if uncounted > 0:
+            return Response(
+                {'error': f'{uncounted} produit(s) n\'ont pas encore été comptés'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Compute summary
+        from django.db.models import Sum
+        totals = session.counts.aggregate(
+            total_expected=Sum('quantity_expected'),
+            total_counted=Sum('quantity_counted'),
+            total_diff=Sum('quantity_difference'),
+            total_diff_value=Sum('difference_value'),
+        )
+        
+        session.total_expected_quantity = totals['total_expected'] or Decimal('0.000')
+        session.total_counted_quantity = totals['total_counted'] or Decimal('0.000')
+        session.total_difference_quantity = totals['total_diff'] or Decimal('0.000')
+        session.total_difference_value = totals['total_diff_value'] or Decimal('0.00')
+        session.status = 'review'
+        session.completed_at = timezone.now()
+        session.save()
+        
+        serializer = InventorySessionDetailSerializer(session)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'])
+    def validate(self, request, pk=None):
+        """
+        Valide la session d'inventaire :
+        1. Applique les ajustements de stock pour chaque différence
+        2. Crée les mouvements de stock correspondants
+        3. Déverrouille le stock
+        """
+        session = self.get_object()
+        
+        if session.status != 'review':
+            return Response(
+                {'error': 'Seules les sessions en révision peuvent être validées'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        with transaction.atomic():
+            for count in session.counts.filter(is_counted=True).select_related('product'):
+                if count.quantity_difference == 0:
+                    continue
+                
+                product_cost = count.unit_cost or (count.product.cost_price or Decimal('0.00'))
+                stock, created = Stock.objects.select_for_update().get_or_create(
+                    organization=session.organization,
+                    product=count.product,
+                    variant=count.variant,
+                    warehouse=session.warehouse,
+                    defaults={'quantity': Decimal('0.000'), 'avg_cost': product_cost}
+                )
+                
+                if not created and stock.avg_cost == 0 and product_cost > 0:
+                    stock.avg_cost = product_cost
+                
+                quantity_before = stock.quantity
+                stock.quantity = count.quantity_counted
+                stock.last_counted_at = timezone.now()
+                stock.last_movement_at = timezone.now()
+                stock.save()
+                
+                movement_type = 'adjustment_in' if count.quantity_difference > 0 else 'adjustment_out'
+                
+                StockMovement.objects.create(
+                    organization=session.organization,
+                    product=count.product,
+                    variant=count.variant,
+                    warehouse=session.warehouse,
+                    movement_type=movement_type,
+                    quantity=count.quantity_difference,
+                    unit_cost=count.unit_cost,
+                    quantity_before=quantity_before,
+                    quantity_after=stock.quantity,
+                    reference_type='inventory_session',
+                    reference_id=session.id,
+                    notes=f"Inventaire {session.reference}: {session.name}",
+                    created_by=request.user
+                )
+            
+            # Unlock stock and finalize
+            session.status = 'validated'
+            session.is_stock_locked = False
+            session.validated_at = timezone.now()
+            session.validated_by = request.user
+            session.save()
+        
+        serializer = InventorySessionDetailSerializer(session)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        """Annule une session d'inventaire et déverrouille le stock."""
+        session = self.get_object()
+        
+        if session.status in ['validated', 'cancelled']:
+            return Response(
+                {'error': 'Cette session ne peut pas être annulée'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        session.status = 'cancelled'
+        session.is_stock_locked = False
+        session.save()
+        
+        return Response({'status': 'cancelled'})
+
+    @action(detail=True, methods=['get'])
+    def counts(self, request, pk=None):
+        """Retourne les lignes de comptage d'une session avec filtres."""
+        session = self.get_object()
+        
+        qs = session.counts.select_related('product', 'variant', 'counted_by')
+        
+        # Filters
+        is_counted = request.query_params.get('is_counted')
+        if is_counted is not None:
+            qs = qs.filter(is_counted=is_counted.lower() == 'true')
+        
+        has_difference = request.query_params.get('has_difference')
+        if has_difference is not None and has_difference.lower() == 'true':
+            qs = qs.filter(is_counted=True).exclude(quantity_difference=Decimal('0.000'))
+        
+        search = request.query_params.get('search')
+        if search:
+            qs = qs.filter(
+                Q(product__name__icontains=search) |
+                Q(product__sku__icontains=search)
+            )
+        
+        category = request.query_params.get('category')
+        if category:
+            qs = qs.filter(product__category_id=category)
+        
+        serializer = InventoryCountSerializer(qs, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['get'], url_path='print-data')
+    def print_data(self, request, pk=None):
+        """
+        Retourne les données formatées pour l'impression de l'inventaire.
+        Inclut les informations de la session et toutes les lignes de comptage.
+        """
+        session = self.get_object()
+        
+        counts = session.counts.select_related(
+            'product', 'product__category', 'product__unit', 'variant', 'counted_by'
+        ).order_by('product__category__name', 'product__name')
+        
+        # Group by category
+        categories_data = {}
+        for count in counts:
+            cat_name = count.product.category.name if count.product.category else 'Sans catégorie'
+            if cat_name not in categories_data:
+                categories_data[cat_name] = []
+            categories_data[cat_name].append(InventoryCountSerializer(count).data)
+        
+        return Response({
+            'session': InventorySessionListSerializer(session).data,
+            'warehouse': {
+                'name': session.warehouse.name,
+                'code': session.warehouse.code,
+                'address': session.warehouse.address,
+            },
+            'categories': categories_data,
+            'summary': {
+                'total_products': session.items_total,
+                'counted_products': session.items_counted,
+                'products_with_difference': session.items_with_difference,
+                'total_expected_quantity': str(session.total_expected_quantity),
+                'total_counted_quantity': str(session.total_counted_quantity),
+                'total_difference_quantity': str(session.total_difference_quantity),
+                'total_difference_value': str(session.total_difference_value),
+            },
+            'printed_at': timezone.now().isoformat(),
+            'printed_by': request.user.full_name or request.user.email,
+        })

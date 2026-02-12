@@ -3,9 +3,11 @@ Serializers DRF pour l'app Inventory.
 """
 from rest_framework import serializers
 from decimal import Decimal
+from django.utils import timezone
 from .models import (
     Warehouse, StockLocation, Stock, StockBatch, StockMovement,
-    StockTransfer, StockTransferItem, StockAdjustment, StockAdjustmentItem
+    StockTransfer, StockTransferItem, StockAdjustment, StockAdjustmentItem,
+    InventorySession, InventoryCount
 )
 
 
@@ -559,3 +561,219 @@ class StockAdjustmentCreateSerializer(serializers.ModelSerializer):
             )
         
         return adjustment
+
+
+# =============================================================================
+# INVENTORY SESSION SERIALIZERS
+# =============================================================================
+
+class InventoryCountSerializer(serializers.ModelSerializer):
+    """Serializer pour les lignes de comptage d'inventaire."""
+    
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    product_sku = serializers.CharField(source='product.sku', read_only=True)
+    product_category_name = serializers.SerializerMethodField()
+    variant_name = serializers.CharField(source='variant.name', read_only=True, default=None)
+    counted_by_name = serializers.SerializerMethodField()
+    unit_name = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = InventoryCount
+        fields = [
+            'id', 'session', 'product', 'product_name', 'product_sku',
+            'product_category_name', 'variant', 'variant_name',
+            'quantity_expected', 'quantity_counted', 'quantity_difference',
+            'unit_cost', 'difference_value',
+            'is_counted', 'counted_by', 'counted_by_name', 'counted_at',
+            'unit_name', 'notes',
+        ]
+        read_only_fields = [
+            'id', 'session', 'product', 'variant',
+            'quantity_expected', 'quantity_difference', 'difference_value',
+            'unit_cost',
+        ]
+
+    def get_product_category_name(self, obj):
+        if obj.product.category:
+            return obj.product.category.name
+        return None
+
+    def get_counted_by_name(self, obj):
+        if obj.counted_by:
+            return obj.counted_by.full_name or obj.counted_by.email
+        return None
+
+    def get_unit_name(self, obj):
+        if obj.product.unit:
+            return obj.product.unit.symbol
+        return None
+
+
+class InventorySessionListSerializer(serializers.ModelSerializer):
+    """Serializer léger pour les listes de sessions d'inventaire."""
+    
+    warehouse_name = serializers.CharField(source='warehouse.name', read_only=True)
+    created_by_name = serializers.SerializerMethodField()
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    scope_type_display = serializers.CharField(source='get_scope_type_display', read_only=True)
+    progress_percentage = serializers.FloatField(read_only=True)
+    items_total = serializers.IntegerField(read_only=True)
+    items_counted = serializers.IntegerField(read_only=True)
+    items_with_difference = serializers.IntegerField(read_only=True)
+    
+    class Meta:
+        model = InventorySession
+        fields = [
+            'id', 'reference', 'name', 'warehouse', 'warehouse_name',
+            'scope_type', 'scope_type_display',
+            'status', 'status_display', 'is_stock_locked',
+            'progress_percentage', 'items_total', 'items_counted', 'items_with_difference',
+            'total_expected_quantity', 'total_counted_quantity',
+            'total_difference_quantity', 'total_difference_value',
+            'created_by', 'created_by_name',
+            'started_at', 'completed_at', 'validated_at',
+            'created_at',
+        ]
+        read_only_fields = ['id', 'reference', 'created_at']
+
+    def get_created_by_name(self, obj):
+        if obj.created_by:
+            return obj.created_by.full_name or obj.created_by.email
+        return None
+
+
+class InventorySessionDetailSerializer(serializers.ModelSerializer):
+    """Serializer complet pour le détail d'une session d'inventaire."""
+    
+    warehouse_name = serializers.CharField(source='warehouse.name', read_only=True)
+    created_by_name = serializers.SerializerMethodField()
+    validated_by_name = serializers.SerializerMethodField()
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    scope_type_display = serializers.CharField(source='get_scope_type_display', read_only=True)
+    progress_percentage = serializers.FloatField(read_only=True)
+    items_total = serializers.IntegerField(read_only=True)
+    items_counted = serializers.IntegerField(read_only=True)
+    items_with_difference = serializers.IntegerField(read_only=True)
+    counts = InventoryCountSerializer(many=True, read_only=True)
+    category_names = serializers.SerializerMethodField()
+    product_names = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = InventorySession
+        fields = [
+            'id', 'reference', 'name', 'warehouse', 'warehouse_name',
+            'scope_type', 'scope_type_display',
+            'status', 'status_display', 'is_stock_locked',
+            'notes',
+            'progress_percentage', 'items_total', 'items_counted', 'items_with_difference',
+            'total_expected_quantity', 'total_counted_quantity',
+            'total_difference_quantity', 'total_difference_value',
+            'counts', 'category_names', 'product_names',
+            'created_by', 'created_by_name',
+            'validated_by', 'validated_by_name',
+            'started_at', 'completed_at', 'validated_at',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'reference', 'created_at', 'updated_at']
+
+    def get_created_by_name(self, obj):
+        if obj.created_by:
+            return obj.created_by.full_name or obj.created_by.email
+        return None
+
+    def get_validated_by_name(self, obj):
+        if obj.validated_by:
+            return obj.validated_by.full_name or obj.validated_by.email
+        return None
+
+    def get_category_names(self, obj):
+        return list(obj.categories.values_list('name', flat=True))
+
+    def get_product_names(self, obj):
+        return list(obj.products.values_list('name', flat=True))
+
+
+class InventorySessionCreateSerializer(serializers.ModelSerializer):
+    """Serializer pour la création d'une session d'inventaire."""
+    
+    category_ids = serializers.ListField(
+        child=serializers.UUIDField(), required=False, default=list
+    )
+    product_ids = serializers.ListField(
+        child=serializers.UUIDField(), required=False, default=list
+    )
+    name = serializers.CharField(required=False, allow_blank=True)
+    
+    class Meta:
+        model = InventorySession
+        fields = ['name', 'warehouse', 'scope_type', 'notes', 'category_ids', 'product_ids']
+
+    def validate(self, data):
+        scope_type = data.get('scope_type', 'full')
+        category_ids = data.get('category_ids', [])
+        product_ids = data.get('product_ids', [])
+        
+        if scope_type == 'category' and not category_ids:
+            raise serializers.ValidationError({
+                'category_ids': "Au moins une catégorie est requise pour un inventaire par catégorie."
+            })
+        
+        if scope_type == 'product' and not product_ids:
+            raise serializers.ValidationError({
+                'product_ids': "Au moins un produit est requis pour un inventaire par produit."
+            })
+        
+        # Check warehouse has stock
+        warehouse = data.get('warehouse')
+        organization = self.context['request'].headers.get('X-Organization-ID')
+        
+        has_stock = Stock.objects.filter(
+            organization_id=organization,
+            warehouse=warehouse,
+            quantity__gt=0,
+        ).exists()
+        if not has_stock:
+            raise serializers.ValidationError({
+                'warehouse': "Cet entrepôt ne contient aucun produit en stock."
+            })
+        
+        # Check no active inventory session for same warehouse
+        active_sessions = InventorySession.objects.filter(
+            organization_id=organization,
+            warehouse=warehouse,
+            status__in=['in_progress', 'review'],
+            is_deleted=False,
+        )
+        if active_sessions.exists():
+            raise serializers.ValidationError({
+                'warehouse': "Un inventaire est déjà en cours pour cet entrepôt."
+            })
+        
+        return data
+
+    def create(self, validated_data):
+        category_ids = validated_data.pop('category_ids', [])
+        product_ids = validated_data.pop('product_ids', [])
+        
+        from apps.core.utils import ReferenceGenerator
+        organization_id = self.context['request'].headers.get('X-Organization-ID')
+        from apps.organizations.models import Organization
+        org = Organization.objects.get(id=organization_id)
+        
+        validated_data['reference'] = ReferenceGenerator.generate_inventory_reference(org)
+        validated_data['organization'] = org
+        validated_data['created_by'] = self.context['request'].user
+        
+        # Auto-generate name from date if not provided
+        if not validated_data.get('name'):
+            now = timezone.now()
+            validated_data['name'] = f"Inventaire du {now.strftime('%d/%m/%Y')}"
+        
+        session = InventorySession.objects.create(**validated_data)
+        
+        if category_ids:
+            session.categories.set(category_ids)
+        if product_ids:
+            session.products.set(product_ids)
+        
+        return session

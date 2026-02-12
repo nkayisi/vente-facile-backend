@@ -524,3 +524,229 @@ class StockAdjustmentItem(TenantModel):
 
     def __str__(self):
         return f"{self.product.name}: {self.quantity_difference:+}"
+
+
+# =============================================================================
+# INVENTORY SESSION & COUNT MODELS
+# =============================================================================
+
+class InventorySession(TenantSoftDeleteModel):
+    """
+    Represents a full inventory count session.
+    
+    An inventory session can be scoped to:
+    - A specific warehouse (required)
+    - Specific categories (optional filter)
+    - Specific products (optional filter)
+    - Full warehouse inventory (no category/product filter)
+    
+    When a session is started (status=in_progress), the stock of the
+    targeted products in the warehouse is locked (movements blocked)
+    until the session is completed or cancelled.
+    """
+    
+    class Status(models.TextChoices):
+        DRAFT = 'draft', 'Brouillon'
+        IN_PROGRESS = 'in_progress', 'En cours'
+        REVIEW = 'review', 'En révision'
+        VALIDATED = 'validated', 'Validé'
+        CANCELLED = 'cancelled', 'Annulé'
+
+    class ScopeType(models.TextChoices):
+        FULL = 'full', 'Inventaire complet'
+        CATEGORY = 'category', 'Par catégorie'
+        PRODUCT = 'product', 'Par produit'
+
+    reference = models.CharField(max_length=50, unique=True)
+    name = models.CharField(max_length=255)
+    
+    warehouse = models.ForeignKey(
+        Warehouse,
+        on_delete=models.CASCADE,
+        related_name='inventory_sessions'
+    )
+    
+    scope_type = models.CharField(
+        max_length=20,
+        choices=ScopeType.choices,
+        default=ScopeType.FULL
+    )
+    
+    # Optional scope filters
+    categories = models.ManyToManyField(
+        'products.Category',
+        blank=True,
+        related_name='inventory_sessions'
+    )
+    products = models.ManyToManyField(
+        'products.Product',
+        blank=True,
+        related_name='inventory_sessions'
+    )
+    
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.DRAFT
+    )
+    
+    notes = models.TextField(blank=True)
+    
+    # Stock locking: when True, stock movements for targeted products are blocked
+    is_stock_locked = models.BooleanField(default=False)
+    
+    # Dates
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    validated_at = models.DateTimeField(null=True, blank=True)
+    
+    # Users
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name='created_inventory_sessions'
+    )
+    validated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='validated_inventory_sessions'
+    )
+    
+    # Summary fields (computed on validation)
+    total_expected_quantity = models.DecimalField(
+        max_digits=15, decimal_places=3, default=Decimal('0.000')
+    )
+    total_counted_quantity = models.DecimalField(
+        max_digits=15, decimal_places=3, default=Decimal('0.000')
+    )
+    total_difference_quantity = models.DecimalField(
+        max_digits=15, decimal_places=3, default=Decimal('0.000')
+    )
+    total_difference_value = models.DecimalField(
+        max_digits=15, decimal_places=2, default=Decimal('0.00')
+    )
+
+    objects = TenantSoftDeleteManager()
+
+    class Meta:
+        db_table = 'inventory_sessions'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['organization', 'status']),
+            models.Index(fields=['reference']),
+            models.Index(fields=['warehouse', 'status']),
+        ]
+
+    def __str__(self):
+        return f"{self.reference} - {self.name}"
+
+    @property
+    def progress_percentage(self):
+        """Percentage of items that have been counted."""
+        total = self.counts.count()
+        if total == 0:
+            return 0
+        counted = self.counts.filter(is_counted=True).count()
+        return round((counted / total) * 100, 1)
+
+    @property
+    def items_total(self):
+        return self.counts.count()
+
+    @property
+    def items_counted(self):
+        return self.counts.filter(is_counted=True).count()
+
+    @property
+    def items_with_difference(self):
+        return self.counts.filter(is_counted=True).exclude(quantity_difference=Decimal('0.000')).count()
+
+
+class InventoryCount(TenantModel):
+    """
+    Individual product count within an inventory session.
+    
+    Each row represents one product (optionally one variant) to be counted.
+    The expected quantity is captured at session start (snapshot of current stock).
+    The counted quantity is entered by the user during the count.
+    """
+    
+    session = models.ForeignKey(
+        InventorySession,
+        on_delete=models.CASCADE,
+        related_name='counts'
+    )
+    
+    product = models.ForeignKey(
+        'products.Product',
+        on_delete=models.CASCADE,
+        related_name='inventory_counts'
+    )
+    variant = models.ForeignKey(
+        'products.ProductVariant',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='inventory_counts'
+    )
+    
+    # Stock snapshot at session start
+    quantity_expected = models.DecimalField(
+        max_digits=15, decimal_places=3, default=Decimal('0.000')
+    )
+    
+    # User-entered count
+    quantity_counted = models.DecimalField(
+        max_digits=15, decimal_places=3, default=Decimal('0.000')
+    )
+    
+    # Computed difference (counted - expected)
+    quantity_difference = models.DecimalField(
+        max_digits=15, decimal_places=3, default=Decimal('0.000')
+    )
+    
+    # Cost for value calculation
+    unit_cost = models.DecimalField(
+        max_digits=15, decimal_places=2, default=Decimal('0.00')
+    )
+    
+    # Difference in value
+    difference_value = models.DecimalField(
+        max_digits=15, decimal_places=2, default=Decimal('0.00')
+    )
+    
+    is_counted = models.BooleanField(default=False)
+    
+    counted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='inventory_counts'
+    )
+    counted_at = models.DateTimeField(null=True, blank=True)
+    
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        db_table = 'inventory_counts'
+        ordering = ['product__name']
+        unique_together = ['session', 'product', 'variant']
+        indexes = [
+            models.Index(fields=['session', 'is_counted']),
+        ]
+
+    def __str__(self):
+        name = self.product.name
+        if self.variant:
+            name += f" ({self.variant.name})"
+        return f"{name}: attendu={self.quantity_expected}, compté={self.quantity_counted}"
+
+    def save(self, *args, **kwargs):
+        if self.is_counted:
+            self.quantity_difference = self.quantity_counted - self.quantity_expected
+            self.difference_value = self.quantity_difference * self.unit_cost
+        super().save(*args, **kwargs)

@@ -1,7 +1,8 @@
 from django.contrib import admin
 from .models import (
     Warehouse, StockLocation, Stock, StockBatch, StockMovement,
-    StockTransfer, StockTransferItem, StockAdjustment, StockAdjustmentItem
+    StockTransfer, StockTransferItem, StockAdjustment, StockAdjustmentItem,
+    InventorySession, InventoryCount
 )
 
 
@@ -75,3 +76,19 @@ class StockAdjustmentAdmin(admin.ModelAdmin):
     search_fields = ['reference']
     raw_id_fields = ['organization', 'warehouse', 'created_by', 'approved_by']
     inlines = [StockAdjustmentItemInline]
+
+
+class InventoryCountInline(admin.TabularInline):
+    model = InventoryCount
+    extra = 0
+    raw_id_fields = ['product', 'variant', 'counted_by']
+    readonly_fields = ['quantity_difference', 'difference_value']
+
+
+@admin.register(InventorySession)
+class InventorySessionAdmin(admin.ModelAdmin):
+    list_display = ['reference', 'name', 'warehouse', 'scope_type', 'status', 'is_stock_locked', 'created_at']
+    list_filter = ['status', 'scope_type', 'organization']
+    search_fields = ['reference', 'name']
+    raw_id_fields = ['organization', 'warehouse', 'created_by', 'validated_by']
+    inlines = [InventoryCountInline]

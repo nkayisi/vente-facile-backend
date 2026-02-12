@@ -7,7 +7,8 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     WarehouseViewSet, StockLocationViewSet, StockViewSet,
     StockBatchViewSet, StockMovementViewSet,
-    StockTransferViewSet, StockAdjustmentViewSet
+    StockTransferViewSet, StockAdjustmentViewSet,
+    InventorySessionViewSet
 )
 
 router = DefaultRouter()
@@ -18,6 +19,7 @@ router.register(r'stock-batches', StockBatchViewSet, basename='stock-batch')
 router.register(r'stock-movements', StockMovementViewSet, basename='stock-movement')
 router.register(r'stock-transfers', StockTransferViewSet, basename='stock-transfer')
 router.register(r'stock-adjustments', StockAdjustmentViewSet, basename='stock-adjustment')
+router.register(r'inventory-sessions', InventorySessionViewSet, basename='inventory-session')
 
 app_name = 'inventory'
 

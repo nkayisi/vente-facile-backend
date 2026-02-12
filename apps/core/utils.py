@@ -146,6 +146,29 @@ class ReferenceGenerator:
         return f"{prefix}-{num:04d}"
 
     @staticmethod
+    def generate_inventory_reference(organization):
+        """Generate inventory session reference: INV-YYYYMMDD-XXXX"""
+        from apps.inventory.models import InventorySession
+        
+        today = timezone.now()
+        prefix = f"INV-{today.strftime('%Y%m%d')}"
+        
+        last = InventorySession.objects.filter(
+            organization=organization,
+            reference__startswith=prefix
+        ).order_by('-reference').first()
+        
+        if last:
+            try:
+                num = int(last.reference.split('-')[-1]) + 1
+            except (ValueError, IndexError):
+                num = 1
+        else:
+            num = 1
+        
+        return f"{prefix}-{num:04d}"
+
+    @staticmethod
     def generate_customer_code(organization):
         """Generate customer code: CL-XXXXX"""
         from apps.contacts.models import Customer
