@@ -1,8 +1,34 @@
 """
-Permissions DRF personnalisées pour le multi-tenant et django-guardian.
+Permissions DRF personnalisées pour le multi-tenant.
+
+Système de permissions basé sur les rôles :
+- owner (Admin) : toutes les permissions
+- manager (Gérant) : gestion complète sauf abonnement/paramètres
+- stock_keeper (Magasinier) : stock, inventaire, réceptions
+- cashier (Caissier) : ventes, consultation produits/prix
 """
+from functools import wraps
 from rest_framework import permissions
-from guardian.shortcuts import get_perms, assign_perm
+from rest_framework.response import Response
+from rest_framework import status as http_status
+
+
+def _get_membership(request):
+    """Helper : récupère le membership de l'utilisateur pour l'organisation courante."""
+    if not request.user.is_authenticated:
+        return None
+    org_id = request.headers.get('X-Organization-ID')
+    if not org_id:
+        return None
+    # Cache le membership sur la request pour éviter les requêtes répétées
+    cache_key = f'_membership_{org_id}'
+    if not hasattr(request, cache_key):
+        membership = request.user.memberships.filter(
+            organization_id=org_id,
+            is_active=True
+        ).select_related('organization').first()
+        setattr(request, cache_key, membership)
+    return getattr(request, cache_key)
 
 
 class IsTenantMember(permissions.BasePermission):
@@ -13,59 +39,40 @@ class IsTenantMember(permissions.BasePermission):
     message = "Vous n'avez pas accès à cette organisation."
 
     def has_permission(self, request, view):
-        if not request.user.is_authenticated:
-            return False
-        
-        org_id = request.headers.get('X-Organization-ID')
-        if not org_id:
-            return False
-        
-        return request.user.memberships.filter(
-            organization_id=org_id,
-            is_active=True
-        ).exists()
+        return _get_membership(request) is not None
 
 
 class IsTenantAdmin(permissions.BasePermission):
     """
-    Vérifie que l'utilisateur est admin ou owner de l'organisation.
+    Vérifie que l'utilisateur est admin (owner) de l'organisation.
     """
     message = "Vous devez être administrateur pour effectuer cette action."
 
     def has_permission(self, request, view):
-        if not request.user.is_authenticated:
-            return False
-        
-        org_id = request.headers.get('X-Organization-ID')
-        if not org_id:
-            return False
-        
-        return request.user.memberships.filter(
-            organization_id=org_id,
-            is_active=True,
-            role__in=['owner', 'admin']
-        ).exists()
+        membership = _get_membership(request)
+        return membership is not None and membership.role == 'owner'
 
 
 class IsTenantOwner(permissions.BasePermission):
     """
-    Vérifie que l'utilisateur est owner de l'organisation.
+    Alias de IsTenantAdmin (owner = admin dans notre système).
     """
     message = "Vous devez être propriétaire pour effectuer cette action."
 
     def has_permission(self, request, view):
-        if not request.user.is_authenticated:
-            return False
-        
-        org_id = request.headers.get('X-Organization-ID')
-        if not org_id:
-            return False
-        
-        return request.user.memberships.filter(
-            organization_id=org_id,
-            is_active=True,
-            role='owner'
-        ).exists()
+        membership = _get_membership(request)
+        return membership is not None and membership.role == 'owner'
+
+
+class IsTenantManager(permissions.BasePermission):
+    """
+    Vérifie que l'utilisateur est au moins gérant (owner ou manager).
+    """
+    message = "Vous devez être gérant ou administrateur pour effectuer cette action."
+
+    def has_permission(self, request, view):
+        membership = _get_membership(request)
+        return membership is not None and membership.role in ['owner', 'manager']
 
 
 class HasActiveSubscription(permissions.BasePermission):
@@ -76,7 +83,6 @@ class HasActiveSubscription(permissions.BasePermission):
     message = "Votre abonnement est inactif. Veuillez le renouveler."
 
     def has_permission(self, request, view):
-        # En mode DEBUG, on désactive la vérification d'abonnement
         from django.conf import settings
         if settings.DEBUG:
             return True
@@ -84,32 +90,20 @@ class HasActiveSubscription(permissions.BasePermission):
         if request.method in permissions.SAFE_METHODS:
             return True
         
-        if not request.user.is_authenticated:
+        membership = _get_membership(request)
+        if not membership:
             return False
         
-        org_id = request.headers.get('X-Organization-ID')
-        if not org_id:
-            return False
-        
-        from apps.organizations.models import Organization
-        try:
-            organization = Organization.objects.get(id=org_id)
-            subscription = organization.get_active_subscription()
-            return subscription is not None and subscription.is_active
-        except Organization.DoesNotExist:
-            return False
+        subscription = membership.organization.get_active_subscription()
+        return subscription is not None and subscription.is_active
 
 
 class TenantObjectPermission(permissions.BasePermission):
     """
-    Permission object-level : vérifie que l'objet appartient à l'organisation
-    de l'utilisateur et qu'il a les permissions guardian nécessaires.
+    Permission object-level : vérifie que l'objet appartient à l'organisation.
     """
     
     def has_object_permission(self, request, view, obj):
-        if not request.user.is_authenticated:
-            return False
-        
         if not hasattr(obj, 'organization'):
             return True
         
@@ -117,63 +111,59 @@ class TenantObjectPermission(permissions.BasePermission):
         if not org_id:
             return False
         
-        if str(obj.organization_id) != org_id:
-            return False
-        
-        return request.user.memberships.filter(
-            organization_id=org_id,
-            is_active=True
-        ).exists()
+        return str(obj.organization_id) == org_id
 
 
-class GuardianPermission(permissions.BasePermission):
+class HasPermission(permissions.BasePermission):
     """
-    Permission basée sur django-guardian.
-    Vérifie les permissions object-level définies dans guardian.
-    """
+    Permission granulaire basée sur le système de permissions par rôle.
     
-    perms_map = {
-        'GET': ['view_%(model_name)s'],
-        'OPTIONS': [],
-        'HEAD': [],
-        'POST': ['add_%(model_name)s'],
-        'PUT': ['change_%(model_name)s'],
-        'PATCH': ['change_%(model_name)s'],
-        'DELETE': ['delete_%(model_name)s'],
-    }
-
-    def get_required_permissions(self, method, model_cls):
-        """Retourne les permissions requises pour la méthode HTTP."""
-        kwargs = {
-            'model_name': model_cls._meta.model_name
+    Utilisation dans un ViewSet via l'attribut `action_permissions` :
+    
+        action_permissions = {
+            'list': 'products.view',
+            'create': 'products.create',
+            'update': 'products.edit',
+            'partial_update': 'products.edit',
+            'destroy': 'products.delete',
+            # Actions custom
+            'approve': 'stock_adjustments.approve',
         }
-        return [perm % kwargs for perm in self.perms_map.get(method, [])]
+    
+    Si une action n'est pas dans le dict, l'accès est refusé par défaut.
+    Utiliser '*' comme valeur pour autoriser tous les membres.
+    """
+    message = "Vous n'avez pas la permission d'effectuer cette action."
 
     def has_permission(self, request, view):
-        if not request.user.is_authenticated:
+        membership = _get_membership(request)
+        if not membership:
             return False
         
-        if hasattr(view, 'get_queryset'):
-            queryset = view.get_queryset()
-            model_cls = queryset.model
-            perms = self.get_required_permissions(request.method, model_cls)
-            
-            return all(
-                request.user.has_perm(perm)
-                for perm in perms
-            )
+        action_permissions = getattr(view, 'action_permissions', None)
+        if not action_permissions:
+            return True
         
-        return True
-
-    def has_object_permission(self, request, view, obj):
-        if not request.user.is_authenticated:
+        action = getattr(view, 'action', None)
+        if not action:
+            return True
+        
+        required_perm = action_permissions.get(action)
+        if required_perm is None:
+            # Action non listée = accès refusé
             return False
         
-        model_cls = obj.__class__
-        perms = self.get_required_permissions(request.method, model_cls)
+        if required_perm == '*':
+            return True
         
-        user_perms = get_perms(request.user, obj)
-        return all(perm.split('.')[-1] in user_perms for perm in perms)
+        from apps.core.services import PermissionService
+        role_perms = PermissionService.get_role_permissions(membership.role)
+        
+        # Supporte une permission unique ou une liste
+        if isinstance(required_perm, (list, tuple)):
+            return any(p in role_perms for p in required_perm)
+        
+        return required_perm in role_perms
 
 
 class RoleBasedPermission(permissions.BasePermission):
@@ -183,26 +173,14 @@ class RoleBasedPermission(permissions.BasePermission):
     
     Exemple d'utilisation dans un ViewSet:
         role_permissions = {
-            'list': ['owner', 'admin', 'manager', 'cashier'],
-            'create': ['owner', 'admin', 'manager'],
-            'update': ['owner', 'admin', 'manager'],
-            'destroy': ['owner', 'admin'],
+            'list': ['owner', 'manager', 'cashier'],
+            'create': ['owner', 'manager'],
+            'destroy': ['owner'],
         }
     """
     
     def has_permission(self, request, view):
-        if not request.user.is_authenticated:
-            return False
-        
-        org_id = request.headers.get('X-Organization-ID')
-        if not org_id:
-            return False
-        
-        membership = request.user.memberships.filter(
-            organization_id=org_id,
-            is_active=True
-        ).first()
-        
+        membership = _get_membership(request)
         if not membership:
             return False
         
@@ -221,22 +199,36 @@ class RoleBasedPermission(permissions.BasePermission):
         return membership.role in allowed_roles
 
 
-def assign_object_permissions(user, obj, permissions_list=None):
+def require_permission(*perms):
     """
-    Attribue les permissions guardian sur un objet.
+    Décorateur pour les actions custom de ViewSet.
+    Vérifie que l'utilisateur a la permission requise.
     
-    Args:
-        user: L'utilisateur qui reçoit les permissions
-        obj: L'objet sur lequel attribuer les permissions
-        permissions_list: Liste des permissions (si None, attribue view/change/delete)
+    Usage:
+        @action(detail=True, methods=['post'])
+        @require_permission('inventory.validate')
+        def validate(self, request, pk=None):
+            ...
     """
-    if permissions_list is None:
-        model_name = obj._meta.model_name
-        permissions_list = [
-            f'view_{model_name}',
-            f'change_{model_name}',
-            f'delete_{model_name}',
-        ]
-    
-    for perm in permissions_list:
-        assign_perm(perm, user, obj)
+    def decorator(func):
+        @wraps(func)
+        def wrapper(self, request, *args, **kwargs):
+            membership = _get_membership(request)
+            if not membership:
+                return Response(
+                    {'detail': "Vous n'avez pas accès à cette organisation."},
+                    status=http_status.HTTP_403_FORBIDDEN
+                )
+            
+            from apps.core.services import PermissionService
+            role_perms = PermissionService.get_role_permissions(membership.role)
+            
+            if not any(p in role_perms for p in perms):
+                return Response(
+                    {'detail': "Vous n'avez pas la permission d'effectuer cette action."},
+                    status=http_status.HTTP_403_FORBIDDEN
+                )
+            
+            return func(self, request, *args, **kwargs)
+        return wrapper
+    return decorator

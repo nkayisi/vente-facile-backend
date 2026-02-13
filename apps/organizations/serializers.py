@@ -94,15 +94,24 @@ class OrganizationUpdateSerializer(serializers.ModelSerializer):
 class OrganizationMembershipSerializer(serializers.ModelSerializer):
     """Serializer pour les membres d'organisation."""
     
+    user_id = serializers.UUIDField(source='user.id', read_only=True)
     user_email = serializers.CharField(source='user.email', read_only=True)
     user_name = serializers.CharField(source='user.full_name', read_only=True)
+    user_first_name = serializers.CharField(source='user.first_name', read_only=True)
+    user_last_name = serializers.CharField(source='user.last_name', read_only=True)
+    user_phone = serializers.CharField(source='user.phone', read_only=True)
+    user_avatar = serializers.ImageField(source='user.avatar', read_only=True)
+    user_is_active = serializers.BooleanField(source='user.is_active', read_only=True)
+    user_last_login = serializers.DateTimeField(source='user.last_login', read_only=True)
     role_display = serializers.CharField(source='get_role_display', read_only=True)
     invited_by_name = serializers.CharField(source='invited_by.full_name', read_only=True)
     
     class Meta:
         model = OrganizationMembership
         fields = [
-            'id', 'user', 'user_email', 'user_name',
+            'id', 'user', 'user_id', 'user_email', 'user_name',
+            'user_first_name', 'user_last_name', 'user_phone',
+            'user_avatar', 'user_is_active', 'user_last_login',
             'role', 'role_display', 'is_active',
             'invited_by', 'invited_by_name', 'joined_at'
         ]
@@ -110,16 +119,36 @@ class OrganizationMembershipSerializer(serializers.ModelSerializer):
 
 
 class MembershipCreateSerializer(serializers.Serializer):
-    """Serializer pour ajouter un membre."""
+    """Serializer pour ajouter un membre existant par email."""
     
     email = serializers.EmailField()
     role = serializers.ChoiceField(choices=OrganizationMembership.Role.choices)
 
 
+class MemberCreateWithUserSerializer(serializers.Serializer):
+    """
+    Serializer pour créer un nouvel utilisateur et l'ajouter à l'organisation.
+    Utilisé par l'admin et le gérant pour créer des comptes directement.
+    """
+    
+    email = serializers.EmailField()
+    first_name = serializers.CharField(max_length=150)
+    last_name = serializers.CharField(max_length=150)
+    phone = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    password = serializers.CharField(write_only=True, min_length=6)
+    role = serializers.ChoiceField(choices=OrganizationMembership.Role.choices)
+
+    def validate_email(self, value):
+        from apps.users.models import User
+        if User.objects.filter(email=value).exists():
+            raise serializers.ValidationError('Un utilisateur avec cet email existe déjà.')
+        return value
+
+
 class MembershipUpdateSerializer(serializers.Serializer):
     """Serializer pour modifier un membre."""
     
-    role = serializers.ChoiceField(choices=OrganizationMembership.Role.choices)
+    role = serializers.ChoiceField(choices=OrganizationMembership.Role.choices, required=False)
     is_active = serializers.BooleanField(required=False)
 
 

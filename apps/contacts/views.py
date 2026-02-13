@@ -11,7 +11,7 @@ from decimal import Decimal
 
 from apps.core.api_mixins import TenantViewSetMixin, AuditMixin
 from apps.core.api_permissions import (
-    IsTenantMember, HasActiveSubscription, TenantObjectPermission
+    IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission
 )
 from .models import Customer, CustomerTransaction, Supplier, SupplierProduct
 from .serializers import (
@@ -46,7 +46,7 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     """
     
     queryset = Customer.objects.all()
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, TenantObjectPermission]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['customer_type', 'is_active']
     search_fields = ['name', 'code', 'email', 'phone', 'company_name']
@@ -55,14 +55,22 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     
     select_related_fields = ['created_by']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'cashier', 'accountant', 'viewer'],
-        'retrieve': ['owner', 'admin', 'manager', 'cashier', 'accountant', 'viewer'],
-        'create': ['owner', 'admin', 'manager', 'cashier'],
-        'update': ['owner', 'admin', 'manager'],
-        'partial_update': ['owner', 'admin', 'manager'],
-        'destroy': ['owner', 'admin'],
-        'adjust_balance': ['owner', 'admin', 'accountant'],
+    action_permissions = {
+        'list': 'customers.view',
+        'retrieve': 'customers.view',
+        'create': 'customers.create',
+        'update': 'customers.edit',
+        'partial_update': 'customers.edit',
+        'destroy': 'customers.delete',
+        'sales': 'customers.view',
+        'transactions': 'customers.view',
+        'record_payment': 'customers.edit',
+        'record_advance': 'customers.edit',
+        'adjust_balance': 'customers.edit',
+        'with_balance': 'customers.view',
+        'debt_summary': 'customers.view',
+        'search': 'customers.view',
+        'stats': 'customers.view',
     }
 
     def get_serializer_class(self):
@@ -348,7 +356,7 @@ class SupplierViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     """
     
     queryset = Supplier.objects.all()
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, TenantObjectPermission]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['is_active']
     search_fields = ['name', 'code', 'email', 'contact_person']
@@ -358,13 +366,17 @@ class SupplierViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     select_related_fields = ['created_by']
     prefetch_related_fields = ['products']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant', 'viewer'],
-        'retrieve': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant', 'viewer'],
-        'create': ['owner', 'admin', 'manager'],
-        'update': ['owner', 'admin', 'manager'],
-        'partial_update': ['owner', 'admin', 'manager'],
-        'destroy': ['owner', 'admin'],
+    action_permissions = {
+        'list': 'suppliers.view',
+        'retrieve': 'suppliers.view',
+        'create': 'suppliers.create',
+        'update': 'suppliers.edit',
+        'partial_update': 'suppliers.edit',
+        'destroy': 'suppliers.delete',
+        'orders': 'purchases.view',
+        'products': 'suppliers.view',
+        'with_balance': 'suppliers.view',
+        'search': 'suppliers.view',
     }
 
     def get_serializer_class(self):
@@ -471,7 +483,15 @@ class SupplierProductViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     
     queryset = SupplierProduct.objects.all()
     serializer_class = SupplierProductSerializer
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
+    action_permissions = {
+        'list': 'suppliers.view',
+        'retrieve': 'suppliers.view',
+        'create': 'suppliers.create',
+        'update': 'suppliers.edit',
+        'partial_update': 'suppliers.edit',
+        'destroy': 'suppliers.delete',
+    }
     
     select_related_fields = ['product', 'supplier']
     

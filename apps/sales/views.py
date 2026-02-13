@@ -12,7 +12,7 @@ from decimal import Decimal
 
 from apps.core.api_mixins import TenantViewSetMixin, AuditMixin
 from apps.core.api_permissions import (
-    IsTenantMember, HasActiveSubscription, TenantObjectPermission
+    IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission
 )
 from .models import (
     Register, RegisterSession, Sale, SaleItem, PaymentMethod, Payment,
@@ -47,7 +47,7 @@ class RegisterViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     
     queryset = Register.objects.all()
     serializer_class = RegisterSerializer
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, TenantObjectPermission]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ['is_active', 'branch']
     search_fields = ['name', 'code']
@@ -55,13 +55,13 @@ class RegisterViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     
     select_related_fields = ['branch', 'warehouse']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'cashier'],
-        'retrieve': ['owner', 'admin', 'manager', 'cashier'],
-        'create': ['owner', 'admin'],
-        'update': ['owner', 'admin'],
-        'partial_update': ['owner', 'admin'],
-        'destroy': ['owner', 'admin'],
+    action_permissions = {
+        'list': 'sales.view',
+        'retrieve': 'sales.view',
+        'create': 'sales.create',
+        'update': 'sales.create',
+        'partial_update': 'sales.create',
+        'destroy': 'sales.cancel',
     }
 
 
@@ -82,18 +82,19 @@ class RegisterSessionViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     """
     
     queryset = RegisterSession.objects.all()
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ['status', 'register', 'opened_by']
     ordering = ['-opened_at']
     
     select_related_fields = ['register', 'opened_by', 'closed_by']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'cashier', 'accountant'],
-        'retrieve': ['owner', 'admin', 'manager', 'cashier', 'accountant'],
-        'open': ['owner', 'admin', 'manager', 'cashier'],
-        'close': ['owner', 'admin', 'manager', 'cashier'],
+    action_permissions = {
+        'list': 'sales.view',
+        'retrieve': 'sales.view',
+        'open': 'sales.create',
+        'close': 'sales.create',
+        'current': 'sales.view',
     }
     
     # Sessions en lecture seule sauf pour open/close
@@ -231,19 +232,19 @@ class PaymentMethodViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     
     queryset = PaymentMethod.objects.all()
     serializer_class = PaymentMethodSerializer
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ['is_active', 'method_type']
     search_fields = ['name', 'code']
     ordering = ['name']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'cashier', 'accountant'],
-        'retrieve': ['owner', 'admin', 'manager', 'cashier', 'accountant'],
-        'create': ['owner', 'admin'],
-        'update': ['owner', 'admin'],
-        'partial_update': ['owner', 'admin'],
-        'destroy': ['owner', 'admin'],
+    action_permissions = {
+        'list': 'payment_methods.view',
+        'retrieve': 'payment_methods.view',
+        'create': 'payment_methods.manage',
+        'update': 'payment_methods.manage',
+        'partial_update': 'payment_methods.manage',
+        'destroy': 'payment_methods.manage',
     }
 
 
@@ -276,15 +277,17 @@ class SaleViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     select_related_fields = ['customer', 'register', 'warehouse', 'sold_by', 'session']
     prefetch_related_fields = ['items', 'items__product', 'payments']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'cashier', 'accountant', 'viewer'],
-        'retrieve': ['owner', 'admin', 'manager', 'cashier', 'accountant', 'viewer'],
-        'create': ['owner', 'admin', 'manager', 'cashier'],
-        'update': ['owner', 'admin', 'manager'],
-        'partial_update': ['owner', 'admin', 'manager'],
-        'destroy': ['owner', 'admin'],
-        'add_payment': ['owner', 'admin', 'manager', 'cashier'],
-        'cancel': ['owner', 'admin', 'manager'],
+    action_permissions = {
+        'list': 'sales.view',
+        'retrieve': 'sales.view',
+        'create': 'sales.create',
+        'update': 'sales.create',
+        'partial_update': 'sales.create',
+        'destroy': 'sales.cancel',
+        'add_payment': 'sales.create',
+        'cancel': 'sales.cancel',
+        'today': 'sales.view',
+        'stats': 'sales.view',
     }
 
     def get_serializer_class(self):
@@ -604,12 +607,12 @@ class SaleReturnViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     select_related_fields = ['original_sale', 'created_by', 'approved_by']
     prefetch_related_fields = ['items', 'items__original_item__product']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'cashier', 'accountant'],
-        'retrieve': ['owner', 'admin', 'manager', 'cashier', 'accountant'],
-        'create': ['owner', 'admin', 'manager', 'cashier'],
-        'approve': ['owner', 'admin', 'manager'],
-        'reject': ['owner', 'admin', 'manager'],
+    action_permissions = {
+        'list': 'sale_returns.view',
+        'retrieve': 'sale_returns.view',
+        'create': 'sale_returns.create',
+        'approve': 'sale_returns.approve',
+        'reject': 'sale_returns.approve',
     }
 
     def get_serializer_class(self):
@@ -740,15 +743,15 @@ class QuotationViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     select_related_fields = ['customer', 'created_by', 'converted_sale']
     prefetch_related_fields = ['items', 'items__product']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'cashier'],
-        'retrieve': ['owner', 'admin', 'manager', 'cashier'],
-        'create': ['owner', 'admin', 'manager', 'cashier'],
-        'update': ['owner', 'admin', 'manager'],
-        'partial_update': ['owner', 'admin', 'manager'],
-        'destroy': ['owner', 'admin', 'manager'],
-        'convert': ['owner', 'admin', 'manager', 'cashier'],
-        'send': ['owner', 'admin', 'manager'],
+    action_permissions = {
+        'list': 'sales.view',
+        'retrieve': 'sales.view',
+        'create': 'sales.create',
+        'update': 'sales.create',
+        'partial_update': 'sales.create',
+        'destroy': 'sales.cancel',
+        'convert': 'sales.create',
+        'send': 'sales.create',
     }
 
     def get_serializer_class(self):

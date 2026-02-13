@@ -12,7 +12,7 @@ from decimal import Decimal
 
 from apps.core.api_mixins import TenantViewSetMixin, AuditMixin
 from apps.core.api_permissions import (
-    IsTenantMember, HasActiveSubscription, TenantObjectPermission
+    IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission
 )
 from .models import (
     PurchaseOrder, PurchaseOrderItem, GoodsReceipt, GoodsReceiptItem,
@@ -56,16 +56,16 @@ class PurchaseOrderViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
     select_related_fields = ['supplier', 'warehouse', 'created_by', 'approved_by']
     prefetch_related_fields = ['items', 'items__product']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant'],
-        'retrieve': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant'],
-        'create': ['owner', 'admin', 'manager'],
-        'update': ['owner', 'admin', 'manager'],
-        'partial_update': ['owner', 'admin', 'manager'],
-        'destroy': ['owner', 'admin'],
-        'approve': ['owner', 'admin', 'manager'],
-        'send': ['owner', 'admin', 'manager'],
-        'cancel': ['owner', 'admin', 'manager'],
+    action_permissions = {
+        'list': 'purchases.view',
+        'retrieve': 'purchases.view',
+        'create': 'purchases.create',
+        'update': 'purchases.edit',
+        'partial_update': 'purchases.edit',
+        'destroy': 'purchases.edit',
+        'approve': 'purchases.edit',
+        'send': 'purchases.edit',
+        'cancel': 'purchases.edit',
     }
 
     def get_serializer_class(self):
@@ -179,12 +179,12 @@ class GoodsReceiptViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet)
     select_related_fields = ['purchase_order', 'warehouse', 'received_by']
     prefetch_related_fields = ['items', 'items__product']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant'],
-        'retrieve': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant'],
-        'create': ['owner', 'admin', 'manager', 'stock_keeper'],
-        'complete': ['owner', 'admin', 'manager', 'stock_keeper'],
-        'cancel': ['owner', 'admin', 'manager'],
+    action_permissions = {
+        'list': 'purchases.view',
+        'retrieve': 'purchases.view',
+        'create': 'purchases.receive',
+        'complete': 'purchases.receive',
+        'cancel': 'purchases.edit',
     }
 
     def get_serializer_class(self):
@@ -323,11 +323,11 @@ class SupplierPaymentViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewS
     select_related_fields = ['supplier', 'payment_method', 'created_by']
     prefetch_related_fields = ['allocations', 'allocations__purchase_order']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'accountant'],
-        'retrieve': ['owner', 'admin', 'manager', 'accountant'],
-        'create': ['owner', 'admin', 'manager', 'accountant'],
-        'cancel': ['owner', 'admin'],
+    action_permissions = {
+        'list': 'purchases.view',
+        'retrieve': 'purchases.view',
+        'create': 'purchases.edit',
+        'cancel': 'purchases.edit',
     }
 
     def get_serializer_class(self):
@@ -393,13 +393,13 @@ class PurchaseReturnViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSe
     select_related_fields = ['supplier', 'purchase_order', 'warehouse', 'created_by']
     prefetch_related_fields = ['items', 'items__product']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant'],
-        'retrieve': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant'],
-        'create': ['owner', 'admin', 'manager', 'stock_keeper'],
-        'approve': ['owner', 'admin', 'manager'],
-        'ship': ['owner', 'admin', 'manager', 'stock_keeper'],
-        'cancel': ['owner', 'admin', 'manager'],
+    action_permissions = {
+        'list': 'purchases.view',
+        'retrieve': 'purchases.view',
+        'create': 'purchases.edit',
+        'approve': 'purchases.edit',
+        'ship': 'purchases.receive',
+        'cancel': 'purchases.edit',
     }
 
     def get_serializer_class(self):

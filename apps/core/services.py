@@ -163,88 +163,224 @@ class OrganizationService:
 
 
 class PermissionService:
-    """Service for managing django-guardian permissions."""
+    """
+    Service de gestion des permissions basé sur les rôles.
+    
+    Chaque permission est une chaîne au format 'module.action', ex: 'products.view'.
+    Les permissions sont déterminées par le rôle du membre dans l'organisation.
+    Pas besoin de django-guardian pour ce système — le rôle suffit.
+    """
+    
+    # =========================================================================
+    # PERMISSIONS GRANULAIRES PAR RÔLE
+    # =========================================================================
     
     ROLE_PERMISSIONS = {
+        # ADMIN (owner) : toutes les permissions
         OrganizationMembership.Role.OWNER: [
-            'view_organization', 'change_organization', 'delete_organization',
-            'manage_members', 'manage_subscription', 'view_reports',
-            'manage_products', 'manage_inventory', 'manage_sales',
-            'manage_purchases', 'manage_contacts', 'manage_settings',
+            # Organisation & paramètres
+            'organization.view', 'organization.edit', 'organization.settings',
+            # Utilisateurs
+            'users.view', 'users.create', 'users.edit', 'users.deactivate',
+            # Abonnement
+            'subscription.view', 'subscription.manage',
+            # Produits
+            'products.view', 'products.create', 'products.edit', 'products.delete',
+            'categories.view', 'categories.create', 'categories.edit', 'categories.delete',
+            # Stock
+            'stock.view', 'stock.adjust',
+            'warehouses.view', 'warehouses.create', 'warehouses.edit', 'warehouses.delete',
+            'stock_movements.view', 'stock_movements.create',
+            'stock_transfers.view', 'stock_transfers.create', 'stock_transfers.ship',
+            'stock_transfers.receive', 'stock_transfers.cancel',
+            'stock_adjustments.view', 'stock_adjustments.create', 'stock_adjustments.approve',
+            # Inventaire
+            'inventory.view', 'inventory.create', 'inventory.start',
+            'inventory.count', 'inventory.submit', 'inventory.validate', 'inventory.cancel',
+            'inventory.print',
+            # Ventes
+            'sales.view', 'sales.create', 'sales.cancel', 'sales.discount',
+            'sales.view_all',
+            'payment_methods.view', 'payment_methods.manage',
+            'sale_returns.view', 'sale_returns.create', 'sale_returns.approve',
+            # Achats / Fournisseurs
+            'purchases.view', 'purchases.create', 'purchases.edit', 'purchases.receive',
+            'suppliers.view', 'suppliers.create', 'suppliers.edit', 'suppliers.delete',
+            # Clients
+            'customers.view', 'customers.create', 'customers.edit', 'customers.delete',
+            # Rapports
+            'reports.view', 'reports.export',
+            # Dashboard
+            'dashboard.view',
         ],
-        OrganizationMembership.Role.ADMIN: [
-            'view_organization', 'change_organization',
-            'manage_members', 'view_reports',
-            'manage_products', 'manage_inventory', 'manage_sales',
-            'manage_purchases', 'manage_contacts', 'manage_settings',
-        ],
+        
+        # GÉRANT (manager) : gestion complète sauf abonnement et paramètres critiques
         OrganizationMembership.Role.MANAGER: [
-            'view_organization', 'view_reports',
-            'manage_products', 'manage_inventory', 'manage_sales',
-            'manage_purchases', 'manage_contacts',
+            # Organisation
+            'organization.view',
+            # Utilisateurs (peut créer magasiniers et caissiers uniquement)
+            'users.view', 'users.create', 'users.edit', 'users.deactivate',
+            # Produits
+            'products.view', 'products.create', 'products.edit', 'products.delete',
+            'categories.view', 'categories.create', 'categories.edit', 'categories.delete',
+            # Stock
+            'stock.view', 'stock.adjust',
+            'warehouses.view', 'warehouses.create', 'warehouses.edit',
+            'stock_movements.view', 'stock_movements.create',
+            'stock_transfers.view', 'stock_transfers.create', 'stock_transfers.ship',
+            'stock_transfers.receive', 'stock_transfers.cancel',
+            'stock_adjustments.view', 'stock_adjustments.create', 'stock_adjustments.approve',
+            # Inventaire
+            'inventory.view', 'inventory.create', 'inventory.start',
+            'inventory.count', 'inventory.submit', 'inventory.validate', 'inventory.cancel',
+            'inventory.print',
+            # Ventes
+            'sales.view', 'sales.create', 'sales.cancel', 'sales.discount',
+            'sales.view_all',
+            'payment_methods.view',
+            'sale_returns.view', 'sale_returns.create', 'sale_returns.approve',
+            # Achats / Fournisseurs
+            'purchases.view', 'purchases.create', 'purchases.edit', 'purchases.receive',
+            'suppliers.view', 'suppliers.create', 'suppliers.edit', 'suppliers.delete',
+            # Clients
+            'customers.view', 'customers.create', 'customers.edit', 'customers.delete',
+            # Rapports
+            'reports.view', 'reports.export',
+            # Dashboard
+            'dashboard.view',
         ],
-        OrganizationMembership.Role.CASHIER: [
-            'view_organization',
-            'view_products', 'create_sales', 'view_sales',
-            'view_contacts',
-        ],
+        
+        # MAGASINIER (stock_keeper) : stock, inventaire, réceptions, fournisseurs
         OrganizationMembership.Role.STOCK_KEEPER: [
-            'view_organization',
-            'view_products', 'manage_inventory',
-            'view_purchases',
+            # Organisation
+            'organization.view',
+            # Produits (lecture + modification stock)
+            'products.view', 'products.edit',
+            'categories.view',
+            # Stock (gestion complète)
+            'stock.view', 'stock.adjust',
+            'warehouses.view',
+            'stock_movements.view', 'stock_movements.create',
+            'stock_transfers.view', 'stock_transfers.create', 'stock_transfers.ship',
+            'stock_transfers.receive', 'stock_transfers.cancel',
+            'stock_adjustments.view', 'stock_adjustments.create',
+            # Inventaire (peut compter et soumettre, pas valider)
+            'inventory.view', 'inventory.create', 'inventory.start',
+            'inventory.count', 'inventory.submit',
+            'inventory.print',
+            # Achats / Fournisseurs (réceptions)
+            'purchases.view', 'purchases.receive',
+            'suppliers.view', 'suppliers.create', 'suppliers.edit',
+            # Clients (lecture seule)
+            'customers.view',
+            # Dashboard
+            'dashboard.view',
         ],
-        OrganizationMembership.Role.ACCOUNTANT: [
-            'view_organization', 'view_reports',
-            'view_products', 'view_inventory', 'view_sales',
-            'view_purchases', 'view_contacts',
-        ],
-        OrganizationMembership.Role.VIEWER: [
-            'view_organization',
-            'view_products', 'view_inventory', 'view_sales',
-            'view_purchases', 'view_contacts',
+        
+        # CAISSIER (cashier) : ventes, consultation produits/prix, clients basique
+        OrganizationMembership.Role.CASHIER: [
+            # Organisation
+            'organization.view',
+            # Produits (lecture seule)
+            'products.view',
+            'categories.view',
+            # Stock (lecture seule)
+            'stock.view',
+            'warehouses.view',
+            # Ventes (créer, voir les siennes)
+            'sales.view', 'sales.create',
+            'payment_methods.view',
+            # Clients (créer + voir)
+            'customers.view', 'customers.create',
+            # Dashboard
+            'dashboard.view',
         ],
     }
 
     @classmethod
+    def get_role_permissions(cls, role):
+        """Retourne la liste des permissions pour un rôle donné."""
+        return cls.ROLE_PERMISSIONS.get(role, [])
+
+    @classmethod
+    def has_permission(cls, user, organization, permission):
+        """
+        Vérifie si un utilisateur a une permission spécifique dans une organisation.
+        Basé uniquement sur le rôle du membre.
+        """
+        membership = OrganizationMembership.objects.filter(
+            user=user,
+            organization=organization,
+            is_active=True
+        ).first()
+        if not membership:
+            return False
+        return permission in cls.get_role_permissions(membership.role)
+
+    @classmethod
+    def has_any_permission(cls, user, organization, permissions):
+        """Vérifie si l'utilisateur a au moins une des permissions listées."""
+        membership = OrganizationMembership.objects.filter(
+            user=user,
+            organization=organization,
+            is_active=True
+        ).first()
+        if not membership:
+            return False
+        role_perms = cls.get_role_permissions(membership.role)
+        return any(p in role_perms for p in permissions)
+
+    @classmethod
+    def get_user_permissions(cls, user, organization):
+        """Retourne toutes les permissions d'un utilisateur dans une organisation."""
+        membership = OrganizationMembership.objects.filter(
+            user=user,
+            organization=organization,
+            is_active=True
+        ).first()
+        if not membership:
+            return []
+        return cls.get_role_permissions(membership.role)
+
+    @classmethod
+    def get_user_role(cls, user, organization):
+        """Retourne le rôle d'un utilisateur dans une organisation."""
+        membership = OrganizationMembership.objects.filter(
+            user=user,
+            organization=organization,
+            is_active=True
+        ).first()
+        return membership.role if membership else None
+
+    @classmethod
     def assign_owner_permissions(cls, user, organization):
-        """Assign all owner permissions to a user."""
-        cls.assign_role_permissions(
-            user, organization, OrganizationMembership.Role.OWNER
-        )
+        """Assign owner guardian permissions (backward compat)."""
+        # Guardian permissions are no longer the primary system,
+        # but we keep this for backward compatibility
+        try:
+            for perm in ['view_organization', 'change_organization', 'delete_organization']:
+                assign_perm(perm, user, organization)
+        except Exception:
+            pass
 
     @classmethod
     def assign_role_permissions(cls, user, organization, role):
-        """Assign permissions based on role."""
-        from django.contrib.auth.models import Permission
-        permissions = cls.ROLE_PERMISSIONS.get(role, [])
-        for perm in permissions:
-            try:
-                assign_perm(perm, user, organization)
-            except Permission.DoesNotExist:
-                # Permission n'existe pas encore, on l'ignore en développement
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.warning(f"Permission '{perm}' does not exist for {organization._meta.model_name}")
+        """Assign guardian permissions for backward compat."""
+        try:
+            assign_perm('view_organization', user, organization)
+            if role in ['owner', 'manager']:
+                assign_perm('change_organization', user, organization)
+        except Exception:
+            pass
 
     @classmethod
     def remove_all_permissions(cls, user, organization):
-        """Remove all permissions from a user for an organization."""
-        all_perms = set()
-        for perms in cls.ROLE_PERMISSIONS.values():
-            all_perms.update(perms)
-        
-        for perm in all_perms:
-            remove_perm(perm, user, organization)
-
-    @staticmethod
-    def has_permission(user, permission, organization):
-        """Check if user has a specific permission on organization."""
-        return permission in get_perms(user, organization)
-
-    @staticmethod
-    def get_user_permissions(user, organization):
-        """Get all permissions a user has on an organization."""
-        return get_perms(user, organization)
+        """Remove guardian permissions for backward compat."""
+        try:
+            for perm in ['view_organization', 'change_organization', 'delete_organization']:
+                remove_perm(perm, user, organization)
+        except Exception:
+            pass
 
 
 class SubscriptionService:

@@ -92,6 +92,46 @@ class UserViewSet(viewsets.ModelViewSet):
         
         return Response(UserDetailSerializer(user).data)
 
+    @action(detail=False, methods=['get'], url_path='me/permissions')
+    def permissions(self, request):
+        """
+        Retourne le rôle et les permissions de l'utilisateur dans l'organisation courante.
+        Nécessite le header X-Organization-ID.
+        """
+        from apps.core.services import PermissionService
+        from apps.organizations.models import OrganizationMembership
+        
+        org_id = request.headers.get('X-Organization-ID')
+        if not org_id:
+            return Response(
+                {'detail': 'Header X-Organization-ID requis'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        membership = request.user.memberships.filter(
+            organization_id=org_id,
+            is_active=True
+        ).first()
+        
+        if not membership:
+            return Response(
+                {'detail': "Vous n'êtes pas membre de cette organisation"},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        permissions_list = PermissionService.get_role_permissions(membership.role)
+        manageable_roles = OrganizationMembership.MANAGEABLE_ROLES.get(membership.role, [])
+        
+        return Response({
+            'role': membership.role,
+            'role_display': membership.get_role_display(),
+            'permissions': permissions_list,
+            'manageable_roles': [
+                {'value': r, 'label': dict(OrganizationMembership.Role.choices).get(r, r)}
+                for r in manageable_roles
+            ],
+        })
+
     @action(detail=False, methods=['post'], url_path='me/change-password')
     def change_password(self, request):
         """Change le mot de passe de l'utilisateur connecté."""

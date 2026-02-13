@@ -14,7 +14,7 @@ from decimal import Decimal
 
 from apps.core.api_mixins import TenantViewSetMixin, AuditMixin
 from apps.core.api_permissions import (
-    IsTenantMember, HasActiveSubscription, TenantObjectPermission
+    IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission
 )
 from .models import (
     Warehouse, StockLocation, Stock, StockBatch, StockMovement,
@@ -52,7 +52,7 @@ class WarehouseViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     """
     
     queryset = Warehouse.objects.all()
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, TenantObjectPermission]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['is_active', 'is_default', 'branch']
     search_fields = ['name', 'code']
@@ -61,13 +61,14 @@ class WarehouseViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     select_related_fields = ['branch', 'manager']
     prefetch_related_fields = ['locations']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant', 'viewer'],
-        'retrieve': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant', 'viewer'],
-        'create': ['owner', 'admin'],
-        'update': ['owner', 'admin'],
-        'partial_update': ['owner', 'admin'],
-        'destroy': ['owner', 'admin'],
+    action_permissions = {
+        'list': 'warehouses.view',
+        'retrieve': 'warehouses.view',
+        'create': 'warehouses.create',
+        'update': 'warehouses.edit',
+        'partial_update': 'warehouses.edit',
+        'destroy': 'warehouses.delete',
+        'stock_summary': 'stock.view',
     }
 
     def get_serializer_class(self):
@@ -118,20 +119,20 @@ class StockLocationViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     
     queryset = StockLocation.objects.all()
     serializer_class = StockLocationSerializer
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ['warehouse', 'is_active', 'parent']
     search_fields = ['name', 'code']
     
     select_related_fields = ['warehouse', 'parent']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'stock_keeper'],
-        'retrieve': ['owner', 'admin', 'manager', 'stock_keeper'],
-        'create': ['owner', 'admin', 'manager'],
-        'update': ['owner', 'admin', 'manager'],
-        'partial_update': ['owner', 'admin', 'manager'],
-        'destroy': ['owner', 'admin'],
+    action_permissions = {
+        'list': 'warehouses.view',
+        'retrieve': 'warehouses.view',
+        'create': 'warehouses.create',
+        'update': 'warehouses.edit',
+        'partial_update': 'warehouses.edit',
+        'destroy': 'warehouses.delete',
     }
 
 
@@ -153,7 +154,7 @@ class StockViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     """
     
     queryset = Stock.objects.all()
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['warehouse', 'product', 'variant']
     search_fields = ['product__name', 'product__sku']
@@ -162,9 +163,13 @@ class StockViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     
     select_related_fields = ['product', 'variant', 'warehouse', 'location']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'stock_keeper', 'cashier', 'accountant', 'viewer'],
-        'retrieve': ['owner', 'admin', 'manager', 'stock_keeper', 'cashier', 'accountant', 'viewer'],
+    action_permissions = {
+        'list': 'stock.view',
+        'retrieve': 'stock.view',
+        'by_product': 'stock.view',
+        'by_warehouse': 'stock.view',
+        'low_stock': 'stock.view',
+        'expiring': 'stock.view',
     }
     
     # Stock est en lecture seule - les modifications passent par les mouvements
@@ -276,7 +281,7 @@ class StockMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     """
     
     queryset = StockMovement.objects.all()
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['warehouse', 'product', 'movement_type']
     search_fields = ['product__name', 'product__sku', 'notes']
@@ -285,10 +290,10 @@ class StockMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     
     select_related_fields = ['product', 'variant', 'warehouse', 'batch', 'created_by']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant'],
-        'retrieve': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant'],
-        'create': ['owner', 'admin', 'manager', 'stock_keeper'],
+    action_permissions = {
+        'list': 'stock_movements.view',
+        'retrieve': 'stock_movements.view',
+        'create': 'stock_movements.create',
     }
 
     def get_serializer_class(self):
@@ -375,17 +380,17 @@ class StockTransferViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
     select_related_fields = ['source_warehouse', 'destination_warehouse', 'requested_by', 'approved_by']
     prefetch_related_fields = ['items', 'items__product']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'stock_keeper'],
-        'retrieve': ['owner', 'admin', 'manager', 'stock_keeper'],
-        'create': ['owner', 'admin', 'manager', 'stock_keeper'],
-        'update': ['owner', 'admin', 'manager'],
-        'partial_update': ['owner', 'admin', 'manager'],
-        'destroy': ['owner', 'admin'],
-        'approve': ['owner', 'admin', 'manager'],
-        'ship': ['owner', 'admin', 'manager', 'stock_keeper'],
-        'receive': ['owner', 'admin', 'manager', 'stock_keeper'],
-        'cancel': ['owner', 'admin', 'manager'],
+    action_permissions = {
+        'list': 'stock_transfers.view',
+        'retrieve': 'stock_transfers.view',
+        'create': 'stock_transfers.create',
+        'update': 'stock_transfers.create',
+        'partial_update': 'stock_transfers.create',
+        'destroy': 'stock_transfers.cancel',
+        'approve': 'stock_transfers.ship',
+        'ship': 'stock_transfers.ship',
+        'receive': 'stock_transfers.receive',
+        'cancel': 'stock_transfers.cancel',
     }
 
     def get_serializer_class(self):
@@ -642,15 +647,15 @@ class StockAdjustmentViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewS
     select_related_fields = ['warehouse', 'created_by', 'approved_by']
     prefetch_related_fields = ['items', 'items__product']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant'],
-        'retrieve': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant'],
-        'create': ['owner', 'admin', 'manager', 'stock_keeper'],
-        'update': ['owner', 'admin', 'manager'],
-        'partial_update': ['owner', 'admin', 'manager'],
-        'destroy': ['owner', 'admin'],
-        'approve': ['owner', 'admin', 'manager'],
-        'reject': ['owner', 'admin', 'manager'],
+    action_permissions = {
+        'list': 'stock_adjustments.view',
+        'retrieve': 'stock_adjustments.view',
+        'create': 'stock_adjustments.create',
+        'update': 'stock_adjustments.create',
+        'partial_update': 'stock_adjustments.create',
+        'destroy': 'stock_adjustments.create',
+        'approve': 'stock_adjustments.approve',
+        'reject': 'stock_adjustments.approve',
     }
 
     def get_serializer_class(self):
@@ -784,18 +789,18 @@ class InventorySessionViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelView
     select_related_fields = ['warehouse', 'created_by', 'validated_by']
     prefetch_related_fields = ['categories', 'products']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant'],
-        'retrieve': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant'],
-        'create': ['owner', 'admin', 'manager', 'stock_keeper'],
-        'destroy': ['owner', 'admin'],
-        'start': ['owner', 'admin', 'manager', 'stock_keeper'],
-        'count': ['owner', 'admin', 'manager', 'stock_keeper'],
-        'submit': ['owner', 'admin', 'manager', 'stock_keeper'],
-        'validate': ['owner', 'admin', 'manager'],
-        'cancel': ['owner', 'admin', 'manager'],
-        'counts': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant'],
-        'print_data': ['owner', 'admin', 'manager', 'stock_keeper', 'accountant'],
+    action_permissions = {
+        'list': 'inventory.view',
+        'retrieve': 'inventory.view',
+        'create': 'inventory.create',
+        'destroy': 'inventory.cancel',
+        'start': 'inventory.start',
+        'count': 'inventory.count',
+        'submit': 'inventory.submit',
+        'validate': 'inventory.validate',
+        'cancel': 'inventory.cancel',
+        'counts': 'inventory.view',
+        'print_data': 'inventory.print',
     }
 
     def get_serializer_class(self):

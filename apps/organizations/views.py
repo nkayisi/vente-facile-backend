@@ -12,14 +12,16 @@ from datetime import timedelta
 
 from apps.core.api_mixins import TenantViewSetMixin, AuditMixin
 from apps.core.api_permissions import (
-    IsTenantMember, IsTenantAdmin, IsTenantOwner, HasActiveSubscription
+    IsTenantMember, IsTenantAdmin, IsTenantOwner, IsTenantManager,
+    HasActiveSubscription, HasPermission, _get_membership
 )
 from apps.core.services import OrganizationService, PermissionService
 from .models import Organization, OrganizationMembership, Branch, OrganizationInvitation
 from .serializers import (
     OrganizationListSerializer, OrganizationDetailSerializer,
     OrganizationCreateSerializer, OrganizationUpdateSerializer,
-    OrganizationMembershipSerializer, MembershipCreateSerializer, MembershipUpdateSerializer,
+    OrganizationMembershipSerializer, MembershipCreateSerializer,
+    MemberCreateWithUserSerializer, MembershipUpdateSerializer,
     BranchListSerializer, BranchDetailSerializer, BranchCreateSerializer,
     OrganizationInvitationSerializer, InvitationCreateSerializer
 )
@@ -390,16 +392,22 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet pour la gestion des membres d'organisation.
     
+    Hiérarchie des rôles :
+    - owner (Admin) peut gérer : manager, stock_keeper, cashier
+    - manager (Gérant) peut gérer : stock_keeper, cashier
+    - stock_keeper et cashier ne peuvent gérer personne
+    
     Endpoints:
     - GET /memberships/ : Liste des membres
-    - POST /memberships/ : Ajouter un membre (par email)
+    - POST /memberships/ : Ajouter un membre existant (par email)
+    - POST /memberships/create_user/ : Créer un nouvel utilisateur + l'ajouter
     - GET /memberships/{id}/ : Détail d'un membre
-    - PUT/PATCH /memberships/{id}/ : Modifier le rôle
+    - PUT/PATCH /memberships/{id}/ : Modifier le rôle / activer/désactiver
     - DELETE /memberships/{id}/ : Retirer un membre
     """
     
     queryset = OrganizationMembership.objects.all()
-    permission_classes = [IsAuthenticated, IsTenantMember]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ['role', 'is_active']
     search_fields = ['user__email', 'user__first_name', 'user__last_name']
@@ -407,18 +415,21 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     
     select_related_fields = ['user', 'organization', 'invited_by']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager'],
-        'retrieve': ['owner', 'admin', 'manager'],
-        'create': ['owner', 'admin'],
-        'update': ['owner', 'admin'],
-        'partial_update': ['owner', 'admin'],
-        'destroy': ['owner'],
+    action_permissions = {
+        'list': 'users.view',
+        'retrieve': 'users.view',
+        'create': 'users.create',
+        'create_user': 'users.create',
+        'update': 'users.edit',
+        'partial_update': 'users.edit',
+        'destroy': 'users.deactivate',
     }
 
     def get_serializer_class(self):
         if self.action == 'create':
             return MembershipCreateSerializer
+        elif self.action == 'create_user':
+            return MemberCreateWithUserSerializer
         elif self.action in ['update', 'partial_update']:
             return MembershipUpdateSerializer
         return OrganizationMembershipSerializer
@@ -430,8 +441,28 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             queryset = queryset.filter(organization=organization)
         return queryset
 
+    def _check_role_hierarchy(self, request, target_role):
+        """
+        Vérifie que l'utilisateur courant peut gérer le rôle cible.
+        Retourne (ok, error_response).
+        """
+        membership = _get_membership(request)
+        if not membership:
+            return False, Response(
+                {'detail': "Vous n'êtes pas membre de cette organisation."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        if not membership.can_manage_role(target_role):
+            return False, Response(
+                {'detail': f"Vous n'avez pas la permission de gérer le rôle '{dict(OrganizationMembership.Role.choices).get(target_role, target_role)}'."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        return True, None
+
     def create(self, request, *args, **kwargs):
-        """Ajoute un membre par email."""
+        """Ajoute un membre existant par email."""
         serializer = MembershipCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
@@ -439,47 +470,127 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         email = serializer.validated_data['email']
         role = serializer.validated_data['role']
         
-        # Vérifier les limites d'abonnement
-        from apps.core.services import SubscriptionService
-        if not SubscriptionService.can_add_user(organization):
+        # Vérifier la hiérarchie des rôles
+        ok, error = self._check_role_hierarchy(request, role)
+        if not ok:
+            return error
+        
+        # Empêcher de créer un owner
+        if role == 'owner':
             return Response(
-                {'error': 'Limite d\'utilisateurs atteinte pour votre abonnement'},
+                {'detail': "Impossible de créer un autre administrateur principal."},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        
+        # TODO: Réactiver la vérification des limites d'abonnement
+        # from apps.core.services import SubscriptionService
+        # if not SubscriptionService.can_add_user(organization):
+        #     return Response(
+        #         {'detail': "Limite d'utilisateurs atteinte pour votre abonnement."},
+        #         status=status.HTTP_400_BAD_REQUEST
+        #     )
         
         # Chercher l'utilisateur
         from apps.users.models import User
         user = User.objects.filter(email=email).first()
         
-        if user:
-            # Ajouter directement si l'utilisateur existe
+        if not user:
+            return Response(
+                {'detail': "Aucun utilisateur trouvé avec cet email. Utilisez 'Créer un utilisateur' pour créer un nouveau compte."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Vérifier s'il est déjà membre
+        existing = OrganizationMembership.objects.filter(
+            user=user, organization=organization
+        ).first()
+        if existing:
+            if existing.is_active:
+                return Response(
+                    {'detail': "Cet utilisateur est déjà membre de l'organisation."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            # Réactiver le membre
+            existing.role = role
+            existing.is_active = True
+            existing.save()
+            PermissionService.assign_role_permissions(user, organization, role)
+            return Response(
+                OrganizationMembershipSerializer(existing).data,
+                status=status.HTTP_200_OK
+            )
+        
+        membership = OrganizationService.add_member(
+            organization=organization,
+            user=user,
+            role=role,
+            invited_by=request.user
+        )
+        return Response(
+            OrganizationMembershipSerializer(membership).data,
+            status=status.HTTP_201_CREATED
+        )
+
+    @action(detail=False, methods=['post'], url_path='create-user')
+    def create_user(self, request):
+        """
+        Crée un nouvel utilisateur et l'ajoute à l'organisation.
+        L'admin peut créer manager, stock_keeper, cashier.
+        Le gérant peut créer stock_keeper, cashier uniquement.
+        """
+        serializer = MemberCreateWithUserSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        organization = self.get_organization()
+        role = serializer.validated_data['role']
+        
+        # Vérifier la hiérarchie des rôles
+        ok, error = self._check_role_hierarchy(request, role)
+        if not ok:
+            return error
+        
+        # Empêcher de créer un owner
+        if role == 'owner':
+            return Response(
+                {'detail': "Impossible de créer un autre administrateur principal."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # TODO: Réactiver la vérification des limites d'abonnement
+        # from apps.core.services import SubscriptionService
+        # if not SubscriptionService.can_add_user(organization):
+        #     return Response(
+        #         {'detail': "Limite d'utilisateurs atteinte pour votre abonnement."},
+        #         status=status.HTTP_400_BAD_REQUEST
+        #     )
+        
+        # Créer l'utilisateur
+        from apps.users.models import User
+        from django.db import transaction
+        
+        with transaction.atomic():
+            user = User.objects.create(
+                email=serializer.validated_data['email'],
+                first_name=serializer.validated_data['first_name'],
+                last_name=serializer.validated_data['last_name'],
+                phone=serializer.validated_data.get('phone', ''),
+                is_active=True,
+            )
+            user.set_password(serializer.validated_data['password'])
+            user.active_organization = organization
+            user.save()
+            
             membership = OrganizationService.add_member(
                 organization=organization,
                 user=user,
                 role=role,
                 invited_by=request.user
             )
-            return Response(
-                OrganizationMembershipSerializer(membership).data,
-                status=status.HTTP_201_CREATED
-            )
-        else:
-            # Créer une invitation
-            invitation = OrganizationInvitation.objects.create(
-                organization=organization,
-                email=email,
-                role=role,
-                token=secrets.token_urlsafe(32),
-                invited_by=request.user,
-                expires_at=timezone.now() + timedelta(days=7)
-            )
-            
-            # TODO: Envoyer l'email d'invitation
-            
-            return Response({
-                'message': 'Invitation envoyée',
-                'invitation': OrganizationInvitationSerializer(invitation).data
-            }, status=status.HTTP_201_CREATED)
+        
+        return Response(
+            OrganizationMembershipSerializer(membership).data,
+            status=status.HTTP_201_CREATED
+        )
 
     def update(self, request, *args, **kwargs):
         """Met à jour le rôle d'un membre."""
@@ -488,7 +599,14 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         # Empêcher de modifier le owner
         if membership.role == 'owner':
             return Response(
-                {'error': 'Impossible de modifier le propriétaire'},
+                {'detail': "Impossible de modifier l'administrateur principal."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Empêcher de se modifier soi-même
+        if membership.user == request.user:
+            return Response(
+                {'detail': "Vous ne pouvez pas modifier votre propre rôle."},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
@@ -498,7 +616,29 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         new_role = serializer.validated_data.get('role', membership.role)
         is_active = serializer.validated_data.get('is_active', membership.is_active)
         
-        # Mettre à jour les permissions
+        # Vérifier la hiérarchie pour le rôle actuel ET le nouveau rôle
+        current_membership = _get_membership(request)
+        if not current_membership:
+            return Response(
+                {'detail': "Vous n'êtes pas membre de cette organisation."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Vérifier qu'on peut gérer le rôle actuel du membre
+        if not current_membership.can_manage_role(membership.role):
+            return Response(
+                {'detail': "Vous n'avez pas la permission de modifier cet utilisateur."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Vérifier qu'on peut attribuer le nouveau rôle
+        if new_role != membership.role:
+            if not current_membership.can_manage_role(new_role):
+                return Response(
+                    {'detail': f"Vous n'avez pas la permission d'attribuer le rôle '{dict(OrganizationMembership.Role.choices).get(new_role, new_role)}'."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+        
         PermissionService.remove_all_permissions(membership.user, membership.organization)
         
         membership.role = new_role
@@ -519,15 +659,23 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         # Empêcher de retirer le owner
         if membership.role == 'owner':
             return Response(
-                {'error': 'Impossible de retirer le propriétaire'},
+                {'detail': "Impossible de retirer l'administrateur principal."},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
         # Empêcher de se retirer soi-même
         if membership.user == request.user:
             return Response(
-                {'error': 'Vous ne pouvez pas vous retirer vous-même'},
+                {'detail': "Vous ne pouvez pas vous retirer vous-même."},
                 status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Vérifier la hiérarchie
+        current_membership = _get_membership(request)
+        if current_membership and not current_membership.can_manage_role(membership.role):
+            return Response(
+                {'detail': "Vous n'avez pas la permission de retirer cet utilisateur."},
+                status=status.HTTP_403_FORBIDDEN
             )
         
         OrganizationService.remove_member(membership.organization, membership.user)

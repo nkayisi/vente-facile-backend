@@ -11,7 +11,7 @@ from django.db.models import Sum, Count
 
 from apps.core.api_mixins import TenantViewSetMixin, BulkActionMixin, AuditMixin
 from apps.core.api_permissions import (
-    IsTenantMember, HasActiveSubscription, TenantObjectPermission, RoleBasedPermission
+    IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission
 )
 from .models import Category, Brand, Unit, Product, ProductImage, ProductVariant, PriceList, ProductPrice
 from .serializers import (
@@ -43,25 +43,25 @@ class CategoryViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     """
     
     queryset = Category.objects.all()
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, TenantObjectPermission]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['is_active', 'parent']
     search_fields = ['name', 'description']
     ordering_fields = ['name', 'sort_order', 'created_at']
     ordering = ['sort_order', 'name']
     
-    # Optimisation des requêtes
     select_related_fields = ['parent']
     prefetch_related_fields = ['children']
     
-    # Permissions par rôle
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'cashier', 'stock_keeper', 'accountant', 'viewer'],
-        'retrieve': ['owner', 'admin', 'manager', 'cashier', 'stock_keeper', 'accountant', 'viewer'],
-        'create': ['owner', 'admin', 'manager'],
-        'update': ['owner', 'admin', 'manager'],
-        'partial_update': ['owner', 'admin', 'manager'],
-        'destroy': ['owner', 'admin'],
+    action_permissions = {
+        'list': 'categories.view',
+        'retrieve': 'categories.view',
+        'create': 'categories.create',
+        'update': 'categories.edit',
+        'partial_update': 'categories.edit',
+        'destroy': 'categories.delete',
+        'products': 'products.view',
+        'tree': 'categories.view',
     }
 
     def get_serializer_class(self):
@@ -131,20 +131,20 @@ class BrandViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     
     queryset = Brand.objects.all()
     serializer_class = BrandSerializer
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, TenantObjectPermission]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['is_active']
     search_fields = ['name']
     ordering_fields = ['name', 'created_at']
     ordering = ['name']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'cashier', 'stock_keeper', 'accountant', 'viewer'],
-        'retrieve': ['owner', 'admin', 'manager', 'cashier', 'stock_keeper', 'accountant', 'viewer'],
-        'create': ['owner', 'admin', 'manager'],
-        'update': ['owner', 'admin', 'manager'],
-        'partial_update': ['owner', 'admin', 'manager'],
-        'destroy': ['owner', 'admin'],
+    action_permissions = {
+        'list': 'products.view',
+        'retrieve': 'products.view',
+        'create': 'products.create',
+        'update': 'products.edit',
+        'partial_update': 'products.edit',
+        'destroy': 'products.delete',
     }
 
 
@@ -166,20 +166,20 @@ class UnitViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     
     queryset = Unit.objects.all()
     serializer_class = UnitSerializer
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, TenantObjectPermission]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['name', 'symbol']
     ordering = ['name']
     
     select_related_fields = ['base_unit']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'cashier', 'stock_keeper', 'accountant', 'viewer'],
-        'retrieve': ['owner', 'admin', 'manager', 'cashier', 'stock_keeper', 'accountant', 'viewer'],
-        'create': ['owner', 'admin'],
-        'update': ['owner', 'admin'],
-        'partial_update': ['owner', 'admin'],
-        'destroy': ['owner', 'admin'],
+    action_permissions = {
+        'list': 'products.view',
+        'retrieve': 'products.view',
+        'create': 'products.create',
+        'update': 'products.edit',
+        'partial_update': 'products.edit',
+        'destroy': 'products.delete',
     }
 
 
@@ -205,29 +205,29 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
     """
     
     queryset = Product.objects.all()
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, TenantObjectPermission]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['category', 'brand', 'is_active', 'is_featured', 'product_type', 'track_inventory']
     search_fields = ['name', 'sku', 'barcode', 'description']
     ordering_fields = ['name', 'sku', 'selling_price', 'created_at']
     ordering = ['name']
     
-    # Optimisation des requêtes
     select_related_fields = ['category', 'brand', 'unit']
     prefetch_related_fields = ['stocks', 'images', 'variants']
-    
-    # Champs autorisés pour la mise à jour en masse
     bulk_update_fields = ['is_active', 'is_featured', 'category', 'brand']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'cashier', 'stock_keeper', 'accountant', 'viewer'],
-        'retrieve': ['owner', 'admin', 'manager', 'cashier', 'stock_keeper', 'accountant', 'viewer'],
-        'create': ['owner', 'admin', 'manager'],
-        'update': ['owner', 'admin', 'manager'],
-        'partial_update': ['owner', 'admin', 'manager'],
-        'destroy': ['owner', 'admin'],
-        'bulk_update': ['owner', 'admin'],
-        'bulk_delete': ['owner', 'admin'],
+    action_permissions = {
+        'list': 'products.view',
+        'retrieve': 'products.view',
+        'create': 'products.create',
+        'update': 'products.edit',
+        'partial_update': 'products.edit',
+        'destroy': 'products.delete',
+        'bulk_update': 'products.delete',
+        'bulk_delete': 'products.delete',
+        'stock': 'stock.view',
+        'low_stock': 'stock.view',
+        'search_barcode': 'products.view',
     }
 
     def get_serializer_class(self):
@@ -403,7 +403,15 @@ class ProductImageViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     
     queryset = ProductImage.objects.all()
     serializer_class = ProductImageSerializer
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
+    action_permissions = {
+        'list': 'products.view',
+        'retrieve': 'products.view',
+        'create': 'products.create',
+        'update': 'products.edit',
+        'partial_update': 'products.edit',
+        'destroy': 'products.delete',
+    }
     
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -435,7 +443,15 @@ class ProductVariantViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     
     queryset = ProductVariant.objects.all()
     serializer_class = ProductVariantSerializer
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
+    action_permissions = {
+        'list': 'products.view',
+        'retrieve': 'products.view',
+        'create': 'products.create',
+        'update': 'products.edit',
+        'partial_update': 'products.edit',
+        'destroy': 'products.delete',
+    }
     
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -468,19 +484,19 @@ class PriceListViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     
     queryset = PriceList.objects.all()
     serializer_class = PriceListSerializer
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ['is_active', 'is_default']
     search_fields = ['name', 'code']
     ordering = ['name']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'accountant'],
-        'retrieve': ['owner', 'admin', 'manager', 'accountant'],
-        'create': ['owner', 'admin'],
-        'update': ['owner', 'admin'],
-        'partial_update': ['owner', 'admin'],
-        'destroy': ['owner', 'admin'],
+    action_permissions = {
+        'list': 'products.view',
+        'retrieve': 'products.view',
+        'create': 'products.create',
+        'update': 'products.edit',
+        'partial_update': 'products.edit',
+        'destroy': 'products.delete',
     }
 
 

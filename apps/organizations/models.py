@@ -70,16 +70,35 @@ class OrganizationMembership(TimeStampedModel, UUIDModel):
     """
     Links users to organizations with specific roles.
     A user can belong to multiple organizations.
+    
+    Rôles:
+    - owner (Admin) : créateur de la boutique, toutes les permissions
+    - manager (Gérant) : gestion complète, peut créer magasiniers et caissiers
+    - stock_keeper (Magasinier) : gestion du stock, inventaires, transferts
+    - cashier (Caissier) : ventes, consultation produits/prix
     """
     
     class Role(models.TextChoices):
-        OWNER = 'owner', 'Propriétaire'
-        ADMIN = 'admin', 'Administrateur'
+        OWNER = 'owner', 'Admin'
         MANAGER = 'manager', 'Gérant'
-        CASHIER = 'cashier', 'Caissier'
         STOCK_KEEPER = 'stock_keeper', 'Magasinier'
-        ACCOUNTANT = 'accountant', 'Comptable'
-        VIEWER = 'viewer', 'Lecteur'
+        CASHIER = 'cashier', 'Caissier'
+
+    # Hiérarchie des rôles (index = niveau, plus haut = plus de pouvoir)
+    ROLE_HIERARCHY = {
+        'owner': 4,
+        'manager': 3,
+        'stock_keeper': 2,
+        'cashier': 1,
+    }
+
+    # Rôles que chaque rôle peut créer/gérer
+    MANAGEABLE_ROLES = {
+        'owner': ['manager', 'stock_keeper', 'cashier'],
+        'manager': ['stock_keeper', 'cashier'],
+        'stock_keeper': [],
+        'cashier': [],
+    }
 
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -117,6 +136,19 @@ class OrganizationMembership(TimeStampedModel, UUIDModel):
 
     def __str__(self):
         return f"{self.user.email} - {self.organization.name} ({self.role})"
+
+    @property
+    def role_level(self):
+        """Retourne le niveau hiérarchique du rôle."""
+        return self.ROLE_HIERARCHY.get(self.role, 0)
+
+    def can_manage_role(self, target_role):
+        """Vérifie si ce membre peut créer/modifier un utilisateur avec le rôle cible."""
+        return target_role in self.MANAGEABLE_ROLES.get(self.role, [])
+
+    def is_above(self, other_membership):
+        """Vérifie si ce membre est hiérarchiquement au-dessus d'un autre."""
+        return self.role_level > other_membership.role_level
 
 
 class Branch(TimeStampedModel, UUIDModel, SoftDeleteModel):
