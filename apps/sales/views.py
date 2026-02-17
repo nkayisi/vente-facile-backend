@@ -192,6 +192,46 @@ class RegisterSessionViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         session.notes = serializer.validated_data.get('notes', session.notes)
         session.save()
         
+        # Enregistrer un ajustement de caisse si écart détecté
+        if session.difference != Decimal('0.00'):
+            from apps.cashbook.services import _get_last_balance
+            from apps.cashbook.models import CashMovement as CM
+            from apps.core.utils import ReferenceGenerator
+            
+            diff = session.difference
+            previous_balance = _get_last_balance(session.organization)
+            
+            if diff > 0:
+                # Plus d'argent que prévu → entrée
+                new_balance = previous_balance + diff
+                CM.objects.create(
+                    organization=session.organization,
+                    reference=ReferenceGenerator.generate_cash_movement_reference(session.organization),
+                    direction='in',
+                    movement_type='adjustment',
+                    amount=diff,
+                    description=f"Écart de caisse positif - Session {session.register.name}",
+                    balance_after=new_balance,
+                    movement_date=timezone.now(),
+                    created_by=request.user,
+                    notes=f"Attendu: {expected_balance}, Réel: {closing_balance}",
+                )
+            else:
+                # Moins d'argent que prévu → sortie
+                new_balance = previous_balance + diff  # diff is negative
+                CM.objects.create(
+                    organization=session.organization,
+                    reference=ReferenceGenerator.generate_cash_movement_reference(session.organization),
+                    direction='out',
+                    movement_type='adjustment',
+                    amount=abs(diff),
+                    description=f"Écart de caisse négatif - Session {session.register.name}",
+                    balance_after=new_balance,
+                    movement_date=timezone.now(),
+                    created_by=request.user,
+                    notes=f"Attendu: {expected_balance}, Réel: {closing_balance}",
+                )
+        
         return Response(RegisterSessionDetailSerializer(session).data)
 
     @action(detail=False, methods=['get'])
@@ -413,6 +453,24 @@ class SaleViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
                                 created_by=request.user
                             )
             
+            # Enregistrer le mouvement de caisse
+            from apps.cashbook.services import record_sale_income, record_debt_collection
+            if sale.sale_type == 'credit' and sale.customer:
+                record_debt_collection(
+                    organization=sale.organization,
+                    sale=sale,
+                    amount=payment.amount,
+                    customer=sale.customer,
+                    user=request.user,
+                )
+            else:
+                record_sale_income(
+                    organization=sale.organization,
+                    sale=sale,
+                    amount=payment.amount,
+                    user=request.user,
+                )
+            
             # Mettre à jour le solde client pour les ventes à crédit
             if sale.customer and sale.sale_type == 'credit':
                 from apps.contacts.models import Customer
@@ -487,6 +545,16 @@ class SaleViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
                             notes=f"Annulation vente {sale.reference}",
                             created_by=request.user
                         )
+            
+            # Enregistrer le mouvement de caisse (remboursement) si la vente avait été payée
+            if sale.amount_paid > 0:
+                from apps.cashbook.services import record_sale_cancellation
+                record_sale_cancellation(
+                    organization=sale.organization,
+                    sale=sale,
+                    amount=sale.amount_paid,
+                    user=request.user,
+                )
             
             # Restaurer le solde client pour les ventes à crédit
             if sale.customer and sale.sale_type == 'credit' and sale.amount_due > 0:
@@ -695,6 +763,16 @@ class SaleReturnViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
             sale_return.approved_by = request.user
             sale_return.approved_at = timezone.now()
             sale_return.save()
+            
+            # Enregistrer le mouvement de caisse si remboursement au client
+            if sale_return.refund_amount and sale_return.refund_amount > 0:
+                from apps.cashbook.services import record_sale_return_refund
+                record_sale_return_refund(
+                    organization=sale_return.organization,
+                    sale_return=sale_return,
+                    amount=sale_return.refund_amount,
+                    user=request.user,
+                )
         
         return Response({'status': 'approved'})
 

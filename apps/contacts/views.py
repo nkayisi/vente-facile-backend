@@ -156,6 +156,16 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
                 notes=serializer.validated_data.get('notes', ''),
                 created_by=request.user
             )
+            
+            # Enregistrer le mouvement de caisse (entrée)
+            from apps.cashbook.services import record_customer_debt_payment
+            record_customer_debt_payment(
+                organization=customer.organization,
+                customer=customer,
+                amount=amount,
+                user=request.user,
+                notes=serializer.validated_data.get('notes', ''),
+            )
         
         return Response({
             'transaction': CustomerTransactionSerializer(txn).data,
@@ -190,6 +200,16 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
                 reference=serializer.validated_data.get('reference', ''),
                 notes=serializer.validated_data.get('notes', ''),
                 created_by=request.user
+            )
+            
+            # Enregistrer le mouvement de caisse (entrée)
+            from apps.cashbook.services import record_customer_advance
+            record_customer_advance(
+                organization=customer.organization,
+                customer=customer,
+                amount=amount,
+                user=request.user,
+                notes=serializer.validated_data.get('notes', ''),
             )
         
         return Response({
@@ -234,6 +254,17 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
                 notes=serializer.validated_data.get('notes', ''),
                 created_by=request.user
             )
+            
+            # Enregistrer le mouvement de caisse si l'ajustement réduit la dette (= argent reçu)
+            if amount < 0:
+                from apps.cashbook.services import record_customer_debt_payment
+                record_customer_debt_payment(
+                    organization=customer.organization,
+                    customer=customer,
+                    amount=abs(amount),
+                    user=request.user,
+                    notes=f"Ajustement solde client - {serializer.validated_data.get('notes', '')}",
+                )
         
         return Response({
             'transaction': CustomerTransactionSerializer(txn).data,

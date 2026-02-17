@@ -205,3 +205,49 @@ class ReferenceGenerator:
             num = 1
         
         return f"FR-{num:05d}"
+
+    @staticmethod
+    def generate_expense_reference(organization):
+        """Generate expense reference: DEP-YYYYMMDD-XXXX"""
+        from apps.cashbook.models import Expense
+        
+        today = timezone.now()
+        prefix = f"DEP-{today.strftime('%Y%m%d')}"
+        
+        last = Expense.objects.filter(
+            organization=organization,
+            reference__startswith=prefix
+        ).order_by('-reference').first()
+        
+        if last:
+            try:
+                num = int(last.reference.split('-')[-1]) + 1
+            except (ValueError, IndexError):
+                num = 1
+        else:
+            num = 1
+        
+        return f"{prefix}-{num:04d}"
+
+    @staticmethod
+    def generate_cash_movement_reference(organization):
+        """Generate cash movement reference: MC-YYYYMMDD-XXXX"""
+        from apps.cashbook.models import CashMovement
+        
+        today = timezone.now()
+        prefix = f"MC-{today.strftime('%Y%m%d')}"
+        
+        last = CashMovement.objects.filter(
+            organization=organization,
+            reference__startswith=prefix
+        ).order_by('-reference').first()
+        
+        if last:
+            try:
+                num = int(last.reference.split('-')[-1]) + 1
+            except (ValueError, IndexError):
+                num = 1
+        else:
+            num = 1
+        
+        return f"{prefix}-{num:04d}"

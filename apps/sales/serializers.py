@@ -457,6 +457,16 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         
         sale.save()
         
+        # Enregistrer le mouvement de caisse si paiement reçu
+        if total_paid > 0:
+            from apps.cashbook.services import record_sale_income
+            record_sale_income(
+                organization=org,
+                sale=sale,
+                amount=min(total_paid, sale.total),
+                user=self.context['request'].user,
+            )
+        
         # Mettre à jour le stock si la vente est complétée et qu'un entrepôt est défini
         if sale.status == 'completed' and warehouse:
             for item in sale.items.all():

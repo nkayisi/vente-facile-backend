@@ -360,6 +360,28 @@ class SupplierPaymentViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewS
         supplier.current_balance += payment.amount
         supplier.save()
         
+        # Enregistrer le mouvement de caisse inverse (remboursement fournisseur)
+        from apps.cashbook.services import _get_last_balance
+        from apps.cashbook.models import CashMovement as CM
+        from apps.core.utils import ReferenceGenerator
+        from django.utils import timezone as tz
+        previous_balance = _get_last_balance(payment.organization)
+        new_balance = previous_balance + payment.amount
+        first_alloc = payment.allocations.first()
+        CM.objects.create(
+            organization=payment.organization,
+            reference=ReferenceGenerator.generate_cash_movement_reference(payment.organization),
+            direction='in',
+            movement_type='supplier_refund',
+            amount=payment.amount,
+            description=f"Annulation paiement fournisseur {payment.reference} - {supplier.name}",
+            purchase_order=first_alloc.purchase_order if first_alloc else None,
+            supplier=supplier,
+            balance_after=new_balance,
+            movement_date=tz.now(),
+            created_by=request.user,
+        )
+        
         payment.status = 'cancelled'
         payment.save()
         
@@ -470,6 +492,22 @@ class PurchaseReturnViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSe
         
         purchase_return.status = 'shipped'
         purchase_return.save()
+        
+        # Enregistrer le mouvement de caisse (remboursement fournisseur attendu)
+        if purchase_return.total_amount and purchase_return.total_amount > 0:
+            from apps.cashbook.services import record_purchase_return_refund
+            record_purchase_return_refund(
+                organization=purchase_return.organization,
+                purchase_return=purchase_return,
+                amount=purchase_return.total_amount,
+                supplier=purchase_return.supplier,
+                user=request.user,
+            )
+            
+            # Réduire le solde fournisseur (on nous doit moins)
+            supplier = purchase_return.supplier
+            supplier.current_balance -= purchase_return.total_amount
+            supplier.save()
         
         return Response({'status': 'shipped'})
 

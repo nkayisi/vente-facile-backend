@@ -1,0 +1,105 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+.env
+venv.bak/
+db.sqlite3
+
+# =========================
+# Django
+# =========================
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+media/
+staticfiles/
+*.pot
+*.pyc
+
+# =========================
+# Environment variables
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# Migrations (optionnel)
+# Décommente si tu ne veux PAS versionner les migrations
+# =========================
+# */migrations/*
+# !*/migrations/__init__.py
+
+# =========================
+# Static & collected files
+# =========================
+static/
+static_root/
+assets/
+
+# =========================
+# IDE / Editors
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# =========================
+# Testing / Coverage
+# =========================
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover
+
+# =========================
+# Docker
+# =========================
+*.pid
+*.seed
+*.pid.lock
+docker-compose.override.yml
+
+# =========================
+# Celery
+# =========================
+celerybeat-schedule
+
+# =========================
+# Logs
+# =========================
+logs/
+*.log
+
+# =========================
+# PostgreSQL
+# =========================
+*.sql
+*.dump
+
+# =========================
+# Redis
+# =========================
+dump.rdb
+
+# =========================
+# OS Files
+# =========================
+Thumbs.db

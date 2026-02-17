@@ -210,6 +210,11 @@ class PermissionService:
             'customers.view', 'customers.create', 'customers.edit', 'customers.delete',
             # Rapports
             'reports.view', 'reports.export',
+            # Livre de caisse
+            'cashbook.view', 'cashbook.view_reports',
+            'cashbook.create_movement', 'cashbook.cancel_movement', 'cashbook.delete_movement',
+            'cashbook.create_expense', 'cashbook.approve_expense', 'cashbook.delete_expense',
+            'cashbook.manage_categories',
             # Dashboard
             'dashboard.view',
         ],
@@ -246,6 +251,11 @@ class PermissionService:
             'customers.view', 'customers.create', 'customers.edit', 'customers.delete',
             # Rapports
             'reports.view', 'reports.export',
+            # Livre de caisse
+            'cashbook.view', 'cashbook.view_reports',
+            'cashbook.create_movement', 'cashbook.cancel_movement',
+            'cashbook.create_expense', 'cashbook.approve_expense',
+            'cashbook.manage_categories',
             # Dashboard
             'dashboard.view',
         ],
@@ -273,6 +283,8 @@ class PermissionService:
             'suppliers.view', 'suppliers.create', 'suppliers.edit',
             # Clients (lecture seule)
             'customers.view',
+            # Livre de caisse (lecture seule)
+            'cashbook.view',
             # Dashboard
             'dashboard.view',
         ],
@@ -292,6 +304,8 @@ class PermissionService:
             'payment_methods.view',
             # Clients (créer + voir)
             'customers.view', 'customers.create',
+            # Livre de caisse (lecture seule + créer dépenses)
+            'cashbook.view', 'cashbook.create_expense',
             # Dashboard
             'dashboard.view',
         ],

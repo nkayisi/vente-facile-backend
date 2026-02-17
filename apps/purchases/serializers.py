@@ -468,6 +468,18 @@ class SupplierPaymentCreateSerializer(serializers.ModelSerializer):
         supplier.current_balance -= payment.amount
         supplier.save()
         
+        # Enregistrer le mouvement de caisse
+        from apps.cashbook.services import record_purchase_payment
+        # Lier au premier PO alloué s'il existe
+        first_po = allocations_data[0]['purchase_order'] if allocations_data else None
+        record_purchase_payment(
+            organization=org,
+            purchase_order=first_po,
+            amount=payment.amount,
+            supplier=supplier,
+            user=self.context['request'].user,
+        )
+        
         return payment
 
 
