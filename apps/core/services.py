@@ -22,6 +22,7 @@ class OrganizationService:
         from apps.inventory.models import Warehouse
         from apps.sales.models import PaymentMethod
         from apps.subscriptions.models import Plan, Subscription
+        from apps.settings.models import Currency, OrganizationCurrency
         
         slug = slugify(name)
         base_slug = slug
@@ -112,6 +113,32 @@ class OrganizationService:
                 is_default=is_default,
                 is_active=True
             )
+        
+        # Créer la devise principale de l'organisation
+        currency_code = organization.currency or 'CDF'
+        currency_obj = Currency.objects.filter(code=currency_code).first()
+        if not currency_obj:
+            # Fallback: créer la devise si elle n'existe pas
+            currency_defaults = {
+                'CDF': ('Franc Congolais', 'FC', 0),
+                'USD': ('Dollar Américain', '$', 2),
+                'EUR': ('Euro', '€', 2),
+            }
+            name_c, symbol, decimals = currency_defaults.get(currency_code, (currency_code, currency_code, 2))
+            currency_obj = Currency.objects.create(
+                code=currency_code,
+                name=name_c,
+                symbol=symbol,
+                decimal_places=decimals,
+                is_active=True
+            )
+        
+        OrganizationCurrency.objects.create(
+            organization=organization,
+            currency=currency_obj,
+            is_primary=True,
+            is_active=True
+        )
         
         PermissionService.assign_owner_permissions(user, organization)
         

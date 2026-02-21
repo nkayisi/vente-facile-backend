@@ -5,6 +5,32 @@ from rest_framework import serializers
 from .models import Organization, OrganizationMembership, Branch, OrganizationInvitation
 
 
+def _get_default_currency_info(organization):
+    """Helper to get the primary currency info for an organization."""
+    from apps.settings.models import OrganizationCurrency
+    try:
+        primary = OrganizationCurrency.objects.select_related('currency').get(
+            organization=organization,
+            is_primary=True
+        )
+        return {
+            'code': primary.currency.code,
+            'name': primary.currency.name,
+            'symbol': primary.currency.symbol,
+            'decimal_places': primary.currency.decimal_places,
+        }
+    except OrganizationCurrency.DoesNotExist:
+        # Fallback: utiliser le champ currency de l'organisation
+        code = organization.currency or 'CDF'
+        defaults = {
+            'CDF': {'name': 'Franc Congolais', 'symbol': 'FC', 'decimal_places': 0},
+            'USD': {'name': 'Dollar Américain', 'symbol': '$', 'decimal_places': 2},
+            'EUR': {'name': 'Euro', 'symbol': '€', 'decimal_places': 2},
+        }
+        info = defaults.get(code, {'name': code, 'symbol': code, 'decimal_places': 2})
+        return {'code': code, **info}
+
+
 # =============================================================================
 # ORGANIZATION SERIALIZERS
 # =============================================================================
@@ -16,17 +42,21 @@ class OrganizationListSerializer(serializers.ModelSerializer):
         source='get_business_type_display', read_only=True
     )
     members_count = serializers.SerializerMethodField()
+    default_currency_info = serializers.SerializerMethodField()
     
     class Meta:
         model = Organization
         fields = [
             'id', 'name', 'slug', 'business_type', 'business_type_display',
-            'logo', 'is_active', 'members_count', 'created_at'
+            'logo', 'is_active', 'members_count', 'default_currency_info', 'created_at'
         ]
         read_only_fields = ['id', 'slug', 'created_at']
 
     def get_members_count(self, obj):
         return obj.memberships.filter(is_active=True).count()
+
+    def get_default_currency_info(self, obj):
+        return _get_default_currency_info(obj)
 
 
 class OrganizationDetailSerializer(serializers.ModelSerializer):
@@ -36,6 +66,7 @@ class OrganizationDetailSerializer(serializers.ModelSerializer):
         source='get_business_type_display', read_only=True
     )
     subscription_status = serializers.SerializerMethodField()
+    default_currency_info = serializers.SerializerMethodField()
     
     class Meta:
         model = Organization
@@ -44,10 +75,13 @@ class OrganizationDetailSerializer(serializers.ModelSerializer):
             'logo', 'email', 'phone', 'address', 'city', 'country',
             'tax_id', 'rccm', 'id_nat',
             'currency', 'timezone', 'is_active',
-            'settings', 'subscription_status',
+            'settings', 'subscription_status', 'default_currency_info',
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'slug', 'created_at', 'updated_at']
+
+    def get_default_currency_info(self, obj):
+        return _get_default_currency_info(obj)
 
     def get_subscription_status(self, obj):
         subscription = obj.get_active_subscription()

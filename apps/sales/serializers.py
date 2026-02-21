@@ -553,6 +553,10 @@ class SalePaymentSerializer(serializers.Serializer):
     
     payment_method = serializers.UUIDField()
     amount = serializers.DecimalField(max_digits=15, decimal_places=2)
+    currency = serializers.CharField(max_length=3, required=False, allow_blank=True)
+    exchange_rate = serializers.DecimalField(
+        max_digits=15, decimal_places=6, required=False
+    )
     reference = serializers.CharField(required=False, allow_blank=True)
     notes = serializers.CharField(required=False, allow_blank=True)
 

@@ -87,8 +87,23 @@ class OrganizationCurrencyViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
         instance = self.get_object()
         org = self.get_organization()
         
+        # Bloquer le changement de devise principale après la création
+        existing_primary = OrganizationCurrency.objects.filter(
+            organization=org,
+            is_primary=True
+        ).first()
+        
+        if existing_primary and existing_primary.id != instance.id:
+            return Response(
+                {
+                    'error': "La devise par défaut ne peut pas être modifiée après la création de l'établissement. "
+                             "Vous pouvez ajouter d'autres devises secondaires, mais la devise principale reste fixe."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
         with transaction.atomic():
-            # Désactiver l'ancienne devise principale
+            # Désactiver l'ancienne devise principale (si aucune n'existe encore)
             OrganizationCurrency.objects.filter(
                 organization=org,
                 is_primary=True
@@ -98,6 +113,12 @@ class OrganizationCurrencyViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
             instance.is_primary = True
             instance.exchange_rate = Decimal('1.000000')
             instance.save()
+            
+            # Synchroniser Organization.currency
+            from apps.organizations.models import Organization
+            Organization.objects.filter(id=org.id).update(
+                currency=instance.currency.code
+            )
         
         serializer = self.get_serializer(instance)
         return Response(serializer.data)

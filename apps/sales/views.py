@@ -374,20 +374,49 @@ class SaleViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         previous_status = sale.status
         
         with transaction.atomic():
-            # Créer le paiement
+            # Gestion multi-devise : convertir le paiement dans la devise de la vente
+            payment_amount = serializer.validated_data['amount']
+            payment_currency = serializer.validated_data.get('currency', '').strip()
+            payment_exchange_rate = serializer.validated_data.get('exchange_rate')
+            
+            # Montant converti dans la devise principale (de la vente)
+            amount_in_sale_currency = payment_amount
+            
+            if payment_currency and payment_currency != sale.currency:
+                # Le client paie dans une devise différente de la facture
+                from apps.settings.services import CurrencyService
+                org = sale.organization
+                
+                if payment_exchange_rate and payment_exchange_rate > 0:
+                    # Utiliser le taux fourni par le frontend
+                    amount_in_sale_currency = (payment_amount * payment_exchange_rate).quantize(Decimal('0.01'))
+                else:
+                    # Calculer via le service de conversion
+                    result = CurrencyService.convert(
+                        payment_amount, payment_currency, sale.currency, org
+                    )
+                    amount_in_sale_currency = result['converted_amount']
+                    payment_exchange_rate = result['exchange_rate']
+            else:
+                payment_currency = sale.currency
+                payment_exchange_rate = Decimal('1.0000')
+            
+            # Créer le paiement avec les infos de devise
             payment = Payment.objects.create(
                 sale=sale,
                 organization=sale.organization,
                 payment_method_id=serializer.validated_data['payment_method'],
-                amount=serializer.validated_data['amount'],
+                amount=amount_in_sale_currency,
+                currency=payment_currency,
+                exchange_rate=payment_exchange_rate or Decimal('1.0000'),
                 reference=serializer.validated_data.get('reference', ''),
                 notes=serializer.validated_data.get('notes', ''),
                 received_by=request.user,
                 status='completed'
             )
             
-            # Mettre à jour la vente
-            sale.amount_paid += payment.amount
+            # Mettre à jour la vente (toujours en devise de la vente)
+            sale.amount_paid += amount_in_sale_currency
             sale.amount_due = (sale.total - sale.amount_paid).quantize(Decimal('0.01'))
             
             if sale.amount_paid >= sale.total:
