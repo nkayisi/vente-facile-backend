@@ -473,10 +473,26 @@ class SaleViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
             
             # Mettre à jour le solde client pour les ventes à crédit
             if sale.customer and sale.sale_type == 'credit':
-                from apps.contacts.models import Customer
+                from apps.contacts.models import Customer, CustomerTransaction
                 customer = Customer.objects.select_for_update().get(id=sale.customer.id)
+                balance_before = customer.current_balance
                 customer.current_balance -= payment.amount
                 customer.save()
+                
+                # Créer une transaction client pour l'historique
+                CustomerTransaction.objects.create(
+                    organization=sale.organization,
+                    customer=customer,
+                    transaction_type='payment',
+                    amount=payment.amount,
+                    balance_before=balance_before,
+                    balance_after=customer.current_balance,
+                    sale=sale,
+                    reference=sale.reference,
+                    payment_method=payment.payment_method.method_type if payment.payment_method else 'cash',
+                    notes=f"Paiement sur facture {sale.reference}",
+                    created_by=request.user
+                )
         
         return Response(SaleDetailSerializer(sale).data)
 
@@ -582,6 +598,16 @@ class SaleViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         
         serializer = SaleListSerializer(sales, many=True)
         return Response(serializer.data)
+
+    @action(detail=True, methods=['post'], url_path='mark-receipt-printed')
+    def mark_receipt_printed(self, request, pk=None):
+        """Marque le reçu comme imprimé."""
+        sale = self.get_object()
+        
+        sale.receipt_printed = True
+        sale.save(update_fields=['receipt_printed'])
+        
+        return Response(SaleDetailSerializer(sale).data)
 
     @action(detail=False, methods=['get'])
     def stats(self, request):

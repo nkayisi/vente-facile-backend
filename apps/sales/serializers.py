@@ -279,7 +279,7 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             'currency', 'exchange_rate',
             'notes', 'internal_notes',
             'sold_by', 'sold_by_name',
-            'sale_date', 'due_date', 'is_pos',
+            'sale_date', 'due_date', 'is_pos', 'receipt_printed',
             'items', 'payments',
             'created_at', 'updated_at'
         ]

@@ -257,6 +257,7 @@ class Sale(TenantSoftDeleteModel):
     due_date = models.DateField(null=True, blank=True)
     
     is_pos = models.BooleanField(default=True)
+    receipt_printed = models.BooleanField(default=False)
 
     objects = TenantSoftDeleteManager()
 
