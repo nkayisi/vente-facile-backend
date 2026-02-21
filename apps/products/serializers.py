@@ -385,8 +385,7 @@ class ProductDetailSerializer(serializers.ModelSerializer):
         model = Product
         fields = [
             'id', 'name', 'slug', 'sku', 'barcode',
-            'description', 'short_description',
-            'product_type',
+            'short_description',
             'category', 'category_name',
             'brand', 'brand_name',
             'unit', 'unit_name', 'unit_symbol',
@@ -435,8 +434,7 @@ class ProductCreateSerializer(serializers.ModelSerializer):
         model = Product
         fields = [
             'name', 'slug', 'sku', 'barcode',
-            'description', 'short_description',
-            'product_type',
+            'short_description',
             'category', 'brand', 'unit',
             'cost_price', 'selling_price', 'wholesale_price',
             'tax_rate', 'is_taxable',

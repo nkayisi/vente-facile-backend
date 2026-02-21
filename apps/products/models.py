@@ -133,25 +133,13 @@ class Product(TenantSoftDeleteModel):
     Main product model.
     Supports variants, multiple prices, and inventory tracking.
     """
-    
-    class ProductType(models.TextChoices):
-        PHYSICAL = 'physical', 'Produit physique'
-        SERVICE = 'service', 'Service'
-        BUNDLE = 'bundle', 'Pack/Bundle'
 
     name = models.CharField(max_length=255)
     slug = models.SlugField(max_length=255)
     sku = models.CharField(max_length=100, db_index=True)
     barcode = models.CharField(max_length=100, blank=True, db_index=True)
     
-    description = models.TextField(blank=True)
     short_description = models.CharField(max_length=500, blank=True)
-    
-    product_type = models.CharField(
-        max_length=20,
-        choices=ProductType.choices,
-        default=ProductType.PHYSICAL
-    )
     
     category = models.ForeignKey(
         Category,

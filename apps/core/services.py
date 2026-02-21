@@ -217,6 +217,8 @@ class PermissionService:
             'cashbook.manage_categories',
             # Dashboard
             'dashboard.view',
+            # Paramètres
+            'settings.view', 'settings.manage',
         ],
         
         # GÉRANT (manager) : gestion complète sauf abonnement et paramètres critiques
@@ -258,6 +260,8 @@ class PermissionService:
             'cashbook.manage_categories',
             # Dashboard
             'dashboard.view',
+            # Paramètres (lecture seule)
+            'settings.view',
         ],
         
         # MAGASINIER (stock_keeper) : stock, inventaire, réceptions, fournisseurs

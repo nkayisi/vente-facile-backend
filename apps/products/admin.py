@@ -45,7 +45,7 @@ class ProductPriceInline(admin.TabularInline):
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
     list_display = ['name', 'sku', 'organization', 'category', 'selling_price', 'is_active']
-    list_filter = ['is_active', 'product_type', 'category', 'brand', 'organization']
+    list_filter = ['is_active', 'category', 'brand', 'organization']
     search_fields = ['name', 'sku', 'barcode']
     prepopulated_fields = {'slug': ('name',)}
     raw_id_fields = ['organization', 'category', 'brand', 'unit', 'created_by']
@@ -53,10 +53,10 @@ class ProductAdmin(admin.ModelAdmin):
     
     fieldsets = (
         (None, {
-            'fields': ('organization', 'name', 'slug', 'sku', 'barcode', 'product_type')
+            'fields': ('organization', 'name', 'slug', 'sku', 'barcode')
         }),
         ('Description', {
-            'fields': ('description', 'short_description', 'image')
+            'fields': ('short_description', 'image')
         }),
         ('Classification', {
             'fields': ('category', 'brand', 'unit')

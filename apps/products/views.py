@@ -207,8 +207,8 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
     queryset = Product.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['category', 'brand', 'is_active', 'is_featured', 'product_type', 'track_inventory']
-    search_fields = ['name', 'sku', 'barcode', 'description']
+    filterset_fields = ['category', 'brand', 'is_active', 'is_featured', 'track_inventory']
+    search_fields = ['name', 'sku', 'barcode', 'short_description']
     ordering_fields = ['name', 'sku', 'selling_price', 'created_at']
     ordering = ['name']
     
