@@ -357,36 +357,14 @@ class OrganizationSettings(TenantModel):
     Singleton per organization.
     """
     
-    # Paramètres généraux
+    # Paramètres généraux des reçus
     receipt_header = models.TextField(blank=True, help_text="En-tête des reçus")
     receipt_footer = models.TextField(blank=True, help_text="Pied de page des reçus")
-    
-    # Paramètres de vente
-    allow_negative_stock_sales = models.BooleanField(
-        default=False,
-        help_text="Autoriser les ventes même si le stock est insuffisant"
-    )
-    default_tax_rate = models.DecimalField(
-        max_digits=5,
-        decimal_places=2,
-        default=Decimal('0.00'),
-        help_text="Taux de TVA par défaut (%)"
-    )
-    
-    # Paramètres de devise
-    show_secondary_currency_on_receipt = models.BooleanField(
-        default=False,
-        help_text="Afficher le montant en devise secondaire sur les reçus"
-    )
-    auto_update_exchange_rates = models.BooleanField(
-        default=False,
-        help_text="Mettre à jour automatiquement les taux de change"
-    )
     
     # Paramètres de fidélité
     show_loyalty_points_on_receipt = models.BooleanField(
         default=True,
-        help_text="Afficher les points de fidélité sur les reçus"
+        help_text="Afficher les points gagnés et le solde du client sur les reçus"
     )
     
     # Notifications

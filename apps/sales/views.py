@@ -353,6 +353,45 @@ class SaleViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
             queryset = queryset.filter(sale_date__date__lte=date_to)
         
         return queryset
+    
+    def _award_loyalty_points(self, sale, user):
+        """Attribue les points de fidélité au client pour une vente complétée."""
+        from apps.settings.models import LoyaltyProgram, CustomerLoyalty, LoyaltyTransaction
+        
+        try:
+            program = LoyaltyProgram.objects.get(organization=sale.organization, is_active=True)
+        except LoyaltyProgram.DoesNotExist:
+            return  # Pas de programme de fidélité actif
+        
+        # Vérifier si seuls les clients enregistrés peuvent gagner des points
+        if program.only_registered_customers and not sale.customer:
+            return
+        
+        # Calculer les points gagnés
+        points = program.calculate_points(sale.total)
+        if points <= 0:
+            return
+        
+        # Obtenir ou créer le compte de fidélité du client
+        loyalty, created = CustomerLoyalty.objects.get_or_create(
+            organization=sale.organization,
+            customer=sale.customer
+        )
+        
+        # Ajouter les points
+        loyalty.add_points(points)
+        
+        # Créer la transaction de fidélité
+        LoyaltyTransaction.objects.create(
+            organization=sale.organization,
+            customer_loyalty=loyalty,
+            transaction_type=LoyaltyTransaction.TransactionType.EARN,
+            points=points,
+            balance_after=loyalty.current_points,
+            sale=sale,
+            description=f"Points gagnés sur vente {sale.reference}",
+            created_by=user
+        )
 
     @action(detail=True, methods=['post'], url_path='add-payment')
     def add_payment(self, request, pk=None):
@@ -481,6 +520,10 @@ class SaleViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
                                 notes=f"Vente {sale.reference}",
                                 created_by=request.user
                             )
+                
+                # Attribuer les points de fidélité si applicable
+                if sale.customer:
+                    self._award_loyalty_points(sale, request.user)
             
             # Enregistrer le mouvement de caisse
             from apps.cashbook.services import record_sale_income, record_debt_collection

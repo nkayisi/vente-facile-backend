@@ -51,5 +51,5 @@ class LoyaltyTransactionAdmin(admin.ModelAdmin):
 
 @admin.register(OrganizationSettings)
 class OrganizationSettingsAdmin(admin.ModelAdmin):
-    list_display = ['organization', 'default_tax_rate', 'low_stock_threshold']
+    list_display = ['organization', 'show_loyalty_points_on_receipt', 'low_stock_threshold']
     search_fields = ['organization__name']

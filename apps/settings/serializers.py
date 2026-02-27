@@ -244,8 +244,6 @@ class OrganizationSettingsSerializer(serializers.ModelSerializer):
         fields = [
             'id',
             'receipt_header', 'receipt_footer',
-            'allow_negative_stock_sales', 'default_tax_rate',
-            'show_secondary_currency_on_receipt', 'auto_update_exchange_rates',
             'show_loyalty_points_on_receipt',
             'low_stock_threshold',
             'created_at', 'updated_at'

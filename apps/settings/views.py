@@ -201,7 +201,7 @@ class LoyaltyProgramViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     
     action_permissions = {
-        'list': 'settings.view',
+        'list': '*',  # Accessible à tous les membres de l'organisation
         'retrieve': 'settings.view',
         'create': 'settings.manage',
         'update': 'settings.manage',

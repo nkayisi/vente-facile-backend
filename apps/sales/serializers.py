@@ -294,6 +294,7 @@ class SaleCreateSerializer(serializers.ModelSerializer):
     
     items = SaleItemCreateSerializer(many=True)
     payments = PaymentCreateSerializer(many=True, required=False)
+    points_used = serializers.IntegerField(required=False, min_value=0, default=0)
     
     class Meta:
         model = Sale
@@ -301,7 +302,7 @@ class SaleCreateSerializer(serializers.ModelSerializer):
             'register', 'warehouse', 'customer', 'sale_type', 'price_list',
             'discount_percentage', 'currency', 'exchange_rate',
             'notes', 'internal_notes', 'due_date', 'is_pos',
-            'items', 'payments'
+            'items', 'payments', 'points_used'
         ]
 
     def validate_items(self, value):
@@ -338,6 +339,7 @@ class SaleCreateSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         items_data = validated_data.pop('items')
         payments_data = validated_data.pop('payments', [])
+        points_used = validated_data.pop('points_used', 0)
         
         # Générer la référence
         from apps.core.utils import ReferenceGenerator
@@ -545,7 +547,117 @@ class SaleCreateSerializer(serializers.ModelSerializer):
                 created_by=self.context['request'].user
             )
         
+        # Utiliser les points de fidélité si demandé
+        if points_used > 0 and sale.customer:
+            self._redeem_loyalty_points(sale, org, points_used)
+        
+        # Attribuer les points de fidélité si applicable
+        if sale.status == 'completed' and sale.customer:
+            self._award_loyalty_points(sale, org)
+        
         return sale
+    
+    def _redeem_loyalty_points(self, sale, organization, points_to_redeem):
+        """Utilise les points de fidélité du client pour une réduction."""
+        from apps.settings.models import LoyaltyProgram, CustomerLoyalty, LoyaltyTransaction
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        logger.info(f"[Loyalty] Attempting to redeem {points_to_redeem} points for sale {sale.reference}")
+        
+        try:
+            program = LoyaltyProgram.objects.get(organization=organization, is_active=True)
+        except LoyaltyProgram.DoesNotExist:
+            logger.warning("[Loyalty] No active loyalty program found for redemption")
+            return
+        
+        # Vérifier le minimum de points requis
+        if points_to_redeem < program.min_points_to_redeem:
+            logger.warning(f"[Loyalty] Points to redeem ({points_to_redeem}) is less than minimum ({program.min_points_to_redeem})")
+            return
+        
+        # Obtenir le compte de fidélité du client
+        try:
+            loyalty = CustomerLoyalty.objects.get(
+                organization=organization,
+                customer=sale.customer
+            )
+        except CustomerLoyalty.DoesNotExist:
+            logger.warning("[Loyalty] Customer loyalty account not found")
+            return
+        
+        # Vérifier que le client a assez de points
+        if loyalty.current_points < points_to_redeem:
+            logger.warning(f"[Loyalty] Insufficient points. Has: {loyalty.current_points}, Wants: {points_to_redeem}")
+            return
+        
+        # Utiliser les points
+        loyalty.redeem_points(points_to_redeem)
+        logger.info(f"[Loyalty] Points redeemed. New balance: {loyalty.current_points}")
+        
+        # Créer la transaction de fidélité
+        LoyaltyTransaction.objects.create(
+            organization=organization,
+            customer_loyalty=loyalty,
+            transaction_type=LoyaltyTransaction.TransactionType.REDEEM,
+            points=-points_to_redeem,
+            balance_after=loyalty.current_points,
+            sale=sale,
+            description=f"Points utilisés sur vente {sale.reference}",
+            created_by=self.context['request'].user
+        )
+        logger.info(f"[Loyalty] Redemption transaction created")
+    
+    def _award_loyalty_points(self, sale, organization):
+        """Attribue les points de fidélité au client pour une vente complétée."""
+        from apps.settings.models import LoyaltyProgram, CustomerLoyalty, LoyaltyTransaction
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        logger.info(f"[Loyalty] Attempting to award points for sale {sale.reference}, customer: {sale.customer}")
+        
+        try:
+            program = LoyaltyProgram.objects.get(organization=organization, is_active=True)
+            logger.info(f"[Loyalty] Found active program: {program.name}")
+        except LoyaltyProgram.DoesNotExist:
+            logger.info("[Loyalty] No active loyalty program found")
+            return  # Pas de programme de fidélité actif
+        
+        # Vérifier si seuls les clients enregistrés peuvent gagner des points
+        if program.only_registered_customers and not sale.customer:
+            logger.info("[Loyalty] Program requires registered customers but no customer on sale")
+            return
+        
+        # Calculer les points gagnés
+        points = program.calculate_points(sale.total)
+        logger.info(f"[Loyalty] Calculated points: {points} for amount {sale.total}")
+        if points <= 0:
+            logger.info("[Loyalty] No points to award (points <= 0)")
+            return
+        
+        # Obtenir ou créer le compte de fidélité du client
+        loyalty, created = CustomerLoyalty.objects.get_or_create(
+            organization=organization,
+            customer=sale.customer
+        )
+        logger.info(f"[Loyalty] Customer loyalty account {'created' if created else 'found'}: {loyalty.id}")
+        
+        # Ajouter les points
+        loyalty.add_points(points)
+        logger.info(f"[Loyalty] Points added. New balance: {loyalty.current_points}")
+        
+        # Créer la transaction de fidélité
+        transaction = LoyaltyTransaction.objects.create(
+            organization=organization,
+            customer_loyalty=loyalty,
+            transaction_type=LoyaltyTransaction.TransactionType.EARN,
+            points=points,
+            balance_after=loyalty.current_points,
+            sale=sale,
+            description=f"Points gagnés sur vente {sale.reference}",
+            created_by=self.context['request'].user
+        )
+        logger.info(f"[Loyalty] Transaction created: {transaction.id}")
 
 
 class SalePaymentSerializer(serializers.Serializer):
