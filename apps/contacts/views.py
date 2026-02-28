@@ -281,6 +281,11 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
             is_deleted=False
         ).exclude(current_balance=0).order_by('-current_balance')
         
+        page = self.paginate_queryset(customers)
+        if page is not None:
+            serializer = CustomerListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
         serializer = CustomerListSerializer(customers, many=True)
         return Response(serializer.data)
 
@@ -450,6 +455,11 @@ class SupplierViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
             is_active=True
         ).select_related('product')
         
+        page = self.paginate_queryset(products)
+        if page is not None:
+            serializer = SupplierProductSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
         serializer = SupplierProductSerializer(products, many=True)
         return Response(serializer.data)
 
@@ -462,6 +472,11 @@ class SupplierViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
             organization=organization,
             is_deleted=False
         ).exclude(current_balance=0).order_by('-current_balance')
+        
+        page = self.paginate_queryset(suppliers)
+        if page is not None:
+            serializer = SupplierListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
         
         serializer = SupplierListSerializer(suppliers, many=True)
         return Response(serializer.data)

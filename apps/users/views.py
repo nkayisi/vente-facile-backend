@@ -158,10 +158,15 @@ class UserViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def activities(self, request):
-        """Retourne les activités de l'utilisateur connecté."""
+        """Retourne les activités de l'utilisateur connecté avec pagination."""
         activities = UserActivity.objects.filter(
             user=request.user
-        ).order_by('-created_at')[:50]
+        ).order_by('-created_at')
+        
+        page = self.paginate_queryset(activities)
+        if page is not None:
+            serializer = UserActivitySerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
         
         serializer = UserActivitySerializer(activities, many=True)
         return Response(serializer.data)

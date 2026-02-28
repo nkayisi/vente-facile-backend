@@ -658,7 +658,7 @@ class SaleViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def today(self, request):
-        """Retourne les ventes du jour."""
+        """Retourne les ventes du jour avec pagination."""
         organization = self.get_organization()
         today = timezone.now().date()
         
@@ -667,6 +667,11 @@ class SaleViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
             sale_date__date=today,
             is_deleted=False
         ).select_related('customer', 'sold_by').order_by('-sale_date')
+        
+        page = self.paginate_queryset(sales)
+        if page is not None:
+            serializer = SaleListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
         
         serializer = SaleListSerializer(sales, many=True)
         return Response(serializer.data)

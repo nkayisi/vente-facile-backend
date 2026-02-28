@@ -140,7 +140,7 @@ class PurchaseOrderViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
 
     @action(detail=False, methods=['get'])
     def pending(self, request):
-        """Retourne les commandes en attente de réception."""
+        """Retourne les commandes en attente de réception avec pagination."""
         organization = self.get_organization()
         
         pos = PurchaseOrder.objects.filter(
@@ -148,6 +148,11 @@ class PurchaseOrderViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
             status__in=['sent', 'confirmed', 'partially_received'],
             is_deleted=False
         ).select_related('supplier').order_by('expected_date')
+        
+        page = self.paginate_queryset(pos)
+        if page is not None:
+            serializer = PurchaseOrderListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
         
         serializer = PurchaseOrderListSerializer(pos, many=True)
         return Response(serializer.data)

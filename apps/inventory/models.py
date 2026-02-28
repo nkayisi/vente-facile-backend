@@ -664,6 +664,86 @@ class InventorySession(TenantSoftDeleteModel):
     def items_with_difference(self):
         return self.counts.filter(is_counted=True).exclude(quantity_difference=Decimal('0.000')).count()
 
+    def get_locked_product_ids(self):
+        """
+        Retourne les IDs des produits bloqués par cette session d'inventaire.
+        """
+        if not self.is_stock_locked:
+            return set()
+        
+        product_ids = set()
+        
+        if self.scope_type == self.ScopeType.FULL:
+            # Tous les produits de l'entrepôt avec du stock
+            from apps.inventory.models import Stock
+            product_ids = set(
+                Stock.objects.filter(
+                    organization=self.organization,
+                    warehouse=self.warehouse
+                ).values_list('product_id', flat=True)
+            )
+        elif self.scope_type == self.ScopeType.CATEGORY:
+            # Produits des catégories sélectionnées
+            from apps.products.models import Product
+            category_ids = list(self.categories.values_list('id', flat=True))
+            if category_ids:
+                product_ids = set(
+                    Product.objects.filter(
+                        organization=self.organization,
+                        category_id__in=category_ids,
+                        is_deleted=False
+                    ).values_list('id', flat=True)
+                )
+        elif self.scope_type == self.ScopeType.PRODUCT:
+            # Produits spécifiquement sélectionnés
+            product_ids = set(self.products.values_list('id', flat=True))
+        
+        return product_ids
+
+    @classmethod
+    def get_all_locked_product_ids(cls, organization):
+        """
+        Retourne les IDs de tous les produits bloqués par des inventaires en cours
+        pour une organisation donnée.
+        """
+        locked_sessions = cls.objects.filter(
+            organization=organization,
+            is_stock_locked=True,
+            status__in=[cls.Status.IN_PROGRESS, cls.Status.REVIEW],
+            is_deleted=False
+        )
+        
+        all_locked_ids = set()
+        for session in locked_sessions:
+            all_locked_ids.update(session.get_locked_product_ids())
+        
+        return all_locked_ids
+
+    @classmethod
+    def get_locking_sessions_for_products(cls, organization, product_ids):
+        """
+        Retourne les sessions d'inventaire qui bloquent les produits donnés.
+        """
+        if not product_ids:
+            return []
+        
+        product_ids = set(product_ids)
+        locking_sessions = []
+        
+        locked_sessions = cls.objects.filter(
+            organization=organization,
+            is_stock_locked=True,
+            status__in=[cls.Status.IN_PROGRESS, cls.Status.REVIEW],
+            is_deleted=False
+        ).select_related('warehouse')
+        
+        for session in locked_sessions:
+            session_locked_ids = session.get_locked_product_ids()
+            if session_locked_ids & product_ids:  # Intersection
+                locking_sessions.append(session)
+        
+        return locking_sessions
+
 
 class InventoryCount(TenantModel):
     """

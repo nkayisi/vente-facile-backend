@@ -623,6 +623,17 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             count=Count('id'),
         ).order_by('direction', '-total')
 
+        # Pagination des mouvements
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 20))
+        
+        all_movements = list(movements)
+        total_movements = len(all_movements)
+        
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        paginated_movements = all_movements[start_idx:end_idx]
+
         return Response({
             'date': date_str,
             'opening_balance': opening_balance,
@@ -631,7 +642,13 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             'total_out': totals['total_out'],
             'net': totals['total_in'] - totals['total_out'],
             'by_type': list(by_type),
-            'movements': CashMovementListSerializer(movements, many=True).data,
+            'movements': {
+                'results': CashMovementListSerializer(paginated_movements, many=True).data,
+                'count': total_movements,
+                'page': page,
+                'page_size': page_size,
+                'total_pages': (total_movements + page_size - 1) // page_size if page_size > 0 else 0,
+            },
         })
 
     @action(detail=False, methods=['get'], url_path='monthly-report')

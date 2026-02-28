@@ -220,3 +220,61 @@ class FilterMixin:
                 queryset = queryset.filter(**{field: value})
         
         return queryset
+
+
+class ActionPaginationMixin:
+    """
+    Mixin pour paginer les résultats des actions personnalisées (@action).
+    Utilise les paramètres page et page_size de la requête.
+    """
+    DEFAULT_PAGE_SIZE = 20
+    MAX_PAGE_SIZE = 100
+    
+    def paginate_action_results(self, data, request, serializer_class=None):
+        """
+        Pagine une liste de données pour une action personnalisée.
+        
+        Args:
+            data: Liste ou QuerySet à paginer
+            request: L'objet request DRF
+            serializer_class: Optionnel, serializer à utiliser pour les résultats
+            
+        Returns:
+            Response avec les données paginées
+        """
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', self.DEFAULT_PAGE_SIZE))
+        
+        # Limiter la taille de page
+        page_size = min(page_size, self.MAX_PAGE_SIZE)
+        
+        # Convertir en liste si c'est un QuerySet
+        if hasattr(data, 'count'):
+            total_count = data.count()
+        else:
+            total_count = len(data)
+        
+        # Calculer les indices
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        
+        # Extraire la page de données
+        if hasattr(data, '__getitem__'):
+            paginated_data = data[start_idx:end_idx]
+        else:
+            paginated_data = list(data)[start_idx:end_idx]
+        
+        # Sérialiser si un serializer est fourni
+        if serializer_class:
+            paginated_data = serializer_class(paginated_data, many=True).data
+        
+        # Calculer le nombre total de pages
+        total_pages = (total_count + page_size - 1) // page_size if page_size > 0 else 0
+        
+        return Response({
+            'results': paginated_data,
+            'count': total_count,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': total_pages,
+        })

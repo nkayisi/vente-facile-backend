@@ -82,6 +82,11 @@ class CategoryViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
             is_deleted=False
         ).select_related('brand', 'unit')
         
+        page = self.paginate_queryset(products)
+        if page is not None:
+            serializer = ProductListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
         serializer = ProductListSerializer(products, many=True)
         return Response(serializer.data)
 
@@ -289,7 +294,7 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
 
     @action(detail=False, methods=['get'])
     def low_stock(self, request):
-        """Retourne les produits en stock bas."""
+        """Retourne les produits en stock bas avec pagination."""
         organization = self.get_organization()
         
         products = Product.objects.filter(
@@ -302,6 +307,11 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
         ).filter(
             total_stock__lte=models.F('reorder_point')
         ).select_related('category', 'brand')
+        
+        page = self.paginate_queryset(products)
+        if page is not None:
+            serializer = ProductListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
         
         serializer = ProductListSerializer(products, many=True)
         return Response(serializer.data)

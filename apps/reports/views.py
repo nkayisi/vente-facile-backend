@@ -2,6 +2,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.pagination import PageNumberPagination
 from django.db.models import Sum, Count, Avg, F, Q, DecimalField
 from django.db.models.functions import Coalesce, TruncDate, TruncWeek, TruncMonth
 from django.utils import timezone
@@ -9,6 +10,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 from apps.core.mixins import TenantQuerysetMixin
+from apps.core.api_mixins import ActionPaginationMixin
 from apps.core.api_permissions import IsTenantMember, HasActiveSubscription, HasPermission
 from apps.sales.models import Sale, SaleItem, Payment
 from apps.products.models import Product
@@ -85,7 +87,7 @@ class DashboardViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
         )
 
 
-class StatisticsViewSet(TenantQuerysetMixin, viewsets.ViewSet):
+class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.ViewSet):
     """
     ViewSet pour les statistiques et rapports en temps réel.
     Fournit des endpoints pour différentes métriques de l'entreprise.
@@ -191,10 +193,12 @@ class StatisticsViewSet(TenantQuerysetMixin, viewsets.ViewSet):
     
     @action(detail=False, methods=['get'])
     def sales_by_period(self, request):
-        """Ventes groupées par période (jour/semaine/mois)"""
+        """Ventes groupées par période (jour/semaine/mois) avec pagination"""
         org = self.get_organization()
         start_date, end_date, _, _ = self._parse_date_range(request)
         group_by = request.query_params.get('group_by', 'day')
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 20))
         
         sales = Sale.objects.filter(
             organization=org,
@@ -217,23 +221,38 @@ class StatisticsViewSet(TenantQuerysetMixin, viewsets.ViewSet):
             count=Count('id')
         ).order_by('period')
         
+        all_data = list(data)
+        total_count = len(all_data)
+        
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        paginated_data = all_data[start_idx:end_idx]
+        
         result = [
             {
                 'period': item['period'].strftime('%Y-%m-%d') if item['period'] else '',
                 'total': item['total'],
                 'count': item['count']
             }
-            for item in data
+            for item in paginated_data
         ]
         
         serializer = SalesByPeriodSerializer(result, many=True)
-        return Response(serializer.data)
+        return Response({
+            'results': serializer.data,
+            'count': total_count,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': (total_count + page_size - 1) // page_size if page_size > 0 else 0,
+        })
     
     @action(detail=False, methods=['get'])
     def sales_by_category(self, request):
-        """Ventes par catégorie de produit"""
+        """Ventes par catégorie de produit avec pagination"""
         org = self.get_organization()
         start_date, end_date, _, _ = self._parse_date_range(request)
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 20))
         
         items = SaleItem.objects.filter(
             sale__organization=org,
@@ -250,7 +269,15 @@ class StatisticsViewSet(TenantQuerysetMixin, viewsets.ViewSet):
             quantity_sold=Coalesce(Sum('quantity'), Decimal('0'), output_field=DecimalField())
         ).order_by('-total_revenue')
         
-        total_revenue = sum(item['total_revenue'] for item in data)
+        # Calculer le total pour les pourcentages
+        all_data = list(data)
+        total_revenue = sum(item['total_revenue'] for item in all_data)
+        total_count = len(all_data)
+        
+        # Pagination
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        paginated_data = all_data[start_idx:end_idx]
         
         result = [
             {
@@ -260,17 +287,25 @@ class StatisticsViewSet(TenantQuerysetMixin, viewsets.ViewSet):
                 'quantity_sold': item['quantity_sold'],
                 'percentage': round((item['total_revenue'] / total_revenue * 100) if total_revenue > 0 else 0, 2)
             }
-            for item in data
+            for item in paginated_data
         ]
         
         serializer = SalesByCategorySerializer(result, many=True)
-        return Response(serializer.data)
+        return Response({
+            'results': serializer.data,
+            'count': total_count,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': (total_count + page_size - 1) // page_size if page_size > 0 else 0,
+        })
     
     @action(detail=False, methods=['get'])
     def sales_by_payment_method(self, request):
-        """Ventes par méthode de paiement"""
+        """Ventes par méthode de paiement avec pagination"""
         org = self.get_organization()
         start_date, end_date, _, _ = self._parse_date_range(request)
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 20))
         
         payments = Payment.objects.filter(
             sale__organization=org,
@@ -286,7 +321,13 @@ class StatisticsViewSet(TenantQuerysetMixin, viewsets.ViewSet):
             count=Count('id')
         ).order_by('-total')
         
-        total_amount = sum(item['total'] for item in data)
+        all_data = list(data)
+        total_amount = sum(item['total'] for item in all_data)
+        total_count = len(all_data)
+        
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        paginated_data = all_data[start_idx:end_idx]
         
         result = [
             {
@@ -296,18 +337,25 @@ class StatisticsViewSet(TenantQuerysetMixin, viewsets.ViewSet):
                 'count': item['count'],
                 'percentage': round((item['total'] / total_amount * 100) if total_amount > 0 else 0, 2)
             }
-            for item in data
+            for item in paginated_data
         ]
         
         serializer = SalesByPaymentMethodSerializer(result, many=True)
-        return Response(serializer.data)
+        return Response({
+            'results': serializer.data,
+            'count': total_count,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': (total_count + page_size - 1) // page_size if page_size > 0 else 0,
+        })
     
     @action(detail=False, methods=['get'])
     def top_products(self, request):
-        """Top produits les plus vendus"""
+        """Top produits les plus vendus avec pagination"""
         org = self.get_organization()
         start_date, end_date, _, _ = self._parse_date_range(request)
-        limit = int(request.query_params.get('limit', 10))
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 20))
         
         items = SaleItem.objects.filter(
             sale__organization=org,
@@ -323,7 +371,13 @@ class StatisticsViewSet(TenantQuerysetMixin, viewsets.ViewSet):
         ).annotate(
             quantity_sold=Coalesce(Sum('quantity'), Decimal('0'), output_field=DecimalField()),
             total_revenue=Coalesce(Sum('total'), Decimal('0'), output_field=DecimalField())
-        ).order_by('-quantity_sold')[:limit]
+        ).order_by('-quantity_sold')
+        
+        # Pagination
+        total_count = data.count()
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        paginated_data = data[start_idx:end_idx]
         
         result = [
             {
@@ -333,18 +387,25 @@ class StatisticsViewSet(TenantQuerysetMixin, viewsets.ViewSet):
                 'quantity_sold': item['quantity_sold'],
                 'total_revenue': item['total_revenue']
             }
-            for item in data
+            for item in paginated_data
         ]
         
         serializer = TopProductSerializer(result, many=True)
-        return Response(serializer.data)
+        return Response({
+            'results': serializer.data,
+            'count': total_count,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': (total_count + page_size - 1) // page_size if page_size > 0 else 0,
+        })
     
     @action(detail=False, methods=['get'])
     def top_customers(self, request):
-        """Meilleurs clients"""
+        """Meilleurs clients avec pagination"""
         org = self.get_organization()
         start_date, end_date, _, _ = self._parse_date_range(request)
-        limit = int(request.query_params.get('limit', 10))
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 20))
         
         sales = Sale.objects.filter(
             organization=org,
@@ -361,7 +422,12 @@ class StatisticsViewSet(TenantQuerysetMixin, viewsets.ViewSet):
         ).annotate(
             total_purchases=Coalesce(Sum('total'), Decimal('0'), output_field=DecimalField()),
             order_count=Count('id')
-        ).order_by('-total_purchases')[:limit]
+        ).order_by('-total_purchases')
+        
+        total_count = data.count()
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        paginated_data = data[start_idx:end_idx]
         
         result = [
             {
@@ -371,11 +437,17 @@ class StatisticsViewSet(TenantQuerysetMixin, viewsets.ViewSet):
                 'order_count': item['order_count'],
                 'current_balance': item['customer__current_balance'] or Decimal('0')
             }
-            for item in data
+            for item in paginated_data
         ]
         
         serializer = TopCustomerSerializer(result, many=True)
-        return Response(serializer.data)
+        return Response({
+            'results': serializer.data,
+            'count': total_count,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': (total_count + page_size - 1) // page_size if page_size > 0 else 0,
+        })
     
     @action(detail=False, methods=['get'])
     def stock(self, request):
@@ -396,10 +468,12 @@ class StatisticsViewSet(TenantQuerysetMixin, viewsets.ViewSet):
     
     @action(detail=False, methods=['get'])
     def cash_flow(self, request):
-        """Flux de trésorerie par période"""
+        """Flux de trésorerie par période avec pagination"""
         org = self.get_organization()
         start_date, end_date, _, _ = self._parse_date_range(request)
         group_by = request.query_params.get('group_by', 'day')
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 20))
         
         movements = CashMovement.objects.filter(
             organization=org,
@@ -427,6 +501,13 @@ class StatisticsViewSet(TenantQuerysetMixin, viewsets.ViewSet):
             )
         ).order_by('period')
         
+        all_data = list(data)
+        total_count = len(all_data)
+        
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        paginated_data = all_data[start_idx:end_idx]
+        
         result = [
             {
                 'period': item['period'].strftime('%Y-%m-%d') if item['period'] else '',
@@ -434,11 +515,17 @@ class StatisticsViewSet(TenantQuerysetMixin, viewsets.ViewSet):
                 'expenses': item['expenses'],
                 'net': item['income'] - item['expenses']
             }
-            for item in data
+            for item in paginated_data
         ]
         
         serializer = CashFlowByPeriodSerializer(result, many=True)
-        return Response(serializer.data)
+        return Response({
+            'results': serializer.data,
+            'count': total_count,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': (total_count + page_size - 1) // page_size if page_size > 0 else 0,
+        })
     
     @action(detail=False, methods=['get'])
     def customers(self, request):
@@ -718,9 +805,19 @@ class StatisticsViewSet(TenantQuerysetMixin, viewsets.ViewSet):
             'net_cash_flow': net_cash_flow,
         }
         
-        # Liste des mouvements
+        # Liste des mouvements avec pagination
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 20))
+        
+        all_movements = list(movements)
+        total_movements = len(all_movements)
+        
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        paginated_movements = all_movements[start_idx:end_idx]
+        
         movements_list = []
-        for m in movements:
+        for m in paginated_movements:
             movements_list.append({
                 'id': m.id,
                 'time': m.movement_date.time(),
@@ -735,7 +832,13 @@ class StatisticsViewSet(TenantQuerysetMixin, viewsets.ViewSet):
         
         return Response({
             'report': DailyCashReportSerializer(report_data).data,
-            'movements': DailyCashMovementSerializer(movements_list, many=True).data,
+            'movements': {
+                'results': DailyCashMovementSerializer(movements_list, many=True).data,
+                'count': total_movements,
+                'page': page,
+                'page_size': page_size,
+                'total_pages': (total_movements + page_size - 1) // page_size if page_size > 0 else 0,
+            },
         })
     
     # ========================================================================
@@ -799,10 +902,11 @@ class StatisticsViewSet(TenantQuerysetMixin, viewsets.ViewSet):
     
     @action(detail=False, methods=['get'])
     def product_profits(self, request):
-        """Bénéfices par produit"""
+        """Bénéfices par produit avec pagination"""
         org = self.get_organization()
         start_date, end_date, _, _ = self._parse_date_range(request)
-        limit = int(request.query_params.get('limit', 20))
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 20))
         
         sale_items = SaleItem.objects.filter(
             sale__organization=org,
@@ -844,8 +948,20 @@ class StatisticsViewSet(TenantQuerysetMixin, viewsets.ViewSet):
         # Trier par profit décroissant
         result.sort(key=lambda x: x['profit'], reverse=True)
         
-        serializer = ProductProfitSerializer(result[:limit], many=True)
-        return Response(serializer.data)
+        # Pagination
+        total_count = len(result)
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        paginated_result = result[start_idx:end_idx]
+        
+        serializer = ProductProfitSerializer(paginated_result, many=True)
+        return Response({
+            'results': serializer.data,
+            'count': total_count,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': (total_count + page_size - 1) // page_size if page_size > 0 else 0,
+        })
     
     # ========================================================================
     # STOCKS DÉTAILLÉS
@@ -853,9 +969,11 @@ class StatisticsViewSet(TenantQuerysetMixin, viewsets.ViewSet):
     
     @action(detail=False, methods=['get'])
     def stock_details(self, request):
-        """Liste détaillée du stock par produit"""
+        """Liste détaillée du stock par produit avec pagination"""
         org = self.get_organization()
         filter_status = request.query_params.get('status')  # low, out, available
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 20))
         
         stocks = Stock.objects.filter(
             organization=org,
@@ -905,8 +1023,20 @@ class StatisticsViewSet(TenantQuerysetMixin, viewsets.ViewSet):
         status_order = {'out_of_stock': 0, 'low_stock': 1, 'available': 2}
         result.sort(key=lambda x: (status_order.get(x['status'], 3), x['product_name']))
         
-        serializer = StockDetailSerializer(result, many=True)
-        return Response(serializer.data)
+        # Pagination
+        total_count = len(result)
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        paginated_result = result[start_idx:end_idx]
+        
+        serializer = StockDetailSerializer(paginated_result, many=True)
+        return Response({
+            'results': serializer.data,
+            'count': total_count,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': (total_count + page_size - 1) // page_size if page_size > 0 else 0,
+        })
     
     @action(detail=False, methods=['get'])
     def stock_movements_summary(self, request):
@@ -959,3 +1089,25 @@ class StatisticsViewSet(TenantQuerysetMixin, viewsets.ViewSet):
         
         serializer = StockMovementSummarySerializer(data)
         return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'])
+    def product_supplies(self, request):
+        """Approvisionnements par produit pour une période donnée"""
+        org = self.get_organization()
+        start_date, end_date, _, _ = self._parse_date_range(request)
+        
+        from apps.inventory.models import StockMovement
+        
+        # Récupérer les mouvements d'entrée (approvisionnements) par produit
+        supplies = StockMovement.objects.filter(
+            organization=org,
+            created_at__date__gte=start_date,
+            created_at__date__lte=end_date,
+            movement_type__in=['purchase', 'initial', 'transfer_in', 'adjustment_in', 'return_in']
+        ).values('product_id').annotate(
+            total_supply=Sum('quantity')
+        )
+        
+        # Convertir en dictionnaire product_id -> quantity
+        result = {str(s['product_id']): float(s['total_supply']) for s in supplies}
+        return Response(result)

@@ -312,10 +312,34 @@ class SaleCreateSerializer(serializers.ModelSerializer):
 
     def validate(self, data):
         """Validations globales de la vente."""
-        # Vérifier le stock si nécessaire
         items = data.get('items', [])
         warehouse = data.get('warehouse')
         
+        # Récupérer l'organisation
+        organization_id = self.context['request'].headers.get('X-Organization-ID')
+        from apps.organizations.models import Organization
+        org = Organization.objects.get(id=organization_id)
+        
+        # Vérifier si des produits sont bloqués par un inventaire en cours
+        from apps.inventory.models import InventorySession
+        product_ids = [item['product'].id for item in items]
+        locked_product_ids = InventorySession.get_all_locked_product_ids(org)
+        
+        blocked_products = []
+        for item in items:
+            if item['product'].id in locked_product_ids:
+                blocked_products.append(item['product'].name)
+        
+        if blocked_products:
+            # Récupérer les sessions qui bloquent ces produits
+            locking_sessions = InventorySession.get_locking_sessions_for_products(org, product_ids)
+            session_refs = [s.reference for s in locking_sessions]
+            raise serializers.ValidationError({
+                'items': f"Les produits suivants sont bloqués par un inventaire en cours ({', '.join(session_refs)}): {', '.join(blocked_products)}. "
+                         f"Veuillez attendre la fin de l'inventaire pour effectuer cette vente."
+            })
+        
+        # Vérifier le stock si nécessaire
         if warehouse:
             from apps.inventory.models import Stock
             for item in items:

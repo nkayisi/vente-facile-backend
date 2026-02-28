@@ -189,6 +189,11 @@ class StockViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             product_id=product_id
         ).select_related('warehouse', 'location')
         
+        page = self.paginate_queryset(stocks)
+        if page is not None:
+            serializer = StockListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
         serializer = StockListSerializer(stocks, many=True)
         return Response(serializer.data)
 
@@ -200,6 +205,11 @@ class StockViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             organization=organization,
             warehouse_id=warehouse_id
         ).select_related('product', 'variant')
+        
+        page = self.paginate_queryset(stocks)
+        if page is not None:
+            serializer = StockListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
         
         serializer = StockListSerializer(stocks, many=True)
         return Response(serializer.data)
@@ -214,6 +224,11 @@ class StockViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             quantity__lte=F('product__reorder_point'),
             product__track_inventory=True
         ).select_related('product', 'warehouse')
+        
+        page = self.paginate_queryset(stocks)
+        if page is not None:
+            serializer = StockListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
         
         serializer = StockListSerializer(stocks, many=True)
         return Response(serializer.data)
@@ -232,6 +247,11 @@ class StockViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             expiry_date__gte=timezone.now().date(),
             quantity__gt=0
         ).select_related('product', 'warehouse').order_by('expiry_date')
+        
+        page = self.paginate_queryset(batches)
+        if page is not None:
+            serializer = StockBatchSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
         
         serializer = StockBatchSerializer(batches, many=True)
         return Response(serializer.data)
@@ -1101,6 +1121,11 @@ class InventorySessionViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelView
         if category:
             qs = qs.filter(product__category_id=category)
         
+        page = self.paginate_queryset(qs)
+        if page is not None:
+            serializer = InventoryCountSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
         serializer = InventoryCountSerializer(qs, many=True)
         return Response(serializer.data)
 
@@ -1143,4 +1168,27 @@ class InventorySessionViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelView
             },
             'printed_at': timezone.now().isoformat(),
             'printed_by': request.user.full_name or request.user.email,
+        })
+
+    @action(detail=False, methods=['get'], url_path='locked-products')
+    def locked_products(self, request):
+        """
+        Retourne les IDs des produits bloqués par des inventaires en cours.
+        Utilisé par le frontend pour désactiver ces produits dans le POS.
+        """
+        organization = self.get_organization()
+        locked_product_ids = InventorySession.get_all_locked_product_ids(organization)
+        
+        # Récupérer les sessions actives pour information
+        active_sessions = InventorySession.objects.filter(
+            organization=organization,
+            is_stock_locked=True,
+            status__in=['in_progress', 'review'],
+            is_deleted=False
+        ).select_related('warehouse').values('id', 'reference', 'name', 'warehouse__name', 'status')
+        
+        return Response({
+            'locked_product_ids': list(locked_product_ids),
+            'active_sessions': list(active_sessions),
+            'has_active_inventory': len(locked_product_ids) > 0
         })
