@@ -17,11 +17,9 @@ class OrganizationService:
         Also creates default branch, warehouse, and trial subscription.
         """
         from django.utils.text import slugify
-        from django.utils import timezone
-        from datetime import timedelta
         from apps.inventory.models import Warehouse
         from apps.sales.models import PaymentMethod
-        from apps.subscriptions.models import Plan, Subscription
+        from apps.subscriptions.services import SubscriptionService
         from apps.settings.models import Currency, OrganizationCurrency
         
         slug = slugify(name)
@@ -48,39 +46,8 @@ class OrganizationService:
         user.active_organization = organization
         user.save(update_fields=['active_organization'])
         
-        # Créer la subscription trial
-        trial_plan = Plan.objects.filter(code='trial').first()
-        if not trial_plan:
-            # Créer un plan trial par défaut si inexistant
-            trial_plan = Plan.objects.create(
-                name='Essai Gratuit',
-                code='trial',
-                description='Plan d\'essai gratuit de 14 jours',
-                price_monthly=0,
-                price_yearly=0,
-                max_users=3,
-                max_branches=1,
-                max_products=100,
-                max_monthly_transactions=500,
-                storage_limit_mb=100,
-                trial_days=14,
-                is_active=True
-            )
-        
-        now = timezone.now()
-        trial_days = trial_plan.trial_days or 14
-        Subscription.objects.create(
-            organization=organization,
-            plan=trial_plan,
-            status=Subscription.Status.TRIAL,
-            billing_cycle=Plan.BillingCycle.MONTHLY,
-            price=0,
-            currency=organization.currency or 'USD',
-            trial_start=now,
-            trial_end=now + timedelta(days=trial_days),
-            current_period_start=now,
-            current_period_end=now + timedelta(days=trial_days)
-        )
+        # Créer la subscription trial via le service centralisé
+        SubscriptionService.create_trial(organization)
         
         branch = Branch.objects.create(
             organization=organization,

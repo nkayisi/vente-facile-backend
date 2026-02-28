@@ -338,6 +338,13 @@ class SubscriptionPayment(TimeStampedModel, UUIDModel):
         on_delete=models.CASCADE,
         related_name='subscription_payments'
     )
+    subscription = models.ForeignKey(
+        Subscription,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='payments'
+    )
     invoice = models.ForeignKey(
         Invoice,
         on_delete=models.SET_NULL,
@@ -365,6 +372,14 @@ class SubscriptionPayment(TimeStampedModel, UUIDModel):
     
     paid_at = models.DateTimeField(null=True, blank=True)
     
+    notes = models.TextField(blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='subscription_payments_created'
+    )
+    
     metadata = models.JSONField(default=dict, blank=True)
 
     class Meta:
@@ -372,4 +387,38 @@ class SubscriptionPayment(TimeStampedModel, UUIDModel):
         ordering = ['-created_at']
 
     def __str__(self):
-        return f"Payment {self.amount} {self.currency}"
+        return f"Payment {self.amount} {self.currency} - {self.organization.name}"
+
+
+class GlobalConfig(models.Model):
+    """
+    Configuration globale du système (singleton).
+    Gérée uniquement via l'admin Django.
+    """
+    trial_days = models.PositiveIntegerField(
+        default=15,
+        help_text="Nombre de jours de la période d'essai pour les nouveaux comptes"
+    )
+    grace_period_days = models.PositiveIntegerField(
+        default=3,
+        help_text="Nombre de jours de grâce après expiration avant blocage total"
+    )
+    
+    class Meta:
+        db_table = 'global_config'
+        verbose_name = 'Configuration globale'
+        verbose_name_plural = 'Configuration globale'
+
+    def __str__(self):
+        return "Configuration globale"
+
+    def save(self, *args, **kwargs):
+        # Singleton: force l'id à 1
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def get(cls):
+        """Retourne l'instance unique de configuration, la crée si besoin."""
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj

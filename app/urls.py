@@ -33,6 +33,7 @@ api_v1_patterns = [
     path('', include('apps.cashbook.urls')),
     path('reports/', include('apps.reports.urls')),
     path('settings/', include('apps.settings.urls')),
+    path('', include('apps.subscriptions.urls')),
 ]
 
 urlpatterns = [

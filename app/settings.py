@@ -76,6 +76,7 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'apps.core.middleware.TenantMiddleware',
     'apps.core.middleware.OrganizationHeaderMiddleware',
+    'apps.core.middleware.SubscriptionMiddleware',
 ]
 
 ROOT_URLCONF = 'app.urls'
@@ -120,6 +121,8 @@ if DB_ENGINE == 'django.db.backends.postgresql':
         'CONN_MAX_AGE': 60,
         'OPTIONS': {
             'connect_timeout': 10,
+            'options': '-c statement_timeout=30000',  # 30s max par requête
+
         },
     })
 elif DB_ENGINE == 'django.db.backends.sqlite3':
