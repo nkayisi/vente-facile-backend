@@ -1,28 +1,36 @@
-# Utiliser Python 3.12
+# ---------- Base image ----------
 FROM python:3.12-slim
 
-# Variables d'environnement
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONUNBUFFERED 1
+# ---------- Environment ----------
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
-# Installer dépendances système
-RUN apt-get update && apt-get install -y build-essential libpq-dev
-
-# Créer un dossier de travail
+# ---------- Workdir ----------
 WORKDIR /app
 
-# Copier requirements.txt
+# ---------- System dependencies ----------
+RUN apt-get update && apt-get install -y \
+    gcc \
+    libpq-dev \
+    netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------- Python dependencies ----------
 COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Installer les packages Python
-RUN pip install --upgrade pip
-RUN pip install -r requirements.txt
-
-# Copier le code
+# ---------- Copy project ----------
 COPY . .
 
-# Exposer le port
+# ---------- Create needed directories ----------
+RUN mkdir -p /app/media /app/staticfiles
+
+# ---------- Entrypoint ----------
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# ---------- Expose ----------
 EXPOSE 8001
 
-# Commande par défaut (sera overridée par docker-compose.yml)
-CMD ["gunicorn", "app.wsgi:application", "--bind", "0.0.0.0:8001", "--workers", "3"]
+ENTRYPOINT ["/entrypoint.sh"]
