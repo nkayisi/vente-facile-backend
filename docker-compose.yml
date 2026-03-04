@@ -16,11 +16,6 @@ services:
       - postgres_data:/var/lib/postgresql/data
     networks:
       - vente-facile-network
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
   backend:
     build:
@@ -35,16 +30,12 @@ services:
       - "8001:8001"
     depends_on:
       db:
-        condition: service_healthy
+        condition: service_started
     networks:
       - vente-facile-network
     volumes:
       - ./media:/app/media
       - ./staticfiles:/app/staticfiles
-    command: >
-      sh -c "python manage.py migrate &&
-             python manage.py collectstatic --noinput &&
-             gunicorn app.wsgi:application --bind 0.0.0.0:8001 --workers 3"
              
 networks:
   vente-facile-network:
