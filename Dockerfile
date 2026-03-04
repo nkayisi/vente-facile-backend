@@ -24,5 +24,5 @@ COPY . .
 # Exposer le port
 EXPOSE 8001
 
-# Commande par défaut
-CMD ["gunicorn", "app.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3"]
+# Commande par défaut (sera overridée par docker-compose.yml)
+CMD ["gunicorn", "app.wsgi:application", "--bind", "0.0.0.0:8001", "--workers", "3"]
