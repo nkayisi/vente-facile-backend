@@ -1,42 +1,32 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-.venv/
-ENV/
-.env
-
-# Django
-*.log
-db.sqlite3
-db.sqlite3-journal
-media/
-staticfiles/
-
-# Tests
-.pytest_cache/
-.coverage
-htmlcov/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Git
-.git/
+.git
 .gitignore
-
-# Docker
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env
+pip-log.txt
+pip-delete-this-directory.txt
+.tox
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.mypy_cache
+.pytest_cache
+.hypothesis
+*.egg-info
+.installed.cfg
+*.egg
+.env
+.env.*
+db.sqlite3
+*.sqlite3
 Dockerfile
 docker-compose.yml
 .dockerignore
-
-# Documentation
-*.md
-docs/

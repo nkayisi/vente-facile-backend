@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   db:
     image: postgres:16
@@ -22,20 +20,19 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: vente_facile_backend
-    env_file:
-      - .env
-    environment:
-      - DB_HOST=db
     ports:
       - "8001:8001"
-    depends_on:
-      db:
-        condition: service_started
-    networks:
-      - vente-facile-network
+    env_file:
+      - .env
     volumes:
       - ./media:/app/media
       - ./staticfiles:/app/staticfiles
+    depends_on:
+      db:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - vente-facile-network
              
 networks:
   vente-facile-network:
