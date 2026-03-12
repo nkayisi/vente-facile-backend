@@ -60,9 +60,10 @@ class Organization(TimeStampedModel, UUIDModel, SoftDeleteModel):
         return self.name
 
     def get_active_subscription(self):
-        """Get the current active subscription."""
+        """Get the current active subscription (including trial)."""
+        from apps.subscriptions.models import Subscription
         return self.subscriptions.filter(
-            status='active'
+            status__in=[Subscription.Status.TRIAL, Subscription.Status.ACTIVE]
         ).order_by('-created_at').first()
 
 

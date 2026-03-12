@@ -102,3 +102,7 @@ dump.rdb
 # OS Files
 # =========================
 Thumbs.db
+
+vente_facile
+Pipfile
+Pipfile.lock
