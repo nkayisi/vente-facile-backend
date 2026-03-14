@@ -316,7 +316,7 @@ class StockTransfer(TenantSoftDeleteModel):
         COMPLETED = 'completed', 'Terminé'
         CANCELLED = 'cancelled', 'Annulé'
 
-    reference = models.CharField(max_length=50, unique=True)
+    reference = models.CharField(max_length=50)
     
     source_warehouse = models.ForeignKey(
         Warehouse,
@@ -362,6 +362,9 @@ class StockTransfer(TenantSoftDeleteModel):
         indexes = [
             models.Index(fields=['organization', 'status']),
             models.Index(fields=['reference']),
+        ]
+        constraints = [
+            models.UniqueConstraint(fields=['organization', 'reference'], name='unique_transfer_reference_per_org'),
         ]
 
     def __str__(self):
@@ -435,7 +438,7 @@ class StockAdjustment(TenantSoftDeleteModel):
         APPROVED = 'approved', 'Approuvé'
         REJECTED = 'rejected', 'Rejeté'
 
-    reference = models.CharField(max_length=50, unique=True)
+    reference = models.CharField(max_length=50)
     warehouse = models.ForeignKey(
         Warehouse,
         on_delete=models.CASCADE,
@@ -476,6 +479,9 @@ class StockAdjustment(TenantSoftDeleteModel):
         indexes = [
             models.Index(fields=['organization', 'status']),
             models.Index(fields=['reference']),
+        ]
+        constraints = [
+            models.UniqueConstraint(fields=['organization', 'reference'], name='unique_adjustment_reference_per_org'),
         ]
 
     def __str__(self):
@@ -557,7 +563,7 @@ class InventorySession(TenantSoftDeleteModel):
         CATEGORY = 'category', 'Par catégorie'
         PRODUCT = 'product', 'Par produit'
 
-    reference = models.CharField(max_length=50, unique=True)
+    reference = models.CharField(max_length=50)
     name = models.CharField(max_length=255)
     
     warehouse = models.ForeignKey(
@@ -638,6 +644,9 @@ class InventorySession(TenantSoftDeleteModel):
             models.Index(fields=['organization', 'status']),
             models.Index(fields=['reference']),
             models.Index(fields=['warehouse', 'status']),
+        ]
+        constraints = [
+            models.UniqueConstraint(fields=['organization', 'reference'], name='unique_inventory_reference_per_org'),
         ]
 
     def __str__(self):
