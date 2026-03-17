@@ -360,6 +360,10 @@ class OrganizationSettings(TenantModel):
     # Paramètres généraux des reçus
     receipt_header = models.TextField(blank=True, help_text="En-tête des reçus")
     receipt_footer = models.TextField(blank=True, help_text="Pied de page des reçus")
+    receipt_paper_width = models.PositiveIntegerField(
+        default=58,
+        help_text="Largeur du papier du ticket en mm (58 ou 80)"
+    )
     
     # Paramètres de fidélité
     show_loyalty_points_on_receipt = models.BooleanField(

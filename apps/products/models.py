@@ -192,6 +192,10 @@ class Product(TenantSoftDeleteModel):
     
     track_inventory = models.BooleanField(default=True)
     allow_negative_stock = models.BooleanField(default=False)
+    has_expiry_date = models.BooleanField(
+        default=False,
+        help_text="Indique si ce produit est périssable et nécessite un suivi des dates d'expiration"
+    )
     min_stock_level = models.PositiveIntegerField(default=0)
     max_stock_level = models.PositiveIntegerField(null=True, blank=True)
     reorder_point = models.PositiveIntegerField(default=0)

@@ -411,6 +411,7 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         
         # Import pour la gestion du stock
         from apps.inventory.models import Stock, StockMovement
+        from apps.inventory.services import FIFOService
         TWO_PLACES = Decimal('0.01')
         
         # Créer les items — SaleItem.save() calcule et arrondit tous les montants
@@ -421,15 +422,38 @@ class SaleCreateSerializer(serializers.ModelSerializer):
             discount_pct = item_data.get('discount_percentage', Decimal('0.00'))
             tax_rate = item_data.get('tax_rate') or (product.tax_rate if product.is_taxable else Decimal('0.00'))
             
+            # Déterminer le cost_price via FIFO si le produit a un suivi de stock
+            cost_price = product.cost_price
+            batch = item_data.get('batch')
+            
+            if product.track_inventory and warehouse:
+                # Utiliser FIFO pour déterminer le coût réel des lots
+                allocations, _ = FIFOService.allocate_quantity(
+                    organization=org,
+                    product=product,
+                    warehouse=warehouse,
+                    quantity_needed=quantity,
+                    variant=item_data.get('variant'),
+                    exclude_expired=True,
+                    use_fefo=product.has_expiry_date if hasattr(product, 'has_expiry_date') else False
+                )
+                
+                if allocations:
+                    # Utiliser le coût moyen pondéré des lots alloués
+                    cost_price = FIFOService.calculate_weighted_cost(allocations)
+                    # Si un seul lot, l'associer à l'item
+                    if len(allocations) == 1:
+                        batch = allocations[0].batch
+            
             SaleItem.objects.create(
                 sale=sale,
                 organization=org,
                 product=product,
                 variant=item_data.get('variant'),
-                batch=item_data.get('batch'),
+                batch=batch,
                 quantity=quantity,
                 unit_price=unit_price,
-                cost_price=product.cost_price,
+                cost_price=cost_price,
                 discount_percentage=discount_pct,
                 tax_rate=tax_rate,
                 notes=item_data.get('notes', '')
@@ -497,6 +521,21 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         if sale.status == 'completed' and warehouse:
             for item in sale.items.all():
                 if item.product.track_inventory:
+                    # Consommer les lots en FIFO
+                    allocations, remaining = FIFOService.consume_from_batches(
+                        organization=org,
+                        product=item.product,
+                        warehouse=warehouse,
+                        quantity=item.quantity,
+                        variant=item.variant,
+                        reference_type='sale',
+                        reference_id=str(sale.id),
+                        user=self.context['request'].user,
+                        notes=f"Vente {sale.reference}",
+                        exclude_expired=True,
+                        use_fefo=item.product.has_expiry_date if hasattr(item.product, 'has_expiry_date') else False
+                    )
+                    
                     # Récupérer ou créer le stock avec verrouillage
                     product_cost = item.product.cost_price if item.product.cost_price else Decimal('0.00')
                     cost = item.cost_price if item.cost_price and item.cost_price > 0 else product_cost

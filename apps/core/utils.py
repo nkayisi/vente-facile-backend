@@ -146,6 +146,29 @@ class ReferenceGenerator:
         return f"{prefix}-{num:04d}"
 
     @staticmethod
+    def generate_batch_number(organization):
+        """Generate batch number: LOT-YYYYMMDD-XXXX"""
+        from apps.inventory.models import StockBatch
+        
+        today = timezone.now()
+        prefix = f"LOT-{today.strftime('%Y%m%d')}"
+        
+        last = StockBatch.objects.filter(
+            organization=organization,
+            batch_number__startswith=prefix
+        ).order_by('-batch_number').first()
+        
+        if last:
+            try:
+                num = int(last.batch_number.split('-')[-1]) + 1
+            except (ValueError, IndexError):
+                num = 1
+        else:
+            num = 1
+        
+        return f"{prefix}-{num:04d}"
+
+    @staticmethod
     def generate_inventory_reference(organization):
         """Generate inventory session reference: INV-YYYYMMDD-XXXX"""
         from apps.inventory.models import InventorySession

@@ -243,7 +243,7 @@ class OrganizationSettingsSerializer(serializers.ModelSerializer):
         model = OrganizationSettings
         fields = [
             'id',
-            'receipt_header', 'receipt_footer',
+            'receipt_header', 'receipt_footer', 'receipt_paper_width',
             'show_loyalty_points_on_receipt',
             'low_stock_threshold',
             'created_at', 'updated_at'

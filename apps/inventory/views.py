@@ -115,6 +115,7 @@ class StockLocationViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     - GET /stock-locations/{id}/ : Détail d'un emplacement
     - PUT/PATCH /stock-locations/{id}/ : Modifier un emplacement
     - DELETE /stock-locations/{id}/ : Supprimer un emplacement
+    - GET /stock-locations/by-warehouse/{warehouse_id}/ : Emplacements d'un entrepôt
     """
     
     queryset = StockLocation.objects.all()
@@ -133,7 +134,21 @@ class StockLocationViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         'update': 'warehouses.edit',
         'partial_update': 'warehouses.edit',
         'destroy': 'warehouses.delete',
+        'by_warehouse': 'warehouses.view',
     }
+
+    @action(detail=False, methods=['get'], url_path='by-warehouse/(?P<warehouse_id>[^/.]+)')
+    def by_warehouse(self, request, warehouse_id=None):
+        """Retourne tous les emplacements actifs d'un entrepôt."""
+        organization = self.get_organization()
+        locations = StockLocation.objects.filter(
+            organization=organization,
+            warehouse_id=warehouse_id,
+            is_active=True
+        ).select_related('warehouse', 'parent').order_by('name')
+        
+        serializer = StockLocationSerializer(locations, many=True)
+        return Response(serializer.data)
 
 
 # =============================================================================
@@ -256,6 +271,42 @@ class StockViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         serializer = StockBatchSerializer(batches, many=True)
         return Response(serializer.data)
 
+    @action(detail=False, methods=['get'], url_path='batches/(?P<product_id>[^/.]+)')
+    def product_batches(self, request, product_id=None):
+        """Retourne tous les lots d'un produit avec stock disponible (FIFO order)."""
+        organization = self.get_organization()
+        warehouse_id = request.query_params.get('warehouse')
+        include_empty = request.query_params.get('include_empty', 'false').lower() == 'true'
+        include_expired = request.query_params.get('include_expired', 'false').lower() == 'true'
+        
+        batches = StockBatch.objects.filter(
+            organization=organization,
+            product_id=product_id
+        ).select_related('product', 'warehouse', 'variant')
+        
+        if warehouse_id:
+            batches = batches.filter(warehouse_id=warehouse_id)
+        
+        if not include_empty:
+            batches = batches.filter(quantity__gt=0)
+        
+        if not include_expired:
+            today = timezone.now().date()
+            batches = batches.filter(
+                db_models.Q(expiry_date__isnull=True) | db_models.Q(expiry_date__gte=today)
+            )
+        
+        # Ordre FIFO (les plus anciens en premier)
+        batches = batches.order_by('received_at')
+        
+        page = self.paginate_queryset(batches)
+        if page is not None:
+            serializer = StockBatchSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = StockBatchSerializer(batches, many=True)
+        return Response(serializer.data)
+
 
 # =============================================================================
 # STOCK BATCH VIEWSET
@@ -326,6 +377,8 @@ class StockMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     @transaction.atomic
     def perform_create(self, serializer):
         """Crée un mouvement et met à jour le stock."""
+        from .services import FIFOService
+        
         organization = self.get_organization()
         data = serializer.validated_data
         
@@ -342,10 +395,53 @@ class StockMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         
         quantity_before = stock.quantity
         unit_cost = data.get('unit_cost') or Decimal('0.00')
+        movement_type = data.get('movement_type', '')
         
         # Si le stock existait mais sans avg_cost, initialiser depuis le produit
         if not created and stock.avg_cost == 0 and product_cost > 0:
             stock.avg_cost = product_cost
+        
+        # Pour les entrées de stock (approvisionnements), créer un lot
+        batch = data.get('batch')
+        if data['quantity'] > 0 and movement_type in ['purchase', 'initial', 'return_in', 'transfer_in', 'adjustment_in', 'production_in']:
+            # Créer un lot avec numéro auto-généré
+            location = data.get('location')
+            expiry_date = data.get('expiry_date')
+            
+            batch = FIFOService.add_to_batch(
+                organization=organization,
+                product=product,
+                warehouse=data['warehouse'],
+                quantity=data['quantity'],
+                cost_price=unit_cost if unit_cost > 0 else product_cost,
+                batch_number=None,  # Auto-généré par le service
+                variant=data.get('variant'),
+                location=location,
+                expiry_date=expiry_date,
+                notes=data.get('notes', ''),
+                user=self.request.user
+            )
+        
+        # Pour les sorties de stock, consommer les lots en FIFO
+        elif data['quantity'] < 0 and movement_type in ['sale', 'damage', 'expired', 'transfer_out', 'adjustment_out', 'production_out']:
+            quantity_to_consume = abs(data['quantity'])
+            allocations, remaining = FIFOService.consume_from_batches(
+                organization=organization,
+                product=product,
+                warehouse=data['warehouse'],
+                quantity=quantity_to_consume,
+                variant=data.get('variant'),
+                reference_type=movement_type,
+                reference_id=data.get('reference_id'),
+                user=self.request.user,
+                notes=data.get('notes', ''),
+                exclude_expired=(movement_type != 'expired'),
+                use_fefo=product.has_expiry_date if hasattr(product, 'has_expiry_date') else False
+            )
+            
+            # Associer le premier lot consommé au mouvement
+            if allocations:
+                batch = allocations[0].batch
         
         # Mettre à jour le coût moyen pondéré pour les entrées
         if data['quantity'] > 0 and unit_cost > 0:
@@ -366,6 +462,7 @@ class StockMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         # Créer le mouvement
         serializer.save(
             organization=organization,
+            batch=batch,
             quantity_before=quantity_before,
             quantity_after=stock.quantity,
             created_by=self.request.user

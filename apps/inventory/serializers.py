@@ -222,6 +222,7 @@ class StockBatchSerializer(serializers.ModelSerializer):
     
     product_name = serializers.CharField(source='product.name', read_only=True)
     warehouse_name = serializers.CharField(source='warehouse.name', read_only=True)
+    location_name = serializers.CharField(source='location.name', read_only=True)
     is_expired = serializers.BooleanField(read_only=True)
     days_until_expiry = serializers.SerializerMethodField()
     
@@ -229,7 +230,7 @@ class StockBatchSerializer(serializers.ModelSerializer):
         model = StockBatch
         fields = [
             'id', 'product', 'product_name', 'variant',
-            'warehouse', 'warehouse_name',
+            'warehouse', 'warehouse_name', 'location', 'location_name',
             'batch_number', 'quantity', 'cost_price',
             'manufacturing_date', 'expiry_date',
             'is_expired', 'days_until_expiry',
@@ -286,11 +287,21 @@ class StockMovementDetailSerializer(StockMovementListSerializer):
 class StockMovementCreateSerializer(serializers.ModelSerializer):
     """Serializer pour la création manuelle de mouvement."""
     
+    # Champs additionnels pour la création de lots lors des approvisionnements
+    location = serializers.PrimaryKeyRelatedField(
+        queryset=StockLocation.objects.all(),
+        required=False,
+        allow_null=True,
+        write_only=True
+    )
+    expiry_date = serializers.DateField(required=False, allow_null=True, write_only=True)
+    
     class Meta:
         model = StockMovement
         fields = [
             'product', 'variant', 'warehouse', 'batch',
-            'movement_type', 'quantity', 'unit_cost', 'notes'
+            'movement_type', 'quantity', 'unit_cost', 'notes',
+            'location', 'expiry_date'
         ]
 
     def validate(self, data):
@@ -304,6 +315,15 @@ class StockMovementCreateSerializer(serializers.ModelSerializer):
             data['quantity'] = -abs(quantity)
         
         return data
+
+    def create(self, validated_data):
+        """Crée le mouvement en extrayant les champs write_only."""
+        # Extraire les champs qui ne font pas partie du modèle StockMovement
+        validated_data.pop('location', None)
+        validated_data.pop('expiry_date', None)
+        
+        # Créer le mouvement normalement
+        return super().create(validated_data)
 
 
 # =============================================================================
