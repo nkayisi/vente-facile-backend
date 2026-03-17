@@ -6,8 +6,10 @@ from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.parsers import MultiPartParser, FormParser
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Sum, Count
+from django.http import HttpResponse
 
 from apps.core.api_mixins import TenantViewSetMixin, BulkActionMixin, AuditMixin
 from apps.core.api_permissions import (
@@ -22,6 +24,7 @@ from .serializers import (
     PriceListSerializer, ProductPriceSerializer,
     ProductBulkUpdateSerializer
 )
+from .services import ProductExcelService
 
 
 # =============================================================================
@@ -233,6 +236,9 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
         'stock': 'stock.view',
         'low_stock': 'stock.view',
         'search_barcode': 'products.view',
+        'import_template': 'products.view',
+        'import_products': 'products.create',
+        'check_duplicate': 'products.view',
     }
 
     def get_serializer_class(self):
@@ -395,6 +401,69 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
             count += 1
         
         return Response({'deleted': count})
+
+    @action(detail=False, methods=['get'], url_path='import-template')
+    def import_template(self, request):
+        """Télécharge le template Excel pour l'importation de produits."""
+        organization = self.get_organization()
+        
+        buffer = ProductExcelService.generate_template(organization)
+        
+        response = HttpResponse(
+            buffer.getvalue(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        response['Content-Disposition'] = 'attachment; filename="template_import_produits.xlsx"'
+        return response
+
+    @action(detail=False, methods=['post'], url_path='import', parser_classes=[MultiPartParser, FormParser])
+    def import_products(self, request):
+        """
+        Importe des produits depuis un fichier Excel.
+        Le fichier doit être basé sur le template officiel.
+        """
+        if 'file' not in request.FILES:
+            return Response(
+                {'error': 'Aucun fichier fourni'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        file = request.FILES['file']
+        
+        # Vérifier l'extension
+        if not file.name.endswith(('.xlsx', '.xls')):
+            return Response(
+                {'error': 'Format de fichier invalide. Utilisez un fichier Excel (.xlsx)'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        organization = self.get_organization()
+        file_content = file.read()
+        
+        result = ProductExcelService.import_products(file_content, organization, request.user)
+        
+        if result['success']:
+            return Response(result, status=status.HTTP_200_OK)
+        else:
+            return Response(result, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=['post'], url_path='check-duplicate')
+    def check_duplicate(self, request):
+        """
+        Vérifie si un produit avec le même SKU ou code-barres existe déjà.
+        Utilisé pour la validation en temps réel lors de la création.
+        """
+        organization = self.get_organization()
+        sku = request.data.get('sku')
+        barcode = request.data.get('barcode')
+        exclude_id = request.data.get('exclude_id')
+        
+        duplicates = ProductExcelService.check_duplicate(organization, sku, barcode, exclude_id)
+        
+        return Response({
+            'has_duplicate': bool(duplicates['sku'] or duplicates['barcode']),
+            'duplicates': duplicates
+        })
 
 
 # =============================================================================
