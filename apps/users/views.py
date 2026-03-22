@@ -10,6 +10,13 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils import timezone
 
+from django.contrib.auth.tokens import default_token_generator
+from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
+from django.utils.encoding import force_bytes, force_str
+from django.core.mail import send_mail
+from django.conf import settings
+from django.template.loader import render_to_string
+
 from apps.core.api_mixins import TenantViewSetMixin
 from apps.core.api_permissions import IsTenantMember, IsTenantAdmin
 from .models import User, UserActivity
@@ -371,6 +378,7 @@ class LogoutView(APIView):
 class ResetPasswordRequestView(APIView):
     """
     Vue pour demander une réinitialisation de mot de passe.
+    Génère un token et envoie un email avec le lien de réinitialisation.
     
     POST /auth/password-reset/
     """
@@ -382,11 +390,38 @@ class ResetPasswordRequestView(APIView):
         serializer.is_valid(raise_exception=True)
         
         email = serializer.validated_data['email']
-        user = User.objects.filter(email=email).first()
+        user = User.objects.filter(email=email, is_active=True).first()
         
         if user:
-            # TODO: Générer un token et envoyer l'email
-            pass
+            uid = urlsafe_base64_encode(force_bytes(user.pk))
+            token = default_token_generator.make_token(user)
+            
+            frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:3000')
+            reset_link = f"{frontend_url}/auth/reset-password?uid={uid}&token={token}"
+            
+            subject = "Vente Facile — Réinitialisation de votre mot de passe"
+            message = (
+                f"Bonjour {user.first_name or user.email},\n\n"
+                f"Vous avez demandé la réinitialisation de votre mot de passe.\n\n"
+                f"Cliquez sur le lien ci-dessous pour choisir un nouveau mot de passe :\n"
+                f"{reset_link}\n\n"
+                f"Ce lien est valide pendant 24 heures.\n\n"
+                f"Si vous n'avez pas fait cette demande, ignorez simplement cet email.\n\n"
+                f"— L'équipe Vente Facile"
+            )
+            
+            try:
+                send_mail(
+                    subject,
+                    message,
+                    settings.DEFAULT_FROM_EMAIL,
+                    [user.email],
+                    fail_silently=False,
+                )
+            except Exception as e:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.error(f"Erreur envoi email reset password à {email}: {e}")
         
         # Toujours retourner succès pour éviter l'énumération d'emails
         return Response({
@@ -397,6 +432,7 @@ class ResetPasswordRequestView(APIView):
 class ResetPasswordConfirmView(APIView):
     """
     Vue pour confirmer la réinitialisation de mot de passe.
+    Valide le token et applique le nouveau mot de passe.
     
     POST /auth/password-reset/confirm/
     """
@@ -407,9 +443,36 @@ class ResetPasswordConfirmView(APIView):
         serializer = ResetPasswordConfirmSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
-        # TODO: Valider le token et réinitialiser le mot de passe
+        token = serializer.validated_data['token']
+        uid_b64 = serializer.validated_data['uid']
+        new_password = serializer.validated_data['new_password']
         
-        return Response({'message': 'Mot de passe réinitialisé avec succès'})
+        try:
+            uid = force_str(urlsafe_base64_decode(uid_b64))
+            user = User.objects.get(pk=uid)
+        except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+            return Response(
+                {'error': 'Le lien de réinitialisation est invalide.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not default_token_generator.check_token(user, token):
+            return Response(
+                {'error': 'Le lien de réinitialisation a expiré ou est invalide.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        user.set_password(new_password)
+        user.save()
+        
+        UserActivity.objects.create(
+            user=user,
+            action='update',
+            resource_type='password',
+            details={'method': 'password_reset'},
+        )
+        
+        return Response({'message': 'Mot de passe réinitialisé avec succès.'})
 
 
 # =============================================================================

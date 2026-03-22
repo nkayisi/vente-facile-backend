@@ -206,6 +206,7 @@ class ResetPasswordRequestSerializer(serializers.Serializer):
 class ResetPasswordConfirmSerializer(serializers.Serializer):
     """Serializer pour la confirmation de réinitialisation."""
     
+    uid = serializers.CharField()
     token = serializers.CharField()
     new_password = serializers.CharField(write_only=True, validators=[validate_password])
     new_password_confirm = serializers.CharField(write_only=True)

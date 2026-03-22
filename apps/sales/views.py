@@ -339,6 +339,16 @@ class SaleViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
             return SalePaymentSerializer
         return SaleDetailSerializer
 
+    def create(self, request, *args, **kwargs):
+        """Créer une vente et retourner le détail complet (avec reference, id, etc.)."""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        sale = serializer.save()
+        # Recharger avec les relations pour SaleDetailSerializer
+        sale.refresh_from_db()
+        detail_serializer = SaleDetailSerializer(sale)
+        return Response(detail_serializer.data, status=status.HTTP_201_CREATED)
+
     def get_queryset(self):
         """Filtre supplémentaire par date."""
         queryset = super().get_queryset()
