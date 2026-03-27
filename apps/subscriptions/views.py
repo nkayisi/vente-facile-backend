@@ -3,7 +3,7 @@ ViewSets pour le module Abonnements.
 """
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 
 from apps.core.api_permissions import IsTenantMember, IsTenantOwner
@@ -11,6 +11,7 @@ from apps.core.api_permissions import IsTenantMember, IsTenantOwner
 from .models import Plan, Subscription, SubscriptionPayment, Invoice
 from .serializers import (
     PlanSerializer,
+    PublicPlanSerializer,
     SubscriptionSerializer,
     SubscriptionStatusSerializer,
     ActivateSubscriptionSerializer,
@@ -18,6 +19,17 @@ from .serializers import (
     InvoiceSerializer,
 )
 from .services import SubscriptionService
+
+
+class PublicPlanViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Plans visibles publiquement sur la landing page.
+    Aucune authentification requise.
+    """
+    queryset = Plan.objects.filter(is_active=True).order_by('sort_order', 'price_monthly')
+    serializer_class = PublicPlanSerializer
+    permission_classes = [AllowAny]
+    pagination_class = None
 
 
 class PlanViewSet(viewsets.ReadOnlyModelViewSet):

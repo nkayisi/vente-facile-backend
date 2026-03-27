@@ -258,3 +258,42 @@ class TokenResponseSerializer(serializers.Serializer):
     access = serializers.CharField()
     refresh = serializers.CharField()
     user = UserDetailSerializer()
+
+
+class CustomTokenObtainPairSerializer(serializers.Serializer):
+    """
+    Custom JWT serializer that includes user info in the token response.
+    Returns: access, refresh, user { id, email, first_name, last_name, is_staff }
+    """
+    email = serializers.EmailField()
+    password = serializers.CharField(write_only=True)
+
+    def validate(self, attrs):
+        from rest_framework_simplejwt.tokens import RefreshToken
+        from django.contrib.auth import authenticate
+
+        user = authenticate(
+            request=self.context.get('request'),
+            email=attrs['email'],
+            password=attrs['password'],
+        )
+
+        if not user:
+            raise serializers.ValidationError('Email ou mot de passe incorrect.')
+
+        if not user.is_active:
+            raise serializers.ValidationError('Ce compte est désactivé.')
+
+        refresh = RefreshToken.for_user(user)
+
+        return {
+            'access': str(refresh.access_token),
+            'refresh': str(refresh),
+            'user': {
+                'id': str(user.id),
+                'email': user.email,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'is_staff': user.is_staff,
+            },
+        }

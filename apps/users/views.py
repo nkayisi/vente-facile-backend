@@ -25,8 +25,25 @@ from .serializers import (
     UserCreateSerializer, UserUpdateSerializer,
     ChangePasswordSerializer, ResetPasswordRequestSerializer, ResetPasswordConfirmSerializer,
     UserActivitySerializer, LoginSerializer, TokenResponseSerializer,
-    RegisterWithOrganizationSerializer
+    RegisterWithOrganizationSerializer, CustomTokenObtainPairSerializer
 )
+
+
+class CustomTokenObtainPairView(APIView):
+    """
+    Custom JWT token endpoint that returns user info (including is_staff).
+    Replaces the default TokenObtainPairView.
+    POST /api/v1/auth/token/
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = CustomTokenObtainPairSerializer(
+            data=request.data,
+            context={'request': request}
+        )
+        serializer.is_valid(raise_exception=True)
+        return Response(serializer.validated_data)
 
 
 # =============================================================================

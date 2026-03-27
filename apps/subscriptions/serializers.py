@@ -11,6 +11,22 @@ class PlanFeatureSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'code', 'description', 'is_enabled', 'limit_value']
 
 
+class PublicPlanSerializer(serializers.ModelSerializer):
+    """Serializer exposé publiquement (landing page). Ne contient que les infos commerciales."""
+    plan_features = PlanFeatureSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Plan
+        fields = [
+            'id', 'name', 'code', 'description',
+            'price_monthly', 'price_yearly', 'currency',
+            'max_users', 'max_branches', 'max_products',
+            'max_monthly_transactions', 'storage_limit_mb',
+            'is_featured', 'trial_days', 'sort_order',
+            'plan_features',
+        ]
+
+
 class PlanSerializer(serializers.ModelSerializer):
     plan_features = PlanFeatureSerializer(many=True, read_only=True)
 

@@ -6,10 +6,10 @@ from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
 from rest_framework_simplejwt.views import (
-    TokenObtainPairView,
     TokenRefreshView,
     TokenBlacklistView,
 )
+from apps.users.views import CustomTokenObtainPairView
 from drf_spectacular.views import (
     SpectacularAPIView,
     SpectacularSwaggerView,
@@ -18,7 +18,7 @@ from drf_spectacular.views import (
 
 api_v1_patterns = [
     # Authentication JWT
-    path('auth/token/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
+    path('auth/token/', CustomTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('auth/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     path('auth/token/blacklist/', TokenBlacklistView.as_view(), name='token_blacklist'),
     
@@ -34,6 +34,7 @@ api_v1_patterns = [
     path('reports/', include('apps.reports.urls')),
     path('settings/', include('apps.settings.urls')),
     path('', include('apps.subscriptions.urls')),
+    path('platform-admin/', include('apps.platform_admin.urls')),
 ]
 
 urlpatterns = [
