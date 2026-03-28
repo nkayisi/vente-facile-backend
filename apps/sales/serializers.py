@@ -2,6 +2,7 @@
 Serializers DRF pour l'app Sales (POS).
 """
 from rest_framework import serializers
+from rest_framework.exceptions import ValidationError as DRFValidationError
 from decimal import Decimal
 from django.utils import timezone
 from django.db import transaction
@@ -9,6 +10,7 @@ from .models import (
     Register, RegisterSession, Sale, SaleItem, PaymentMethod, Payment,
     SaleReturn, SaleReturnItem, Quotation, QuotationItem
 )
+from .sale_validation import max_sale_discount_percent
 
 
 # =============================================================================
@@ -110,18 +112,15 @@ class RegisterSessionDetailSerializer(RegisterSessionListSerializer):
 
 
 class RegisterSessionOpenSerializer(serializers.Serializer):
-    """Serializer pour l'ouverture de session."""
-    
+    """Ouverture de session : uniquement la caisse (solde d'ouverture = 0, pas de notes)."""
+
     register = serializers.UUIDField()
-    opening_balance = serializers.DecimalField(max_digits=15, decimal_places=2)
-    notes = serializers.CharField(required=False, allow_blank=True)
 
 
 class RegisterSessionCloseSerializer(serializers.Serializer):
-    """Serializer pour la fermeture de session."""
-    
-    closing_balance = serializers.DecimalField(max_digits=15, decimal_places=2)
-    notes = serializers.CharField(required=False, allow_blank=True)
+    """Fermeture sans saisie : le solde de clôture est le solde théorique (espèces encaissées)."""
+
+    pass
 
 
 # =============================================================================
@@ -184,6 +183,27 @@ class SaleItemCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("La quantité doit être positive.")
         return value
 
+    def validate_unit_price(self, value):
+        if value is not None and value < 0:
+            raise serializers.ValidationError("Le prix unitaire ne peut pas être négatif.")
+        return value
+
+    def validate_discount_percentage(self, value):
+        if value < 0:
+            raise serializers.ValidationError("La remise ne peut pas être négative.")
+        request = self.context.get("request")
+        max_p = Decimal("50")
+        if request:
+            org_id = request.headers.get("X-Organization-ID")
+            if org_id:
+                from apps.organizations.models import Organization
+                org = Organization.objects.filter(id=org_id).first()
+                if org:
+                    max_p = max_sale_discount_percent(org)
+        if value > max_p:
+            raise serializers.ValidationError(f"La remise par article ne peut pas dépasser {max_p}%.")
+        return value
+
 
 # =============================================================================
 # PAYMENT SERIALIZERS
@@ -220,7 +240,12 @@ class PaymentCreateSerializer(serializers.ModelSerializer):
 
     def validate_amount(self, value):
         if value <= 0:
-            raise serializers.ValidationError("Le montant doit être positif.")
+            raise serializers.ValidationError("Le montant doit être strictement positif.")
+        return value
+
+    def validate_exchange_rate(self, value):
+        if value is not None and value <= 0:
+            raise serializers.ValidationError("Le taux de change doit être strictement positif.")
         return value
 
 
@@ -305,6 +330,32 @@ class SaleCreateSerializer(serializers.ModelSerializer):
             'items', 'payments', 'points_used'
         ]
 
+    def validate_discount_percentage(self, value):
+        v = value if value is not None else Decimal("0")
+        if v < 0:
+            raise serializers.ValidationError("La remise globale ne peut pas être négative.")
+        request = self.context.get("request")
+        max_p = Decimal("50")
+        if request:
+            oid = request.headers.get("X-Organization-ID")
+            if oid:
+                from apps.organizations.models import Organization
+                org = Organization.objects.filter(id=oid).first()
+                if org:
+                    max_p = max_sale_discount_percent(org)
+        if v > max_p:
+            raise serializers.ValidationError(
+                f"La remise globale ne peut pas dépasser {max_p}%."
+            )
+        return value
+
+    def validate_exchange_rate(self, value):
+        if value is not None and value <= 0:
+            raise serializers.ValidationError(
+                "Le taux de change de la vente doit être strictement positif."
+            )
+        return value
+
     def validate_items(self, value):
         if not value:
             raise serializers.ValidationError("Au moins un article est requis.")
@@ -356,7 +407,15 @@ class SaleCreateSerializer(serializers.ModelSerializer):
                         raise serializers.ValidationError({
                             'items': f"Stock insuffisant pour {product.name}. Disponible: {available}"
                         })
-        
+
+        payments = data.get("payments") or []
+        for p in payments:
+            amt = p.get("amount")
+            if amt is not None and amt < 0:
+                raise serializers.ValidationError({
+                    "payments": "Les montants de paiement ne peuvent pas être négatifs."
+                })
+
         return data
 
     @transaction.atomic
@@ -480,8 +539,10 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         
         # total = subtotal - toutes remises + taxes
         sale.total = (items_subtotal - sale.discount_amount + tax_total).quantize(TWO_PLACES)
+        if sale.total < 0:
+            raise DRFValidationError("Le total de la vente ne peut pas être négatif.")
         sale.amount_due = sale.total
-        
+
         # Créer les paiements
         total_paid = Decimal('0.00')
         for payment_data in payments_data:

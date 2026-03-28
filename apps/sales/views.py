@@ -143,13 +143,13 @@ class RegisterSessionViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Créer la session
+        # Créer la session (pas de solde d'ouverture ni notes saisis : toujours 0 / vide)
         session = RegisterSession.objects.create(
             organization=organization,
             register=register,
             opened_by=request.user,
-            opening_balance=serializer.validated_data['opening_balance'],
-            notes=serializer.validated_data.get('notes', ''),
+            opening_balance=Decimal('0.00'),
+            notes='',
             status='open'
         )
         
@@ -169,69 +169,28 @@ class RegisterSessionViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        serializer = RegisterSessionCloseSerializer(data=request.data)
+        serializer = RegisterSessionCloseSerializer(data=request.data if request.data else {})
         serializer.is_valid(raise_exception=True)
-        
-        closing_balance = serializer.validated_data['closing_balance']
-        
-        # Calculer le solde attendu
+
+        # Solde théorique en espèces (pas de comptage manuel)
         cash_payments = Payment.objects.filter(
             sale__session=session,
             payment_method__method_type='cash',
             status='completed'
         ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
-        
+
         expected_balance = session.opening_balance + cash_payments
-        
+        closing_balance = expected_balance
+
         session.closing_balance = closing_balance
         session.expected_balance = expected_balance
-        session.difference = closing_balance - expected_balance
+        session.difference = Decimal('0.00')
         session.closed_by = request.user
         session.closed_at = timezone.now()
         session.status = 'closed'
-        session.notes = serializer.validated_data.get('notes', session.notes)
+        session.notes = ''
         session.save()
-        
-        # Enregistrer un ajustement de caisse si écart détecté
-        if session.difference != Decimal('0.00'):
-            from apps.cashbook.services import _get_last_balance
-            from apps.cashbook.models import CashMovement as CM
-            from apps.core.utils import ReferenceGenerator
-            
-            diff = session.difference
-            previous_balance = _get_last_balance(session.organization)
-            
-            if diff > 0:
-                # Plus d'argent que prévu → entrée
-                new_balance = previous_balance + diff
-                CM.objects.create(
-                    organization=session.organization,
-                    reference=ReferenceGenerator.generate_cash_movement_reference(session.organization),
-                    direction='in',
-                    movement_type='adjustment',
-                    amount=diff,
-                    description=f"Écart de caisse positif - Session {session.register.name}",
-                    balance_after=new_balance,
-                    movement_date=timezone.now(),
-                    created_by=request.user,
-                    notes=f"Attendu: {expected_balance}, Réel: {closing_balance}",
-                )
-            else:
-                # Moins d'argent que prévu → sortie
-                new_balance = previous_balance + diff  # diff is negative
-                CM.objects.create(
-                    organization=session.organization,
-                    reference=ReferenceGenerator.generate_cash_movement_reference(session.organization),
-                    direction='out',
-                    movement_type='adjustment',
-                    amount=abs(diff),
-                    description=f"Écart de caisse négatif - Session {session.register.name}",
-                    balance_after=new_balance,
-                    movement_date=timezone.now(),
-                    created_by=request.user,
-                    notes=f"Attendu: {expected_balance}, Réel: {closing_balance}",
-                )
-        
+
         return Response(RegisterSessionDetailSerializer(session).data)
 
     @action(detail=False, methods=['get'])
