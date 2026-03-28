@@ -3,9 +3,21 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.pagination import PageNumberPagination
-from django.db.models import Sum, Count, Avg, F, Q, DecimalField
+from django.db.models import (
+    Sum,
+    Count,
+    Avg,
+    F,
+    Q,
+    DecimalField,
+    ExpressionWrapper,
+    Case,
+    When,
+    Value,
+)
 from django.db.models.functions import Coalesce, TruncDate, TruncWeek, TruncMonth
 from django.utils import timezone
+from collections import defaultdict
 from datetime import timedelta
 from decimal import Decimal
 
@@ -13,6 +25,7 @@ from apps.core.mixins import TenantQuerysetMixin
 from apps.core.api_mixins import ActionPaginationMixin
 from apps.core.api_permissions import IsTenantMember, HasActiveSubscription, HasPermission
 from apps.sales.models import Sale, SaleItem, Payment
+from apps.sales.profit_allocation import allocated_line_ht_revenues_for_sale, effective_unit_cost
 from apps.products.models import Product
 from apps.inventory.models import Stock, StockBatch
 from apps.contacts.models import Customer
@@ -859,17 +872,30 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             status__in=['completed', 'partially_paid']
         )
         
-        total_revenue = sales.aggregate(total=Coalesce(Sum('total'), Decimal('0'), output_field=DecimalField()))['total']
-        
-        # Coût des marchandises vendues
-        sale_items = SaleItem.objects.filter(
-            sale__in=sales
-        ).select_related('product')
-        
-        total_cost = Decimal('0')
-        for item in sale_items:
-            cost_price = item.product.cost_price or Decimal('0')
-            total_cost += cost_price * item.quantity
+        # CA HT net (toutes remises), cohérent avec sale.total = subtotal - discount_amount + tax
+        revenue_expr = ExpressionWrapper(
+            F('subtotal') - F('discount_amount'),
+            output_field=DecimalField(max_digits=15, decimal_places=2),
+        )
+        total_revenue = sales.aggregate(
+            total=Coalesce(Sum(revenue_expr), Decimal('0'), output_field=DecimalField(max_digits=15, decimal_places=2))
+        )['total']
+        total_revenue = (total_revenue or Decimal('0')).quantize(Decimal('0.01'))
+
+        # CMV : coût ligne (FIFO) si > 0, sinon coût produit
+        cost_unit = Case(
+            When(cost_price__gt=0, then=F('cost_price')),
+            default=Coalesce(F('product__cost_price'), Value(Decimal('0'))),
+            output_field=DecimalField(max_digits=15, decimal_places=2),
+        )
+        line_cmv = ExpressionWrapper(
+            F('quantity') * cost_unit,
+            output_field=DecimalField(max_digits=24, decimal_places=6),
+        )
+        total_cost = SaleItem.objects.filter(sale__in=sales).aggregate(
+            tc=Coalesce(Sum(line_cmv), Decimal('0'), output_field=DecimalField(max_digits=24, decimal_places=6))
+        )['tc']
+        total_cost = (total_cost or Decimal('0')).quantize(Decimal('0.01'))
         
         # Bénéfice brut
         gross_profit = total_revenue - total_cost
@@ -913,26 +939,43 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             sale__sale_date__date__gte=start_date,
             sale__sale_date__date__lte=end_date,
             sale__status__in=['completed', 'partially_paid']
-        ).select_related('product')
-        
-        # Grouper par produit
+        ).select_related('product', 'sale').order_by('sale_id', 'id')
+
+        sale_ids = list(sale_items.values_list('sale_id', flat=True).distinct())
+        sales_by_id = {
+            s.id: s
+            for s in Sale.objects.filter(id__in=sale_ids).prefetch_related('items__product')
+        }
+
+        by_sale_lines = defaultdict(list)
+        for row in sale_items:
+            by_sale_lines[row.sale_id].append(row)
+
         product_data = {}
-        for item in sale_items:
-            pid = str(item.product.id)
-            if pid not in product_data:
-                product_data[pid] = {
-                    'product_id': item.product.id,
-                    'product_name': item.product.name,
-                    'product_sku': item.product.sku,
-                    'quantity_sold': 0,
-                    'total_revenue': Decimal('0'),
-                    'total_cost': Decimal('0'),
-                }
-            
-            cost_price = item.product.cost_price or Decimal('0')
-            product_data[pid]['quantity_sold'] += item.quantity
-            product_data[pid]['total_revenue'] += item.total
-            product_data[pid]['total_cost'] += cost_price * item.quantity
+        for sid, lines in by_sale_lines.items():
+            sale = sales_by_id.get(sid)
+            if not sale:
+                continue
+            alloc_list = allocated_line_ht_revenues_for_sale(sale)
+            alloc_by_item_id = {i.id: rev for i, rev in alloc_list}
+
+            for item in lines:
+                pid = str(item.product.id)
+                if pid not in product_data:
+                    product_data[pid] = {
+                        'product_id': item.product.id,
+                        'product_name': item.product.name,
+                        'product_sku': item.product.sku,
+                        'quantity_sold': Decimal('0'),
+                        'total_revenue': Decimal('0'),
+                        'total_cost': Decimal('0'),
+                    }
+
+                cu = effective_unit_cost(item)
+                rev = alloc_by_item_id.get(item.id, Decimal('0')).quantize(Decimal('0.01'))
+                product_data[pid]['quantity_sold'] += item.quantity
+                product_data[pid]['total_revenue'] += rev
+                product_data[pid]['total_cost'] += (cu * item.quantity).quantize(Decimal('0.01'))
         
         # Calculer profit et marge
         result = []

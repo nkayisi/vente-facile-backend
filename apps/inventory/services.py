@@ -430,46 +430,57 @@ class ProfitCalculationService:
     def calculate_sale_profit(sale) -> dict:
         """
         Calcule le profit total d'une vente basé sur les coûts FIFO des lots.
-        
+        CA HT par ligne après remises (y compris remise globale répartie), aligné sur les rapports.
+
         Args:
             sale: Instance de Sale
-        
+
         Returns:
             Dict avec total_revenue, total_cost, total_profit, margin_percentage, items_detail
         """
+        from apps.sales.profit_allocation import allocated_line_ht_revenues_for_sale, effective_unit_cost
+
         total_revenue = Decimal('0.00')
         total_cost = Decimal('0.00')
         items_detail = []
-        
+
+        alloc_by_item_id = {
+            i.id: rev for i, rev in allocated_line_ht_revenues_for_sale(sale)
+        }
+
         for item in sale.items.all():
-            item_profit = ProfitCalculationService.calculate_item_profit(
-                selling_price=item.unit_price,
-                quantity=item.quantity,
-                cost_price=item.cost_price,
-                discount_amount=item.discount_amount
-            )
-            
-            total_revenue += item_profit['revenue']
-            total_cost += item_profit['cost']
-            
+            revenue = alloc_by_item_id.get(item.id, Decimal('0.00')).quantize(Decimal('0.01'))
+            cu = effective_unit_cost(item)
+            cost = (cu * item.quantity).quantize(Decimal('0.01'))
+            profit = (revenue - cost).quantize(Decimal('0.01'))
+            margin_percentage = Decimal('0.00')
+            if revenue > 0:
+                margin_percentage = ((profit / revenue) * 100).quantize(Decimal('0.01'))
+
+            total_revenue += revenue
+            total_cost += cost
+
             items_detail.append({
                 'product_id': str(item.product_id),
                 'product_name': item.product.name,
                 'quantity': item.quantity,
                 'unit_price': item.unit_price,
                 'cost_price': item.cost_price,
-                **item_profit
+                'revenue': revenue,
+                'cost': cost,
+                'profit': profit,
+                'margin_percentage': margin_percentage,
             })
-        
-        total_profit = total_revenue - total_cost
-        margin_percentage = Decimal('0.00')
+
+        total_profit = (total_revenue - total_cost).quantize(Decimal('0.01'))
+        margin_sale = Decimal('0.00')
         if total_revenue > 0:
-            margin_percentage = ((total_profit / total_revenue) * 100).quantize(Decimal('0.01'))
-        
+            margin_sale = ((total_profit / total_revenue) * 100).quantize(Decimal('0.01'))
+
         return {
             'total_revenue': total_revenue,
             'total_cost': total_cost,
             'total_profit': total_profit,
-            'margin_percentage': margin_percentage,
+            'margin_percentage': margin_sale,
             'items_detail': items_detail
         }

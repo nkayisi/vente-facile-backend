@@ -209,7 +209,7 @@ class ProductProfitSerializer(serializers.Serializer):
     product_id = serializers.UUIDField()
     product_name = serializers.CharField()
     product_sku = serializers.CharField()
-    quantity_sold = serializers.IntegerField()
+    quantity_sold = serializers.DecimalField(max_digits=15, decimal_places=3)
     total_revenue = serializers.DecimalField(max_digits=15, decimal_places=2)
     total_cost = serializers.DecimalField(max_digits=15, decimal_places=2)
     profit = serializers.DecimalField(max_digits=15, decimal_places=2)
