@@ -4,6 +4,7 @@ Serializers for the Platform Admin module.
 from rest_framework import serializers
 from apps.organizations.models import Organization, OrganizationMembership
 from apps.users.models import User
+from apps.settings.models import Currency
 from apps.subscriptions.models import Plan, PlanFeature, Subscription, SubscriptionPayment
 
 
@@ -145,8 +146,15 @@ class AdminPlanFeatureSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'code', 'description', 'is_enabled', 'limit_value']
 
 
+class AdminPlanCurrencySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Currency
+        fields = ['id', 'code', 'symbol']
+
+
 class AdminPlanSerializer(serializers.ModelSerializer):
     plan_features = AdminPlanFeatureSerializer(many=True, read_only=True)
+    currency = AdminPlanCurrencySerializer(read_only=True)
     subscribers_count = serializers.SerializerMethodField()
 
     class Meta:
@@ -169,6 +177,12 @@ class AdminPlanSerializer(serializers.ModelSerializer):
 
 
 class AdminPlanCreateUpdateSerializer(serializers.ModelSerializer):
+    currency = serializers.PrimaryKeyRelatedField(
+        queryset=Currency.objects.filter(is_active=True),
+        required=False,
+        allow_null=True,
+    )
+
     class Meta:
         model = Plan
         fields = [
@@ -179,6 +193,22 @@ class AdminPlanCreateUpdateSerializer(serializers.ModelSerializer):
             'features', 'is_active', 'is_featured',
             'trial_days', 'sort_order',
         ]
+
+    def validate(self, attrs):
+        if self.instance is None:
+            cur = attrs.get('currency')
+            if cur is None:
+                usd = Currency.objects.filter(code='USD', is_active=True).first()
+                if not usd:
+                    raise serializers.ValidationError({
+                        'currency': "Aucune devise USD active : configurez les devises (settings) d'abord.",
+                    })
+                attrs['currency'] = usd
+        elif 'currency' in attrs and attrs['currency'] is None:
+            raise serializers.ValidationError({
+                'currency': 'La devise ne peut pas être vide.',
+            })
+        return attrs
 
 
 # =============================================================================

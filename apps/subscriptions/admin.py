@@ -35,10 +35,19 @@ class PlanFeatureInline(admin.TabularInline):
 
 @admin.register(Plan)
 class PlanAdmin(admin.ModelAdmin):
-    list_display = ['name', 'code', 'price_monthly', 'price_yearly', 'currency', 'max_users', 'is_active', 'is_featured']
+    list_display = [
+        'name', 'code', 'price_monthly', 'price_yearly',
+        'currency_symbol_display', 'max_users', 'is_active', 'is_featured',
+    ]
     list_filter = ['is_active', 'is_featured']
     search_fields = ['name', 'code']
     inlines = [PlanFeatureInline]
+
+    @admin.display(description='Devise')
+    def currency_symbol_display(self, obj):
+        if getattr(obj, 'currency_id', None) and obj.currency:
+            return f"{obj.currency.symbol} ({obj.currency.code})"
+        return '—'
     
     fieldsets = (
         (None, {

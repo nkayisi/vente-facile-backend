@@ -110,6 +110,12 @@ class RegisterWithOrganizationSerializer(serializers.Serializer):
     
     # Informations boutique
     organization_name = serializers.CharField(max_length=255)
+    organization_phone = serializers.CharField(
+        max_length=20,
+        required=True,
+        allow_blank=False,
+        trim_whitespace=True,
+    )
     business_type = serializers.ChoiceField(
         choices=[
             ('boutique', 'Boutique'),
@@ -147,6 +153,7 @@ class RegisterWithOrganizationSerializer(serializers.Serializer):
         validated_data.pop('password_confirm')
         
         org_name = validated_data.pop('organization_name')
+        organization_phone = validated_data.pop('organization_phone')
         business_type = validated_data.pop('business_type')
         currency = validated_data.pop('currency')
         country = validated_data.pop('country')
@@ -161,6 +168,7 @@ class RegisterWithOrganizationSerializer(serializers.Serializer):
             user=user,
             name=org_name,
             business_type=business_type,
+            phone=organization_phone,
             currency=currency,
             country=country
         )

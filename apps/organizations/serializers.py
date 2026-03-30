@@ -96,7 +96,14 @@ class OrganizationDetailSerializer(serializers.ModelSerializer):
 
 class OrganizationCreateSerializer(serializers.ModelSerializer):
     """Serializer pour la création d'organisation."""
-    
+
+    phone = serializers.CharField(
+        max_length=20,
+        required=True,
+        allow_blank=False,
+        trim_whitespace=True,
+    )
+
     class Meta:
         model = Organization
         fields = [

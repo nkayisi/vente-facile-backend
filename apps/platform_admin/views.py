@@ -297,7 +297,7 @@ class AdminPlanViewSet(viewsets.ModelViewSet):
     ordering = ['sort_order', 'price_monthly']
 
     def get_queryset(self):
-        return Plan.objects.all()
+        return Plan.objects.all().select_related("currency")
 
     def get_serializer_class(self):
         if self.action in ['create', 'update', 'partial_update']:

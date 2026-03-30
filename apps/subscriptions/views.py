@@ -26,7 +26,13 @@ class PublicPlanViewSet(viewsets.ReadOnlyModelViewSet):
     Plans visibles publiquement sur la landing page.
     Aucune authentification requise.
     """
-    queryset = Plan.objects.filter(is_active=True).order_by('sort_order', 'price_monthly')
+
+    def get_queryset(self):
+        return (
+            Plan.objects.filter(is_active=True)
+            .select_related("currency")
+            .order_by("sort_order", "price_monthly")
+        )
     serializer_class = PublicPlanSerializer
     permission_classes = [AllowAny]
     pagination_class = None
@@ -37,7 +43,9 @@ class PlanViewSet(viewsets.ReadOnlyModelViewSet):
     Liste des plans d'abonnement disponibles.
     Accessible à tous les utilisateurs authentifiés.
     """
-    queryset = Plan.objects.filter(is_active=True)
+
+    def get_queryset(self):
+        return Plan.objects.filter(is_active=True).select_related("currency")
     serializer_class = PlanSerializer
     permission_classes = [IsAuthenticated]
     pagination_class = None

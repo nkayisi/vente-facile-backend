@@ -7,7 +7,13 @@ from decimal import Decimal
 from django.db import transaction
 from django.utils import timezone
 
+from apps.settings.models import Currency
+
 from .models import Plan, Subscription, SubscriptionPayment, Invoice, InvoiceItem, GlobalConfig
+
+
+def _default_plan_currency():
+    return Currency.objects.filter(code="USD", is_active=True).first()
 
 
 class SubscriptionService:
@@ -116,12 +122,19 @@ class SubscriptionService:
 
         trial_plan = Plan.objects.filter(code='trial', is_active=True).first()
         if not trial_plan:
+            default_currency = _default_plan_currency()
+            if not default_currency:
+                raise RuntimeError(
+                    "Devise USD introuvable en base : exécutez les migrations "
+                    "de l’app settings (devises) avant de créer un plan d’essai."
+                )
             trial_plan = Plan.objects.create(
                 name='Essai Gratuit',
                 code='trial',
                 description=f"Plan d'essai gratuit de {trial_days} jours",
                 price_monthly=0,
                 price_yearly=0,
+                currency=default_currency,
                 max_users=3,
                 max_branches=1,
                 max_products=100,
@@ -201,7 +214,7 @@ class SubscriptionService:
             status=Subscription.Status.ACTIVE,
             billing_cycle=billing_cycle,
             price=price,
-            currency=plan.currency or 'USD',
+            currency=plan.currency.code,
             current_period_start=now,
             current_period_end=end,
             metadata={
@@ -239,7 +252,7 @@ class SubscriptionService:
             organization=organization,
             subscription=subscription,
             amount=amount,
-            currency=plan.currency or 'USD',
+            currency=plan.currency.code,
             payment_method=payment_method,
             status=SubscriptionPayment.Status.COMPLETED,
             reference=reference,

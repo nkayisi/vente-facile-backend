@@ -30,8 +30,12 @@ class Plan(TimeStampedModel, UUIDModel):
         decimal_places=2,
         default=Decimal('0.00')
     )
-    
-    currency = models.CharField(max_length=3, default='USD')
+
+    currency = models.ForeignKey(
+        'settings.Currency',
+        on_delete=models.PROTECT,
+        related_name='subscription_plans',
+    )
     
     max_users = models.PositiveIntegerField(default=1)
     max_branches = models.PositiveIntegerField(default=1)
@@ -45,7 +49,7 @@ class Plan(TimeStampedModel, UUIDModel):
     is_active = models.BooleanField(default=True)
     is_featured = models.BooleanField(default=False)
     
-    trial_days = models.PositiveIntegerField(default=14)
+    trial_days = models.PositiveIntegerField(default=0)
     
     sort_order = models.PositiveIntegerField(default=0)
 

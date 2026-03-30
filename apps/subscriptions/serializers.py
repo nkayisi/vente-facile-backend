@@ -2,7 +2,17 @@
 Serializers pour le module Abonnements.
 """
 from rest_framework import serializers
+from apps.settings.models import Currency
+
 from .models import Plan, PlanFeature, Subscription, SubscriptionPayment, Invoice, InvoiceItem
+
+
+class PlanCurrencySerializer(serializers.ModelSerializer):
+    """Devise d'un plan : symbole pour l'affichage, code ISO pour la logique."""
+
+    class Meta:
+        model = Currency
+        fields = ["id", "code", "symbol"]
 
 
 class PlanFeatureSerializer(serializers.ModelSerializer):
@@ -14,6 +24,7 @@ class PlanFeatureSerializer(serializers.ModelSerializer):
 class PublicPlanSerializer(serializers.ModelSerializer):
     """Serializer exposé publiquement (landing page). Ne contient que les infos commerciales."""
     plan_features = PlanFeatureSerializer(many=True, read_only=True)
+    currency = PlanCurrencySerializer(read_only=True)
 
     class Meta:
         model = Plan
@@ -29,6 +40,7 @@ class PublicPlanSerializer(serializers.ModelSerializer):
 
 class PlanSerializer(serializers.ModelSerializer):
     plan_features = PlanFeatureSerializer(many=True, read_only=True)
+    currency = PlanCurrencySerializer(read_only=True)
 
     class Meta:
         model = Plan
