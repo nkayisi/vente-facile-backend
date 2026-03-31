@@ -159,18 +159,35 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
         """
         Active un abonnement suite à un paiement.
         Endpoint: POST /api/v1/subscriptions/activate/
-        Accessible uniquement au propriétaire (owner).
+        
+        TEMPORAIREMENT BLOQUÉ pour les utilisateurs normaux tant que
+        le système de paiement n'est pas entièrement configuré.
+        Seuls les administrateurs plateforme (is_staff) peuvent activer
+        un abonnement via l'admin panel.
         """
-        # Vérifier que l'utilisateur est owner
-        org_id = request.headers.get('X-Organization-ID')
-        membership = request.user.memberships.filter(
-            organization_id=org_id, is_active=True
-        ).first()
-        if not membership or membership.role != 'owner':
+        if not request.user.is_staff:
             return Response(
-                {'detail': 'Seul le propriétaire peut gérer l\'abonnement.'},
-                status=status.HTTP_403_FORBIDDEN
+                {
+                    'detail': (
+                        'Le paiement en ligne n\'est pas encore disponible. '
+                        'Veuillez contacter l\'administrateur pour activer '
+                        'votre abonnement.'
+                    )
+                },
+                status=status.HTTP_403_FORBIDDEN,
             )
+
+        # Vérifier que l'utilisateur est owner ou admin
+        org_id = request.headers.get('X-Organization-ID')
+        if not request.user.is_staff:
+            membership = request.user.memberships.filter(
+                organization_id=org_id, is_active=True
+            ).first()
+            if not membership or membership.role != 'owner':
+                return Response(
+                    {'detail': 'Seul le propriétaire peut gérer l\'abonnement.'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
 
         organization = self._get_organization(request)
         if not organization:
