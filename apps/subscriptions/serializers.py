@@ -109,6 +109,24 @@ class ActivateSubscriptionSerializer(serializers.Serializer):
         return value
 
 
+class MokoInitiateSerializer(serializers.Serializer):
+    """Démarrage d'un paiement d'abonnement via MOKO / GoFreshPay."""
+
+    MOKO_METHODS = ('airtel', 'orange', 'mpesa', 'africell')
+
+    plan_id = serializers.UUIDField()
+    billing_cycle = serializers.ChoiceField(choices=Plan.BillingCycle.choices)
+    method = serializers.ChoiceField(choices=[(m, m) for m in MOKO_METHODS])
+    customer_number = serializers.CharField(max_length=32)
+
+    def validate_plan_id(self, value):
+        try:
+            Plan.objects.get(id=value, is_active=True)
+        except Plan.DoesNotExist:
+            raise serializers.ValidationError("Plan introuvable ou inactif.")
+        return value
+
+
 class SubscriptionPaymentSerializer(serializers.ModelSerializer):
     payment_method_display = serializers.CharField(source='get_payment_method_display', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)

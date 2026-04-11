@@ -200,9 +200,9 @@ class InvoiceAdmin(admin.ModelAdmin):
 
 @admin.register(SubscriptionPayment)
 class SubscriptionPaymentAdmin(admin.ModelAdmin):
-    list_display = ['organization', 'amount', 'currency', 'payment_method', 'status_badge', 'reference', 'paid_at', 'created_by']
+    list_display = ['organization', 'amount', 'currency', 'payment_method', 'status_badge', 'reference', 'external_transaction_id', 'paid_at', 'created_by']
     list_filter = ['status', 'payment_method']
-    search_fields = ['organization__name', 'reference']
+    search_fields = ['organization__name', 'reference', 'external_transaction_id', 'external_id']
     raw_id_fields = ['organization', 'subscription', 'invoice', 'created_by']
     actions = ['action_mark_completed']
 

@@ -371,8 +371,14 @@ class SubscriptionPayment(TimeStampedModel, UUIDModel):
         default=Status.PENDING
     )
     
-    reference = models.CharField(max_length=255, blank=True)
+    reference = models.CharField(max_length=255, blank=True, db_index=True)
     external_id = models.CharField(max_length=255, blank=True)
+    external_transaction_id = models.CharField(
+        max_length=255,
+        blank=True,
+        db_index=True,
+        help_text='Identifiant transaction PayDRC / MOKO (paydrc_reference)',
+    )
     
     paid_at = models.DateTimeField(null=True, blank=True)
     

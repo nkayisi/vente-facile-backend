@@ -275,6 +275,115 @@ class SubscriptionService:
             'invoice': invoice,
         }
 
+    @staticmethod
+    @transaction.atomic
+    def complete_pending_moko_payment(
+        pending_payment,
+        *,
+        paid_by=None,
+        external_id='',
+        extra_notes='',
+    ):
+        """
+        Finalise un SubscriptionPayment en pending après confirmation MOKO.
+        Idempotent si le paiement n'est plus pending.
+        """
+        if pending_payment.status != SubscriptionPayment.Status.PENDING:
+            return {
+                'already_done': True,
+                'payment': pending_payment,
+                'subscription': pending_payment.subscription,
+                'invoice': getattr(pending_payment, 'invoice', None),
+            }
+
+        metadata = pending_payment.metadata or {}
+        plan_id = metadata.get('plan_id')
+        billing_cycle = metadata.get('billing_cycle')
+        if not plan_id or not billing_cycle:
+            raise ValueError('Métadonnées de paiement MOKO incomplètes.')
+
+        plan = Plan.objects.get(id=plan_id, is_active=True)
+        notes = (metadata.get('notes') or '') + (extra_notes or '')
+
+        subscription = SubscriptionService.activate_subscription(
+            organization=pending_payment.organization,
+            plan=plan,
+            billing_cycle=billing_cycle,
+            activated_by=paid_by,
+            notes=notes or 'Paiement MOKO',
+        )
+
+        pending_payment.subscription = subscription
+        pending_payment.status = SubscriptionPayment.Status.COMPLETED
+        pending_payment.paid_at = timezone.now()
+        if external_id:
+            pending_payment.external_id = external_id[:255]
+            if not pending_payment.external_transaction_id:
+                pending_payment.external_transaction_id = external_id[:255]
+        if extra_notes:
+            pending_payment.notes = (pending_payment.notes or '') + extra_notes
+        pending_payment.save()
+
+        invoice = SubscriptionService._create_invoice(
+            organization=pending_payment.organization,
+            subscription=subscription,
+            payment=pending_payment,
+            plan=plan,
+        )
+        pending_payment.invoice = invoice
+        pending_payment.save(update_fields=['invoice', 'updated_at'])
+
+        return {
+            'already_done': False,
+            'subscription': subscription,
+            'payment': pending_payment,
+            'invoice': invoice,
+        }
+
+    @staticmethod
+    @transaction.atomic
+    def fail_pending_moko_payment(payment, *, reason: str = ''):
+        """Marque un paiement MOKO pending comme échoué."""
+        if payment.status != SubscriptionPayment.Status.PENDING:
+            return {'already_done': True, 'payment': payment}
+        payment.status = SubscriptionPayment.Status.FAILED
+        if reason:
+            payment.notes = (payment.notes or '') + f' | {reason}'
+        payment.save(update_fields=['status', 'notes', 'updated_at'])
+        return {'already_done': False, 'payment': payment}
+
+    @staticmethod
+    def apply_moko_terminal_or_intermediate_status(
+        payment,
+        moko_status: str,
+        *,
+        paid_by=None,
+        detail_note: str = '',
+    ):
+        """
+        Interprète le statut transaction MOKO (API /payments/transactions/status).
+        Retourne: 'pending' | 'completed' | 'failed' | 'unknown'
+        """
+        s = (moko_status or '').strip().lower()
+        if s in ('pending', 'submitted'):
+            return 'pending'
+        if s in ('successful', 'success', 'completed'):
+            ext = (payment.external_transaction_id or payment.external_id or '').strip()
+            SubscriptionService.complete_pending_moko_payment(
+                payment,
+                paid_by=paid_by,
+                external_id=ext,
+                extra_notes=detail_note or ' | Confirmé (MOKO status)',
+            )
+            return 'completed'
+        if s in ('failed', 'error', 'cancelled', 'canceled'):
+            SubscriptionService.fail_pending_moko_payment(
+                payment,
+                reason=detail_note or 'MOKO: transaction failed',
+            )
+            return 'failed'
+        return 'unknown'
+
     # ------------------------------------------------------------------ #
     # Helpers internes
     # ------------------------------------------------------------------ #

@@ -305,20 +305,44 @@ CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
 # CACHING
 # =============================================================================
 
-# Pour le développement sans Redis, utiliser le cache local
+REDIS_URL = config('REDIS_URL', default='redis://127.0.0.1:6379/1')
+# DB dédiée MOKO (token + files d’attente côté code Redis brut) — par défaut même instance, autre logique possible via URL
+REDIS_URL = config('REDIS_URL', default=REDIS_URL)
+TOKEN_CACHE_TTL = config('TOKEN_CACHE_TTL', default=3600, cast=int)
+PENDING_META_TTL_SECONDS = config(
+    'PENDING_META_TTL_SECONDS',
+    default=172800,
+    cast=int,
+)
+POLL_BATCH_SIZE = config('POLL_BATCH_SIZE', default=50, cast=int)
+
+# Pour le développement sans Redis, utiliser le cache local pour default.
+# Le cache « moko » utilise Redis si disponible (token partagé web + worker Celery).
 if DEBUG:
     CACHES = {
         'default': {
             'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
             'LOCATION': 'unique-snowflake',
-        }
+        },
+        'moko': {
+            'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+            'LOCATION': REDIS_URL,
+            'KEY_PREFIX': 'vf_moko',
+            'TIMEOUT': TOKEN_CACHE_TTL,
+        },
     }
 else:
     CACHES = {
         'default': {
             'BACKEND': 'django.core.cache.backends.redis.RedisCache',
-            'LOCATION': config('REDIS_URL', default='redis://localhost:6379/1'),
-        }
+            'LOCATION': REDIS_URL,
+        },
+        'moko': {
+            'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+            'LOCATION': REDIS_URL,
+            'KEY_PREFIX': 'vf_moko',
+            'TIMEOUT': TOKEN_CACHE_TTL,
+        },
     }
 
 # =============================================================================
@@ -335,6 +359,16 @@ DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='noreply@ventefacile.c
 
 FRONTEND_URL = config('FRONTEND_URL', default='http://localhost:3000')
 PASSWORD_RESET_TIMEOUT = 3600  # 1 heure en secondes
+
+# MOKO / GoFreshPay v2 (abonnements)
+MOKO_API_V2_URL = config(
+    'MOKO_API_V2_URL',
+    default='https://moko.gofreshpay.com',
+)
+MOKO_API_KEY = config('MOKO_API_KEY', default='')
+# URL publique du backend pour le callback (MOKO doit pouvoir joindre cette URL)
+PUBLIC_BACKEND_URL = config('PUBLIC_BACKEND_URL', default='http://127.0.0.1:8000')
+
 
 # =============================================================================
 # LOGGING
