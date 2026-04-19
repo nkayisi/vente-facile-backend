@@ -58,6 +58,7 @@ LOCAL_APPS = [
     'apps.cashbook',
     'apps.settings',
     'apps.platform_admin',
+    'apps.sync',
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS

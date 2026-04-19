@@ -35,6 +35,9 @@ api_v1_patterns = [
     path('settings/', include('apps.settings.urls')),
     path('', include('apps.subscriptions.urls')),
     path('platform-admin/', include('apps.platform_admin.urls')),
+    
+    # Sync API (WatermelonDB)
+    path('', include('apps.sync.urls')),
 ]
 
 urlpatterns = [

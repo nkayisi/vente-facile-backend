@@ -68,6 +68,7 @@ class SubscriptionMiddleware(MiddlewareMixin):
         '/api/v1/users/me/',
         '/api/v1/organizations/',
         '/api/v1/subscriptions/',
+        '/api/v1/sync/',  # Mobile sync must work even with expired subscription
         '/admin/',
         '/api/schema/',
         '/api/docs/',

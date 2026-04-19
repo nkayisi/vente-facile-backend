@@ -64,3 +64,91 @@ class TenantSoftDeleteModel(TenantModel, SoftDeleteModel):
     
     class Meta:
         abstract = True
+
+
+class SyncableModel(models.Model):
+    """
+    Base mixin for models that need to be synchronized with WatermelonDB.
+    
+    Key features:
+    - `sync_updated_at`: Manually settable timestamp for sync conflict resolution
+    - `server_created_at`: Server-side creation timestamp (auto)
+    - Methods for sync operations
+    
+    Note: This mixin should be used alongside TenantSoftDeleteModel for full sync support.
+    The `created_at`, `updated_at`, `deleted_at` fields come from parent classes.
+    """
+    
+    # Separate field for sync timestamp that can be set manually during push
+    # This allows conflict resolution based on client timestamps
+    sync_updated_at = models.DateTimeField(
+        db_index=True,
+        null=True,
+        blank=True,
+        help_text="Timestamp used for sync conflict resolution. Can be set by client."
+    )
+    
+    # Track if this record was created via sync (from mobile)
+    synced_from_client = models.BooleanField(
+        default=False,
+        help_text="True if this record was created/updated via sync from mobile client"
+    )
+
+    class Meta:
+        abstract = True
+        indexes = [
+            models.Index(fields=['sync_updated_at']),
+        ]
+
+    def save(self, *args, **kwargs):
+        """
+        Override save to automatically set sync_updated_at if not provided.
+        This ensures the field is always populated for sync queries.
+        """
+        if self.sync_updated_at is None:
+            self.sync_updated_at = timezone.now()
+        super().save(*args, **kwargs)
+
+    def mark_synced(self, client_timestamp=None):
+        """
+        Mark this record as synced with the given client timestamp.
+        
+        Args:
+            client_timestamp: The timestamp from the client. If None, uses current server time.
+        """
+        self.sync_updated_at = client_timestamp or timezone.now()
+        self.synced_from_client = True
+        self.save(update_fields=['sync_updated_at', 'synced_from_client', 'updated_at'])
+
+    def should_accept_sync_update(self, incoming_timestamp):
+        """
+        Determine if an incoming sync update should be accepted based on timestamps.
+        
+        Conflict resolution rule: Last-Write-Wins based on sync_updated_at.
+        
+        Args:
+            incoming_timestamp: The timestamp from the incoming sync data.
+            
+        Returns:
+            bool: True if the update should be accepted, False otherwise.
+        """
+        if self.sync_updated_at is None:
+            return True
+        return incoming_timestamp > self.sync_updated_at
+
+
+class TenantSyncableModel(TenantSoftDeleteModel, SyncableModel):
+    """
+    Combined model for tenant-scoped, soft-deletable, syncable records.
+    
+    This is the base class for all models that need to be synchronized
+    with WatermelonDB mobile clients.
+    
+    Inherits:
+    - TenantModel: organization scoping, created_at, updated_at, UUID pk
+    - SoftDeleteModel: is_deleted, deleted_at, soft_delete(), restore()
+    - SyncableModel: sync_updated_at, synced_from_client, sync methods
+    """
+    
+    class Meta:
+        abstract = True
