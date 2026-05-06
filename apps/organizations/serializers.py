@@ -132,9 +132,17 @@ class OrganizationUpdateSerializer(serializers.ModelSerializer):
 # MEMBERSHIP SERIALIZERS
 # =============================================================================
 
+class AssignedWarehouseMiniSerializer(serializers.Serializer):
+    """Lecture seule pour les entrepôts assignés."""
+
+    id = serializers.UUIDField(read_only=True)
+    name = serializers.CharField(read_only=True)
+    code = serializers.CharField(read_only=True)
+
+
 class OrganizationMembershipSerializer(serializers.ModelSerializer):
     """Serializer pour les membres d'organisation."""
-    
+
     user_id = serializers.UUIDField(source='user.id', read_only=True)
     user_email = serializers.CharField(source='user.email', read_only=True)
     user_name = serializers.CharField(source='user.full_name', read_only=True)
@@ -146,7 +154,11 @@ class OrganizationMembershipSerializer(serializers.ModelSerializer):
     user_last_login = serializers.DateTimeField(source='user.last_login', read_only=True)
     role_display = serializers.CharField(source='get_role_display', read_only=True)
     invited_by_name = serializers.CharField(source='invited_by.full_name', read_only=True)
-    
+    warehouse_access = serializers.SerializerMethodField()
+    assigned_warehouses = serializers.SerializerMethodField()
+    role_permissions = serializers.SerializerMethodField()
+    effective_permissions = serializers.SerializerMethodField()
+
     class Meta:
         model = OrganizationMembership
         fields = [
@@ -154,16 +166,55 @@ class OrganizationMembershipSerializer(serializers.ModelSerializer):
             'user_first_name', 'user_last_name', 'user_phone',
             'user_avatar', 'user_is_active', 'user_last_login',
             'role', 'role_display', 'is_active',
-            'invited_by', 'invited_by_name', 'joined_at'
+            'invited_by', 'invited_by_name', 'joined_at',
+            'warehouse_access', 'assigned_warehouses',
+            'extra_permissions', 'role_permissions', 'effective_permissions',
         ]
         read_only_fields = ['id', 'joined_at']
+
+    def get_warehouse_access(self, obj):
+        if obj.role == OrganizationMembership.Role.OWNER:
+            return 'all'
+        return 'restricted'
+
+    def get_assigned_warehouses(self, obj):
+        if obj.role == OrganizationMembership.Role.OWNER:
+            return []
+        qs = obj.assigned_warehouses.filter(is_deleted=False).order_by('name')
+        return AssignedWarehouseMiniSerializer(qs, many=True).data
+
+    def get_role_permissions(self, obj):
+        from apps.core.services import PermissionService
+        return PermissionService.get_role_permissions(obj.role)
+
+    def get_effective_permissions(self, obj):
+        from apps.core.services import PermissionService
+        return PermissionService.get_effective_permissions(obj)
 
 
 class MembershipCreateSerializer(serializers.Serializer):
     """Serializer pour ajouter un membre existant par email."""
-    
+
     email = serializers.EmailField()
     role = serializers.ChoiceField(choices=OrganizationMembership.Role.choices)
+    warehouse_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=True,
+        allow_empty=False,
+    )
+
+    def validate(self, attrs):
+        org = self.context.get('organization')
+        if not org:
+            raise serializers.ValidationError('Organisation manquante.')
+        from apps.organizations.membership_warehouse_validation import (
+            validate_membership_warehouse_ids,
+        )
+
+        validate_membership_warehouse_ids(
+            attrs['role'], attrs['warehouse_ids'], org
+        )
+        return attrs
 
 
 class MemberCreateWithUserSerializer(serializers.Serializer):
@@ -171,13 +222,18 @@ class MemberCreateWithUserSerializer(serializers.Serializer):
     Serializer pour créer un nouvel utilisateur et l'ajouter à l'organisation.
     Utilisé par l'admin et le gérant pour créer des comptes directement.
     """
-    
+
     email = serializers.EmailField()
     first_name = serializers.CharField(max_length=150)
     last_name = serializers.CharField(max_length=150)
     phone = serializers.CharField(max_length=20, required=False, allow_blank=True)
     password = serializers.CharField(write_only=True, min_length=6)
     role = serializers.ChoiceField(choices=OrganizationMembership.Role.choices)
+    warehouse_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=True,
+        allow_empty=False,
+    )
 
     def validate_email(self, value):
         from apps.users.models import User
@@ -185,12 +241,85 @@ class MemberCreateWithUserSerializer(serializers.Serializer):
             raise serializers.ValidationError('Un utilisateur avec cet email existe déjà.')
         return value
 
+    def validate(self, attrs):
+        org = self.context.get('organization')
+        if not org:
+            raise serializers.ValidationError('Organisation manquante.')
+        from apps.organizations.membership_warehouse_validation import (
+            validate_membership_warehouse_ids,
+        )
+
+        validate_membership_warehouse_ids(
+            attrs['role'], attrs['warehouse_ids'], org
+        )
+        return attrs
+
 
 class MembershipUpdateSerializer(serializers.Serializer):
     """Serializer pour modifier un membre."""
-    
-    role = serializers.ChoiceField(choices=OrganizationMembership.Role.choices, required=False)
+
+    role = serializers.ChoiceField(
+        choices=OrganizationMembership.Role.choices, required=False
+    )
     is_active = serializers.BooleanField(required=False)
+    warehouse_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        allow_empty=True,
+    )
+    extra_permissions = serializers.ListField(
+        child=serializers.CharField(max_length=100),
+        required=False,
+        allow_empty=True,
+    )
+
+    def validate_extra_permissions(self, value):
+        if value is None:
+            return value
+        from apps.core.services import PermissionService
+        all_permissions = PermissionService.get_all_permissions()
+        invalid = [p for p in value if p not in all_permissions]
+        if invalid:
+            raise serializers.ValidationError(
+                f"Permissions invalides: {', '.join(invalid)}"
+            )
+        return value
+
+    def validate(self, attrs):
+        warehouse_ids = attrs.get('warehouse_ids')
+        if warehouse_ids is None:
+            return attrs
+        org = self.context.get('organization')
+        membership = self.context.get('membership')
+        if not org or not membership:
+            raise serializers.ValidationError('Contexte incomplet.')
+        role = attrs.get('role', membership.role)
+        from apps.organizations.membership_warehouse_validation import (
+            validate_membership_warehouse_ids,
+        )
+
+        validate_membership_warehouse_ids(role, warehouse_ids, org)
+        return attrs
+
+
+class MembershipPermissionsSerializer(serializers.Serializer):
+    """Serializer pour gérer les permissions additionnelles d'un membre."""
+
+    extra_permissions = serializers.ListField(
+        child=serializers.CharField(max_length=100),
+        required=True,
+        allow_empty=True,
+    )
+
+    def validate_extra_permissions(self, value):
+        from apps.core.services import PermissionService
+        all_permissions = PermissionService.get_all_permissions()
+        invalid = [p for p in value if p not in all_permissions]
+        if invalid:
+            raise serializers.ValidationError(
+                f"Permissions invalides: {', '.join(invalid)}"
+            )
+        return value
 
 
 # =============================================================================

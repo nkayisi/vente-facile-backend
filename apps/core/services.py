@@ -112,7 +112,29 @@ class OrganizationService:
         return organization
 
     @staticmethod
-    def add_member(organization, user, role, invited_by=None):
+    def sync_membership_assigned_warehouses(membership, warehouse_ids, organization=None):
+        """Assigne les entrepôtes M2M selon le rôle (owner → aucune ligne)."""
+        from apps.organizations.membership_warehouse_validation import (
+            validate_membership_warehouse_ids,
+        )
+
+        org = organization or membership.organization
+        validated = validate_membership_warehouse_ids(
+            membership.role, warehouse_ids, org
+        )
+        if membership.role == OrganizationMembership.Role.OWNER:
+            membership.assigned_warehouses.clear()
+        else:
+            membership.assigned_warehouses.set(validated)
+
+    @staticmethod
+    def add_member(
+        organization,
+        user,
+        role,
+        invited_by=None,
+        warehouse_ids=None,
+    ):
         """Add a user to an organization with a specific role."""
         membership, created = OrganizationMembership.objects.get_or_create(
             user=user,
@@ -130,6 +152,13 @@ class OrganizationService:
             membership.save()
         
         PermissionService.assign_role_permissions(user, organization, role)
+
+        if role == OrganizationMembership.Role.OWNER:
+            membership.assigned_warehouses.clear()
+        elif warehouse_ids is not None:
+            OrganizationService.sync_membership_assigned_warehouses(
+                membership, warehouse_ids, organization
+            )
         
         return membership
 
@@ -287,16 +316,12 @@ class PermissionService:
             'dashboard.view',
         ],
         
-        # CAISSIER (cashier) : ventes, consultation produits/prix, clients basique
+        # CAISSIER (cashier) : ventes, livre de caisse, clients basique, dashboard
+        # Note: pas d'accès aux produits (products.view) ni au stock (stock.view) par défaut
+        # Ces permissions peuvent être accordées individuellement via extra_permissions
         OrganizationMembership.Role.CASHIER: [
             # Organisation
             'organization.view',
-            # Produits (lecture seule)
-            'products.view',
-            'categories.view',
-            # Stock (lecture seule)
-            'stock.view',
-            'warehouses.view',
             # Ventes (créer, voir les siennes)
             'sales.view', 'sales.create',
             'payment_methods.view',
@@ -309,16 +334,40 @@ class PermissionService:
         ],
     }
 
+    ALL_PERMISSIONS = None
+
     @classmethod
     def get_role_permissions(cls, role):
         """Retourne la liste des permissions pour un rôle donné."""
         return cls.ROLE_PERMISSIONS.get(role, [])
 
     @classmethod
+    def get_all_permissions(cls):
+        """Retourne la liste de toutes les permissions disponibles dans le système."""
+        if cls.ALL_PERMISSIONS is None:
+            all_perms = set()
+            for role_perms in cls.ROLE_PERMISSIONS.values():
+                all_perms.update(role_perms)
+            cls.ALL_PERMISSIONS = sorted(all_perms)
+        return cls.ALL_PERMISSIONS
+
+    @classmethod
+    def get_effective_permissions(cls, membership):
+        """
+        Retourne les permissions effectives d'un membership.
+        Permissions effectives = permissions du rôle + extra_permissions.
+        """
+        if not membership:
+            return []
+        role_perms = set(cls.get_role_permissions(membership.role))
+        extra_perms = set(membership.extra_permissions or [])
+        return sorted(role_perms | extra_perms)
+
+    @classmethod
     def has_permission(cls, user, organization, permission):
         """
         Vérifie si un utilisateur a une permission spécifique dans une organisation.
-        Basé uniquement sur le rôle du membre.
+        Basé sur le rôle du membre + ses permissions additionnelles.
         """
         membership = OrganizationMembership.objects.filter(
             user=user,
@@ -327,7 +376,8 @@ class PermissionService:
         ).first()
         if not membership:
             return False
-        return permission in cls.get_role_permissions(membership.role)
+        effective_perms = cls.get_effective_permissions(membership)
+        return permission in effective_perms
 
     @classmethod
     def has_any_permission(cls, user, organization, permissions):
@@ -339,12 +389,12 @@ class PermissionService:
         ).first()
         if not membership:
             return False
-        role_perms = cls.get_role_permissions(membership.role)
-        return any(p in role_perms for p in permissions)
+        effective_perms = cls.get_effective_permissions(membership)
+        return any(p in effective_perms for p in permissions)
 
     @classmethod
     def get_user_permissions(cls, user, organization):
-        """Retourne toutes les permissions d'un utilisateur dans une organisation."""
+        """Retourne toutes les permissions effectives d'un utilisateur dans une organisation."""
         membership = OrganizationMembership.objects.filter(
             user=user,
             organization=organization,
@@ -352,7 +402,7 @@ class PermissionService:
         ).first()
         if not membership:
             return []
-        return cls.get_role_permissions(membership.role)
+        return cls.get_effective_permissions(membership)
 
     @classmethod
     def get_user_role(cls, user, organization):

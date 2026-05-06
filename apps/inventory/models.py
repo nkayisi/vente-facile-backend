@@ -717,10 +717,13 @@ class InventorySession(TenantSoftDeleteModel):
         return product_ids
 
     @classmethod
-    def get_all_locked_product_ids(cls, organization):
+    def get_all_locked_product_ids(cls, organization, warehouse_ids=None):
         """
         Retourne les IDs de tous les produits bloqués par des inventaires en cours
         pour une organisation donnée.
+
+        Si ``warehouse_ids`` est une liste, limite aux sessions dans ces entrepôts.
+        ``None`` = tous les entrepôts (ex. owner).
         """
         locked_sessions = cls.objects.filter(
             organization=organization,
@@ -728,6 +731,8 @@ class InventorySession(TenantSoftDeleteModel):
             status__in=[cls.Status.IN_PROGRESS, cls.Status.REVIEW],
             is_deleted=False
         )
+        if warehouse_ids is not None:
+            locked_sessions = locked_sessions.filter(warehouse_id__in=warehouse_ids)
         
         all_locked_ids = set()
         for session in locked_sessions:
@@ -736,9 +741,11 @@ class InventorySession(TenantSoftDeleteModel):
         return all_locked_ids
 
     @classmethod
-    def get_locking_sessions_for_products(cls, organization, product_ids):
+    def get_locking_sessions_for_products(cls, organization, product_ids, warehouse_ids=None):
         """
         Retourne les sessions d'inventaire qui bloquent les produits donnés.
+
+        Si ``warehouse_ids`` est une liste, seules les sessions dans ces entrepôts sont prises en compte.
         """
         if not product_ids:
             return []
@@ -752,6 +759,8 @@ class InventorySession(TenantSoftDeleteModel):
             status__in=[cls.Status.IN_PROGRESS, cls.Status.REVIEW],
             is_deleted=False
         ).select_related('warehouse')
+        if warehouse_ids is not None:
+            locked_sessions = locked_sessions.filter(warehouse_id__in=warehouse_ids)
         
         for session in locked_sessions:
             session_locked_ids = session.get_locked_product_ids()

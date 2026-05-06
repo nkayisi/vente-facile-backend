@@ -3,6 +3,7 @@ Serializers DRF pour l'app Products.
 """
 from rest_framework import serializers
 from .models import Category, Brand, Unit, Product, ProductImage, ProductVariant, PriceList, ProductPrice
+from apps.core.warehouse_scope import accessible_warehouse_ids, get_membership_for_request
 
 
 # =============================================================================
@@ -409,16 +410,26 @@ class ProductDetailSerializer(serializers.ModelSerializer):
         return str(obj.get_price_with_tax())
 
     def get_stock_by_warehouse(self, obj):
-        """Retourne le stock par entrepôt."""
+        """Retourne le stock par entrepôt, filtré par le scope warehouse du membership."""
+        stocks = obj.stocks.select_related('warehouse').all()
+
+        request = self.context.get('request')
+        if request:
+            m = get_membership_for_request(request)
+            if m:
+                wh_ids = accessible_warehouse_ids(m)
+                if wh_ids is not None:
+                    stocks = stocks.filter(warehouse_id__in=wh_ids)
+
         return [
             {
                 'warehouse_id': str(stock.warehouse_id),
                 'warehouse_name': stock.warehouse.name,
                 'quantity': str(stock.quantity),
                 'available': str(stock.available_quantity),
-                'reserved': str(stock.reserved_quantity)
+                'reserved': str(stock.reserved_quantity),
             }
-            for stock in obj.stocks.select_related('warehouse').all()
+            for stock in stocks
         ]
 
 

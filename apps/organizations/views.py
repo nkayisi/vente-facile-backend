@@ -24,6 +24,7 @@ from .serializers import (
     OrganizationCreateSerializer, OrganizationUpdateSerializer,
     OrganizationMembershipSerializer, MembershipCreateSerializer,
     MemberCreateWithUserSerializer, MembershipUpdateSerializer,
+    MembershipPermissionsSerializer,
     BranchListSerializer, BranchDetailSerializer, BranchCreateSerializer,
     OrganizationInvitationSerializer, InvitationCreateSerializer
 )
@@ -425,6 +426,7 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         'update': 'users.edit',
         'partial_update': 'users.edit',
         'destroy': 'users.deactivate',
+        'manage_permissions': 'users.edit',
     }
 
     def get_serializer_class(self):
@@ -440,7 +442,9 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         queryset = super().get_queryset()
         organization = self.get_organization()
         if organization:
-            queryset = queryset.filter(organization=organization)
+            queryset = queryset.filter(organization=organization).prefetch_related(
+                'assigned_warehouses'
+            )
         return queryset
 
     def _check_role_hierarchy(self, request, target_role):
@@ -465,12 +469,16 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
 
     def create(self, request, *args, **kwargs):
         """Ajoute un membre existant par email."""
-        serializer = MembershipCreateSerializer(data=request.data)
+        organization = self.get_organization()
+        serializer = MembershipCreateSerializer(
+            data=request.data,
+            context={'organization': organization},
+        )
         serializer.is_valid(raise_exception=True)
         
-        organization = self.get_organization()
         email = serializer.validated_data['email']
         role = serializer.validated_data['role']
+        warehouse_ids = serializer.validated_data['warehouse_ids']
         
         # Vérifier la hiérarchie des rôles
         ok, error = self._check_role_hierarchy(request, role)
@@ -514,6 +522,9 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             existing.is_active = True
             existing.save()
             PermissionService.assign_role_permissions(user, organization, role)
+            OrganizationService.sync_membership_assigned_warehouses(
+                existing, warehouse_ids, organization
+            )
             return Response(
                 OrganizationMembershipSerializer(existing).data,
                 status=status.HTTP_200_OK
@@ -523,7 +534,8 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             organization=organization,
             user=user,
             role=role,
-            invited_by=request.user
+            invited_by=request.user,
+            warehouse_ids=warehouse_ids,
         )
         return Response(
             OrganizationMembershipSerializer(membership).data,
@@ -537,11 +549,15 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         L'admin peut créer manager, stock_keeper, cashier.
         Le gérant peut créer stock_keeper, cashier uniquement.
         """
-        serializer = MemberCreateWithUserSerializer(data=request.data)
+        organization = self.get_organization()
+        serializer = MemberCreateWithUserSerializer(
+            data=request.data,
+            context={'organization': organization},
+        )
         serializer.is_valid(raise_exception=True)
         
-        organization = self.get_organization()
         role = serializer.validated_data['role']
+        warehouse_ids = serializer.validated_data['warehouse_ids']
         
         # Vérifier la hiérarchie des rôles
         ok, error = self._check_role_hierarchy(request, role)
@@ -580,7 +596,8 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
                 organization=organization,
                 user=user,
                 role=role,
-                invited_by=request.user
+                invited_by=request.user,
+                warehouse_ids=warehouse_ids,
             )
         
         return Response(
@@ -606,11 +623,20 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        serializer = MembershipUpdateSerializer(data=request.data)
+        organization = self.get_organization()
+        serializer = MembershipUpdateSerializer(
+            data=request.data,
+            context={
+                'organization': organization,
+                'membership': membership,
+            },
+        )
         serializer.is_valid(raise_exception=True)
         
         new_role = serializer.validated_data.get('role', membership.role)
         is_active = serializer.validated_data.get('is_active', membership.is_active)
+        warehouse_ids = serializer.validated_data.get('warehouse_ids')
+        extra_permissions = serializer.validated_data.get('extra_permissions')
         
         # Vérifier la hiérarchie pour le rôle actuel ET le nouveau rôle
         current_membership = _get_membership(request)
@@ -639,14 +665,82 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         
         membership.role = new_role
         membership.is_active = is_active
+        if extra_permissions is not None:
+            membership.extra_permissions = extra_permissions
         membership.save()
         
         if is_active:
             PermissionService.assign_role_permissions(
                 membership.user, membership.organization, new_role
             )
+
+        if warehouse_ids is not None:
+            OrganizationService.sync_membership_assigned_warehouses(
+                membership, warehouse_ids, organization
+            )
         
         return Response(OrganizationMembershipSerializer(membership).data)
+
+    @action(detail=True, methods=['get', 'patch'], url_path='permissions')
+    def manage_permissions(self, request, pk=None):
+        """
+        GET: Retourne les permissions du membre (rôle, extra, effectives).
+        PATCH: Met à jour les permissions additionnelles du membre.
+        """
+        membership = self.get_object()
+        
+        if request.method == 'GET':
+            return Response({
+                'role': membership.role,
+                'role_display': membership.get_role_display(),
+                'role_permissions': PermissionService.get_role_permissions(membership.role),
+                'extra_permissions': membership.extra_permissions or [],
+                'effective_permissions': PermissionService.get_effective_permissions(membership),
+                'all_permissions': PermissionService.get_all_permissions(),
+            })
+        
+        # PATCH: modifier les permissions additionnelles
+        # Empêcher de modifier le owner
+        if membership.role == 'owner':
+            return Response(
+                {'detail': "Impossible de modifier les permissions de l'administrateur principal."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        current_membership = _get_membership(request)
+        if not current_membership:
+            return Response(
+                {'detail': "Vous n'êtes pas membre de cette organisation."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Seuls owner et manager peuvent modifier les permissions
+        if current_membership.role not in ['owner', 'manager']:
+            return Response(
+                {'detail': "Vous n'avez pas la permission de modifier les permissions."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Vérifier qu'on peut gérer le rôle du membre cible
+        if not current_membership.can_manage_role(membership.role):
+            return Response(
+                {'detail': "Vous n'avez pas la permission de modifier cet utilisateur."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        serializer = MembershipPermissionsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        membership.extra_permissions = serializer.validated_data['extra_permissions']
+        membership.save(update_fields=['extra_permissions', 'updated_at'])
+        
+        return Response({
+            'role': membership.role,
+            'role_display': membership.get_role_display(),
+            'role_permissions': PermissionService.get_role_permissions(membership.role),
+            'extra_permissions': membership.extra_permissions,
+            'effective_permissions': PermissionService.get_effective_permissions(membership),
+        })
 
     def destroy(self, request, *args, **kwargs):
         """Retire un membre de l'organisation."""

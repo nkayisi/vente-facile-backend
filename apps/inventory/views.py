@@ -12,7 +12,14 @@ from django.db import transaction
 from django.utils import timezone
 from decimal import Decimal
 
-from apps.core.api_mixins import TenantViewSetMixin, AuditMixin
+from apps.core.api_mixins import TenantViewSetMixin, AuditMixin, WarehouseScopedQuerysetMixin
+from apps.core.warehouse_scope import (
+    accessible_warehouse_ids,
+    assert_warehouse_allowed_for_request,
+    filter_queryset_by_warehouse_ids,
+    filter_stock_transfer_queryset,
+    get_membership_for_request,
+)
 from apps.core.api_permissions import (
     IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission
 )
@@ -39,7 +46,7 @@ from .serializers import (
 # WAREHOUSE VIEWSET
 # =============================================================================
 
-class WarehouseViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
+class WarehouseViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     """
     ViewSet pour la gestion des entrepôts.
     
@@ -58,6 +65,8 @@ class WarehouseViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     filterset_fields = ['is_active', 'is_default', 'branch']
     search_fields = ['name', 'code']
     ordering = ['name']
+
+    warehouse_scope_field = 'id'
     
     select_related_fields = ['branch', 'manager']
     prefetch_related_fields = ['locations']
@@ -111,7 +120,7 @@ class WarehouseViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
 # STOCK LOCATION VIEWSET
 # =============================================================================
 
-class StockLocationViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
+class StockLocationViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet pour la gestion des emplacements de stock.
     
@@ -143,9 +152,23 @@ class StockLocationViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         'by_warehouse': 'warehouses.view',
     }
 
+    def perform_create(self, serializer):
+        assert_warehouse_allowed_for_request(
+            self.request, serializer.validated_data['warehouse'].id
+        )
+        super().perform_create(serializer)
+
+    def perform_update(self, serializer):
+        if 'warehouse' in serializer.validated_data:
+            assert_warehouse_allowed_for_request(
+                self.request, serializer.validated_data['warehouse'].id
+            )
+        super().perform_update(serializer)
+
     @action(detail=False, methods=['get'], url_path='by-warehouse/(?P<warehouse_id>[^/.]+)')
     def by_warehouse(self, request, warehouse_id=None):
         """Retourne tous les emplacements actifs d'un entrepôt."""
+        assert_warehouse_allowed_for_request(request, warehouse_id)
         organization = self.get_organization()
         locations = StockLocation.objects.filter(
             organization=organization,
@@ -161,7 +184,7 @@ class StockLocationViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
 # STOCK VIEWSET
 # =============================================================================
 
-class StockViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
+class StockViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet pour la consultation du stock.
     
@@ -209,6 +232,9 @@ class StockViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             organization=organization,
             product_id=product_id
         ).select_related('warehouse', 'location')
+        m = get_membership_for_request(request)
+        if m:
+            stocks = filter_queryset_by_warehouse_ids(stocks, m, 'warehouse_id')
         
         page = self.paginate_queryset(stocks)
         if page is not None:
@@ -222,6 +248,7 @@ class StockViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     def by_warehouse(self, request, warehouse_id=None):
         """Retourne tout le stock d'un entrepôt."""
         organization = self.get_organization()
+        assert_warehouse_allowed_for_request(request, warehouse_id)
         stocks = Stock.objects.filter(
             organization=organization,
             warehouse_id=warehouse_id
@@ -245,6 +272,9 @@ class StockViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             quantity__lte=F('product__reorder_point'),
             product__track_inventory=True
         ).select_related('product', 'warehouse')
+        m = get_membership_for_request(request)
+        if m:
+            stocks = filter_queryset_by_warehouse_ids(stocks, m, 'warehouse_id')
         
         page = self.paginate_queryset(stocks)
         if page is not None:
@@ -268,6 +298,9 @@ class StockViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             expiry_date__gte=timezone.now().date(),
             quantity__gt=0
         ).select_related('product', 'warehouse').order_by('expiry_date')
+        m = get_membership_for_request(request)
+        if m:
+            batches = filter_queryset_by_warehouse_ids(batches, m, 'warehouse_id')
         
         page = self.paginate_queryset(batches)
         if page is not None:
@@ -291,7 +324,12 @@ class StockViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         ).select_related('product', 'warehouse', 'variant')
         
         if warehouse_id:
+            assert_warehouse_allowed_for_request(request, warehouse_id)
             batches = batches.filter(warehouse_id=warehouse_id)
+        else:
+            m = get_membership_for_request(request)
+            if m:
+                batches = filter_queryset_by_warehouse_ids(batches, m, 'warehouse_id')
         
         if not include_empty:
             batches = batches.filter(quantity__gt=0)
@@ -318,7 +356,7 @@ class StockViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
 # STOCK BATCH VIEWSET
 # =============================================================================
 
-class StockBatchViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
+class StockBatchViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet pour la gestion des lots de stock.
     
@@ -347,7 +385,7 @@ class StockBatchViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
 # STOCK MOVEMENT VIEWSET
 # =============================================================================
 
-class StockMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
+class StockMovementViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet pour les mouvements de stock.
     
@@ -387,7 +425,8 @@ class StockMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         
         organization = self.get_organization()
         data = serializer.validated_data
-        
+        assert_warehouse_allowed_for_request(self.request, data['warehouse'].id)
+
         # Récupérer ou créer le stock avec verrouillage
         product = data['product']
         product_cost = product.cost_price if product.cost_price else Decimal('0.00')
@@ -515,6 +554,19 @@ class StockTransferViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
         'receive': 'stock_transfers.receive',
         'cancel': 'stock_transfers.cancel',
     }
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        m = get_membership_for_request(self.request)
+        if m:
+            qs = filter_stock_transfer_queryset(qs, m)
+        return qs
+
+    def perform_create(self, serializer):
+        va = serializer.validated_data
+        assert_warehouse_allowed_for_request(self.request, va['source_warehouse'].id)
+        assert_warehouse_allowed_for_request(self.request, va['destination_warehouse'].id)
+        super().perform_create(serializer)
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -748,7 +800,7 @@ class StockTransferViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
 # STOCK ADJUSTMENT VIEWSET
 # =============================================================================
 
-class StockAdjustmentViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
+class StockAdjustmentViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     """
     ViewSet pour les ajustements de stock (inventaire).
     
@@ -780,6 +832,19 @@ class StockAdjustmentViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewS
         'approve': 'stock_adjustments.approve',
         'reject': 'stock_adjustments.approve',
     }
+
+    def perform_create(self, serializer):
+        assert_warehouse_allowed_for_request(
+            self.request, serializer.validated_data['warehouse'].id
+        )
+        super().perform_create(serializer)
+
+    def perform_update(self, serializer):
+        if 'warehouse' in serializer.validated_data:
+            assert_warehouse_allowed_for_request(
+                self.request, serializer.validated_data['warehouse'].id
+            )
+        super().perform_update(serializer)
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -884,7 +949,7 @@ class StockAdjustmentViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewS
 # INVENTORY SESSION VIEWSET
 # =============================================================================
 
-class InventorySessionViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
+class InventorySessionViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     """
     ViewSet pour la gestion des sessions d'inventaire.
     
@@ -925,6 +990,12 @@ class InventorySessionViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelView
         'counts': 'inventory.view',
         'print_data': 'inventory.print',
     }
+
+    def perform_create(self, serializer):
+        assert_warehouse_allowed_for_request(
+            self.request, serializer.validated_data['warehouse'].id
+        )
+        super().perform_create(serializer)
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -1280,15 +1351,30 @@ class InventorySessionViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelView
         Utilisé par le frontend pour désactiver ces produits dans le POS.
         """
         organization = self.get_organization()
-        locked_product_ids = InventorySession.get_all_locked_product_ids(organization)
-        
+        m = get_membership_for_request(request)
+        wh_scope = accessible_warehouse_ids(m) if m else None
+        if wh_scope is not None and not wh_scope:
+            return Response({
+                'locked_product_ids': [],
+                'active_sessions': [],
+                'has_active_inventory': False,
+            })
+        locked_product_ids = InventorySession.get_all_locked_product_ids(
+            organization, warehouse_ids=wh_scope
+        )
+
         # Récupérer les sessions actives pour information
-        active_sessions = InventorySession.objects.filter(
+        active_sessions_qs = InventorySession.objects.filter(
             organization=organization,
             is_stock_locked=True,
             status__in=['in_progress', 'review'],
-            is_deleted=False
-        ).select_related('warehouse').values('id', 'reference', 'name', 'warehouse__name', 'status')
+            is_deleted=False,
+        )
+        if wh_scope is not None:
+            active_sessions_qs = active_sessions_qs.filter(warehouse_id__in=wh_scope)
+        active_sessions = active_sessions_qs.select_related('warehouse').values(
+            'id', 'reference', 'name', 'warehouse__name', 'status'
+        )
         
         return Response({
             'locked_product_ids': list(locked_product_ids),

@@ -121,6 +121,15 @@ class UserViewSet(viewsets.ModelViewSet):
         """
         Retourne le rôle et les permissions de l'utilisateur dans l'organisation courante.
         Nécessite le header X-Organization-ID.
+        
+        Retourne:
+        - role: rôle du membre
+        - role_display: nom affiché du rôle
+        - role_permissions: permissions héritées du rôle
+        - extra_permissions: permissions additionnelles accordées individuellement
+        - permissions: permissions effectives (role + extra)
+        - manageable_roles: rôles que cet utilisateur peut gérer
+        - all_permissions: liste de toutes les permissions du système (pour UI)
         """
         from apps.core.services import PermissionService
         from apps.organizations.models import OrganizationMembership
@@ -143,17 +152,22 @@ class UserViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN
             )
         
-        permissions_list = PermissionService.get_role_permissions(membership.role)
+        role_permissions = PermissionService.get_role_permissions(membership.role)
+        extra_permissions = membership.extra_permissions or []
+        effective_permissions = PermissionService.get_effective_permissions(membership)
         manageable_roles = OrganizationMembership.MANAGEABLE_ROLES.get(membership.role, [])
         
         return Response({
             'role': membership.role,
             'role_display': membership.get_role_display(),
-            'permissions': permissions_list,
+            'role_permissions': role_permissions,
+            'extra_permissions': extra_permissions,
+            'permissions': effective_permissions,
             'manageable_roles': [
                 {'value': r, 'label': dict(OrganizationMembership.Role.choices).get(r, r)}
                 for r in manageable_roles
             ],
+            'all_permissions': PermissionService.get_all_permissions(),
         })
 
     @action(detail=False, methods=['post'], url_path='me/change-password')

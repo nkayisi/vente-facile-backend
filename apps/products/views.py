@@ -8,10 +8,15 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser
 from django_filters.rest_framework import DjangoFilterBackend
-from django.db.models import Sum, Count
+from django.db.models import Sum, Count, Q, F
 from django.http import HttpResponse
 
 from apps.core.api_mixins import TenantViewSetMixin, BulkActionMixin, AuditMixin
+from apps.core.warehouse_scope import (
+    accessible_warehouse_ids,
+    filter_queryset_by_warehouse_ids,
+    get_membership_for_request,
+)
 from apps.core.api_permissions import (
     IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission
 )
@@ -78,19 +83,34 @@ class CategoryViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
 
     @action(detail=True, methods=['get'])
     def products(self, request, pk=None):
-        """Retourne les produits d'une catégorie."""
+        """Retourne les produits d'une catégorie (scope warehouse appliqué)."""
         category = self.get_object()
-        products = Product.objects.filter(
+
+        m = get_membership_for_request(request)
+        wh_ids = accessible_warehouse_ids(m) if m else None
+
+        base_qs = Product.objects.filter(
             organization=category.organization,
             category=category,
-            is_deleted=False
+            is_deleted=False,
         ).select_related('brand', 'unit')
-        
+
+        if wh_ids is not None:
+            wh_filter = Q(stocks__warehouse_id__in=wh_ids)
+            products = (
+                base_qs
+                .filter(Q(track_inventory=False) | Q(stocks__warehouse_id__in=wh_ids))
+                .distinct()
+                .annotate(total_stock=Sum('stocks__quantity', filter=wh_filter))
+            )
+        else:
+            products = base_qs.annotate(total_stock=Sum('stocks__quantity'))
+
         page = self.paginate_queryset(products)
         if page is not None:
             serializer = ProductListSerializer(page, many=True)
             return self.get_paginated_response(serializer.data)
-        
+
         serializer = ProductListSerializer(products, many=True)
         return Response(serializer.data)
 
@@ -256,25 +276,40 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
 
     def get_queryset(self):
         """
-        Surcharge pour ajouter l'annotation du stock total
-        et filtrer par disponibilité en stock si demandé.
+        Surcharge pour :
+        - Restreindre la liste aux produits présents dans les entrepôts du membership
+        - Annoter total_stock filtré par entrepôt
+        - Appliquer le filtre in_stock si demandé
         """
         queryset = super().get_queryset()
-        
-        # Annoter avec le stock total
-        queryset = queryset.annotate(
-            total_stock=Sum('stocks__quantity')
-        )
-        
-        # Filtre in_stock : produits disponibles en stock
-        # Les produits qui ne trackent pas l'inventaire sont toujours inclus
+
+        m = get_membership_for_request(self.request)
+        wh_ids = accessible_warehouse_ids(m) if m else None
+
+        if wh_ids is not None:
+            warehouse_stock_filter = Q(stocks__warehouse_id__in=wh_ids)
+            # Restreindre aux produits ayant un stock dans les entrepôts autorisés
+            # (les produits sans suivi d'inventaire restent toujours visibles)
+            queryset = (
+                queryset
+                .filter(
+                    Q(track_inventory=False)
+                    | Q(stocks__warehouse_id__in=wh_ids)
+                )
+                .distinct()
+                .annotate(total_stock=Sum('stocks__quantity', filter=warehouse_stock_filter))
+            )
+        else:
+            queryset = queryset.annotate(total_stock=Sum('stocks__quantity'))
+
+        # Filtre in_stock : uniquement les produits avec du stock disponible
         in_stock = self.request.query_params.get('in_stock')
         if in_stock and in_stock.lower() in ('true', '1'):
             queryset = queryset.filter(
-                models.Q(track_inventory=False) |
-                models.Q(total_stock__gt=0)
+                Q(track_inventory=False) |
+                Q(total_stock__gt=0)
             )
-        
+
         return queryset
 
     def perform_create(self, serializer):
@@ -292,6 +327,9 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
         """Retourne le détail du stock par entrepôt."""
         product = self.get_object()
         stocks = product.stocks.select_related('warehouse', 'location').all()
+        m = get_membership_for_request(request)
+        if m:
+            stocks = filter_queryset_by_warehouse_ids(stocks, m, 'warehouse_id')
         
         data = [
             {
@@ -313,17 +351,26 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
     def low_stock(self, request):
         """Retourne les produits en stock bas avec pagination."""
         organization = self.get_organization()
-        
-        products = Product.objects.filter(
+        m = get_membership_for_request(request)
+        wh_ids = accessible_warehouse_ids(m) if m else None
+
+        products_qs = Product.objects.filter(
             organization=organization,
             is_deleted=False,
             is_active=True,
-            track_inventory=True
-        ).annotate(
-            total_stock=Sum('stocks__quantity')
-        ).filter(
-            total_stock__lte=models.F('reorder_point')
-        ).select_related('category', 'brand')
+            track_inventory=True,
+        )
+        if wh_ids is not None and not wh_ids:
+            products = Product.objects.none()
+        elif wh_ids is not None:
+            wh_filter = Q(stocks__warehouse_id__in=wh_ids)
+            products = products_qs.annotate(
+                total_stock=Sum('stocks__quantity', filter=wh_filter)
+            ).filter(total_stock__lte=F('reorder_point')).select_related('category', 'brand')
+        else:
+            products = products_qs.annotate(
+                total_stock=Sum('stocks__quantity')
+            ).filter(total_stock__lte=F('reorder_point')).select_related('category', 'brand')
         
         page = self.paginate_queryset(products)
         if page is not None:
@@ -335,40 +382,42 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
 
     @action(detail=False, methods=['get'], url_path='search-barcode')
     def search_barcode(self, request):
-        """Recherche un produit par code-barres."""
+        """Recherche un produit par code-barres (respecte le scope warehouse du membership)."""
         barcode = request.query_params.get('barcode', None)
         if not barcode:
             return Response(
                 {'error': 'Le paramètre barcode est requis'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
-        organization = self.get_organization()
-        
-        # Chercher dans les produits
-        product = Product.objects.filter(
-            organization=organization,
-            barcode=barcode,
-            is_deleted=False
-        ).select_related('category', 'brand', 'unit').first()
-        
+
+        # Chercher dans les produits via get_queryset() pour appliquer le scope warehouse
+        product = (
+            self.get_queryset()
+            .filter(barcode=barcode)
+            .select_related('category', 'brand', 'unit')
+            .first()
+        )
+
         if product:
-            serializer = ProductDetailSerializer(product)
+            serializer = ProductDetailSerializer(product, context=self.get_serializer_context())
             return Response(serializer.data)
-        
-        # Chercher dans les variantes
+
+        # Chercher dans les variantes ; vérifier que le produit parent est accessible
+        organization = self.get_organization()
         variant = ProductVariant.objects.filter(
             organization=organization,
             barcode=barcode,
             is_deleted=False
         ).select_related('product').first()
-        
+
         if variant:
-            serializer = ProductDetailSerializer(variant.product)
-            data = serializer.data
-            data['selected_variant'] = ProductVariantSerializer(variant).data
-            return Response(data)
-        
+            parent = self.get_queryset().filter(id=variant.product_id).first()
+            if parent:
+                serializer = ProductDetailSerializer(parent, context=self.get_serializer_context())
+                data = serializer.data
+                data['selected_variant'] = ProductVariantSerializer(variant).data
+                return Response(data)
+
         return Response(
             {'error': 'Produit non trouvé'},
             status=status.HTTP_404_NOT_FOUND
@@ -588,7 +637,3 @@ class PriceListViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         'partial_update': 'products.edit',
         'destroy': 'products.delete',
     }
-
-
-# Import manquant pour l'annotation
-from django.db import models

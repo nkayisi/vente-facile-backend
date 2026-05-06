@@ -11,6 +11,7 @@ from .models import (
     SaleReturn, SaleReturnItem, Quotation, QuotationItem
 )
 from .sale_validation import max_sale_discount_percent
+from apps.core.warehouse_scope import accessible_warehouse_ids, get_membership_for_request
 
 
 # =============================================================================
@@ -374,7 +375,23 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         # Vérifier si des produits sont bloqués par un inventaire en cours
         from apps.inventory.models import InventorySession
         product_ids = [item['product'].id for item in items]
-        locked_product_ids = InventorySession.get_all_locked_product_ids(org)
+        request = self.context.get('request')
+        wh_filter = None
+        if warehouse:
+            wh_filter = [warehouse.pk]
+        elif request:
+            m = get_membership_for_request(request)
+            if m:
+                scoped = accessible_warehouse_ids(m)
+                if scoped is not None:
+                    wh_filter = scoped
+
+        if wh_filter is not None and len(wh_filter) == 0:
+            locked_product_ids = set()
+        else:
+            locked_product_ids = InventorySession.get_all_locked_product_ids(
+                org, warehouse_ids=wh_filter
+            )
         
         blocked_products = []
         for item in items:
@@ -383,7 +400,9 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         
         if blocked_products:
             # Récupérer les sessions qui bloquent ces produits
-            locking_sessions = InventorySession.get_locking_sessions_for_products(org, product_ids)
+            locking_sessions = InventorySession.get_locking_sessions_for_products(
+                org, product_ids, warehouse_ids=wh_filter
+            )
             session_refs = [s.reference for s in locking_sessions]
             raise serializers.ValidationError({
                 'items': f"Les produits suivants sont bloqués par un inventaire en cours ({', '.join(session_refs)}): {', '.join(blocked_products)}. "
@@ -888,7 +907,21 @@ class SaleReturnCreateSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({
                     'items': f"Quantité de retour supérieure à la quantité vendue pour {original_item.product.name}"
                 })
-        
+
+        # Vérifier le périmètre entrepôt sur la vente d'origine
+        original_sale = data.get('original_sale')
+        request = self.context.get('request')
+        if request and original_sale is not None:
+            m = get_membership_for_request(request)
+            if m:
+                allowed_ids = accessible_warehouse_ids(m)
+                if allowed_ids is not None:
+                    sale_wh_id = original_sale.warehouse_id
+                    if sale_wh_id is not None and sale_wh_id not in allowed_ids:
+                        raise serializers.ValidationError({
+                            'original_sale': "Cette vente n'est pas dans votre périmètre d'entrepôts."
+                        })
+
         return data
 
     def create(self, validated_data):

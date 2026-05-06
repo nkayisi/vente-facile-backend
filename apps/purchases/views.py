@@ -10,7 +10,16 @@ from django.db.models import Sum
 from django.utils import timezone
 from decimal import Decimal
 
-from apps.core.api_mixins import TenantViewSetMixin, AuditMixin
+from apps.core.api_mixins import (
+    TenantViewSetMixin,
+    AuditMixin,
+    WarehouseScopedQuerysetMixin,
+    WarehouseAssertCreateMixin,
+)
+from apps.core.warehouse_scope import (
+    accessible_warehouse_ids,
+    get_membership_for_request,
+)
 from apps.core.api_permissions import (
     IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission
 )
@@ -30,7 +39,13 @@ from .serializers import (
 # PURCHASE ORDER VIEWSET
 # =============================================================================
 
-class PurchaseOrderViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
+class PurchaseOrderViewSet(
+    WarehouseScopedQuerysetMixin,
+    WarehouseAssertCreateMixin,
+    TenantViewSetMixin,
+    AuditMixin,
+    viewsets.ModelViewSet,
+):
     """
     ViewSet pour la gestion des commandes d'achat.
     
@@ -55,6 +70,12 @@ class PurchaseOrderViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
     
     select_related_fields = ['supplier', 'warehouse', 'created_by', 'approved_by']
     prefetch_related_fields = ['items', 'items__product']
+
+    # PO peut avoir un ``warehouse`` nullable (legacy/brouillons).
+    warehouse_scope_field = 'warehouse_id'
+    warehouse_scope_include_null = True
+    warehouse_write_required = False
+    warehouse_write_allow_none = True
     
     action_permissions = {
         'list': 'purchases.view',
@@ -148,6 +169,16 @@ class PurchaseOrderViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
             status__in=['sent', 'confirmed', 'partially_received'],
             is_deleted=False
         ).select_related('supplier').order_by('expected_date')
+
+        # Restreindre au périmètre du membre
+        membership = get_membership_for_request(request)
+        if membership:
+            allowed_ids = accessible_warehouse_ids(membership)
+            if allowed_ids is not None:
+                from django.db.models import Q
+                pos = pos.filter(
+                    Q(warehouse_id__in=allowed_ids) | Q(warehouse__isnull=True)
+                )
         
         page = self.paginate_queryset(pos)
         if page is not None:
@@ -162,7 +193,13 @@ class PurchaseOrderViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
 # GOODS RECEIPT VIEWSET
 # =============================================================================
 
-class GoodsReceiptViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
+class GoodsReceiptViewSet(
+    WarehouseScopedQuerysetMixin,
+    WarehouseAssertCreateMixin,
+    TenantViewSetMixin,
+    AuditMixin,
+    viewsets.ModelViewSet,
+):
     """
     ViewSet pour la gestion des réceptions de marchandises.
     
@@ -183,6 +220,9 @@ class GoodsReceiptViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet)
     
     select_related_fields = ['purchase_order', 'warehouse', 'received_by']
     prefetch_related_fields = ['items', 'items__product']
+
+    # GoodsReceipt.warehouse est obligatoire en base (NOT NULL).
+    warehouse_scope_field = 'warehouse_id'
     
     action_permissions = {
         'list': 'purchases.view',
@@ -307,7 +347,12 @@ class GoodsReceiptViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet)
 # SUPPLIER PAYMENT VIEWSET
 # =============================================================================
 
-class SupplierPaymentViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
+class SupplierPaymentViewSet(
+    WarehouseScopedQuerysetMixin,
+    TenantViewSetMixin,
+    AuditMixin,
+    viewsets.ModelViewSet,
+):
     """
     ViewSet pour la gestion des paiements fournisseurs.
     
@@ -327,6 +372,12 @@ class SupplierPaymentViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewS
     
     select_related_fields = ['supplier', 'payment_method', 'created_by']
     prefetch_related_fields = ['allocations', 'allocations__purchase_order']
+
+    # Filtre par l'entrepôt de la PO la plus liée (au moins une allocation).
+    # ``include_null=True`` car certains paiements peuvent être créés sans
+    # allocation (rare mais possible).
+    warehouse_scope_field = 'allocations__purchase_order__warehouse_id'
+    warehouse_scope_include_null = True
     
     action_permissions = {
         'list': 'purchases.view',
@@ -334,6 +385,9 @@ class SupplierPaymentViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewS
         'create': 'purchases.edit',
         'cancel': 'purchases.edit',
     }
+
+    def get_queryset(self):
+        return super().get_queryset().distinct()
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -397,7 +451,13 @@ class SupplierPaymentViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewS
 # PURCHASE RETURN VIEWSET
 # =============================================================================
 
-class PurchaseReturnViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
+class PurchaseReturnViewSet(
+    WarehouseScopedQuerysetMixin,
+    WarehouseAssertCreateMixin,
+    TenantViewSetMixin,
+    AuditMixin,
+    viewsets.ModelViewSet,
+):
     """
     ViewSet pour la gestion des retours fournisseurs.
     
@@ -419,6 +479,9 @@ class PurchaseReturnViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSe
     
     select_related_fields = ['supplier', 'purchase_order', 'warehouse', 'created_by']
     prefetch_related_fields = ['items', 'items__product']
+
+    # PurchaseReturn.warehouse est obligatoire en base.
+    warehouse_scope_field = 'warehouse_id'
     
     action_permissions = {
         'list': 'purchases.view',

@@ -157,13 +157,13 @@ class HasPermission(permissions.BasePermission):
             return True
         
         from apps.core.services import PermissionService
-        role_perms = PermissionService.get_role_permissions(membership.role)
+        effective_perms = PermissionService.get_effective_permissions(membership)
         
         # Supporte une permission unique ou une liste
         if isinstance(required_perm, (list, tuple)):
-            return any(p in role_perms for p in required_perm)
+            return any(p in effective_perms for p in required_perm)
         
-        return required_perm in role_perms
+        return required_perm in effective_perms
 
 
 class RoleBasedPermission(permissions.BasePermission):
@@ -221,9 +221,9 @@ def require_permission(*perms):
                 )
             
             from apps.core.services import PermissionService
-            role_perms = PermissionService.get_role_permissions(membership.role)
+            effective_perms = PermissionService.get_effective_permissions(membership)
             
-            if not any(p in role_perms for p in perms):
+            if not any(p in effective_perms for p in perms):
                 return Response(
                     {'detail': "Vous n'avez pas la permission d'effectuer cette action."},
                     status=http_status.HTTP_403_FORBIDDEN

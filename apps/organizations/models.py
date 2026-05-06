@@ -130,6 +130,12 @@ class OrganizationMembership(TimeStampedModel, UUIDModel):
     )
     joined_at = models.DateTimeField(auto_now_add=True)
 
+    extra_permissions = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Permissions additionnelles accordées à cet utilisateur en plus de celles de son rôle."
+    )
+
     class Meta:
         db_table = 'organization_memberships'
         unique_together = ['user', 'organization']
@@ -153,6 +159,42 @@ class OrganizationMembership(TimeStampedModel, UUIDModel):
     def is_above(self, other_membership):
         """Vérifie si ce membre est hiérarchiquement au-dessus d'un autre."""
         return self.role_level > other_membership.role_level
+
+    assigned_warehouses = models.ManyToManyField(
+        'inventory.Warehouse',
+        through='MembershipWarehouse',
+        related_name='organization_memberships_m2m',
+        blank=True,
+    )
+
+
+class MembershipWarehouse(TimeStampedModel, UUIDModel):
+    """
+    Entrepôt(s) accessibles pour un membership (hors owner : périmètre « tous » sans lignes).
+    """
+
+    membership = models.ForeignKey(
+        OrganizationMembership,
+        on_delete=models.CASCADE,
+        related_name='warehouse_assignments',
+    )
+    warehouse = models.ForeignKey(
+        'inventory.Warehouse',
+        on_delete=models.PROTECT,
+        related_name='membership_assignments',
+    )
+
+    class Meta:
+        db_table = 'membership_warehouses'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['membership', 'warehouse'],
+                name='uniq_membership_warehouse',
+            ),
+        ]
+
+    def __str__(self):
+        return f'{self.membership_id} → {self.warehouse_id}'
 
 
 class Branch(TimeStampedModel, UUIDModel, SoftDeleteModel):

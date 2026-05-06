@@ -72,10 +72,10 @@ class TenantViewSetMixin:
         """
         organization = self.get_organization()
         instance = serializer.save(organization=organization)
-        
+
         # Attribuer les permissions guardian
         self._assign_guardian_permissions(instance)
-        
+
         return instance
 
     def perform_update(self, serializer):
@@ -102,9 +102,89 @@ class TenantViewSetMixin:
             f'change_{model_name}',
             f'delete_{model_name}',
         ]
-        
+
         for perm in permissions:
             assign_perm(perm, self.request.user, instance)
+
+
+class WarehouseScopedQuerysetMixin:
+    """
+    Restreint le queryset aux entrepôts assignés au membership (non-owner).
+
+    - ``warehouse_scope_field`` : champ direct ou relation Django pour filtrer
+      (ex. ``warehouse_id``, ``id``, ``register__warehouse_id``,
+      ``original_sale__warehouse_id``).
+    - ``warehouse_scope_include_null`` : si ``True``, les lignes avec la
+      relation à ``NULL`` restent visibles (utile pour les mouvements de
+      caisse non rattachés à une vente).
+    """
+
+    warehouse_scope_field = 'warehouse_id'
+    warehouse_scope_include_null = False
+
+    def _filter_queryset_by_membership_warehouses(self, queryset):
+        from apps.core.warehouse_scope import (
+            get_membership_for_request,
+            filter_queryset_by_related_warehouse,
+        )
+
+        membership = get_membership_for_request(self.request)
+        if not membership:
+            return queryset
+        field = getattr(self, 'warehouse_scope_field', 'warehouse_id')
+        include_null = getattr(self, 'warehouse_scope_include_null', False)
+        return filter_queryset_by_related_warehouse(
+            queryset, membership, field, include_null=include_null
+        )
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        return self._filter_queryset_by_membership_warehouses(queryset)
+
+
+class WarehouseAssertCreateMixin:
+    """
+    Vérifie automatiquement que le ``warehouse`` envoyé en création/mise à jour
+    est dans le périmètre du membership courant.
+
+    - ``warehouse_write_field`` : nom du champ ``warehouse`` dans
+      ``serializer.validated_data`` (par défaut ``'warehouse'``).
+    - ``warehouse_write_required`` : si ``False``, ``None`` est toléré pour
+      les rôles non-owner uniquement quand ``warehouse_write_allow_none``
+      est ``True`` aussi.
+    - ``warehouse_write_allow_none`` : autorise un warehouse ``None`` si la
+      logique métier le permet.
+    """
+
+    warehouse_write_field = 'warehouse'
+    warehouse_write_required = True
+    warehouse_write_allow_none = False
+
+    def _assert_warehouse_on_save(self, serializer):
+        from apps.core.warehouse_scope import assert_warehouse_allowed_for_request
+
+        field = getattr(self, 'warehouse_write_field', 'warehouse')
+        wh = serializer.validated_data.get(field)
+        if wh is None and not getattr(self, 'warehouse_write_required', True):
+            return
+        wh_id = getattr(wh, 'id', None) if wh is not None else None
+        assert_warehouse_allowed_for_request(
+            self.request,
+            wh_id,
+            allow_none=getattr(self, 'warehouse_write_allow_none', False),
+        )
+
+    def perform_create(self, serializer):
+        self._assert_warehouse_on_save(serializer)
+        return super().perform_create(serializer)
+
+    def perform_update(self, serializer):
+        if (
+            getattr(self, 'warehouse_write_field', 'warehouse')
+            in serializer.validated_data
+        ):
+            self._assert_warehouse_on_save(serializer)
+        return super().perform_update(serializer)
 
 
 class BulkActionMixin:

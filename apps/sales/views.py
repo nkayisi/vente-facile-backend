@@ -10,7 +10,17 @@ from django.db.models import Sum, Count, F
 from django.utils import timezone
 from decimal import Decimal
 
-from apps.core.api_mixins import TenantViewSetMixin, AuditMixin
+from apps.core.api_mixins import (
+    TenantViewSetMixin,
+    AuditMixin,
+    WarehouseScopedQuerysetMixin,
+    WarehouseAssertCreateMixin,
+)
+from apps.core.warehouse_scope import (
+    accessible_warehouse_ids,
+    assert_warehouse_allowed_for_request,
+    get_membership_for_request,
+)
 from apps.core.api_permissions import (
     IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission
 )
@@ -33,7 +43,13 @@ from .serializers import (
 # REGISTER VIEWSET
 # =============================================================================
 
-class RegisterViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
+class RegisterViewSet(
+    WarehouseScopedQuerysetMixin,
+    WarehouseAssertCreateMixin,
+    TenantViewSetMixin,
+    AuditMixin,
+    viewsets.ModelViewSet,
+):
     """
     ViewSet pour la gestion des caisses.
     
@@ -54,6 +70,13 @@ class RegisterViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     ordering = ['name']
     
     select_related_fields = ['branch', 'warehouse']
+
+    # Le champ ``warehouse`` du Register est nullable : on tolère ``None``
+    # pour les owners et on requiert un entrepôt assigné sinon.
+    warehouse_scope_field = 'warehouse_id'
+    warehouse_scope_include_null = True
+    warehouse_write_required = False
+    warehouse_write_allow_none = True
     
     action_permissions = {
         'list': 'sales.view',
@@ -69,7 +92,11 @@ class RegisterViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
 # REGISTER SESSION VIEWSET
 # =============================================================================
 
-class RegisterSessionViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
+class RegisterSessionViewSet(
+    WarehouseScopedQuerysetMixin,
+    TenantViewSetMixin,
+    viewsets.ModelViewSet,
+):
     """
     ViewSet pour la gestion des sessions de caisse.
     
@@ -88,6 +115,13 @@ class RegisterSessionViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     ordering = ['-opened_at']
     
     select_related_fields = ['register', 'opened_by', 'closed_by']
+
+    # Filtre par l'entrepôt du Register associé. On tolère ``None`` pour les
+    # registres legacy sans entrepôt (visibles uniquement si owner ; sinon
+    # ``include_null=True`` les laisse aux non-owner également afin de ne pas
+    # casser le POS existant).
+    warehouse_scope_field = 'register__warehouse_id'
+    warehouse_scope_include_null = True
     
     action_permissions = {
         'list': 'sales.view',
@@ -130,6 +164,17 @@ class RegisterSessionViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
                 {'error': 'Caisse non trouvée ou inactive'},
                 status=status.HTTP_404_NOT_FOUND
             )
+
+        # Vérifier que la caisse est dans le périmètre du membre
+        membership = get_membership_for_request(request)
+        if membership:
+            allowed_ids = accessible_warehouse_ids(membership)
+            if allowed_ids is not None:
+                if register.warehouse_id is None or register.warehouse_id not in allowed_ids:
+                    return Response(
+                        {'error': "Cette caisse n'est pas dans votre périmètre d'entrepôts."},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
         
         # Vérifier qu'il n'y a pas de session ouverte
         existing_session = RegisterSession.objects.filter(
@@ -251,7 +296,12 @@ class PaymentMethodViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
 # SALE VIEWSET
 # =============================================================================
 
-class SaleViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
+class SaleViewSet(
+    WarehouseScopedQuerysetMixin,
+    TenantViewSetMixin,
+    AuditMixin,
+    viewsets.ModelViewSet,
+):
     """
     ViewSet pour la gestion des ventes (POS).
     
@@ -275,6 +325,11 @@ class SaleViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     
     select_related_fields = ['customer', 'register', 'warehouse', 'sold_by', 'session']
     prefetch_related_fields = ['items', 'items__product', 'payments']
+
+    # Filtre direct par ``warehouse_id`` ; les ventes legacy sans entrepôt
+    # restent visibles aux non-owner pour ne pas masquer l'historique.
+    warehouse_scope_field = 'warehouse_id'
+    warehouse_scope_include_null = True
     
     action_permissions = {
         'list': 'sales.view',
@@ -302,8 +357,12 @@ class SaleViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         """Créer une vente et retourner le détail complet (avec reference, id, etc.)."""
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        # Le serializer expose ``warehouse`` ; on revalide le périmètre ici
+        # pour bloquer toute tentative de soumettre un entrepôt non autorisé.
+        wh = serializer.validated_data.get('warehouse')
+        wh_id = getattr(wh, 'id', None) if wh is not None else None
+        assert_warehouse_allowed_for_request(request, wh_id, allow_none=True)
         sale = serializer.save()
-        # Recharger avec les relations pour SaleDetailSerializer
         sale.refresh_from_db()
         detail_serializer = SaleDetailSerializer(sale)
         return Response(detail_serializer.data, status=status.HTTP_201_CREATED)
@@ -725,7 +784,12 @@ class SaleViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
 # SALE RETURN VIEWSET
 # =============================================================================
 
-class SaleReturnViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
+class SaleReturnViewSet(
+    WarehouseScopedQuerysetMixin,
+    TenantViewSetMixin,
+    AuditMixin,
+    viewsets.ModelViewSet,
+):
     """
     ViewSet pour la gestion des retours de vente.
     
@@ -746,6 +810,9 @@ class SaleReturnViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     
     select_related_fields = ['original_sale', 'created_by', 'approved_by']
     prefetch_related_fields = ['items', 'items__original_item__product']
+
+    warehouse_scope_field = 'original_sale__warehouse_id'
+    warehouse_scope_include_null = True
     
     action_permissions = {
         'list': 'sale_returns.view',
@@ -931,13 +998,42 @@ class QuotationViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Récupérer l'entrepôt par défaut si disponible
+        # Récupérer l'entrepôt cible : prioriser l'entrepôt envoyé,
+        # sinon le premier entrepôt assigné au membre, sinon le défaut.
         from apps.inventory.models import Warehouse
-        warehouse = Warehouse.objects.filter(
-            organization=quotation.organization,
-            is_default=True,
-            is_active=True
-        ).first()
+
+        membership = get_membership_for_request(request)
+        allowed_ids = accessible_warehouse_ids(membership) if membership else None
+
+        warehouse = None
+        explicit_wh = request.data.get('warehouse') if hasattr(request, 'data') else None
+        if explicit_wh:
+            assert_warehouse_allowed_for_request(request, explicit_wh)
+            warehouse = Warehouse.objects.filter(
+                id=explicit_wh,
+                organization=quotation.organization,
+                is_active=True,
+                is_deleted=False,
+            ).first()
+
+        if warehouse is None:
+            base_qs = Warehouse.objects.filter(
+                organization=quotation.organization,
+                is_active=True,
+                is_deleted=False,
+            )
+            if allowed_ids is not None:
+                base_qs = base_qs.filter(id__in=allowed_ids)
+            warehouse = (
+                base_qs.filter(is_default=True).first()
+                or base_qs.first()
+            )
+
+        if warehouse is None and allowed_ids is not None:
+            return Response(
+                {'error': "Aucun entrepôt accessible pour convertir ce devis."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         
         # Vérifier le stock si un entrepôt est disponible
         if warehouse:

@@ -109,6 +109,15 @@ class Expense(TenantModel):
         related_name='expenses'
     )
 
+    warehouse = models.ForeignKey(
+        'inventory.Warehouse',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='expenses',
+        help_text="Entrepôt rattaché à la dépense (filtrage par périmètre membre)"
+    )
+
     description = models.CharField(max_length=500)
     amount = models.DecimalField(
         max_digits=15,

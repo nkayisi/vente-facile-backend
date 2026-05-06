@@ -110,11 +110,15 @@ class ExpenseListSerializer(serializers.ModelSerializer):
     payment_method_name = serializers.CharField(
         source='payment_method.name', read_only=True, default=None
     )
+    warehouse_name = serializers.CharField(
+        source='warehouse.name', read_only=True, default=None
+    )
 
     class Meta:
         model = Expense
         fields = [
             'id', 'reference', 'category', 'category_name', 'category_color',
+            'warehouse', 'warehouse_name',
             'description', 'amount', 'status', 'beneficiary',
             'payment_method', 'payment_method_name', 'payment_reference',
             'expense_date', 'due_date', 'paid_date',
@@ -140,7 +144,7 @@ class ExpenseCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Expense
         fields = [
-            'category', 'description', 'amount', 'beneficiary',
+            'category', 'warehouse', 'description', 'amount', 'beneficiary',
             'payment_method', 'payment_reference',
             'expense_date', 'due_date',
             'is_recurring', 'recurrence_period',
@@ -163,12 +167,16 @@ class ExpenseDetailSerializer(serializers.ModelSerializer):
     payment_method_name = serializers.CharField(
         source='payment_method.name', read_only=True, default=None
     )
+    warehouse_name = serializers.CharField(
+        source='warehouse.name', read_only=True, default=None
+    )
     cash_movements = serializers.SerializerMethodField()
 
     class Meta:
         model = Expense
         fields = [
             'id', 'reference', 'category', 'category_name', 'category_color',
+            'warehouse', 'warehouse_name',
             'description', 'amount', 'status', 'beneficiary',
             'payment_method', 'payment_method_name', 'payment_reference',
             'expense_date', 'due_date', 'paid_date',
@@ -200,7 +208,7 @@ class ExpenseUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Expense
         fields = [
-            'category', 'description', 'amount', 'beneficiary',
+            'category', 'warehouse', 'description', 'amount', 'beneficiary',
             'payment_method', 'payment_reference',
             'expense_date', 'due_date',
             'is_recurring', 'recurrence_period',

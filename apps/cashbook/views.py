@@ -11,7 +11,16 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
 
-from apps.core.api_mixins import TenantViewSetMixin, AuditMixin
+from apps.core.api_mixins import (
+    TenantViewSetMixin,
+    AuditMixin,
+    WarehouseScopedQuerysetMixin,
+    WarehouseAssertCreateMixin,
+)
+from apps.core.warehouse_scope import (
+    accessible_warehouse_ids,
+    get_membership_for_request,
+)
 from apps.core.api_permissions import IsTenantMember, HasPermission
 
 from .models import IncomeCategory, ExpenseCategory, Expense, CashMovement
@@ -131,7 +140,13 @@ class ExpenseCategoryViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
 # EXPENSE VIEWSET
 # =============================================================================
 
-class ExpenseViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
+class ExpenseViewSet(
+    WarehouseScopedQuerysetMixin,
+    WarehouseAssertCreateMixin,
+    TenantViewSetMixin,
+    AuditMixin,
+    viewsets.ModelViewSet,
+):
     """
     CRUD pour les dépenses + actions d'approbation et de paiement.
     
@@ -147,12 +162,19 @@ class ExpenseViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     queryset = Expense.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['status', 'category', 'is_recurring']
+    filterset_fields = ['status', 'category', 'is_recurring', 'warehouse']
     search_fields = ['reference', 'description', 'beneficiary', 'notes']
     ordering_fields = ['expense_date', 'amount', 'created_at']
     ordering = ['-expense_date']
 
-    select_related_fields = ['category', 'payment_method', 'created_by', 'approved_by']
+    select_related_fields = ['category', 'warehouse', 'payment_method', 'created_by', 'approved_by']
+
+    # Le champ ``warehouse`` est nullable (les dépenses globales restent
+    # tolérées), mais filtrées par le périmètre membre quand renseigné.
+    warehouse_scope_field = 'warehouse_id'
+    warehouse_scope_include_null = True
+    warehouse_write_required = False
+    warehouse_write_allow_none = True
 
     action_permissions = {
         'list': 'cashbook.view',
@@ -192,6 +214,8 @@ class ExpenseViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         return queryset
 
     def perform_create(self, serializer):
+        # Vérifie le périmètre warehouse avant de générer la référence.
+        self._assert_warehouse_on_save(serializer)
         from apps.core.utils import ReferenceGenerator
         organization = self.get_organization()
         reference = ReferenceGenerator.generate_expense_reference(organization)
@@ -206,6 +230,8 @@ class ExpenseViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         if expense.status not in ['draft', 'pending']:
             from rest_framework.exceptions import ValidationError
             raise ValidationError("Seules les dépenses en brouillon ou en attente peuvent être modifiées.")
+        if 'warehouse' in serializer.validated_data:
+            self._assert_warehouse_on_save(serializer)
         serializer.save()
 
     @action(detail=True, methods=['post'])
@@ -326,6 +352,15 @@ class ExpenseViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
             status__in=['approved', 'paid']
         )
 
+        # Restreindre au périmètre du membre (None pour owner = pas de filtre)
+        membership = get_membership_for_request(request)
+        if membership:
+            allowed_ids = accessible_warehouse_ids(membership)
+            if allowed_ids is not None:
+                queryset = queryset.filter(
+                    Q(warehouse_id__in=allowed_ids) | Q(warehouse__isnull=True)
+                )
+
         # Filtres de date
         date_from = request.query_params.get('date_from')
         date_to = request.query_params.get('date_to')
@@ -403,6 +438,14 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     Les mouvements liés aux ventes et dépenses sont créés automatiquement.
     Ce ViewSet permet aussi de créer des mouvements manuels
     (apports de fonds, retraits, ajustements, etc.).
+
+    Filtrage par entrepôt : un mouvement est visible si
+    - le membre est ``owner``, OU
+    - la vente liée appartient au périmètre du membre, OU
+    - la dépense liée appartient au périmètre du membre, OU
+    - aucune vente/dépense n'est liée (mouvements généraux : apports, retraits,
+      ajustements). Cette tolérance est nécessaire car ces mouvements ne sont
+      pas rattachés à un entrepôt spécifique.
     """
 
     queryset = CashMovement.objects.all()
@@ -443,8 +486,32 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             return CashMovementCreateSerializer
         return CashMovementDetailSerializer
 
+    def _scope_cash_movements_to_membership(self, queryset):
+        """Restreint un queryset CashMovement au périmètre du membre courant."""
+        membership = get_membership_for_request(self.request)
+        if not membership:
+            return queryset
+        allowed_ids = accessible_warehouse_ids(membership)
+        if allowed_ids is None:
+            return queryset
+        if not allowed_ids:
+            # Tolère les mouvements sans vente/dépense (général)
+            return queryset.filter(
+                sale__isnull=True,
+                expense__isnull=True,
+            )
+        return queryset.filter(
+            Q(sale__warehouse_id__in=allowed_ids)
+            | Q(expense__warehouse_id__in=allowed_ids)
+            | Q(sale__isnull=True, expense__isnull=True)
+            | Q(sale__warehouse__isnull=True, expense__isnull=True)
+            | Q(sale__isnull=True, expense__warehouse__isnull=True)
+        )
+
     def get_queryset(self):
         queryset = super().get_queryset()
+
+        queryset = self._scope_cash_movements_to_membership(queryset)
 
         # Filtres de date
         date_from = self.request.query_params.get('date_from')
@@ -507,20 +574,17 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         """Solde actuel de la caisse."""
         organization = self.get_organization()
 
-        last_movement = CashMovement.objects.filter(
-            organization=organization,
-            is_cancelled=False,
-        ).order_by('-movement_date', '-created_at').first()
+        scoped_qs = self._scope_cash_movements_to_membership(
+            CashMovement.objects.filter(organization=organization, is_cancelled=False)
+        )
+
+        last_movement = scoped_qs.order_by('-movement_date', '-created_at').first()
 
         balance = last_movement.balance_after if last_movement else Decimal('0.00')
 
         # Totaux du jour
         today = timezone.now().date()
-        today_movements = CashMovement.objects.filter(
-            organization=organization,
-            is_cancelled=False,
-            movement_date__date=today,
-        )
+        today_movements = scoped_qs.filter(movement_date__date=today)
 
         today_in = today_movements.filter(direction='in').aggregate(
             total=Sum('amount', default=Decimal('0.00'))
@@ -540,9 +604,8 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     def summary(self, request):
         """Résumé des mouvements avec totaux par type et direction."""
         organization = self.get_organization()
-        queryset = CashMovement.objects.filter(
-            organization=organization,
-            is_cancelled=False,
+        queryset = self._scope_cash_movements_to_membership(
+            CashMovement.objects.filter(organization=organization, is_cancelled=False)
         )
 
         # Filtres de date
@@ -590,18 +653,18 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         organization = self.get_organization()
         date_str = request.query_params.get('date', timezone.now().date().isoformat())
 
-        movements = CashMovement.objects.filter(
-            organization=organization,
-            is_cancelled=False,
+        base_qs = self._scope_cash_movements_to_membership(
+            CashMovement.objects.filter(organization=organization, is_cancelled=False)
+        )
+
+        movements = base_qs.filter(
             movement_date__date=date_str,
         ).select_related(
             'payment_method', 'sale', 'expense', 'customer', 'supplier', 'created_by'
         ).order_by('movement_date')
 
         # Solde d'ouverture (dernier mouvement avant cette date)
-        opening_movement = CashMovement.objects.filter(
-            organization=organization,
-            is_cancelled=False,
+        opening_movement = base_qs.filter(
             movement_date__date__lt=date_str,
         ).order_by('-movement_date', '-created_at').first()
 
@@ -658,9 +721,10 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         year = int(request.query_params.get('year', timezone.now().year))
         month = int(request.query_params.get('month', timezone.now().month))
 
-        movements = CashMovement.objects.filter(
-            organization=organization,
-            is_cancelled=False,
+        base_qs = self._scope_cash_movements_to_membership(
+            CashMovement.objects.filter(organization=organization, is_cancelled=False)
+        )
+        movements = base_qs.filter(
             movement_date__year=year,
             movement_date__month=month,
         )
@@ -703,9 +767,7 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         # Solde d'ouverture du mois
         import datetime
         first_day = datetime.date(year, month, 1)
-        opening_movement = CashMovement.objects.filter(
-            organization=organization,
-            is_cancelled=False,
+        opening_movement = base_qs.filter(
             movement_date__date__lt=first_day,
         ).order_by('-movement_date', '-created_at').first()
 
@@ -732,11 +794,10 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         organization = self.get_organization()
         year = int(request.query_params.get('year', timezone.now().year))
 
-        movements = CashMovement.objects.filter(
-            organization=organization,
-            is_cancelled=False,
-            movement_date__year=year,
+        base_qs = self._scope_cash_movements_to_membership(
+            CashMovement.objects.filter(organization=organization, is_cancelled=False)
         )
+        movements = base_qs.filter(movement_date__year=year)
 
         # Totaux globaux de l'année
         totals = movements.aggregate(
@@ -776,9 +837,7 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         # Solde d'ouverture de l'année
         import datetime
         first_day = datetime.date(year, 1, 1)
-        opening_movement = CashMovement.objects.filter(
-            organization=organization,
-            is_cancelled=False,
+        opening_movement = base_qs.filter(
             movement_date__date__lt=first_day,
         ).order_by('-movement_date', '-created_at').first()
 
@@ -811,9 +870,10 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        movements = CashMovement.objects.filter(
-            organization=organization,
-            is_cancelled=False,
+        base_qs = self._scope_cash_movements_to_membership(
+            CashMovement.objects.filter(organization=organization, is_cancelled=False)
+        )
+        movements = base_qs.filter(
             movement_date__date__gte=date_from,
             movement_date__date__lte=date_to,
         )
@@ -854,9 +914,7 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         ).order_by('-total')
 
         # Solde d'ouverture
-        opening_movement = CashMovement.objects.filter(
-            organization=organization,
-            is_cancelled=False,
+        opening_movement = base_qs.filter(
             movement_date__date__lt=date_from,
         ).order_by('-movement_date', '-created_at').first()
 

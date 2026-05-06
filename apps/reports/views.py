@@ -24,6 +24,10 @@ from decimal import Decimal
 from apps.core.mixins import TenantQuerysetMixin
 from apps.core.api_mixins import ActionPaginationMixin
 from apps.core.api_permissions import IsTenantMember, HasActiveSubscription, HasPermission
+from apps.core.warehouse_scope import (
+    accessible_warehouse_ids,
+    get_membership_for_request,
+)
 from apps.sales.models import Sale, SaleItem, Payment
 from apps.sales.profit_allocation import allocated_line_ht_revenues_for_sale, effective_unit_cost
 from apps.products.models import Product
@@ -127,6 +131,104 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         'product_profits': 'reports.view',
     }
     
+    def _accessible_warehouse_ids(self, request):
+        """Renvoie ``None`` (owner = tout) ou la liste des UUID autorisés.
+
+        Utilisé pour scoper toutes les statistiques au périmètre du membre.
+        """
+        membership = get_membership_for_request(request)
+        if not membership:
+            return None
+        return accessible_warehouse_ids(membership)
+
+    def _scope_sales(self, qs, request):
+        """Applique le filtre warehouse aux ventes."""
+        wh_ids = self._accessible_warehouse_ids(request)
+        if wh_ids is None:
+            return qs
+        if not wh_ids:
+            return qs.filter(warehouse__isnull=True)
+        return qs.filter(Q(warehouse_id__in=wh_ids) | Q(warehouse__isnull=True))
+
+    def _scope_sale_items(self, qs, request):
+        """Applique le filtre warehouse aux items de vente via ``sale``."""
+        wh_ids = self._accessible_warehouse_ids(request)
+        if wh_ids is None:
+            return qs
+        if not wh_ids:
+            return qs.filter(sale__warehouse__isnull=True)
+        return qs.filter(
+            Q(sale__warehouse_id__in=wh_ids) | Q(sale__warehouse__isnull=True)
+        )
+
+    def _scope_payments(self, qs, request):
+        """Applique le filtre warehouse aux paiements via ``sale``."""
+        wh_ids = self._accessible_warehouse_ids(request)
+        if wh_ids is None:
+            return qs
+        if not wh_ids:
+            return qs.filter(sale__warehouse__isnull=True)
+        return qs.filter(
+            Q(sale__warehouse_id__in=wh_ids) | Q(sale__warehouse__isnull=True)
+        )
+
+    def _scope_cash_movements(self, qs, request):
+        """Applique le filtre warehouse aux mouvements de caisse.
+
+        Tolère les mouvements sans vente/dépense liée (apports, retraits) afin
+        de ne pas masquer les opérations générales aux non-owner.
+        """
+        wh_ids = self._accessible_warehouse_ids(request)
+        if wh_ids is None:
+            return qs
+        if not wh_ids:
+            return qs.filter(sale__isnull=True, expense__isnull=True)
+        return qs.filter(
+            Q(sale__warehouse_id__in=wh_ids)
+            | Q(expense__warehouse_id__in=wh_ids)
+            | Q(sale__isnull=True, expense__isnull=True)
+            | Q(sale__warehouse__isnull=True, expense__isnull=True)
+            | Q(sale__isnull=True, expense__warehouse__isnull=True)
+        )
+
+    def _scope_expenses(self, qs, request):
+        """Applique le filtre warehouse aux dépenses (warehouse nullable toléré)."""
+        wh_ids = self._accessible_warehouse_ids(request)
+        if wh_ids is None:
+            return qs
+        if not wh_ids:
+            return qs.filter(warehouse__isnull=True)
+        return qs.filter(
+            Q(warehouse_id__in=wh_ids) | Q(warehouse__isnull=True)
+        )
+
+    def _scope_stocks(self, qs, request):
+        """Applique le filtre warehouse aux stocks (warehouse strict)."""
+        wh_ids = self._accessible_warehouse_ids(request)
+        if wh_ids is None:
+            return qs
+        if not wh_ids:
+            return qs.none()
+        return qs.filter(warehouse_id__in=wh_ids)
+
+    def _scope_stock_batches(self, qs, request):
+        """Applique le filtre warehouse aux lots de stock (warehouse strict)."""
+        wh_ids = self._accessible_warehouse_ids(request)
+        if wh_ids is None:
+            return qs
+        if not wh_ids:
+            return qs.none()
+        return qs.filter(warehouse_id__in=wh_ids)
+
+    def _scope_stock_movements(self, qs, request):
+        """Applique le filtre warehouse aux mouvements de stock."""
+        wh_ids = self._accessible_warehouse_ids(request)
+        if wh_ids is None:
+            return qs
+        if not wh_ids:
+            return qs.none()
+        return qs.filter(warehouse_id__in=wh_ids)
+
     def _parse_date_range(self, request):
         """Parse les paramètres de période"""
         period = request.query_params.get('period', 'month')
@@ -172,16 +274,9 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         org = self.get_organization()
         start_date, end_date, prev_start, prev_end = self._parse_date_range(request)
         
-        # Statistiques des ventes
-        sales_stats = self._get_sales_stats(org, start_date, end_date, prev_start, prev_end)
-        
-        # Statistiques du stock
-        stock_stats = self._get_stock_stats(org)
-        
-        # Statistiques de la caisse
-        cashbook_stats = self._get_cashbook_stats(org, start_date, end_date)
-        
-        # Statistiques des clients
+        sales_stats = self._get_sales_stats(org, start_date, end_date, prev_start, prev_end, request=request)
+        stock_stats = self._get_stock_stats(org, request=request)
+        cashbook_stats = self._get_cashbook_stats(org, start_date, end_date, request=request)
         customer_stats = self._get_customer_stats(org, start_date, end_date)
         
         data = {
@@ -200,7 +295,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         org = self.get_organization()
         start_date, end_date, prev_start, prev_end = self._parse_date_range(request)
         
-        stats = self._get_sales_stats(org, start_date, end_date, prev_start, prev_end)
+        stats = self._get_sales_stats(org, start_date, end_date, prev_start, prev_end, request=request)
         serializer = SalesStatsSerializer(stats)
         return Response(serializer.data)
     
@@ -213,11 +308,14 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         page = int(request.query_params.get('page', 1))
         page_size = int(request.query_params.get('page_size', 20))
         
-        sales = Sale.objects.filter(
-            organization=org,
-            sale_date__date__gte=start_date,
-            sale_date__date__lte=end_date,
-            status__in=['completed', 'partially_paid']
+        sales = self._scope_sales(
+            Sale.objects.filter(
+                organization=org,
+                sale_date__date__gte=start_date,
+                sale_date__date__lte=end_date,
+                status__in=['completed', 'partially_paid']
+            ),
+            request,
         )
         
         if group_by == 'week':
@@ -267,11 +365,14 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         page = int(request.query_params.get('page', 1))
         page_size = int(request.query_params.get('page_size', 20))
         
-        items = SaleItem.objects.filter(
-            sale__organization=org,
-            sale__sale_date__date__gte=start_date,
-            sale__sale_date__date__lte=end_date,
-            sale__status__in=['completed', 'partially_paid']
+        items = self._scope_sale_items(
+            SaleItem.objects.filter(
+                sale__organization=org,
+                sale__sale_date__date__gte=start_date,
+                sale__sale_date__date__lte=end_date,
+                sale__status__in=['completed', 'partially_paid']
+            ),
+            request,
         ).select_related('product__category')
         
         data = items.values(
@@ -320,10 +421,13 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         page = int(request.query_params.get('page', 1))
         page_size = int(request.query_params.get('page_size', 20))
         
-        payments = Payment.objects.filter(
-            sale__organization=org,
-            paid_at__date__gte=start_date,
-            paid_at__date__lte=end_date
+        payments = self._scope_payments(
+            Payment.objects.filter(
+                sale__organization=org,
+                paid_at__date__gte=start_date,
+                paid_at__date__lte=end_date
+            ),
+            request,
         ).select_related('payment_method')
         
         data = payments.values(
@@ -370,11 +474,14 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         page = int(request.query_params.get('page', 1))
         page_size = int(request.query_params.get('page_size', 20))
         
-        items = SaleItem.objects.filter(
-            sale__organization=org,
-            sale__sale_date__date__gte=start_date,
-            sale__sale_date__date__lte=end_date,
-            sale__status__in=['completed', 'partially_paid']
+        items = self._scope_sale_items(
+            SaleItem.objects.filter(
+                sale__organization=org,
+                sale__sale_date__date__gte=start_date,
+                sale__sale_date__date__lte=end_date,
+                sale__status__in=['completed', 'partially_paid']
+            ),
+            request,
         ).select_related('product')
         
         data = items.values(
@@ -420,12 +527,15 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         page = int(request.query_params.get('page', 1))
         page_size = int(request.query_params.get('page_size', 20))
         
-        sales = Sale.objects.filter(
-            organization=org,
-            sale_date__date__gte=start_date,
-            sale_date__date__lte=end_date,
-            status__in=['completed', 'partially_paid'],
-            customer__isnull=False
+        sales = self._scope_sales(
+            Sale.objects.filter(
+                organization=org,
+                sale_date__date__gte=start_date,
+                sale_date__date__lte=end_date,
+                status__in=['completed', 'partially_paid'],
+                customer__isnull=False
+            ),
+            request,
         ).select_related('customer')
         
         data = sales.values(
@@ -466,7 +576,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
     def stock(self, request):
         """Statistiques du stock"""
         org = self.get_organization()
-        stats = self._get_stock_stats(org)
+        stats = self._get_stock_stats(org, request=request)
         serializer = StockStatsSerializer(stats)
         return Response(serializer.data)
     
@@ -475,7 +585,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         """Statistiques de la caisse"""
         org = self.get_organization()
         start_date, end_date, _, _ = self._parse_date_range(request)
-        stats = self._get_cashbook_stats(org, start_date, end_date)
+        stats = self._get_cashbook_stats(org, start_date, end_date, request=request)
         serializer = CashbookStatsSerializer(stats)
         return Response(serializer.data)
     
@@ -488,10 +598,13 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         page = int(request.query_params.get('page', 1))
         page_size = int(request.query_params.get('page_size', 20))
         
-        movements = CashMovement.objects.filter(
-            organization=org,
-            movement_date__date__gte=start_date,
-            movement_date__date__lte=end_date
+        movements = self._scope_cash_movements(
+            CashMovement.objects.filter(
+                organization=org,
+                movement_date__date__gte=start_date,
+                movement_date__date__lte=end_date
+            ),
+            request,
         )
         
         if group_by == 'week':
@@ -553,13 +666,15 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
     # HELPER METHODS
     # ========================================================================
     
-    def _get_sales_stats(self, org, start_date, end_date, prev_start, prev_end):
-        """Calcule les statistiques des ventes"""
+    def _get_sales_stats(self, org, start_date, end_date, prev_start, prev_end, request=None):
+        """Calcule les statistiques des ventes (filtrées par périmètre warehouse)."""
         sales = Sale.objects.filter(
             organization=org,
             sale_date__date__gte=start_date,
             sale_date__date__lte=end_date
         )
+        if request is not None:
+            sales = self._scope_sales(sales, request)
         
         completed_sales = sales.filter(status__in=['completed', 'partially_paid'])
         
@@ -586,6 +701,8 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             sale_date__date__lte=prev_end,
             status__in=['completed', 'partially_paid']
         )
+        if request is not None:
+            prev_sales = self._scope_sales(prev_sales, request)
         
         prev_total = prev_sales.aggregate(
             total=Coalesce(Sum('total'), Decimal('0'), output_field=DecimalField())
@@ -614,15 +731,24 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             'orders_growth': orders_growth,
         }
     
-    def _get_stock_stats(self, org):
-        """Calcule les statistiques du stock"""
+    def _get_stock_stats(self, org, request=None):
+        """Calcule les statistiques du stock (filtrées par périmètre warehouse)."""
         products = Product.objects.filter(organization=org, is_active=True)
-        total_products = products.count()
         
         stocks = Stock.objects.filter(
             organization=org,
             product__is_active=True
         )
+        if request is not None:
+            stocks = self._scope_stocks(stocks, request)
+        
+        # ``total_products`` doit refléter ce qui est visible : on compte les
+        # produits qui ont au moins une position de stock dans le périmètre.
+        if request is not None and self._accessible_warehouse_ids(request) is not None:
+            scoped_product_ids = stocks.values_list('product_id', flat=True).distinct()
+            total_products = products.filter(id__in=scoped_product_ids).count()
+        else:
+            total_products = products.count()
         
         # Valeur totale du stock
         total_value = Decimal('0')
@@ -641,12 +767,15 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         
         # Lots expirant bientôt (30 jours)
         expiring_date = timezone.now().date() + timedelta(days=30)
-        expiring_count = StockBatch.objects.filter(
+        batches = StockBatch.objects.filter(
             organization=org,
             expiry_date__lte=expiring_date,
             expiry_date__gte=timezone.now().date(),
             quantity__gt=0
-        ).count()
+        )
+        if request is not None:
+            batches = self._scope_stock_batches(batches, request)
+        expiring_count = batches.count()
         
         return {
             'total_products': total_products,
@@ -656,31 +785,37 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             'expiring_soon_count': expiring_count,
         }
     
-    def _get_cashbook_stats(self, org, start_date, end_date):
-        """Calcule les statistiques de la caisse"""
+    def _get_cashbook_stats(self, org, start_date, end_date, request=None):
+        """Calcule les statistiques de la caisse (filtrées par périmètre warehouse)."""
         movements = CashMovement.objects.filter(
             organization=org,
             movement_date__date__gte=start_date,
             movement_date__date__lte=end_date
         )
+        if request is not None:
+            movements = self._scope_cash_movements(movements, request)
         
         totals = movements.aggregate(
             income=Coalesce(Sum('amount', filter=Q(direction='in')), Decimal('0'), output_field=DecimalField()),
             expenses=Coalesce(Sum('amount', filter=Q(direction='out')), Decimal('0'), output_field=DecimalField())
         )
         
-        # Solde actuel (dernier mouvement)
-        last_movement = CashMovement.objects.filter(
-            organization=org
-        ).order_by('-movement_date', '-created_at').first()
+        # Solde actuel (dernier mouvement scopé au périmètre)
+        last_movement_qs = CashMovement.objects.filter(organization=org)
+        if request is not None:
+            last_movement_qs = self._scope_cash_movements(last_movement_qs, request)
+        last_movement = last_movement_qs.order_by('-movement_date', '-created_at').first()
         
         current_balance = last_movement.balance_after if last_movement else Decimal('0')
         
         # Dépenses en attente
-        pending_expenses = Expense.objects.filter(
+        pending_expenses_qs = Expense.objects.filter(
             organization=org,
             status__in=['draft', 'pending', 'approved']
-        ).count()
+        )
+        if request is not None:
+            pending_expenses_qs = self._scope_expenses(pending_expenses_qs, request)
+        pending_expenses = pending_expenses_qs.count()
         
         return {
             'current_balance': current_balance,
@@ -737,15 +872,21 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             report_date = timezone.now().date()
         
         # Mouvements du jour
-        movements = CashMovement.objects.filter(
-            organization=org,
-            movement_date__date=report_date
+        movements = self._scope_cash_movements(
+            CashMovement.objects.filter(
+                organization=org,
+                movement_date__date=report_date
+            ),
+            request,
         ).order_by('movement_date')
         
         # Solde d'ouverture (dernier mouvement avant ce jour)
-        prev_movement = CashMovement.objects.filter(
-            organization=org,
-            movement_date__date__lt=report_date
+        prev_movement = self._scope_cash_movements(
+            CashMovement.objects.filter(
+                organization=org,
+                movement_date__date__lt=report_date
+            ),
+            request,
         ).order_by('-movement_date', '-created_at').first()
         
         opening_balance = prev_movement.balance_after if prev_movement else Decimal('0')
@@ -755,19 +896,25 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         closing_balance = last_movement.balance_after if last_movement else opening_balance
         
         # Ventes du jour
-        sales = Sale.objects.filter(
-            organization=org,
-            sale_date__date=report_date,
-            status__in=['completed', 'partially_paid']
+        sales = self._scope_sales(
+            Sale.objects.filter(
+                organization=org,
+                sale_date__date=report_date,
+                status__in=['completed', 'partially_paid']
+            ),
+            request,
         )
         
         total_sales = sales.aggregate(total=Coalesce(Sum('total'), Decimal('0'), output_field=DecimalField()))['total']
         total_sales_count = sales.count()
         
         # Paiements par type
-        payments = Payment.objects.filter(
-            sale__organization=org,
-            paid_at__date=report_date
+        payments = self._scope_payments(
+            Payment.objects.filter(
+                sale__organization=org,
+                paid_at__date=report_date
+            ),
+            request,
         ).select_related('payment_method')
         
         cash_sales = Decimal('0')
@@ -865,11 +1012,14 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         start_date, end_date, _, _ = self._parse_date_range(request)
         
         # Ventes complétées
-        sales = Sale.objects.filter(
-            organization=org,
-            sale_date__date__gte=start_date,
-            sale_date__date__lte=end_date,
-            status__in=['completed', 'partially_paid']
+        sales = self._scope_sales(
+            Sale.objects.filter(
+                organization=org,
+                sale_date__date__gte=start_date,
+                sale_date__date__lte=end_date,
+                status__in=['completed', 'partially_paid']
+            ),
+            request,
         )
         
         # CA HT net (toutes remises), cohérent avec sale.total = subtotal - discount_amount + tax
@@ -902,11 +1052,14 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         gross_margin = (gross_profit / total_revenue * 100) if total_revenue > 0 else Decimal('0')
         
         # Dépenses de la période
-        expenses = Expense.objects.filter(
-            organization=org,
-            expense_date__gte=start_date,
-            expense_date__lte=end_date,
-            status='paid'
+        expenses = self._scope_expenses(
+            Expense.objects.filter(
+                organization=org,
+                expense_date__gte=start_date,
+                expense_date__lte=end_date,
+                status='paid'
+            ),
+            request,
         ).aggregate(total=Coalesce(Sum('amount'), Decimal('0'), output_field=DecimalField()))['total']
         
         # Bénéfice net
@@ -934,11 +1087,14 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         page = int(request.query_params.get('page', 1))
         page_size = int(request.query_params.get('page_size', 20))
         
-        sale_items = SaleItem.objects.filter(
-            sale__organization=org,
-            sale__sale_date__date__gte=start_date,
-            sale__sale_date__date__lte=end_date,
-            sale__status__in=['completed', 'partially_paid']
+        sale_items = self._scope_sale_items(
+            SaleItem.objects.filter(
+                sale__organization=org,
+                sale__sale_date__date__gte=start_date,
+                sale__sale_date__date__lte=end_date,
+                sale__status__in=['completed', 'partially_paid']
+            ),
+            request,
         ).select_related('product', 'sale').order_by('sale_id', 'id')
 
         sale_ids = list(sale_items.values_list('sale_id', flat=True).distinct())
@@ -1018,9 +1174,12 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         page = int(request.query_params.get('page', 1))
         page_size = int(request.query_params.get('page_size', 20))
         
-        stocks = Stock.objects.filter(
-            organization=org,
-            product__is_active=True
+        stocks = self._scope_stocks(
+            Stock.objects.filter(
+                organization=org,
+                product__is_active=True
+            ),
+            request,
         ).select_related('product', 'product__category')
         
         result = []
@@ -1089,10 +1248,13 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         
         from apps.inventory.models import StockMovement
         
-        movements = StockMovement.objects.filter(
-            organization=org,
-            created_at__date__gte=start_date,
-            created_at__date__lte=end_date
+        movements = self._scope_stock_movements(
+            StockMovement.objects.filter(
+                organization=org,
+                created_at__date__gte=start_date,
+                created_at__date__lte=end_date
+            ),
+            request,
         )
         
         # Agrégation par type
@@ -1142,11 +1304,14 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         from apps.inventory.models import StockMovement
         
         # Récupérer les mouvements d'entrée (approvisionnements) par produit
-        supplies = StockMovement.objects.filter(
-            organization=org,
-            created_at__date__gte=start_date,
-            created_at__date__lte=end_date,
-            movement_type__in=['purchase', 'initial', 'transfer_in', 'adjustment_in', 'return_in']
+        supplies = self._scope_stock_movements(
+            StockMovement.objects.filter(
+                organization=org,
+                created_at__date__gte=start_date,
+                created_at__date__lte=end_date,
+                movement_type__in=['purchase', 'initial', 'transfer_in', 'adjustment_in', 'return_in']
+            ),
+            request,
         ).values('product_id').annotate(
             total_supply=Sum('quantity')
         )
