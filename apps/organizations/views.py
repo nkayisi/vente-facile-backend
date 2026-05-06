@@ -16,6 +16,8 @@ from apps.core.api_permissions import (
     HasActiveSubscription, HasPermission, _get_membership
 )
 from apps.core.services import OrganizationService, PermissionService
+from apps.subscriptions.services import SubscriptionService
+from rest_framework.exceptions import ValidationError
 from .models import Organization, OrganizationMembership, Branch, OrganizationInvitation
 from .serializers import (
     OrganizationListSerializer, OrganizationDetailSerializer,
@@ -482,14 +484,11 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # TODO: Réactiver la vérification des limites d'abonnement
-        # from apps.core.services import SubscriptionService
-        # if not SubscriptionService.can_add_user(organization):
-        #     return Response(
-        #         {'detail': "Limite d'utilisateurs atteinte pour votre abonnement."},
-        #         status=status.HTTP_400_BAD_REQUEST
-        #     )
-        
+        try:
+            SubscriptionService.assert_can_add_user(organization)
+        except ValidationError as e:
+            return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
+
         # Chercher l'utilisateur
         from apps.users.models import User
         user = User.objects.filter(email=email).first()
@@ -556,14 +555,11 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # TODO: Réactiver la vérification des limites d'abonnement
-        # from apps.core.services import SubscriptionService
-        # if not SubscriptionService.can_add_user(organization):
-        #     return Response(
-        #         {'detail': "Limite d'utilisateurs atteinte pour votre abonnement."},
-        #         status=status.HTTP_400_BAD_REQUEST
-        #     )
-        
+        try:
+            SubscriptionService.assert_can_add_user(organization)
+        except ValidationError as e:
+            return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
+
         # Créer l'utilisateur
         from apps.users.models import User
         from django.db import transaction
@@ -727,14 +723,7 @@ class BranchViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     def perform_create(self, serializer):
         """Vérifie les limites d'abonnement avant création."""
         organization = self.get_organization()
-        
-        from apps.core.services import SubscriptionService
-        if not SubscriptionService.can_add_branch(organization):
-            from rest_framework.exceptions import PermissionDenied
-            raise PermissionDenied(
-                'Limite de branches atteinte pour votre abonnement'
-            )
-        
+        SubscriptionService.assert_can_add_branch(organization)
         serializer.save(organization=organization)
 
 
@@ -812,6 +801,11 @@ class OrganizationInvitationViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
                 {'error': 'Une invitation est déjà en cours pour cet email'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+        try:
+            SubscriptionService.assert_can_add_user(organization)
+        except ValidationError as e:
+            return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
         
         invitation = OrganizationInvitation.objects.create(
             organization=organization,

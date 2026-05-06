@@ -7,6 +7,9 @@ from decimal import Decimal
 from django.db import transaction
 from django.utils import timezone
 
+from rest_framework.exceptions import ValidationError
+
+from apps.organizations.models import Organization, OrganizationInvitation
 from apps.settings.models import Currency
 
 from .models import Plan, Subscription, SubscriptionPayment, Invoice, InvoiceItem, GlobalConfig
@@ -107,6 +110,273 @@ class SubscriptionService:
         return status['is_blocked']
 
     # ------------------------------------------------------------------ #
+    # Quotas, paliers, checkout
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _subscription_for_quotas(organization):
+        """
+        Abonnement utilisable pour les plafonds (inclut past_due / période de grâce).
+        Exclut les statuts expirés / annulés seuls.
+        """
+        return (
+            organization.subscriptions.filter(
+                status__in=[
+                    Subscription.Status.TRIAL,
+                    Subscription.Status.ACTIVE,
+                    Subscription.Status.PAST_DUE,
+                ]
+            )
+            .select_related('plan')
+            .order_by('-created_at')
+            .first()
+        )
+
+    @staticmethod
+    def get_quota_snapshot(organization):
+        """Comptages + plafonds + drapeaux UI (renouvellement / upgrade)."""
+        from apps.inventory.models import Warehouse
+        from apps.products.models import Product
+
+        now = timezone.now()
+        users = organization.memberships.filter(is_active=True).count()
+        branches = organization.branches.filter(is_active=True).count()
+        products = Product.objects.filter(organization=organization, is_deleted=False).count()
+        warehouses = Warehouse.objects.filter(organization=organization, is_deleted=False).count()
+        pending_invites = organization.invitations.filter(
+            status=OrganizationInvitation.Status.PENDING
+        ).count()
+
+        sub = SubscriptionService._subscription_for_quotas(organization)
+        if not sub:
+            return {
+                'has_plan': False,
+                'users': {'current': users, 'limit': None, 'pending_invitations': pending_invites},
+                'branches': {'current': branches, 'limit': None},
+                'warehouses': {'current': warehouses, 'limit': None},
+                'products': {'current': products, 'limit': None},
+                'plan_tier': None,
+                'current_plan_id': None,
+                'subscription_floor_tier': organization.subscription_floor_tier,
+                'period_end': None,
+                'period_not_ended': False,
+                'can_renew_same_plan': True,
+                'can_upgrade': False,
+            }
+
+        plan = sub.plan
+        period_not_ended = bool(
+            sub.current_period_end and now < sub.current_period_end
+        )
+
+        return {
+            'has_plan': True,
+            'users': {
+                'current': users,
+                'limit': plan.max_users,
+                'pending_invitations': pending_invites,
+            },
+            'branches': {'current': branches, 'limit': plan.max_branches},
+            'warehouses': {'current': warehouses, 'limit': plan.max_warehouses},
+            'products': {
+                'current': products,
+                'limit': plan.max_products,
+            },
+            'plan_tier': plan.tier,
+            'current_plan_id': str(plan.id),
+            'subscription_floor_tier': organization.subscription_floor_tier,
+            'period_end': sub.current_period_end.isoformat() if sub.current_period_end else None,
+            'period_not_ended': period_not_ended,
+            'can_renew_same_plan': not period_not_ended,
+            'can_upgrade': period_not_ended,
+        }
+
+    @staticmethod
+    def assert_can_add_user(organization, extra_active_members: int = 1):
+        """Lève ValidationError si la limite utilisateurs serait dépassée."""
+        if extra_active_members < 1:
+            return
+        sub = SubscriptionService._subscription_for_quotas(organization)
+        if not sub:
+            raise ValidationError(
+                {
+                    'code': 'SUBSCRIPTION_NONE',
+                    'message': "Aucun abonnement actif : impossible d'ajouter des membres.",
+                }
+            )
+        current = organization.memberships.filter(is_active=True).count()
+        pending = organization.invitations.filter(
+            status=OrganizationInvitation.Status.PENDING
+        ).count()
+        if current + pending + extra_active_members > sub.plan.max_users:
+            raise ValidationError(
+                {
+                    'code': 'SUBSCRIPTION_USER_LIMIT',
+                    'message': f"Limite d'utilisateurs atteinte ({sub.plan.max_users} compte(s) "
+                    f"et invitation(s) en attente maximum pour votre formule).",
+                    'limit': sub.plan.max_users,
+                    'current': current,
+                    'pending_invitations': pending,
+                }
+            )
+
+    @staticmethod
+    def assert_can_add_branch(organization):
+        sub = SubscriptionService._subscription_for_quotas(organization)
+        if not sub:
+            raise ValidationError(
+                {
+                    'code': 'SUBSCRIPTION_NONE',
+                    'message': "Aucun abonnement actif : impossible d'ajouter une succursale.",
+                }
+            )
+        if not sub.can_add_branch():
+            n = organization.branches.filter(is_active=True).count()
+            raise ValidationError(
+                {
+                    'code': 'SUBSCRIPTION_BRANCH_LIMIT',
+                    'message': f"Limite de succursales atteinte ({sub.plan.max_branches}) pour votre abonnement.",
+                    'limit': sub.plan.max_branches,
+                    'current': n,
+                }
+            )
+
+    @staticmethod
+    def assert_can_add_warehouse(organization):
+        sub = SubscriptionService._subscription_for_quotas(organization)
+        if not sub:
+            raise ValidationError(
+                {
+                    'code': 'SUBSCRIPTION_NONE',
+                    'message': "Aucun abonnement actif : impossible d'ajouter un entrepôt.",
+                }
+            )
+        if not sub.can_add_warehouse():
+            from apps.inventory.models import Warehouse
+
+            n = Warehouse.objects.filter(organization=organization, is_deleted=False).count()
+            cap = sub.plan.max_warehouses
+            raise ValidationError(
+                {
+                    'code': 'SUBSCRIPTION_WAREHOUSE_LIMIT',
+                    'message': (
+                        f"Limite d'entrepôts atteinte ({cap}) pour votre abonnement."
+                    ),
+                    'limit': cap,
+                    'current': n,
+                }
+            )
+
+    @staticmethod
+    def assert_can_add_products(organization, count: int = 1):
+        if count < 1:
+            return
+        sub = SubscriptionService._subscription_for_quotas(organization)
+        if not sub:
+            raise ValidationError(
+                {
+                    'code': 'SUBSCRIPTION_NONE',
+                    'message': "Aucun abonnement actif : impossible d'ajouter des produits.",
+                }
+            )
+        if not sub.can_add_products(count):
+            from apps.products.models import Product
+
+            n = Product.objects.filter(organization=organization, is_deleted=False).count()
+            cap = sub.plan.max_products
+            raise ValidationError(
+                {
+                    'code': 'SUBSCRIPTION_PRODUCT_LIMIT',
+                    'message': f"Limite de produits atteinte ({cap}) pour votre abonnement.",
+                    'limit': cap,
+                    'current': n,
+                    'requested': count,
+                }
+            )
+
+    @staticmethod
+    def evaluate_checkout(organization, target_plan: Plan) -> dict:
+        """
+        Règles : anti-downgrade (palier min), pas de renouvellement anticipé du même plan,
+        upgrade (tier strictement supérieur) autorisé pendant la période payée.
+        """
+        now = timezone.now()
+
+        if target_plan.tier < organization.subscription_floor_tier:
+            return {
+                'allowed': False,
+                'reason_code': 'SUBSCRIPTION_DOWNGRADE_FORBIDDEN',
+                'message': (
+                    f"Vous avez déjà bénéficié d'un plan de palier "
+                    f"{organization.subscription_floor_tier} ou supérieur. "
+                    "Un retour à une offre inférieure n'est pas autorisé."
+                ),
+            }
+
+        sub = SubscriptionService._subscription_for_quotas(organization)
+        if not sub:
+            return {'allowed': True, 'reason_code': None, 'message': None}
+
+        period_end = sub.current_period_end
+        if period_end and now < period_end:
+            if target_plan.id == sub.plan.id:
+                return {
+                    'allowed': False,
+                    'reason_code': 'SUBSCRIPTION_EARLY_RENEW_FORBIDDEN',
+                    'message': (
+                        "Renouvellement impossible avant la fin de la période en cours. "
+                        "Vous pourrez prolonger ou renouveler une fois la période expirée."
+                    ),
+                }
+            if target_plan.tier <= sub.plan.tier:
+                return {
+                    'allowed': False,
+                    'reason_code': 'SUBSCRIPTION_UPGRADE_REQUIRED',
+                    'message': (
+                        "Pendant la période en cours, seul un plan à palier "
+                        "strictement supérieur est disponible (upgrade)."
+                    ),
+                }
+
+        return {'allowed': True, 'reason_code': None, 'message': None}
+
+    @staticmethod
+    def require_checkout_allowed(organization, plan: Plan):
+        r = SubscriptionService.evaluate_checkout(organization, plan)
+        if not r['allowed']:
+            raise ValidationError(
+                {
+                    'code': r['reason_code'],
+                    'message': r['message'],
+                }
+            )
+
+    @staticmethod
+    def can_add_user(organization) -> bool:
+        """Retour booléen (ex. admin). Inclut invitations en attente. Ne lève pas."""
+        try:
+            SubscriptionService.assert_can_add_user(organization, 1)
+            return True
+        except ValidationError:
+            return False
+
+    @staticmethod
+    def can_add_branch(organization) -> bool:
+        try:
+            SubscriptionService.assert_can_add_branch(organization)
+            return True
+        except ValidationError:
+            return False
+
+    @staticmethod
+    def can_add_warehouse(organization) -> bool:
+        try:
+            SubscriptionService.assert_can_add_warehouse(organization)
+            return True
+        except ValidationError:
+            return False
+
+    # ------------------------------------------------------------------ #
     # Création d'abonnement trial
     # ------------------------------------------------------------------ #
 
@@ -137,10 +407,12 @@ class SubscriptionService:
                 currency=default_currency,
                 max_users=3,
                 max_branches=1,
+                max_warehouses=1,
                 max_products=100,
                 max_monthly_transactions=500,
                 storage_limit_mb=100,
                 trial_days=trial_days,
+                tier=1,
                 is_active=True
             )
 
@@ -224,6 +496,12 @@ class SubscriptionService:
             }
         )
 
+        organization.refresh_from_db()
+        organization.subscription_floor_tier = max(
+            organization.subscription_floor_tier, plan.tier
+        )
+        organization.save(update_fields=['subscription_floor_tier'])
+
         return subscription
 
     # ------------------------------------------------------------------ #
@@ -238,6 +516,8 @@ class SubscriptionService:
         Traite un paiement et active l'abonnement.
         Utilisé pour les paiements en ligne ou manuels.
         """
+        SubscriptionService.require_checkout_allowed(organization, plan)
+
         # Activer l'abonnement
         subscription = SubscriptionService.activate_subscription(
             organization=organization,
@@ -304,6 +584,8 @@ class SubscriptionService:
 
         plan = Plan.objects.get(id=plan_id, is_active=True)
         notes = (metadata.get('notes') or '') + (extra_notes or '')
+
+        SubscriptionService.require_checkout_allowed(pending_payment.organization, plan)
 
         subscription = SubscriptionService.activate_subscription(
             organization=pending_payment.organization,

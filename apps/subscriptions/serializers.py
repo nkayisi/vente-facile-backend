@@ -31,9 +31,9 @@ class PublicPlanSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'code', 'description',
             'price_monthly', 'price_yearly', 'currency',
-            'max_users', 'max_branches', 'max_products',
+            'max_users', 'max_branches', 'max_warehouses', 'max_products',
             'max_monthly_transactions', 'storage_limit_mb',
-            'is_featured', 'trial_days', 'sort_order',
+            'is_featured', 'trial_days', 'sort_order', 'tier',
             'plan_features',
         ]
 
@@ -47,10 +47,10 @@ class PlanSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'code', 'description',
             'price_monthly', 'price_yearly', 'currency',
-            'max_users', 'max_branches', 'max_products',
+            'max_users', 'max_branches', 'max_warehouses', 'max_products',
             'max_monthly_transactions', 'storage_limit_mb',
             'features', 'is_active', 'is_featured',
-            'trial_days', 'sort_order',
+            'trial_days', 'sort_order', 'tier',
             'plan_features',
         ]
 

@@ -9,6 +9,9 @@ from typing import Dict, List, Tuple, Optional, Any
 
 from django.db import transaction
 from django.utils.text import slugify
+from rest_framework.exceptions import ValidationError
+
+from apps.subscriptions.services import SubscriptionService
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, Protection
 from openpyxl.utils import get_column_letter
@@ -521,6 +524,20 @@ class ProductExcelService:
         
         # Créer les produits en transaction
         if products_to_create:
+            try:
+                SubscriptionService.assert_can_add_products(
+                    organization, len(products_to_create)
+                )
+            except ValidationError as e:
+                return {
+                    "success": False,
+                    "error": e.detail,
+                    "created": 0,
+                    "updated": 0,
+                    "skipped": results["skipped"],
+                    "errors": results["errors"],
+                }
+
             try:
                 with transaction.atomic():
                     for product_data in products_to_create:

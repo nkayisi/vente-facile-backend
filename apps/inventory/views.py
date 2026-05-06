@@ -16,6 +16,7 @@ from apps.core.api_mixins import TenantViewSetMixin, AuditMixin
 from apps.core.api_permissions import (
     IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission
 )
+from apps.subscriptions.services import SubscriptionService
 from .models import (
     Warehouse, StockLocation, Stock, StockBatch, StockMovement,
     StockTransfer, StockTransferItem, StockAdjustment, StockAdjustmentItem,
@@ -77,6 +78,11 @@ class WarehouseViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         elif self.action in ['create', 'update', 'partial_update']:
             return WarehouseCreateSerializer
         return WarehouseDetailSerializer
+
+    def perform_create(self, serializer):
+        organization = self.get_organization()
+        SubscriptionService.assert_can_add_warehouse(organization)
+        return super().perform_create(serializer)
 
     @action(detail=True, methods=['get'], url_path='stock-summary')
     def stock_summary(self, request, pk=None):

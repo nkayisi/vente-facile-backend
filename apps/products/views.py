@@ -15,6 +15,7 @@ from apps.core.api_mixins import TenantViewSetMixin, BulkActionMixin, AuditMixin
 from apps.core.api_permissions import (
     IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission
 )
+from apps.subscriptions.services import SubscriptionService
 from .models import Category, Brand, Unit, Product, ProductImage, ProductVariant, PriceList, ProductPrice
 from .serializers import (
     CategoryListSerializer, CategoryDetailSerializer, CategoryCreateSerializer,
@@ -275,6 +276,16 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
             )
         
         return queryset
+
+    def perform_create(self, serializer):
+        organization = self.get_organization()
+        SubscriptionService.assert_can_add_products(organization, 1)
+        extra_kwargs = {}
+        if hasattr(serializer.Meta.model, "created_by"):
+            extra_kwargs["created_by"] = self.request.user
+        instance = serializer.save(organization=organization, **extra_kwargs)
+        self._assign_guardian_permissions(instance)
+        return instance
 
     @action(detail=True, methods=['get'])
     def stock(self, request, pk=None):

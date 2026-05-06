@@ -39,9 +39,6 @@ SYNCABLE_MODELS_MAP = {
 
 # Tables that are read-only on mobile (can only be pulled, not pushed)
 READ_ONLY_TABLES = {
-    'categories',
-    'brands', 
-    'units',
     'warehouses',
     'payment_methods',
 }

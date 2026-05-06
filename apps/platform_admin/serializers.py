@@ -162,10 +162,10 @@ class AdminPlanSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'code', 'description',
             'price_monthly', 'price_yearly', 'currency',
-            'max_users', 'max_branches', 'max_products',
+            'max_users', 'max_branches', 'max_warehouses', 'max_products',
             'max_monthly_transactions', 'storage_limit_mb',
             'features', 'is_active', 'is_featured',
-            'trial_days', 'sort_order',
+            'trial_days', 'sort_order', 'tier',
             'plan_features', 'subscribers_count',
             'created_at', 'updated_at',
         ]
@@ -188,10 +188,10 @@ class AdminPlanCreateUpdateSerializer(serializers.ModelSerializer):
         fields = [
             'name', 'code', 'description',
             'price_monthly', 'price_yearly', 'currency',
-            'max_users', 'max_branches', 'max_products',
+            'max_users', 'max_branches', 'max_warehouses', 'max_products',
             'max_monthly_transactions', 'storage_limit_mb',
             'features', 'is_active', 'is_featured',
-            'trial_days', 'sort_order',
+            'trial_days', 'sort_order', 'tier',
         ]
 
     def validate(self, attrs):

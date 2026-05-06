@@ -317,6 +317,10 @@ class SyncPushService:
         elif table_name == 'stock_movements':
             self._handle_stock_movement_create(model, create_data, data)
         else:
+            if table_name == 'products':
+                from apps.subscriptions.services import SubscriptionService
+
+                SubscriptionService.assert_can_add_products(self.organization, 1)
             model.objects.create(**create_data)
         
         self.stats['created'] += 1

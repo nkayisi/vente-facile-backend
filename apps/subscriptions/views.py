@@ -7,6 +7,7 @@ from decimal import Decimal
 
 from django.conf import settings
 from rest_framework import viewsets, status
+from rest_framework.exceptions import ValidationError
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
@@ -156,6 +157,8 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
         else:
             data['subscription'] = None
             data['plan'] = None
+
+        data['quotas'] = SubscriptionService.get_quota_snapshot(organization)
 
         return Response(data)
 
@@ -347,6 +350,10 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
         data = ser.validated_data
 
         plan = Plan.objects.get(id=data['plan_id'], is_active=True)
+        try:
+            SubscriptionService.require_checkout_allowed(organization, plan)
+        except ValidationError as e:
+            return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
         amount_dec = _subscription_checkout_amount(plan, data['billing_cycle'])
         if amount_dec <= 0:
             return Response(

@@ -39,6 +39,10 @@ class Plan(TimeStampedModel, UUIDModel):
     
     max_users = models.PositiveIntegerField(default=1)
     max_branches = models.PositiveIntegerField(default=1)
+    max_warehouses = models.PositiveIntegerField(
+        default=1,
+        help_text="Nombre maximal d'entrepôts (non supprimés) par organisation.",
+    )
     max_products = models.PositiveIntegerField(null=True, blank=True)
     max_monthly_transactions = models.PositiveIntegerField(null=True, blank=True)
     
@@ -52,6 +56,9 @@ class Plan(TimeStampedModel, UUIDModel):
     trial_days = models.PositiveIntegerField(default=0)
     
     sort_order = models.PositiveIntegerField(default=0)
+
+    #: Palier pour upgrade/downgrade (plus grand = offre plus riche). Anti-downgrade via Organization.subscription_floor_tier.
+    tier = models.PositiveIntegerField(default=1)
 
     class Meta:
         db_table = 'plans'
@@ -180,6 +187,28 @@ class Subscription(TimeStampedModel, UUIDModel):
     def can_add_branch(self):
         current_branches = self.organization.branches.filter(is_active=True).count()
         return current_branches < self.plan.max_branches
+
+    def can_add_warehouse(self) -> bool:
+        from apps.inventory.models import Warehouse
+
+        cap = self.plan.max_warehouses
+        n = Warehouse.objects.filter(organization=self.organization, is_deleted=False).count()
+        return n < cap
+
+    def can_add_products(self, count: int = 1) -> bool:
+        """True si on peut créer encore `count` produits (hors soft-delete)."""
+        if count < 1:
+            return True
+        max_p = self.plan.max_products
+        if max_p is None:
+            return True
+        from apps.products.models import Product
+
+        products_count = Product.objects.filter(
+            organization=self.organization,
+            is_deleted=False,
+        ).count()
+        return products_count + count <= max_p
 
 
 class SubscriptionUsage(TimeStampedModel, UUIDModel):
