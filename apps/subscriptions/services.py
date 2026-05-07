@@ -21,6 +21,8 @@ def _default_plan_currency():
 
 class SubscriptionService:
     """Service centralisé pour la gestion des abonnements."""
+    CHECKOUT_MODE_NEW = 'new'
+    CHECKOUT_MODE_EXTEND = 'extend'
 
     # ------------------------------------------------------------------ #
     # Vérification du statut
@@ -295,12 +297,20 @@ class SubscriptionService:
             )
 
     @staticmethod
-    def evaluate_checkout(organization, target_plan: Plan) -> dict:
+    def evaluate_checkout(organization, target_plan: Plan, mode: str = CHECKOUT_MODE_NEW) -> dict:
         """
-        Règles : anti-downgrade (palier min), pas de renouvellement anticipé du même plan,
+        Règles : anti-downgrade (palier min), prolongation possible du même plan,
         upgrade (tier strictement supérieur) autorisé pendant la période payée.
         """
         now = timezone.now()
+        mode = (mode or SubscriptionService.CHECKOUT_MODE_NEW).strip().lower()
+        if mode not in (SubscriptionService.CHECKOUT_MODE_NEW, SubscriptionService.CHECKOUT_MODE_EXTEND):
+            return {
+                'allowed': False,
+                'reason_code': 'SUBSCRIPTION_INVALID_CHECKOUT_MODE',
+                'message': "Mode de paiement invalide.",
+                'checkout_mode': mode,
+            }
 
         if target_plan.tier < organization.subscription_floor_tier:
             return {
@@ -311,15 +321,25 @@ class SubscriptionService:
                     f"{organization.subscription_floor_tier} ou supérieur. "
                     "Un retour à une offre inférieure n'est pas autorisé."
                 ),
+                'checkout_mode': mode,
             }
 
         sub = SubscriptionService._subscription_for_quotas(organization)
         if not sub:
-            return {'allowed': True, 'reason_code': None, 'message': None}
+            if mode == SubscriptionService.CHECKOUT_MODE_EXTEND:
+                return {
+                    'allowed': False,
+                    'reason_code': 'SUBSCRIPTION_EXTEND_REQUIRES_ACTIVE',
+                    'message': "Aucun abonnement actif à prolonger.",
+                    'checkout_mode': mode,
+                }
+            return {'allowed': True, 'reason_code': None, 'message': None, 'checkout_mode': mode}
 
         period_end = sub.current_period_end
         if period_end and now < period_end:
             if target_plan.id == sub.plan.id:
+                if mode == SubscriptionService.CHECKOUT_MODE_EXTEND:
+                    return {'allowed': True, 'reason_code': None, 'message': None, 'checkout_mode': mode}
                 return {
                     'allowed': False,
                     'reason_code': 'SUBSCRIPTION_EARLY_RENEW_FORBIDDEN',
@@ -327,6 +347,7 @@ class SubscriptionService:
                         "Renouvellement impossible avant la fin de la période en cours. "
                         "Vous pourrez prolonger ou renouveler une fois la période expirée."
                     ),
+                    'checkout_mode': mode,
                 }
             if target_plan.tier <= sub.plan.tier:
                 return {
@@ -336,13 +357,29 @@ class SubscriptionService:
                         "Pendant la période en cours, seul un plan à palier "
                         "strictement supérieur est disponible (upgrade)."
                     ),
+                    'checkout_mode': mode,
+                }
+            if mode == SubscriptionService.CHECKOUT_MODE_EXTEND:
+                return {
+                    'allowed': False,
+                    'reason_code': 'SUBSCRIPTION_EXTEND_PLAN_MISMATCH',
+                    'message': "La prolongation doit se faire sur le plan actuel.",
+                    'checkout_mode': mode,
                 }
 
-        return {'allowed': True, 'reason_code': None, 'message': None}
+        if mode == SubscriptionService.CHECKOUT_MODE_EXTEND:
+            return {
+                'allowed': False,
+                'reason_code': 'SUBSCRIPTION_EXTEND_PERIOD_ENDED',
+                'message': "La prolongation est réservée aux abonnements encore en cours.",
+                'checkout_mode': mode,
+            }
+
+        return {'allowed': True, 'reason_code': None, 'message': None, 'checkout_mode': mode}
 
     @staticmethod
-    def require_checkout_allowed(organization, plan: Plan):
-        r = SubscriptionService.evaluate_checkout(organization, plan)
+    def require_checkout_allowed(organization, plan: Plan, mode: str = CHECKOUT_MODE_NEW):
+        r = SubscriptionService.evaluate_checkout(organization, plan, mode=mode)
         if not r['allowed']:
             raise ValidationError(
                 {
@@ -438,6 +475,14 @@ class SubscriptionService:
     # ------------------------------------------------------------------ #
 
     @staticmethod
+    def _duration_months_from_cycle(billing_cycle) -> int:
+        if billing_cycle == Plan.BillingCycle.YEARLY:
+            return 12
+        if billing_cycle == Plan.BillingCycle.QUARTERLY:
+            return 3
+        return 1
+
+    @staticmethod
     @transaction.atomic
     def activate_subscription(organization, plan, billing_cycle, duration_months=None, activated_by=None, notes=''):
         """
@@ -456,12 +501,7 @@ class SubscriptionService:
 
         # Calculer la durée
         if duration_months is None:
-            if billing_cycle == Plan.BillingCycle.YEARLY:
-                duration_months = 12
-            elif billing_cycle == Plan.BillingCycle.QUARTERLY:
-                duration_months = 3
-            else:
-                duration_months = 1
+            duration_months = SubscriptionService._duration_months_from_cycle(billing_cycle)
 
         end = now + timedelta(days=duration_months * 30)
 
@@ -502,6 +542,68 @@ class SubscriptionService:
         )
         organization.save(update_fields=['subscription_floor_tier'])
 
+        return subscription
+
+    @staticmethod
+    @transaction.atomic
+    def extend_subscription(organization, plan, billing_cycle, notes=''):
+        """
+        Prolonge la période de l'abonnement actif courant (même plan) sans créer une nouvelle ligne.
+        """
+        now = timezone.now()
+        subscription = (
+            organization.subscriptions.filter(
+                status__in=[
+                    Subscription.Status.TRIAL,
+                    Subscription.Status.ACTIVE,
+                    Subscription.Status.PAST_DUE,
+                ]
+            )
+            .select_related('plan')
+            .order_by('-created_at')
+            .first()
+        )
+        if not subscription:
+            raise ValidationError(
+                {
+                    'code': 'SUBSCRIPTION_EXTEND_REQUIRES_ACTIVE',
+                    'message': "Aucun abonnement actif à prolonger.",
+                }
+            )
+        if subscription.plan_id != plan.id:
+            raise ValidationError(
+                {
+                    'code': 'SUBSCRIPTION_EXTEND_PLAN_MISMATCH',
+                    'message': "La prolongation doit se faire sur le plan actuel.",
+                }
+            )
+
+        duration_months = SubscriptionService._duration_months_from_cycle(billing_cycle)
+        duration_days = duration_months * 30
+        start = subscription.current_period_end or now
+
+        subscription.current_period_end = start + timedelta(days=duration_days)
+        subscription.billing_cycle = billing_cycle
+        subscription.price = plan.get_price(billing_cycle) * duration_months
+        if billing_cycle == Plan.BillingCycle.YEARLY:
+            subscription.price = plan.price_yearly
+        if subscription.status in [Subscription.Status.PAST_DUE, Subscription.Status.EXPIRED]:
+            subscription.status = Subscription.Status.ACTIVE
+        if notes:
+            metadata = subscription.metadata or {}
+            metadata['last_extension_note'] = notes
+            subscription.metadata = metadata
+
+        subscription.save(
+            update_fields=[
+                'current_period_end',
+                'billing_cycle',
+                'price',
+                'status',
+                'metadata',
+                'updated_at',
+            ]
+        )
         return subscription
 
     # ------------------------------------------------------------------ #
@@ -583,17 +685,50 @@ class SubscriptionService:
             raise ValueError('Métadonnées de paiement MOKO incomplètes.')
 
         plan = Plan.objects.get(id=plan_id, is_active=True)
+        checkout_mode = metadata.get('checkout_mode')
+        if checkout_mode not in (
+            SubscriptionService.CHECKOUT_MODE_NEW,
+            SubscriptionService.CHECKOUT_MODE_EXTEND,
+        ):
+            # Compatibilité paiements pending legacy (sans checkout_mode).
+            current_subscription = SubscriptionService._subscription_for_quotas(
+                pending_payment.organization
+            )
+            if (
+                current_subscription
+                and current_subscription.plan_id == plan.id
+                and current_subscription.current_period_end
+                and timezone.now() < current_subscription.current_period_end
+            ):
+                checkout_mode = SubscriptionService.CHECKOUT_MODE_EXTEND
+            else:
+                checkout_mode = SubscriptionService.CHECKOUT_MODE_NEW
+            metadata['checkout_mode'] = checkout_mode
+            pending_payment.metadata = metadata
+            pending_payment.save(update_fields=['metadata', 'updated_at'])
+
         notes = (metadata.get('notes') or '') + (extra_notes or '')
 
-        SubscriptionService.require_checkout_allowed(pending_payment.organization, plan)
-
-        subscription = SubscriptionService.activate_subscription(
-            organization=pending_payment.organization,
-            plan=plan,
-            billing_cycle=billing_cycle,
-            activated_by=paid_by,
-            notes=notes or 'Paiement MOKO',
+        SubscriptionService.require_checkout_allowed(
+            pending_payment.organization,
+            plan,
+            mode=checkout_mode,
         )
+        if checkout_mode == SubscriptionService.CHECKOUT_MODE_EXTEND:
+            subscription = SubscriptionService.extend_subscription(
+                organization=pending_payment.organization,
+                plan=plan,
+                billing_cycle=billing_cycle,
+                notes=notes or 'Prolongation MOKO',
+            )
+        else:
+            subscription = SubscriptionService.activate_subscription(
+                organization=pending_payment.organization,
+                plan=plan,
+                billing_cycle=billing_cycle,
+                activated_by=paid_by,
+                notes=notes or 'Paiement MOKO',
+            )
 
         pending_payment.subscription = subscription
         pending_payment.status = SubscriptionPayment.Status.COMPLETED

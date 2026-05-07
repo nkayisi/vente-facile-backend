@@ -113,9 +113,11 @@ class MokoInitiateSerializer(serializers.Serializer):
     """Démarrage d'un paiement d'abonnement via MOKO / GoFreshPay."""
 
     MOKO_METHODS = ('airtel', 'orange', 'mpesa', 'africell')
+    CHECKOUT_MODES = ('new', 'extend')
 
     plan_id = serializers.UUIDField()
     billing_cycle = serializers.ChoiceField(choices=Plan.BillingCycle.choices)
+    mode = serializers.ChoiceField(choices=[(m, m) for m in CHECKOUT_MODES], required=False, default='new')
     method = serializers.ChoiceField(choices=[(m, m) for m in MOKO_METHODS])
     customer_number = serializers.CharField(max_length=32)
 

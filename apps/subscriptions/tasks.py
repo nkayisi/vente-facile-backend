@@ -4,6 +4,7 @@ Tâches Celery — suivi des paiements MOKO en attente (API v2).
 import logging
 
 from celery import shared_task
+from rest_framework.exceptions import ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,26 @@ def poll_moko_pending_payments():
             )
             logger.info('MOKO poll v2: ref=%s status=%s outcome=%s', ref, moko_status, outcome)
             processed += 1
+        except ValidationError as exc:
+            # Erreur métier (ex: règle checkout) : on marque failed pour stopper la boucle pending.
+            detail = exc.detail
+            reason_code = None
+            if isinstance(detail, dict):
+                reason_code = detail.get('code')
+            checkout_mode = (payment.metadata or {}).get('checkout_mode', 'missing')
+            logger.warning(
+                'MOKO poll v2: validation failed for ref=%s mode=%s code=%s detail=%s',
+                ref,
+                checkout_mode,
+                reason_code,
+                detail,
+            )
+            SubscriptionService.fail_pending_moko_payment(
+                payment,
+                reason=f'Validation checkout: {exc.detail}',
+            )
+            remove_pending_payment(ref)
+            continue
         except Exception:
             logger.exception('MOKO poll v2: apply status failed for %s', ref)
             continue

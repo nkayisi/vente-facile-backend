@@ -362,7 +362,11 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
 
         plan = Plan.objects.get(id=data['plan_id'], is_active=True)
         try:
-            SubscriptionService.require_checkout_allowed(organization, plan)
+            SubscriptionService.require_checkout_allowed(
+                organization,
+                plan,
+                mode=data.get('mode', SubscriptionService.CHECKOUT_MODE_NEW),
+            )
         except ValidationError as e:
             return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
         amount_dec = _subscription_checkout_amount(plan, data['billing_cycle'])
@@ -387,6 +391,7 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
         metadata = {
             'plan_id': str(plan.id),
             'billing_cycle': data['billing_cycle'],
+            'checkout_mode': data.get('mode', SubscriptionService.CHECKOUT_MODE_NEW),
             'moko_method': data['method'],
             'user_id': str(request.user.id),
         }
