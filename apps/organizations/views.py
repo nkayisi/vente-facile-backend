@@ -790,7 +790,7 @@ class BranchViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     """
     
     queryset = Branch.objects.all()
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ['is_active', 'is_main']
     search_fields = ['name', 'code', 'city']
@@ -798,13 +798,13 @@ class BranchViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     
     select_related_fields = ['manager']
     
-    role_permissions = {
-        'list': ['owner', 'admin', 'manager', 'cashier', 'stock_keeper', 'accountant', 'viewer'],
-        'retrieve': ['owner', 'admin', 'manager', 'cashier', 'stock_keeper', 'accountant', 'viewer'],
-        'create': ['owner', 'admin'],
-        'update': ['owner', 'admin'],
-        'partial_update': ['owner', 'admin'],
-        'destroy': ['owner', 'admin'],
+    action_permissions = {
+        'list': 'organization.view',
+        'retrieve': 'organization.view',
+        'create': 'organization.edit',
+        'update': 'organization.edit',
+        'partial_update': 'organization.edit',
+        'destroy': 'organization.edit',
     }
 
     def get_serializer_class(self):
@@ -837,7 +837,7 @@ class OrganizationInvitationViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     """
     
     queryset = OrganizationInvitation.objects.all()
-    permission_classes = [IsAuthenticated, IsTenantMember]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ['status', 'role']
     search_fields = ['email']
@@ -845,12 +845,12 @@ class OrganizationInvitationViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     
     select_related_fields = ['organization', 'invited_by']
     
-    role_permissions = {
-        'list': ['owner', 'admin'],
-        'retrieve': ['owner', 'admin'],
-        'create': ['owner', 'admin'],
-        'destroy': ['owner', 'admin'],
-        'resend': ['owner', 'admin'],
+    action_permissions = {
+        'list': 'users.view',
+        'retrieve': 'users.view',
+        'create': 'users.create',
+        'destroy': 'users.deactivate',
+        'resend': 'users.create',
     }
 
     def get_serializer_class(self):

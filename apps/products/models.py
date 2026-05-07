@@ -37,14 +37,14 @@ class Category(TenantSoftDeleteModel):
         ]
         constraints = [
             models.UniqueConstraint(
-                fields=['organization', 'slug'],
+                fields=['organization', 'parent', 'slug'],
                 condition=models.Q(is_deleted=False),
-                name='unique_category_slug_per_org'
+                name='unique_category_slug_per_parent_org'
             ),
             models.UniqueConstraint(
-                fields=['organization', 'name'],
+                fields=['organization', 'parent', 'name'],
                 condition=models.Q(is_deleted=False),
-                name='unique_category_name_per_org'
+                name='unique_category_name_per_parent_org'
             ),
         ]
 

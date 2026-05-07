@@ -222,7 +222,8 @@ class PermissionService:
             'inventory.count', 'inventory.submit', 'inventory.validate', 'inventory.cancel',
             'inventory.print',
             # Ventes
-            'sales.view', 'sales.create', 'sales.cancel', 'sales.discount',
+            'sales.view', 'sales.create', 'sales.manage_registers',
+            'sales.cancel', 'sales.discount',
             'sales.view_all',
             'payment_methods.view', 'payment_methods.manage',
             'sale_returns.view', 'sale_returns.create', 'sale_returns.approve',
@@ -232,7 +233,7 @@ class PermissionService:
             # Clients
             'customers.view', 'customers.create', 'customers.edit', 'customers.delete',
             # Rapports
-            'reports.view', 'reports.export',
+            'reports.view', 'reports.export', 'reports.create', 'reports.delete',
             # Livre de caisse
             'cashbook.view', 'cashbook.view_reports',
             'cashbook.create_movement', 'cashbook.cancel_movement', 'cashbook.delete_movement',
@@ -265,7 +266,8 @@ class PermissionService:
             'inventory.count', 'inventory.submit', 'inventory.validate', 'inventory.cancel',
             'inventory.print',
             # Ventes
-            'sales.view', 'sales.create', 'sales.cancel', 'sales.discount',
+            'sales.view', 'sales.create', 'sales.manage_registers',
+            'sales.cancel', 'sales.discount',
             'sales.view_all',
             'payment_methods.view',
             'sale_returns.view', 'sale_returns.create', 'sale_returns.approve',
@@ -275,7 +277,7 @@ class PermissionService:
             # Clients
             'customers.view', 'customers.create', 'customers.edit', 'customers.delete',
             # Rapports
-            'reports.view', 'reports.export',
+            'reports.view', 'reports.export', 'reports.create', 'reports.delete',
             # Livre de caisse
             'cashbook.view', 'cashbook.view_reports',
             'cashbook.create_movement', 'cashbook.cancel_movement',
@@ -345,10 +347,9 @@ class PermissionService:
     def get_all_permissions(cls):
         """Retourne la liste de toutes les permissions disponibles dans le système."""
         if cls.ALL_PERMISSIONS is None:
-            all_perms = set()
-            for role_perms in cls.ROLE_PERMISSIONS.values():
-                all_perms.update(role_perms)
-            cls.ALL_PERMISSIONS = sorted(all_perms)
+            from apps.core.permissions_catalog import PERMISSION_CATALOG
+
+            cls.ALL_PERMISSIONS = sorted(PERMISSION_CATALOG)
         return cls.ALL_PERMISSIONS
 
     @classmethod

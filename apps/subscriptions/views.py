@@ -12,7 +12,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 
-from apps.core.api_permissions import IsTenantMember, IsTenantOwner
+from apps.core.api_permissions import IsTenantMember, IsTenantOwner, HasPermission
 
 from .models import Plan, Subscription, SubscriptionPayment, Invoice
 from .serializers import (
@@ -112,7 +112,18 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
     """
     Gestion de l'abonnement de l'organisation courante.
     """
-    permission_classes = [IsAuthenticated, IsTenantMember]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasPermission]
+    action_permissions = {
+        'status': 'subscription.view',
+        'current': 'subscription.view',
+        'history': 'subscription.view',
+        'payments': 'subscription.view',
+        'invoices': 'subscription.view',
+        'moko_payment_status': 'subscription.view',
+        'activate': 'subscription.manage',
+        'moko_initiate': 'subscription.manage',
+        'moko_callback': '*',
+    }
 
     def _get_organization(self, request):
         org_id = request.headers.get('X-Organization-ID')

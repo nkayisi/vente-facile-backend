@@ -61,7 +61,7 @@ class PurchaseOrderViewSet(
     """
     
     queryset = PurchaseOrder.objects.all()
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, TenantObjectPermission]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission, TenantObjectPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['status', 'supplier', 'warehouse']
     search_fields = ['reference', 'supplier__name']
@@ -212,7 +212,7 @@ class GoodsReceiptViewSet(
     """
     
     queryset = GoodsReceipt.objects.all()
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, TenantObjectPermission]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission, TenantObjectPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['status', 'purchase_order', 'warehouse']
     search_fields = ['reference', 'supplier_invoice']
@@ -364,7 +364,7 @@ class SupplierPaymentViewSet(
     """
     
     queryset = SupplierPayment.objects.all()
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, TenantObjectPermission]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission, TenantObjectPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['status', 'supplier', 'payment_method']
     search_fields = ['reference', 'supplier__name', 'payment_reference']
@@ -471,7 +471,7 @@ class PurchaseReturnViewSet(
     """
     
     queryset = PurchaseReturn.objects.all()
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, TenantObjectPermission]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission, TenantObjectPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['status', 'supplier']
     search_fields = ['reference', 'supplier__name']

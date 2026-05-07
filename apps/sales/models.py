@@ -22,9 +22,7 @@ class Register(TenantSoftDeleteModel):
     )
     warehouse = models.ForeignKey(
         'inventory.Warehouse',
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
+        on_delete=models.PROTECT,
         related_name='registers'
     )
     

@@ -18,7 +18,7 @@ from django.conf import settings
 from django.template.loader import render_to_string
 
 from apps.core.api_mixins import TenantViewSetMixin
-from apps.core.api_permissions import IsTenantMember, IsTenantAdmin
+from apps.core.api_permissions import IsTenantMember, IsTenantAdmin, HasPermission
 from .models import User, UserActivity
 from .serializers import (
     UserListSerializer, UserDetailSerializer,
@@ -63,6 +63,15 @@ class UserViewSet(viewsets.ModelViewSet):
     
     queryset = User.objects.all()
     permission_classes = [IsAuthenticated]
+    action_permissions = {
+        'list': 'users.view',
+        'retrieve': 'users.view',
+        'permissions': '*',
+        'me': '*',
+        'change_password': '*',
+        'activities': '*',
+    }
+
     filter_backends = [filters.SearchFilter]
     search_fields = ['email', 'first_name', 'last_name']
 
@@ -99,6 +108,8 @@ class UserViewSet(viewsets.ModelViewSet):
     def get_permissions(self):
         if self.action == 'create':
             return [AllowAny()]
+        if self.action in ['list', 'retrieve']:
+            return [IsAuthenticated(), IsTenantMember(), HasPermission()]
         return super().get_permissions()
 
     @action(detail=False, methods=['get', 'put', 'patch'])

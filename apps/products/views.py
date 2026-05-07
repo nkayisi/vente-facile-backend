@@ -8,12 +8,13 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser
 from django_filters.rest_framework import DjangoFilterBackend
-from django.db.models import Sum, Count, Q, F
+from django.db.models import Sum, Count, Q, F, Exists, OuterRef
 from django.http import HttpResponse
 
 from apps.core.api_mixins import TenantViewSetMixin, BulkActionMixin, AuditMixin
 from apps.core.warehouse_scope import (
     accessible_warehouse_ids,
+    assert_warehouse_allowed_for_request,
     filter_queryset_by_warehouse_ids,
     get_membership_for_request,
 )
@@ -22,6 +23,7 @@ from apps.core.api_permissions import (
 )
 from apps.subscriptions.services import SubscriptionService
 from .models import Category, Brand, Unit, Product, ProductImage, ProductVariant, PriceList, ProductPrice
+from apps.inventory.models import Stock
 from .serializers import (
     CategoryListSerializer, CategoryDetailSerializer, CategoryCreateSerializer,
     BrandSerializer, UnitSerializer,
@@ -31,6 +33,31 @@ from .serializers import (
     ProductBulkUpdateSerializer
 )
 from .services import ProductExcelService
+
+
+def _truthy_query_param(value) -> bool:
+    if value is None:
+        return False
+    return str(value).strip().lower() in ('true', '1', 'yes')
+
+
+def _annotate_product_total_stock(queryset, wh_ids):
+    """Somme total_stock : restreinte aux entrepôts du membership si applicable."""
+    if wh_ids is not None:
+        warehouse_stock_filter = Q(stocks__warehouse_id__in=wh_ids)
+        return queryset.annotate(
+            total_stock=Sum('stocks__quantity', filter=warehouse_stock_filter)
+        )
+    return queryset.annotate(total_stock=Sum('stocks__quantity'))
+
+
+def _filter_products_by_membership_warehouses(queryset, wh_ids):
+    """Produits visibles dans le périmètre entrepôt (hors owner)."""
+    if wh_ids is None:
+        return queryset
+    return queryset.filter(
+        Q(track_inventory=False) | Q(stocks__warehouse_id__in=wh_ids)
+    ).distinct()
 
 
 # =============================================================================
@@ -80,6 +107,43 @@ class CategoryViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         elif self.action in ['create']:
             return CategoryCreateSerializer
         return CategoryDetailSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if self.action != 'list':
+            return queryset
+
+        organization = self.get_organization()
+        with_stock = _truthy_query_param(self.request.query_params.get('with_stock'))
+        warehouse_id = self.request.query_params.get('warehouse')
+
+        if not with_stock:
+            return queryset
+
+        membership = get_membership_for_request(self.request)
+        if warehouse_id:
+            assert_warehouse_allowed_for_request(self.request, warehouse_id)
+            stock_qs = Stock.objects.filter(
+                product__organization=organization,
+                product__category_id=OuterRef('pk'),
+                warehouse_id=warehouse_id,
+                quantity__gt=F('reserved_quantity'),
+                product__is_deleted=False,
+            )
+        else:
+            wh_ids = accessible_warehouse_ids(membership) if membership else None
+            stock_qs = Stock.objects.filter(
+                product__organization=organization,
+                product__category_id=OuterRef('pk'),
+                quantity__gt=F('reserved_quantity'),
+                product__is_deleted=False,
+            )
+            if wh_ids is not None:
+                if not wh_ids:
+                    return queryset.none()
+                stock_qs = stock_qs.filter(warehouse_id__in=wh_ids)
+
+        return queryset.filter(Exists(stock_qs))
 
     @action(detail=True, methods=['get'])
     def products(self, request, pk=None):
@@ -219,7 +283,18 @@ class UnitViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
 class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.ModelViewSet):
     """
     ViewSet pour la gestion des produits.
-    
+
+    Liste (GET /products/) : par défaut, produits restreints aux entrepôts assignés au
+    membership (comme le POS). Avec ``full_catalog=true``, tous les produits de
+    l'organisation sont listés ; ``total_stock`` reste sommé sur le périmètre entrepôt
+    lorsque le membre est restreint.
+
+    Lecture fiche (retrieve) et détail stock (stock) : pas de filtre sur les lignes
+    produit au niveau entrepôt ; les lignes de stock renvoyées restent filtrées dans
+    l'action ``stock``.
+
+    Mutations et recherche code-barres : comportement restreint par entrepôt inchangé.
+
     Endpoints:
     - GET /products/ : Liste des produits
     - POST /products/ : Créer un produit
@@ -276,31 +351,43 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
 
     def get_queryset(self):
         """
-        Surcharge pour :
-        - Restreindre la liste aux produits présents dans les entrepôts du membership
-        - Annoter total_stock filtré par entrepôt
-        - Appliquer le filtre in_stock si demandé
+        Scope par entrepôt sur les lignes produit sauf :
+        - GET list avec ``full_catalog=true``
+        - retrieve et action ``stock`` (lecture catalogue / fiche)
         """
         queryset = super().get_queryset()
 
         m = get_membership_for_request(self.request)
         wh_ids = accessible_warehouse_ids(m) if m else None
+        warehouse_param = self.request.query_params.get('warehouse')
+        effective_wh_ids = wh_ids
+        if warehouse_param:
+            assert_warehouse_allowed_for_request(self.request, warehouse_param)
+            effective_wh_ids = [warehouse_param]
 
-        if wh_ids is not None:
-            warehouse_stock_filter = Q(stocks__warehouse_id__in=wh_ids)
-            # Restreindre aux produits ayant un stock dans les entrepôts autorisés
-            # (les produits sans suivi d'inventaire restent toujours visibles)
-            queryset = (
-                queryset
-                .filter(
-                    Q(track_inventory=False)
-                    | Q(stocks__warehouse_id__in=wh_ids)
-                )
-                .distinct()
-                .annotate(total_stock=Sum('stocks__quantity', filter=warehouse_stock_filter))
+        action = getattr(self, 'action', None)
+
+        apply_row_scope = True
+        if action == 'list':
+            apply_row_scope = not _truthy_query_param(
+                self.request.query_params.get('full_catalog')
             )
-        else:
-            queryset = queryset.annotate(total_stock=Sum('stocks__quantity'))
+        elif action in ('retrieve', 'stock'):
+            apply_row_scope = False
+        elif action in (
+            'update',
+            'partial_update',
+            'destroy',
+            'bulk_update',
+            'bulk_delete',
+            'search_barcode',
+        ):
+            apply_row_scope = True
+
+        if apply_row_scope:
+            queryset = _filter_products_by_membership_warehouses(queryset, effective_wh_ids)
+
+        queryset = _annotate_product_total_stock(queryset, effective_wh_ids)
 
         # Filtre in_stock : uniquement les produits avec du stock disponible
         in_stock = self.request.query_params.get('in_stock')

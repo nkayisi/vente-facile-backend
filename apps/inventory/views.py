@@ -533,7 +533,7 @@ class StockTransferViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
     """
     
     queryset = StockTransfer.objects.all()
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, TenantObjectPermission]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission, TenantObjectPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['status', 'source_warehouse', 'destination_warehouse']
     search_fields = ['reference']
@@ -813,7 +813,7 @@ class StockAdjustmentViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, A
     """
     
     queryset = StockAdjustment.objects.all()
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, TenantObjectPermission]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission, TenantObjectPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['status', 'adjustment_type', 'warehouse']
     search_fields = ['reference', 'reason']
@@ -968,7 +968,7 @@ class InventorySessionViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, 
     """
     
     queryset = InventorySession.objects.all()
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, TenantObjectPermission]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission, TenantObjectPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['status', 'scope_type', 'warehouse']
     search_fields = ['reference', 'name']
@@ -1032,8 +1032,14 @@ class InventorySessionViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, 
             product_ids = list(session.products.values_list('id', flat=True))
             if product_ids:
                 base_qs = base_qs.filter(id__in=product_ids)
-        
-        return base_qs
+
+        # N'inclure que les produits avec stock disponible dans l'entrepôt ciblé.
+        # available_quantity = quantity - reserved_quantity > 0
+        return base_qs.filter(
+            stocks__warehouse=session.warehouse,
+            stocks__variant__isnull=True,
+            stocks__quantity__gt=F('stocks__reserved_quantity'),
+        ).distinct()
 
     @action(detail=True, methods=['post'])
     def start(self, request, pk=None):

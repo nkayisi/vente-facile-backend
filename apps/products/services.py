@@ -22,7 +22,8 @@ from .models import Product, Category, Brand, Unit
 
 # Signature secrète pour valider l'authenticité du template
 TEMPLATE_SIGNATURE = "VF-IMPORT-2026-SECURE"
-TEMPLATE_VERSION = "1.1"
+# 1.2: signature globale (sans organization.id) pour que le même fichier reste valide entre orgs / environnements.
+TEMPLATE_VERSION = "1.2"
 
 
 class ProductExcelService:
@@ -34,6 +35,7 @@ class ProductExcelService:
         {"key": "sku", "header": "Code SKU *", "width": 15, "required": True},
         {"key": "barcode", "header": "Code-barres", "width": 18, "required": False},
         {"key": "category", "header": "Catégorie", "width": 25, "required": False},
+        {"key": "subcategory", "header": "Sous-catégorie", "width": 25, "required": False},
         {"key": "brand", "header": "Marque", "width": 15, "required": False},
         {"key": "unit", "header": "Unité", "width": 12, "required": False},
         {"key": "cost_price", "header": "Prix d'achat", "width": 15, "required": False},
@@ -89,8 +91,6 @@ class ProductExcelService:
         guide_sheet.cell(row=row, column=1, value="• 📖 Guide : Cette feuille d'instructions (vous pouvez la consulter à tout moment)").font = text_font
         row += 1
         guide_sheet.cell(row=row, column=1, value="• 📦 Produits : Feuille principale où vous saisissez vos produits").font = text_font
-        row += 1
-        guide_sheet.cell(row=row, column=1, value="• 📚 Références : Liste des catégories, marques et unités existantes").font = text_font
         row += 2
         
         # Section 2 : Colonnes obligatoires
@@ -108,11 +108,11 @@ class ProductExcelService:
         row += 1
         guide_sheet.cell(row=row, column=1, value="• Code-barres : Code-barres EAN/UPC du produit").font = text_font
         row += 1
-        guide_sheet.cell(row=row, column=1, value="• Catégorie : Nom de la catégorie (voir feuille Références)").font = text_font
+        guide_sheet.cell(row=row, column=1, value="• Catégorie : Nom de la catégorie principale").font = text_font
         row += 1
-        guide_sheet.cell(row=row, column=1, value="  → Pour une sous-catégorie, utilisez le format : Catégorie parent > Sous-catégorie").font = example_font
+        guide_sheet.cell(row=row, column=1, value="• Sous-catégorie : Nom de la sous-catégorie (optionnel)").font = text_font
         row += 1
-        guide_sheet.cell(row=row, column=1, value="  → Exemple : Boissons > Sodas ou Alimentation > Conserves > Légumes").font = example_font
+        guide_sheet.cell(row=row, column=1, value="  → Si renseignée, elle sera créée sous la catégorie de la même ligne").font = example_font
         row += 1
         guide_sheet.cell(row=row, column=1, value="• Marque : Nom de la marque du produit").font = text_font
         row += 1
@@ -145,6 +145,8 @@ class ProductExcelService:
         guide_sheet.cell(row=row, column=1, value="→ Exemple : Si vous écrivez 'Électronique' comme catégorie et qu'elle n'existe pas,").font = example_font
         row += 1
         guide_sheet.cell(row=row, column=1, value="  elle sera créée automatiquement avant d'importer le produit.").font = example_font
+        row += 1
+        guide_sheet.cell(row=row, column=1, value="  Le même principe s'applique pour les sous-catégories, marques et unités.").font = example_font
         row += 2
         
         # Section 5 : Règles importantes
@@ -164,14 +166,14 @@ class ProductExcelService:
         # Section 6 : Exemples
         guide_sheet.cell(row=row, column=1, value="📌 EXEMPLES DE SAISIE").font = section_font
         row += 1
-        guide_sheet.cell(row=row, column=1, value="Nom: Coca-Cola 33cl | SKU: COCA-33CL | Prix: 500 | Catégorie: Boissons > Sodas").font = example_font
+        guide_sheet.cell(row=row, column=1, value="Nom: Coca-Cola 33cl | SKU: COCA-33CL | Prix: 500 | Catégorie: Boissons | Sous-catégorie: Sodas").font = example_font
         row += 1
         guide_sheet.cell(row=row, column=1, value="Nom: Riz Oncle Ben's 1kg | SKU: RIZ-OB-1KG | Prix: 2500 | Catégorie: Alimentation").font = example_font
         row += 1
         guide_sheet.cell(row=row, column=1, value="Nom: Savon Palmolive | SKU: SAV-PALM | Prix: 800 | Marque: Palmolive | Unité: Pièce").font = example_font
         row += 2
         
-        guide_sheet.cell(row=row, column=1, value="💡 Astuce : Consultez la feuille 'Références' pour voir les catégories, marques et unités existantes.").font = success_font
+        guide_sheet.cell(row=row, column=1, value="💡 Astuce : Vous pouvez saisir de nouvelles catégories, sous-catégories, marques et unités; elles seront créées automatiquement.").font = success_font
         
         # =====================================================================
         # FEUILLE 2 : PRODUITS
@@ -199,7 +201,7 @@ class ProductExcelService:
             ws.column_dimensions[get_column_letter(col_idx)].width = col_config["width"]
         
         # Ligne 1 : Signature cachée (texte blanc sur fond blanc, protégée)
-        signature_data = cls._generate_signature(organization)
+        signature_data = cls._generate_signature()
         ws.cell(row=1, column=1, value=signature_data)
         ws.cell(row=1, column=1).font = Font(color="FFFFFF", size=1)
         ws.cell(row=1, column=1).fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
@@ -223,91 +225,6 @@ class ProductExcelService:
                 yes_no_validation.add(f"{col_letter}3:{col_letter}1000")
         
         ws.add_data_validation(yes_no_validation)
-        
-        # Charger les catégories avec hiérarchie (parent > enfant)
-        categories_with_path = cls._get_categories_with_path(organization)
-        brands = list(Brand.objects.filter(organization=organization, is_deleted=False).order_by('name').values_list('name', flat=True))
-        units = list(Unit.objects.filter(organization=organization).order_by('name').values_list('name', flat=True))
-        
-        # =====================================================================
-        # FEUILLE 3 : RÉFÉRENCES
-        # =====================================================================
-        ref_sheet = wb.create_sheet("📚 Références")
-        
-        # Styles pour les références
-        ref_header_font = Font(bold=True, color="FFFFFF", size=11)
-        ref_header_fill = PatternFill(start_color="3B82F6", end_color="3B82F6", fill_type="solid")
-        ref_header_alignment = Alignment(horizontal="center", vertical="center")
-        
-        # En-têtes des références
-        ref_headers = [
-            ("Catégories", 35),
-            ("Marques", 25),
-            ("Unités", 20),
-        ]
-        
-        for col_idx, (header, width) in enumerate(ref_headers, start=1):
-            cell = ref_sheet.cell(row=1, column=col_idx, value=header)
-            cell.font = ref_header_font
-            cell.fill = ref_header_fill
-            cell.alignment = ref_header_alignment
-            cell.border = thin_border
-            ref_sheet.column_dimensions[get_column_letter(col_idx)].width = width
-        
-        # Remplir les catégories avec chemin hiérarchique
-        for idx, cat_path in enumerate(categories_with_path, start=2):
-            ref_sheet.cell(row=idx, column=1, value=cat_path)
-        
-        # Remplir les marques
-        for idx, brand in enumerate(brands, start=2):
-            ref_sheet.cell(row=idx, column=2, value=brand)
-        
-        # Remplir les unités
-        for idx, unit in enumerate(units, start=2):
-            ref_sheet.cell(row=idx, column=3, value=unit)
-        
-        # Note explicative en bas
-        note_row = max(len(categories_with_path), len(brands), len(units)) + 4
-        ref_sheet.cell(row=note_row, column=1, value="💡 Note : Vous pouvez utiliser ces valeurs dans la feuille 'Produits'.").font = Font(italic=True, color="6B7280")
-        ref_sheet.cell(row=note_row + 1, column=1, value="Si vous saisissez une valeur qui n'existe pas ici, elle sera créée automatiquement.").font = Font(italic=True, color="6B7280")
-        ref_sheet.cell(row=note_row + 2, column=1, value="Pour les sous-catégories, utilisez le format : Catégorie parent > Sous-catégorie").font = Font(italic=True, color="6B7280")
-        
-        # Figer la première ligne
-        ref_sheet.freeze_panes = "A2"
-        
-        # Validations avec listes déroulantes si des données existent
-        if categories_with_path:
-            cat_validation = DataValidation(
-                type="list",
-                formula1=f"'📚 Références'!$A$2:$A${len(categories_with_path) + 1}",
-                allow_blank=True
-            )
-            cat_col = next(i for i, c in enumerate(cls.COLUMNS, start=1) if c["key"] == "category")
-            cat_letter = get_column_letter(cat_col)
-            cat_validation.add(f"{cat_letter}3:{cat_letter}1000")
-            ws.add_data_validation(cat_validation)
-        
-        if brands:
-            brand_validation = DataValidation(
-                type="list",
-                formula1=f"'📚 Références'!$B$2:$B${len(brands) + 1}",
-                allow_blank=True
-            )
-            brand_col = next(i for i, c in enumerate(cls.COLUMNS, start=1) if c["key"] == "brand")
-            brand_letter = get_column_letter(brand_col)
-            brand_validation.add(f"{brand_letter}3:{brand_letter}1000")
-            ws.add_data_validation(brand_validation)
-        
-        if units:
-            unit_validation = DataValidation(
-                type="list",
-                formula1=f"'📚 Références'!$C$2:$C${len(units) + 1}",
-                allow_blank=True
-            )
-            unit_col = next(i for i, c in enumerate(cls.COLUMNS, start=1) if c["key"] == "unit")
-            unit_letter = get_column_letter(unit_col)
-            unit_validation.add(f"{unit_letter}3:{unit_letter}1000")
-            ws.add_data_validation(unit_validation)
         
         # Ajouter quelques lignes vides formatées pour guider l'utilisateur
         for row in range(3, 13):
@@ -355,18 +272,12 @@ class ProductExcelService:
         return result
     
     @classmethod
-    def _generate_signature(cls, organization) -> str:
-        """Génère une signature unique pour valider le template."""
-        data = f"{TEMPLATE_SIGNATURE}|{TEMPLATE_VERSION}|{organization.id}"
+    def _generate_signature(cls) -> str:
+        """Signature du format de template (identique pour toutes les organisations)."""
+        data = f"{TEMPLATE_SIGNATURE}|{TEMPLATE_VERSION}"
         hash_value = hashlib.sha256(data.encode()).hexdigest()[:16]
         return f"VF|{TEMPLATE_VERSION}|{hash_value}"
-    
-    @classmethod
-    def _validate_signature(cls, signature: str, organization) -> bool:
-        """Valide la signature du fichier importé."""
-        expected = cls._generate_signature(organization)
-        return signature == expected
-    
+
     @classmethod
     def validate_import_file(cls, file_content: bytes, organization) -> Tuple[bool, str, Optional[Workbook]]:
         """
@@ -389,19 +300,18 @@ class ProductExcelService:
             return False, "Feuille 'Produits' introuvable. Utilisez le template officiel.", None
         
         ws = wb[products_sheet_name]
-        
-        # Vérifier la signature (ligne 1, colonne 1)
-        signature = ws.cell(row=1, column=1).value
-        if not signature or not cls._validate_signature(signature, organization):
-            return False, "Ce fichier n'est pas un template valide de Vente Facile. Téléchargez le template officiel.", None
-        
-        # Vérifier les en-têtes (ligne 2)
+
+        # En-têtes (ligne 2) : critère principal du format — doit correspondre au template officiel
         expected_headers = [col["header"] for col in cls.COLUMNS]
         actual_headers = [ws.cell(row=2, column=i).value for i in range(1, len(cls.COLUMNS) + 1)]
-        
+
         if actual_headers != expected_headers:
             return False, "Les en-têtes du fichier ont été modifiés. Utilisez le template officiel sans modifier les en-têtes.", None
-        
+
+        # Signature (ligne 1) : renforce l'authenticité mais ne bloque pas si les en-têtes sont conformes
+        # (ex. template 1.1 lié à une autre organisation, copie entre environnements, Excel qui modifie A1).
+        # Ligne 1 (signature) ignorée pour le blocage : les en-têtes exacts garantissent le format attendu.
+
         return True, "Fichier valide", wb
     
     @classmethod
@@ -426,10 +336,9 @@ class ProductExcelService:
         products_sheet_name = next((s for s in wb.sheetnames if "Produits" in s), None)
         ws = wb[products_sheet_name]
         
-        # Charger les références existantes (avec chemin pour catégories)
-        categories_map = cls._build_categories_map(organization)
-        brands_map = {b.name.lower(): b for b in Brand.objects.filter(organization=organization, is_deleted=False)}
-        units_map = {u.name.lower(): u for u in Unit.objects.filter(organization=organization)}
+        category_lookup = cls._build_category_lookup(organization)
+        brands_map = cls._build_brands_map(organization)
+        units_map = cls._build_units_map(organization)
         
         # Charger les SKU et codes-barres existants pour détecter les doublons
         existing_skus = set(Product.objects.filter(organization=organization, is_deleted=False).values_list('sku', flat=True))
@@ -445,6 +354,10 @@ class ProductExcelService:
         
         products_to_create = []
         row_num = 3  # Données commencent à la ligne 3
+        parent_categories, subcategories, brand_values, unit_values = cls._collect_reference_values(ws)
+        cls._sync_categories(organization, category_lookup, parent_categories, subcategories)
+        cls._sync_brands(organization, brands_map, brand_values)
+        cls._sync_units(organization, units_map, unit_values)
         
         while True:
             # Lire la ligne
@@ -495,7 +408,12 @@ class ProductExcelService:
             
             # Préparer le produit
             try:
-                product_data = cls._parse_row_data(row_data, organization, user)
+                product_data = cls._parse_row_data(
+                    row_data,
+                    category_lookup,
+                    brands_map,
+                    units_map,
+                )
                 product_data["organization"] = organization
                 product_data["created_by"] = user
                 product_data["slug"] = slugify(name)
@@ -551,145 +469,201 @@ class ProductExcelService:
         return results
     
     @classmethod
-    def _build_categories_map(cls, organization) -> Dict[str, Category]:
-        """
-        Construit un dictionnaire des catégories avec leur chemin comme clé.
-        Supporte les formats: "Catégorie" ou "Parent > Enfant > Sous-enfant"
-        """
-        categories = Category.objects.filter(
-            organization=organization, 
-            is_deleted=False
-        ).select_related('parent__parent')
-        
-        result = {}
-        
-        for cat in categories:
-            # Ajouter par nom simple (en minuscules)
-            result[cat.name.lower()] = cat
-            
-            # Ajouter par chemin complet
-            path_parts = [cat.name]
-            current = cat
-            while current.parent:
-                path_parts.insert(0, current.parent.name)
-                current = current.parent
-            full_path = " > ".join(path_parts).lower()
-            result[full_path] = cat
-        
-        return result
-    
+    def _normalize_key(cls, value: Any) -> str:
+        """Normalise une valeur pour comparaison (minuscule, espaces unifiés)."""
+        return " ".join(str(value or "").strip().lower().split())
+
     @classmethod
-    def _get_or_create_category(cls, category_input: str, organization, user) -> Optional[Category]:
+    def _allocate_unique_category_slug(cls, organization, parent: Optional[Category], display_name: str) -> str:
+        """Slug unique pour une catégorie au sein du même parent (contrainte org + parent + slug)."""
+        base = slugify(display_name) or "categorie"
+        slug = base
+        counter = 1
+        qs = Category.objects.filter(organization=organization, is_deleted=False, parent=parent)
+        while qs.filter(slug=slug).exists():
+            slug = f"{base}-{counter}"
+            counter += 1
+        return slug
+
+    @classmethod
+    def _allocate_unique_brand_slug(cls, organization, display_name: str) -> str:
+        base = slugify(display_name) or "marque"
+        slug = base
+        counter = 1
+        qs = Brand.objects.filter(organization=organization, is_deleted=False)
+        while qs.filter(slug=slug).exists():
+            slug = f"{base}-{counter}"
+            counter += 1
+        return slug
+
+    @classmethod
+    def _allocate_unique_unit_symbol(cls, organization, display_name: str) -> str:
         """
-        Récupère ou crée une catégorie à partir d'une chaîne.
-        Supporte le format "Parent > Enfant > Sous-enfant".
+        Symbole unique par organisation (max 10 caractères).
+        Évite les collisions du type « 3 premières lettres » identiques entre unités différentes.
         """
-        if not category_input or not category_input.strip():
-            return None
-        
-        category_input = category_input.strip()
-        
-        # Vérifier si c'est un chemin hiérarchique
-        if " > " in category_input:
-            parts = [p.strip() for p in category_input.split(" > ")]
-            parent = None
-            
-            for part in parts:
-                if not part:
-                    continue
-                    
-                # Chercher la catégorie existante
-                query = Category.objects.filter(
-                    organization=organization,
-                    name__iexact=part,
-                    is_deleted=False
-                )
-                if parent:
-                    query = query.filter(parent=parent)
-                else:
-                    query = query.filter(parent__isnull=True)
-                
-                category = query.first()
-                
-                if not category:
-                    # Créer la catégorie
-                    category = Category.objects.create(
-                        organization=organization,
-                        name=part,
-                        slug=slugify(part),
-                        parent=parent,
-                        created_by=user
-                    )
-                
-                parent = category
-            
-            return parent
-        else:
-            # Catégorie simple (sans hiérarchie)
-            category = Category.objects.filter(
-                organization=organization,
-                name__iexact=category_input,
-                is_deleted=False
-            ).first()
-            
-            if not category:
+        clean = (display_name or "").strip()
+        root = slugify(clean)[:8] or "u"
+        root = root.upper()
+        i = 0
+        while i < 10000:
+            suffix = "" if i == 0 else str(i)
+            candidate = (root + suffix)[:10]
+            if not Unit.objects.filter(organization=organization, symbol=candidate).exists():
+                return candidate
+            i += 1
+        digest = hashlib.sha256(f"{organization.id}|{clean}|unit".encode()).hexdigest()[:10].upper()
+        return digest[:10]
+
+    @classmethod
+    def _clean_text(cls, value: Any) -> str:
+        """Nettoie une valeur texte sans changer sa casse."""
+        return " ".join(str(value or "").strip().split())
+
+    @classmethod
+    def _build_category_lookup(cls, organization) -> Dict[Tuple[Optional[str], str], Category]:
+        """Construit un index de catégories par parent et nom normalisé."""
+        categories = Category.objects.filter(
+            organization=organization,
+            is_deleted=False
+        ).select_related("parent")
+        return {
+            (str(cat.parent_id) if cat.parent_id else None, cls._normalize_key(cat.name)): cat
+            for cat in categories
+        }
+
+    @classmethod
+    def _build_brands_map(cls, organization) -> Dict[str, Brand]:
+        """Construit un index des marques par nom normalisé."""
+        brands = Brand.objects.filter(organization=organization, is_deleted=False)
+        return {cls._normalize_key(brand.name): brand for brand in brands}
+
+    @classmethod
+    def _build_units_map(cls, organization) -> Dict[str, Unit]:
+        """Construit un index des unités par nom normalisé."""
+        units = Unit.objects.filter(organization=organization)
+        return {cls._normalize_key(unit.name): unit for unit in units}
+
+    @classmethod
+    def _collect_reference_values(cls, ws):
+        """Collecte les référentiels saisis dans les lignes du fichier."""
+        parent_categories: Dict[str, str] = {}
+        subcategories: Dict[Tuple[str, str], Tuple[str, str]] = {}
+        brand_values: Dict[str, str] = {}
+        unit_values: Dict[str, str] = {}
+
+        row_num = 3
+        while True:
+            row_data = {}
+            has_data = False
+            for col_idx, col_config in enumerate(cls.COLUMNS, start=1):
+                value = ws.cell(row=row_num, column=col_idx).value
+                if value is not None and str(value).strip():
+                    has_data = True
+                row_data[col_config["key"]] = value
+
+            if not has_data:
+                break
+
+            category_name = cls._clean_text(row_data.get("category"))
+            subcategory_name = cls._clean_text(row_data.get("subcategory"))
+            brand_name = cls._clean_text(row_data.get("brand"))
+            unit_name = cls._clean_text(row_data.get("unit"))
+
+            if category_name and not subcategory_name and ">" in category_name:
+                parts = [cls._clean_text(part) for part in category_name.split(">") if cls._clean_text(part)]
+                if parts:
+                    category_name = parts[0]
+                if len(parts) >= 2:
+                    subcategory_name = parts[-1]
+
+            if category_name:
+                category_key = cls._normalize_key(category_name)
+                if category_key:
+                    parent_categories.setdefault(category_key, category_name)
+
+                    if subcategory_name:
+                        subcategory_key = cls._normalize_key(subcategory_name)
+                        if subcategory_key:
+                            subcategories.setdefault(
+                                (category_key, subcategory_key),
+                                (category_name, subcategory_name),
+                            )
+
+            if brand_name:
+                brand_values.setdefault(cls._normalize_key(brand_name), brand_name)
+            if unit_name:
+                unit_values.setdefault(cls._normalize_key(unit_name), unit_name)
+
+            row_num += 1
+
+        return parent_categories, subcategories, brand_values, unit_values
+
+    @classmethod
+    def _sync_categories(cls, organization, category_lookup, parent_categories, subcategories):
+        """Crée les catégories/sous-catégories manquantes."""
+        for parent_key, display_name in parent_categories.items():
+            lookup_key = (None, parent_key)
+            if lookup_key not in category_lookup:
                 category = Category.objects.create(
                     organization=organization,
-                    name=category_input,
-                    slug=slugify(category_input),
-                    created_by=user
+                    name=display_name,
+                    slug=cls._allocate_unique_category_slug(organization, None, display_name),
                 )
-            
-            return category
+                category_lookup[lookup_key] = category
+
+        for (parent_key, child_key), (parent_display, child_display) in subcategories.items():
+            parent = category_lookup.get((None, parent_key))
+            if not parent:
+                parent = Category.objects.create(
+                    organization=organization,
+                    name=parent_display,
+                    slug=cls._allocate_unique_category_slug(organization, None, parent_display),
+                )
+                category_lookup[(None, parent_key)] = parent
+
+            child_lookup_key = (str(parent.id), child_key)
+            if child_lookup_key not in category_lookup:
+                child = Category.objects.create(
+                    organization=organization,
+                    name=child_display,
+                    slug=cls._allocate_unique_category_slug(organization, parent, child_display),
+                    parent=parent,
+                )
+                category_lookup[child_lookup_key] = child
+
+    @classmethod
+    def _sync_brands(cls, organization, brands_map, brand_values):
+        """Crée les marques manquantes."""
+        for normalized_name, display_name in brand_values.items():
+            if normalized_name and normalized_name not in brands_map:
+                brand = Brand.objects.create(
+                    organization=organization,
+                    name=display_name,
+                    slug=cls._allocate_unique_brand_slug(organization, display_name),
+                )
+                brands_map[normalized_name] = brand
+
+    @classmethod
+    def _sync_units(cls, organization, units_map, unit_values):
+        """Crée les unités manquantes."""
+        for normalized_name, display_name in unit_values.items():
+            if normalized_name and normalized_name not in units_map:
+                unit = Unit.objects.create(
+                    organization=organization,
+                    name=display_name,
+                    symbol=cls._allocate_unique_unit_symbol(organization, display_name),
+                )
+                units_map[normalized_name] = unit
     
     @classmethod
-    def _get_or_create_brand(cls, brand_name: str, organization, user) -> Optional[Brand]:
-        """Récupère ou crée une marque."""
-        if not brand_name or not brand_name.strip():
-            return None
-        
-        brand_name = brand_name.strip()
-        brand = Brand.objects.filter(
-            organization=organization,
-            name__iexact=brand_name,
-            is_deleted=False
-        ).first()
-        
-        if not brand:
-            brand = Brand.objects.create(
-                organization=organization,
-                name=brand_name,
-                slug=slugify(brand_name),
-                created_by=user
-            )
-        
-        return brand
-    
-    @classmethod
-    def _get_or_create_unit(cls, unit_name: str, organization) -> Optional[Unit]:
-        """Récupère ou crée une unité."""
-        if not unit_name or not unit_name.strip():
-            return None
-        
-        unit_name = unit_name.strip()
-        unit = Unit.objects.filter(
-            organization=organization,
-            name__iexact=unit_name
-        ).first()
-        
-        if not unit:
-            # Créer l'unité avec un symbole par défaut
-            symbol = unit_name[:3].upper()
-            unit = Unit.objects.create(
-                organization=organization,
-                name=unit_name,
-                symbol=symbol
-            )
-        
-        return unit
-    
-    @classmethod
-    def _parse_row_data(cls, row_data: Dict, organization, user) -> Dict:
+    def _parse_row_data(
+        cls,
+        row_data: Dict,
+        category_lookup: Dict[Tuple[Optional[str], str], Category],
+        brands_map: Dict[str, Brand],
+        units_map: Dict[str, Unit],
+    ) -> Dict:
         """Parse les données d'une ligne Excel en données de produit."""
         
         def parse_decimal(value, default=Decimal("0.00")):
@@ -718,14 +692,30 @@ class ProductExcelService:
             except (ValueError, TypeError):
                 return default
         
-        # Récupérer ou créer les références
-        category_input = str(row_data.get("category") or "").strip()
-        brand_input = str(row_data.get("brand") or "").strip()
-        unit_input = str(row_data.get("unit") or "").strip()
-        
-        category = cls._get_or_create_category(category_input, organization, user) if category_input else None
-        brand = cls._get_or_create_brand(brand_input, organization, user) if brand_input else None
-        unit = cls._get_or_create_unit(unit_input, organization) if unit_input else None
+        category_input = cls._clean_text(row_data.get("category"))
+        subcategory_input = cls._clean_text(row_data.get("subcategory"))
+        brand_input = cls._clean_text(row_data.get("brand"))
+        unit_input = cls._clean_text(row_data.get("unit"))
+
+        # Compatibilité descendante: autoriser "Parent > Enfant" saisi dans Catégorie.
+        if category_input and not subcategory_input and ">" in category_input:
+            parts = [cls._clean_text(part) for part in category_input.split(">") if cls._clean_text(part)]
+            if parts:
+                category_input = parts[0]
+            if len(parts) >= 2:
+                subcategory_input = parts[-1]
+
+        category = None
+        if category_input:
+            parent_key = cls._normalize_key(category_input)
+            parent_category = category_lookup.get((None, parent_key))
+            category = parent_category
+            if parent_category and subcategory_input:
+                child_key = cls._normalize_key(subcategory_input)
+                category = category_lookup.get((str(parent_category.id), child_key), parent_category)
+
+        brand = brands_map.get(cls._normalize_key(brand_input)) if brand_input else None
+        unit = units_map.get(cls._normalize_key(unit_input)) if unit_input else None
         
         return {
             "name": str(row_data.get("name") or "").strip(),

@@ -35,6 +35,38 @@ class RegisterSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'created_at']
 
+    def validate(self, attrs):
+        instance = getattr(self, 'instance', None)
+        if instance is not None:
+            branch = attrs.get('branch', instance.branch)
+            warehouse = attrs['warehouse'] if 'warehouse' in attrs else instance.warehouse
+        else:
+            branch = attrs.get('branch')
+            warehouse = attrs.get('warehouse')
+
+        if warehouse is None:
+            raise serializers.ValidationError(
+                {'warehouse': 'Entrepôt requis.'}
+            )
+        if branch is None:
+            raise serializers.ValidationError(
+                {'branch': 'Succursale requise.'}
+            )
+
+        if warehouse.organization_id != branch.organization_id:
+            raise serializers.ValidationError({
+                'warehouse':
+                    'L\'entrepôt doit appartenir à la même organisation que la succursale.'
+            })
+
+        wh_branch_id = getattr(warehouse, 'branch_id', None)
+        if wh_branch_id is not None and wh_branch_id != branch.id:
+            raise serializers.ValidationError({
+                'warehouse': 'Cet entrepôt est rattaché à une autre succursale.'
+            })
+
+        return attrs
+
     def get_current_session(self, obj):
         """Retourne la session active si elle existe."""
         session = obj.sessions.filter(status='open').first()

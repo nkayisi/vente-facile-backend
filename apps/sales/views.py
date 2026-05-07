@@ -19,6 +19,8 @@ from apps.core.api_mixins import (
 from apps.core.warehouse_scope import (
     accessible_warehouse_ids,
     assert_warehouse_allowed_for_request,
+    filter_queryset_by_related_warehouse,
+    filter_queryset_by_warehouse_ids,
     get_membership_for_request,
 )
 from apps.core.api_permissions import (
@@ -71,20 +73,18 @@ class RegisterViewSet(
     
     select_related_fields = ['branch', 'warehouse']
 
-    # Le champ ``warehouse`` du Register est nullable : on tolère ``None``
-    # pour les owners et on requiert un entrepôt assigné sinon.
     warehouse_scope_field = 'warehouse_id'
-    warehouse_scope_include_null = True
-    warehouse_write_required = False
-    warehouse_write_allow_none = True
+    warehouse_scope_include_null = False
+    warehouse_write_required = True
+    warehouse_write_allow_none = False
     
     action_permissions = {
         'list': 'sales.view',
         'retrieve': 'sales.view',
-        'create': 'sales.create',
-        'update': 'sales.create',
-        'partial_update': 'sales.create',
-        'destroy': 'sales.cancel',
+        'create': 'sales.manage_registers',
+        'update': 'sales.manage_registers',
+        'partial_update': 'sales.manage_registers',
+        'destroy': 'sales.manage_registers',
     }
 
 
@@ -116,12 +116,10 @@ class RegisterSessionViewSet(
     
     select_related_fields = ['register', 'opened_by', 'closed_by']
 
-    # Filtre par l'entrepôt du Register associé. On tolère ``None`` pour les
-    # registres legacy sans entrepôt (visibles uniquement si owner ; sinon
-    # ``include_null=True`` les laisse aux non-owner également afin de ne pas
-    # casser le POS existant).
+    # Filtre par l'entrepôt de la caisse : uniquement les sessions dont la
+    # caisse est dans le périmètre ``assigned_warehouses`` du membre (owner : tout).
     warehouse_scope_field = 'register__warehouse_id'
-    warehouse_scope_include_null = True
+    warehouse_scope_include_null = False
     
     action_permissions = {
         'list': 'sales.view',
@@ -152,29 +150,24 @@ class RegisterSessionViewSet(
         organization = self.get_organization()
         register_id = serializer.validated_data['register']
         
-        # Vérifier que la caisse existe et appartient à l'organisation
-        register = Register.objects.filter(
+        # Caisse dans l'org, active, et dans le périmètre entrepôt du membre
+        register_qs = Register.objects.filter(
             id=register_id,
             organization=organization,
-            is_active=True
-        ).first()
-        
+            is_active=True,
+        )
+        membership = get_membership_for_request(request)
+        if membership:
+            register_qs = filter_queryset_by_warehouse_ids(
+                register_qs, membership, 'warehouse_id'
+            )
+        register = register_qs.first()
+
         if not register:
             return Response(
                 {'error': 'Caisse non trouvée ou inactive'},
                 status=status.HTTP_404_NOT_FOUND
             )
-
-        # Vérifier que la caisse est dans le périmètre du membre
-        membership = get_membership_for_request(request)
-        if membership:
-            allowed_ids = accessible_warehouse_ids(membership)
-            if allowed_ids is not None:
-                if register.warehouse_id is None or register.warehouse_id not in allowed_ids:
-                    return Response(
-                        {'error': "Cette caisse n'est pas dans votre périmètre d'entrepôts."},
-                        status=status.HTTP_403_FORBIDDEN
-                    )
         
         # Vérifier qu'il n'y a pas de session ouverte
         existing_session = RegisterSession.objects.filter(
@@ -242,13 +235,22 @@ class RegisterSessionViewSet(
     def current(self, request):
         """Retourne la session courante de l'utilisateur."""
         organization = self.get_organization()
-        
-        session = RegisterSession.objects.filter(
+
+        session_qs = RegisterSession.objects.filter(
             organization=organization,
             opened_by=request.user,
-            status='open'
-        ).select_related('register').first()
-        
+            status='open',
+        ).select_related('register')
+        membership = get_membership_for_request(request)
+        if membership:
+            session_qs = filter_queryset_by_related_warehouse(
+                session_qs,
+                membership,
+                'register__warehouse_id',
+                include_null=False,
+            )
+        session = session_qs.first()
+
         if not session:
             return Response(
                 {'error': 'Aucune session ouverte'},
@@ -316,7 +318,7 @@ class SaleViewSet(
     """
     
     queryset = Sale.objects.all()
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, TenantObjectPermission]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission, TenantObjectPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['status', 'sale_type', 'customer', 'register', 'is_pos']
     search_fields = ['reference', 'customer__name']
@@ -802,7 +804,7 @@ class SaleReturnViewSet(
     """
     
     queryset = SaleReturn.objects.all()
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, TenantObjectPermission]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission, TenantObjectPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['status', 'return_type']
     search_fields = ['reference', 'original_sale__reference']
@@ -951,7 +953,7 @@ class QuotationViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     """
     
     queryset = Quotation.objects.all()
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, TenantObjectPermission]
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission, TenantObjectPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['status', 'customer']
     search_fields = ['reference', 'customer__name']

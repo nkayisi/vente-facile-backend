@@ -4,6 +4,8 @@ Serializers DRF pour l'app Inventory.
 from rest_framework import serializers
 from decimal import Decimal
 from django.utils import timezone
+from django.db.models import F
+from apps.products.models import Category
 from .models import (
     Warehouse, StockLocation, Stock, StockBatch, StockMovement,
     StockTransfer, StockTransferItem, StockAdjustment, StockAdjustmentItem,
@@ -746,11 +748,64 @@ class InventorySessionCreateSerializer(serializers.ModelSerializer):
         # Check warehouse has stock
         warehouse = data.get('warehouse')
         organization = self.context['request'].headers.get('X-Organization-ID')
+
+        if scope_type == 'product' and product_ids:
+            available_product_ids = set(
+                Stock.objects.filter(
+                    organization_id=organization,
+                    warehouse=warehouse,
+                    product_id__in=product_ids,
+                    variant__isnull=True,
+                    quantity__gt=F('reserved_quantity'),
+                ).values_list('product_id', flat=True).distinct()
+            )
+            if any(pid not in available_product_ids for pid in product_ids):
+                raise serializers.ValidationError({
+                    'product_ids': (
+                        "Certains produits sélectionnés n'ont pas de stock disponible "
+                        "dans l'entrepôt choisi."
+                    )
+                })
+
+        if scope_type == 'category' and category_ids:
+            valid_category_ids = set(
+                Category.objects.filter(
+                    organization_id=organization,
+                    id__in=category_ids,
+                    is_deleted=False,
+                ).values_list('id', flat=True)
+            )
+            invalid_selection = [
+                cid for cid in category_ids if cid not in valid_category_ids
+            ]
+            if invalid_selection:
+                raise serializers.ValidationError({
+                    'category_ids': (
+                        "Certaines catégories sélectionnées sont invalides pour cette organisation."
+                    )
+                })
+
+            available_category_ids = set(
+                Stock.objects.filter(
+                    organization_id=organization,
+                    warehouse=warehouse,
+                    product__category_id__in=category_ids,
+                    quantity__gt=F('reserved_quantity'),
+                    product__is_deleted=False,
+                ).values_list('product__category_id', flat=True).distinct()
+            )
+            if any(cid not in available_category_ids for cid in category_ids):
+                raise serializers.ValidationError({
+                    'category_ids': (
+                        "Certaines catégories sélectionnées n'ont aucun produit en stock "
+                        "disponible dans l'entrepôt choisi."
+                    )
+                })
         
         has_stock = Stock.objects.filter(
             organization_id=organization,
             warehouse=warehouse,
-            quantity__gt=0,
+            quantity__gt=F('reserved_quantity'),
         ).exists()
         if not has_stock:
             raise serializers.ValidationError({

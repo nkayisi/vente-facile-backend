@@ -35,7 +35,6 @@ from .serializers import (
     CashMovementDetailSerializer,
 )
 
-
 # =============================================================================
 # INCOME CATEGORY VIEWSET
 # =============================================================================
@@ -442,10 +441,7 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     Filtrage par entrepôt : un mouvement est visible si
     - le membre est ``owner``, OU
     - la vente liée appartient au périmètre du membre, OU
-    - la dépense liée appartient au périmètre du membre, OU
-    - aucune vente/dépense n'est liée (mouvements généraux : apports, retraits,
-      ajustements). Cette tolérance est nécessaire car ces mouvements ne sont
-      pas rattachés à un entrepôt spécifique.
+    - la dépense liée appartient au périmètre du membre.
     """
 
     queryset = CashMovement.objects.all()
@@ -495,17 +491,11 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         if allowed_ids is None:
             return queryset
         if not allowed_ids:
-            # Tolère les mouvements sans vente/dépense (général)
-            return queryset.filter(
-                sale__isnull=True,
-                expense__isnull=True,
-            )
+            # Aucun entrepôt assigné => aucun mouvement visible.
+            return queryset.none()
         return queryset.filter(
             Q(sale__warehouse_id__in=allowed_ids)
             | Q(expense__warehouse_id__in=allowed_ids)
-            | Q(sale__isnull=True, expense__isnull=True)
-            | Q(sale__warehouse__isnull=True, expense__isnull=True)
-            | Q(sale__isnull=True, expense__warehouse__isnull=True)
         )
 
     def get_queryset(self):
