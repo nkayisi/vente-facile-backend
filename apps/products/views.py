@@ -2,6 +2,8 @@
 ViewSets DRF pour l'app Products.
 Tous les ViewSets héritent de TenantViewSetMixin pour le filtrage multi-tenant.
 """
+from datetime import datetime
+
 from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -334,6 +336,8 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
         'search_barcode': 'products.view',
         'import_template': 'products.view',
         'import_products': 'products.create',
+        'export_excel': 'products.view',
+        'export_pdf': 'products.view',
         'check_duplicate': 'products.view',
     }
 
@@ -593,6 +597,35 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
             return Response(result, status=status.HTTP_200_OK)
         else:
             return Response(result, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=['get'], url_path='export/excel')
+    def export_excel(self, request):
+        """Exporte tous les produits de l'organisation au format Excel."""
+        organization = self.get_organization()
+        buffer = ProductExcelService.export_excel(organization)
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        response = HttpResponse(
+            buffer.getvalue(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        response['Content-Disposition'] = (
+            f'attachment; filename="produits_export_{timestamp}.xlsx"'
+        )
+        return response
+
+    @action(detail=False, methods=['get'], url_path='export/pdf')
+    def export_pdf(self, request):
+        """Exporte tous les produits de l'organisation au format PDF."""
+        organization = self.get_organization()
+        buffer = ProductExcelService.export_pdf(organization)
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
+        response['Content-Disposition'] = (
+            f'attachment; filename="produits_export_{timestamp}.pdf"'
+        )
+        return response
 
     @action(detail=False, methods=['post'], url_path='check-duplicate')
     def check_duplicate(self, request):

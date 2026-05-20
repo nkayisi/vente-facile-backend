@@ -736,6 +736,228 @@ class ProductExcelService:
             "is_active": True,
         }
     
+    # ---------------------------------------------------------------------
+    # EXPORT
+    # ---------------------------------------------------------------------
+
+    EXPORT_COLUMNS = [
+        {"key": "name", "header": "Nom", "width": 35},
+        {"key": "sku", "header": "Code SKU", "width": 18},
+        {"key": "barcode", "header": "Code-barres", "width": 18},
+        {"key": "category", "header": "Catégorie", "width": 22},
+        {"key": "brand", "header": "Marque", "width": 18},
+        {"key": "unit", "header": "Unité", "width": 12},
+        {"key": "cost_price", "header": "Prix d'achat", "width": 14},
+        {"key": "selling_price", "header": "Prix de vente", "width": 14},
+        {"key": "wholesale_price", "header": "Prix de gros", "width": 14},
+        {"key": "tax_rate", "header": "TVA (%)", "width": 10},
+        {"key": "stock_quantity", "header": "Stock", "width": 10},
+        {"key": "min_stock_level", "header": "Stock min", "width": 10},
+        {"key": "is_active", "header": "Actif", "width": 8},
+    ]
+
+    @classmethod
+    def _export_queryset(cls, organization):
+        return (
+            Product.objects.filter(organization=organization, is_deleted=False)
+            .select_related("category", "brand", "unit")
+            .prefetch_related("stocks")
+            .order_by("name")
+        )
+
+    @classmethod
+    def _product_export_row(cls, product: Product) -> Dict[str, Any]:
+        total_stock = sum((s.quantity or Decimal("0") for s in product.stocks.all()), Decimal("0"))
+        return {
+            "name": product.name or "",
+            "sku": product.sku or "",
+            "barcode": product.barcode or "",
+            "category": product.category.name if product.category_id else "",
+            "brand": product.brand.name if product.brand_id else "",
+            "unit": product.unit.name if product.unit_id else "",
+            "cost_price": product.cost_price or Decimal("0.00"),
+            "selling_price": product.selling_price or Decimal("0.00"),
+            "wholesale_price": product.wholesale_price or "",
+            "tax_rate": product.tax_rate or Decimal("0.00"),
+            "stock_quantity": total_stock if product.track_inventory else "",
+            "min_stock_level": product.min_stock_level or 0,
+            "is_active": "Oui" if product.is_active else "Non",
+        }
+
+    @classmethod
+    def export_excel(cls, organization) -> io.BytesIO:
+        """Génère un fichier Excel contenant tous les produits de l'organisation."""
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Produits"
+
+        header_font = Font(bold=True, color="FFFFFF", size=11)
+        header_fill = PatternFill(start_color="F97316", end_color="F97316", fill_type="solid")
+        header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        thin_border = Border(
+            left=Side(style="thin"),
+            right=Side(style="thin"),
+            top=Side(style="thin"),
+            bottom=Side(style="thin"),
+        )
+
+        for col_idx, col in enumerate(cls.EXPORT_COLUMNS, start=1):
+            cell = ws.cell(row=1, column=col_idx, value=col["header"])
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_alignment
+            cell.border = thin_border
+            ws.column_dimensions[get_column_letter(col_idx)].width = col["width"]
+
+        queryset = cls._export_queryset(organization)
+        for row_offset, product in enumerate(queryset.iterator(chunk_size=500), start=2):
+            row_data = cls._product_export_row(product)
+            for col_idx, col in enumerate(cls.EXPORT_COLUMNS, start=1):
+                value = row_data[col["key"]]
+                if isinstance(value, Decimal):
+                    value = float(value)
+                cell = ws.cell(row=row_offset, column=col_idx, value=value)
+                cell.border = thin_border
+
+        ws.freeze_panes = "A2"
+
+        buffer = io.BytesIO()
+        wb.save(buffer)
+        buffer.seek(0)
+        return buffer
+
+    @classmethod
+    def export_pdf(cls, organization) -> io.BytesIO:
+        """Génère un PDF (paysage) listant tous les produits de l'organisation."""
+        # Import différé pour éviter le coût quand l'export PDF n'est pas utilisé.
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import mm
+        from reportlab.platypus import (
+            SimpleDocTemplate,
+            Paragraph,
+            Spacer,
+            Table,
+            TableStyle,
+        )
+
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=landscape(A4),
+            leftMargin=10 * mm,
+            rightMargin=10 * mm,
+            topMargin=12 * mm,
+            bottomMargin=12 * mm,
+            title=f"Produits - {organization.name}",
+        )
+
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            "Title",
+            parent=styles["Title"],
+            fontSize=16,
+            textColor=colors.HexColor("#F97316"),
+            spaceAfter=4,
+            alignment=0,
+        )
+        meta_style = ParagraphStyle(
+            "Meta",
+            parent=styles["Normal"],
+            fontSize=9,
+            textColor=colors.HexColor("#6B7280"),
+        )
+        cell_style = ParagraphStyle(
+            "Cell",
+            parent=styles["Normal"],
+            fontSize=8,
+            leading=10,
+        )
+
+        pdf_columns = [
+            {"key": "name", "header": "Produit", "width": 55},
+            {"key": "sku", "header": "SKU", "width": 30},
+            {"key": "category", "header": "Catégorie", "width": 35},
+            {"key": "brand", "header": "Marque", "width": 28},
+            {"key": "unit", "header": "Unité", "width": 18},
+            {"key": "cost_price", "header": "P. achat", "width": 25},
+            {"key": "selling_price", "header": "P. vente", "width": 25},
+            {"key": "stock_quantity", "header": "Stock", "width": 18},
+            {"key": "is_active", "header": "Actif", "width": 16},
+        ]
+
+        queryset = cls._export_queryset(organization)
+        total = queryset.count()
+
+        story = [
+            Paragraph(f"Catalogue produits — {organization.name}", title_style),
+            Paragraph(
+                f"Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')} • {total} produit(s)",
+                meta_style,
+            ),
+            Spacer(1, 6 * mm),
+        ]
+
+        data = [[Paragraph(f"<b>{c['header']}</b>", cell_style) for c in pdf_columns]]
+
+        def fmt_money(value):
+            if value in (None, ""):
+                return ""
+            try:
+                return f"{float(value):,.2f}".replace(",", " ")
+            except (TypeError, ValueError):
+                return str(value)
+
+        for product in queryset.iterator(chunk_size=500):
+            row_dict = cls._product_export_row(product)
+            data.append([
+                Paragraph(str(row_dict["name"] or ""), cell_style),
+                Paragraph(str(row_dict["sku"] or ""), cell_style),
+                Paragraph(str(row_dict["category"] or "—"), cell_style),
+                Paragraph(str(row_dict["brand"] or "—"), cell_style),
+                Paragraph(str(row_dict["unit"] or "—"), cell_style),
+                Paragraph(fmt_money(row_dict["cost_price"]), cell_style),
+                Paragraph(fmt_money(row_dict["selling_price"]), cell_style),
+                Paragraph(
+                    str(row_dict["stock_quantity"]) if row_dict["stock_quantity"] != "" else "—",
+                    cell_style,
+                ),
+                Paragraph(str(row_dict["is_active"]), cell_style),
+            ])
+
+        if total == 0:
+            data.append([
+                Paragraph("<i>Aucun produit à exporter.</i>", cell_style),
+                *[Paragraph("", cell_style) for _ in pdf_columns[1:]],
+            ])
+
+        col_widths = [c["width"] * mm for c in pdf_columns]
+        table = Table(data, colWidths=col_widths, repeatRows=1)
+        table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F97316")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("ALIGN", (5, 1), (7, -1), "RIGHT"),
+                    ("ALIGN", (-1, 1), (-1, -1), "CENTER"),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#E5E7EB")),
+                    ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#D1D5DB")),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#FAFAFA")]),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                    ("TOPPADDING", (0, 0), (-1, -1), 4),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ]
+            )
+        )
+        story.append(table)
+
+        doc.build(story)
+        buffer.seek(0)
+        return buffer
+
     @classmethod
     def check_duplicate(cls, organization, sku: str = None, barcode: str = None, exclude_id=None) -> Dict[str, Any]:
         """

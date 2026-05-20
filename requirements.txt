@@ -39,3 +39,4 @@ psycopg2-binary
 whitenoise
 dj-database-url
 openpyxl
+reportlab>=4.0,<5.0
