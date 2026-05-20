@@ -319,7 +319,7 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
     ordering = ['name']
     
     select_related_fields = ['category', 'brand', 'unit']
-    prefetch_related_fields = ['stocks', 'images', 'variants']
+    prefetch_related_fields = ['stocks__warehouse', 'stocks__location', 'images', 'variants']
     bulk_update_fields = ['is_active', 'is_featured', 'category', 'brand']
     
     action_permissions = {

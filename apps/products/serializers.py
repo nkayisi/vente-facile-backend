@@ -340,6 +340,8 @@ class ProductListSerializer(serializers.ModelSerializer):
     brand_name = serializers.CharField(source='brand.name', read_only=True)
     unit_symbol = serializers.CharField(source='unit.symbol', read_only=True)
     stock_quantity = serializers.SerializerMethodField()
+    stock_location = serializers.SerializerMethodField()
+    warehouse_name = serializers.SerializerMethodField()
     
     class Meta:
         model = Product
@@ -350,15 +352,50 @@ class ProductListSerializer(serializers.ModelSerializer):
             'selling_price', 'cost_price',
             'is_taxable', 'tax_rate',
             'is_active', 'is_featured', 'track_inventory',
-            'stock_quantity'
+            'allow_negative_stock', 'reorder_point',
+            'stock_quantity', 'stock_location', 'warehouse_name',
         ]
         read_only_fields = ['id']
 
+    def _warehouse_id_from_request(self):
+        request = self.context.get('request')
+        if not request:
+            return None
+        wh = request.query_params.get('warehouse')
+        return str(wh).strip() if wh else None
+
+    def _stock_for_warehouse(self, obj):
+        wh_id = self._warehouse_id_from_request()
+        stocks = list(obj.stocks.all())
+        if wh_id:
+            for s in stocks:
+                if str(s.warehouse_id) == wh_id:
+                    return s
+            return None
+        return stocks[0] if len(stocks) == 1 else None
+
     def get_stock_quantity(self, obj):
-        """Retourne le stock total disponible."""
-        if hasattr(obj, 'total_stock'):
+        """Retourne le stock disponible (entrepôt filtré si ?warehouse=)."""
+        if hasattr(obj, 'total_stock') and obj.total_stock is not None:
             return obj.total_stock
-        return sum(s.available_quantity for s in obj.stocks.all())
+        stock = self._stock_for_warehouse(obj)
+        if stock:
+            return stock.available_quantity
+        return sum((s.available_quantity for s in obj.stocks.all()), 0)
+
+    def get_stock_location(self, obj):
+        """Emplacement dans l'entrepôt (rayon, allée, etc.)."""
+        stock = self._stock_for_warehouse(obj)
+        if stock and stock.location_id:
+            return stock.location.name
+        return None
+
+    def get_warehouse_name(self, obj):
+        """Nom de l'entrepôt associé au stock affiché."""
+        stock = self._stock_for_warehouse(obj)
+        if stock:
+            return stock.warehouse.name
+        return None
 
 
 class ProductDetailSerializer(serializers.ModelSerializer):

@@ -353,12 +353,19 @@ class SaleCreateSerializer(serializers.ModelSerializer):
     items = SaleItemCreateSerializer(many=True)
     payments = PaymentCreateSerializer(many=True, required=False)
     points_used = serializers.IntegerField(required=False, min_value=0, default=0)
+    global_discount_amount = serializers.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        required=False,
+        min_value=Decimal('0'),
+        default=Decimal('0'),
+    )
     
     class Meta:
         model = Sale
         fields = [
             'register', 'warehouse', 'customer', 'sale_type', 'price_list',
-            'discount_percentage', 'currency', 'exchange_rate',
+            'discount_percentage', 'global_discount_amount', 'currency', 'exchange_rate',
             'notes', 'internal_notes', 'due_date', 'is_pos',
             'items', 'payments', 'points_used'
         ]
@@ -469,11 +476,18 @@ class SaleCreateSerializer(serializers.ModelSerializer):
 
         return data
 
+    def validate_global_discount_amount(self, value):
+        v = value if value is not None else Decimal('0')
+        if v < 0:
+            raise serializers.ValidationError("La remise ne peut pas être négative.")
+        return v
+
     @transaction.atomic
     def create(self, validated_data):
         items_data = validated_data.pop('items')
         payments_data = validated_data.pop('payments', [])
         points_used = validated_data.pop('points_used', 0)
+        global_discount_amount_input = validated_data.pop('global_discount_amount', Decimal('0')) or Decimal('0')
         
         # Générer la référence
         from apps.core.utils import ReferenceGenerator
@@ -579,10 +593,17 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         sale.subtotal = items_subtotal.quantize(TWO_PLACES)
         sale.tax_amount = tax_total.quantize(TWO_PLACES)
         
-        # Remise globale (appliquée sur le net après remises articles)
+        # Remise globale (montant fixe prioritaire, sinon pourcentage legacy)
         net_after_item_discounts = items_subtotal - items_discount_total
         global_discount = Decimal('0.00')
-        if sale.discount_percentage > 0:
+        if global_discount_amount_input > 0:
+            global_discount = global_discount_amount_input.quantize(TWO_PLACES)
+            if global_discount > net_after_item_discounts:
+                raise DRFValidationError(
+                    "La remise ne peut pas dépasser le montant après remises articles."
+                )
+            sale.discount_percentage = Decimal('0.00')
+        elif sale.discount_percentage > 0:
             global_discount = (net_after_item_discounts * sale.discount_percentage / 100).quantize(TWO_PLACES)
         
         # discount_amount = total de toutes les remises (articles + globale)
