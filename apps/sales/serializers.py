@@ -4,7 +4,6 @@ Serializers DRF pour l'app Sales (POS).
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from decimal import Decimal
-from django.utils import timezone
 from django.db import transaction
 from .models import (
     Register, RegisterSession, Sale, SaleItem, PaymentMethod, Payment,
@@ -145,15 +144,37 @@ class RegisterSessionDetailSerializer(RegisterSessionListSerializer):
 
 
 class RegisterSessionOpenSerializer(serializers.Serializer):
-    """Ouverture de session : uniquement la caisse (solde d'ouverture = 0, pas de notes)."""
+    """
+    Ouverture de session : uniquement la caisse.
+
+    Le solde d'ouverture est hérité automatiquement du `closing_balance` de la
+    dernière session fermée sur cette caisse (ou 0 si aucune).
+    """
 
     register = serializers.UUIDField()
 
 
 class RegisterSessionCloseSerializer(serializers.Serializer):
-    """Fermeture sans saisie : le solde de clôture est le solde théorique (espèces encaissées)."""
+    """
+    Fermeture de session avec comptage manuel optionnel.
 
-    pass
+    - `counted_balance` : montant réel compté en caisse (optionnel). Si fourni,
+      on calcule `difference = counted_balance - expected_balance`.
+    - `notes` : obligatoire si la différence est non nulle.
+    """
+
+    counted_balance = serializers.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        required=False,
+        allow_null=True,
+    )
+    notes = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=2000,
+        default='',
+    )
 
 
 # =============================================================================
@@ -332,7 +353,8 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             'warehouse', 'warehouse_name',
             'customer', 'customer_name', 'customer_phone',
             'sale_type', 'status', 'price_list',
-            'subtotal', 'tax_amount', 'discount_amount', 'discount_percentage', 'total',
+            'subtotal', 'tax_amount', 'discount_amount', 'discount_percentage',
+            'loyalty_redemption_amount', 'total',
             'amount_paid', 'amount_due', 'change_amount',
             'currency', 'exchange_rate',
             'notes', 'internal_notes',
@@ -405,7 +427,15 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         """Validations globales de la vente."""
         items = data.get('items', [])
         warehouse = data.get('warehouse')
-        
+        is_pos = data.get('is_pos', True)
+        register = data.get('register')
+
+        # Vente POS : la caisse est obligatoire
+        if is_pos and not register:
+            raise serializers.ValidationError({
+                'register': "Une caisse est obligatoire pour une vente POS."
+            })
+
         # Récupérer l'organisation
         organization_id = self.context['request'].headers.get('X-Organization-ID')
         from apps.organizations.models import Organization
@@ -474,6 +504,31 @@ class SaleCreateSerializer(serializers.ModelSerializer):
                     "payments": "Les montants de paiement ne peuvent pas être négatifs."
                 })
 
+        # Règles métier sur le type de vente.
+        sale_type = data.get('sale_type', 'retail')
+        customer = data.get('customer')
+
+        # Une vente à crédit exige un client identifié.
+        if sale_type == 'credit' and not customer:
+            raise serializers.ValidationError({
+                'customer': "Un client est obligatoire pour une vente à crédit."
+            })
+
+        # Une vente comptant (retail/wholesale) doit avoir au moins un paiement.
+        # Pour différer le règlement, le caissier doit basculer en sale_type='credit'.
+        if sale_type in ('retail', 'wholesale') and is_pos:
+            total_paid = sum(
+                ((p.get('amount') or Decimal('0')) for p in payments),
+                Decimal('0'),
+            )
+            if total_paid <= 0:
+                raise serializers.ValidationError({
+                    'payments': (
+                        "Une vente comptant doit avoir au moins un paiement. "
+                        "Utilisez le type « crédit » pour différer le règlement."
+                    )
+                })
+
         return data
 
     def validate_global_discount_amount(self, value):
@@ -488,25 +543,53 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         payments_data = validated_data.pop('payments', [])
         points_used = validated_data.pop('points_used', 0)
         global_discount_amount_input = validated_data.pop('global_discount_amount', Decimal('0')) or Decimal('0')
-        
-        # Générer la référence
+
+        # Générer la référence (le lock sur la dernière vente du jour évite la
+        # race condition entre deux requêtes simultanées qui tireraient le même
+        # MAX et produiraient une référence en doublon).
         from apps.core.utils import ReferenceGenerator
+        from apps.core.api_permissions import is_manager_or_above
         organization = self.context['request'].headers.get('X-Organization-ID')
         from apps.organizations.models import Organization
         org = Organization.objects.get(id=organization)
-        
+
+        request = self.context['request']
+
+        # Lock pour la génération de référence : on verrouille la dernière vente
+        # du jour pour l'org. C'est suffisant car ReferenceGenerator lit le MAX.
+        from django.utils import timezone as _tz
+        today_prefix = f"VT-{_tz.now().strftime('%Y%m%d')}"
+        _ = list(
+            Sale.objects.select_for_update().filter(
+                organization=org, reference__startswith=today_prefix
+            ).order_by('-reference').values_list('id', flat=True)[:1]
+        )
         validated_data['reference'] = ReferenceGenerator.generate_sale_reference(org)
         validated_data['organization'] = org
-        validated_data['sold_by'] = self.context['request'].user
-        
+        validated_data['sold_by'] = request.user
+
         # Récupérer la session active si POS
         if validated_data.get('is_pos') and validated_data.get('register'):
             session = RegisterSession.objects.filter(
                 register=validated_data['register'],
                 status='open'
             ).first()
+
+            # Vente POS sans session ouverte → refus
+            if session is None:
+                raise serializers.ValidationError({
+                    'register': "Aucune session ouverte sur cette caisse. "
+                                "Veuillez ouvrir une session avant d'encaisser."
+                })
+
+            # Auditabilité : un cashier ne peut pas utiliser la session d'un autre
+            if session.opened_by_id != request.user.id and not is_manager_or_above(request):
+                raise serializers.ValidationError({
+                    'register': "Cette session a été ouverte par un autre utilisateur."
+                })
+
             validated_data['session'] = session
-            
+
             # Si pas de warehouse spécifié, utiliser celui de la caisse
             if not validated_data.get('warehouse') and validated_data['register'].warehouse:
                 validated_data['warehouse'] = validated_data['register'].warehouse
@@ -533,16 +616,23 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         sale = Sale.objects.create(**validated_data)
         warehouse = sale.warehouse
         
-        # Import pour la gestion du stock
-        from apps.inventory.models import Stock, StockMovement
+        # Import pour la gestion du stock (FIFO uniquement ici ; la décrémentation
+        # est centralisée dans `SaleStockService.apply_decrement` appelée plus bas).
         from apps.inventory.services import FIFOService
         TWO_PLACES = Decimal('0.01')
         
         # Créer les items — SaleItem.save() calcule et arrondit tous les montants
         for item_data in items_data:
             product = item_data['product']
+            variant = item_data.get('variant')
             quantity = item_data['quantity']
-            unit_price = item_data.get('unit_price') or product.selling_price
+            # Priorité : prix fourni par le frontend > prix du variant > prix du produit.
+            variant_price = getattr(variant, 'selling_price', None) if variant else None
+            unit_price = (
+                item_data.get('unit_price')
+                or (variant_price if variant_price and variant_price > 0 else None)
+                or product.selling_price
+            )
             discount_pct = item_data.get('discount_percentage', Decimal('0.00'))
             tax_rate = item_data.get('tax_rate') or (product.tax_rate if product.is_taxable else Decimal('0.00'))
             
@@ -608,7 +698,21 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         
         # discount_amount = total de toutes les remises (articles + globale)
         sale.discount_amount = (items_discount_total + global_discount).quantize(TWO_PLACES)
-        
+
+        # Points de fidélité : appliquer comme réduction effective AVANT le total.
+        # Cappés à la fois par le solde points du client et par le total tentatif
+        # (pas de total négatif).
+        loyalty_resolution = None
+        sale.loyalty_redemption_amount = Decimal('0.00')
+        if points_used > 0 and sale.customer:
+            tentative_total = (items_subtotal - sale.discount_amount + tax_total).quantize(TWO_PLACES)
+            loyalty_resolution = self._resolve_loyalty_redemption(
+                sale.customer, org, points_used, tentative_total,
+            )
+            if loyalty_resolution:
+                sale.discount_amount = (sale.discount_amount + loyalty_resolution['amount']).quantize(TWO_PLACES)
+                sale.loyalty_redemption_amount = loyalty_resolution['amount']
+
         # total = subtotal - toutes remises + taxes
         sale.total = (items_subtotal - sale.discount_amount + tax_total).quantize(TWO_PLACES)
         if sale.total < 0:
@@ -650,62 +754,12 @@ class SaleCreateSerializer(serializers.ModelSerializer):
                 user=self.context['request'].user,
             )
         
-        # Mettre à jour le stock si la vente est complétée et qu'un entrepôt est défini
+        # Mettre à jour le stock si la vente est complétée et qu'un entrepôt est défini.
+        # Décrémentation centralisée : FIFO sur les lots + re-check `allow_negative_stock`
+        # sous lock + StockMovement, le tout idempotent.
         if sale.status == 'completed' and warehouse:
-            for item in sale.items.all():
-                if item.product.track_inventory:
-                    # Consommer les lots en FIFO
-                    allocations, remaining = FIFOService.consume_from_batches(
-                        organization=org,
-                        product=item.product,
-                        warehouse=warehouse,
-                        quantity=item.quantity,
-                        variant=item.variant,
-                        reference_type='sale',
-                        reference_id=str(sale.id),
-                        user=self.context['request'].user,
-                        notes=f"Vente {sale.reference}",
-                        exclude_expired=True,
-                        use_fefo=item.product.has_expiry_date if hasattr(item.product, 'has_expiry_date') else False
-                    )
-                    
-                    # Récupérer ou créer le stock avec verrouillage
-                    product_cost = item.product.cost_price if item.product.cost_price else Decimal('0.00')
-                    cost = item.cost_price if item.cost_price and item.cost_price > 0 else product_cost
-                    stock, created = Stock.objects.select_for_update().get_or_create(
-                        organization=org,
-                        product=item.product,
-                        variant=item.variant,
-                        warehouse=warehouse,
-                        defaults={'quantity': Decimal('0.000'), 'avg_cost': cost}
-                    )
-                    
-                    # Initialiser avg_cost si le stock existait mais sans coût
-                    if not created and stock.avg_cost == 0 and cost > 0:
-                        stock.avg_cost = cost
-                    
-                    quantity_before = stock.quantity
-                    stock.quantity -= item.quantity
-                    stock.last_movement_at = timezone.now()
-                    stock.save()
-                    
-                    # Créer le mouvement de stock
-                    StockMovement.objects.create(
-                        organization=org,
-                        product=item.product,
-                        variant=item.variant,
-                        warehouse=warehouse,
-                        batch=item.batch,
-                        movement_type='sale',
-                        quantity=-item.quantity,
-                        unit_cost=item.cost_price,
-                        quantity_before=quantity_before,
-                        quantity_after=stock.quantity,
-                        reference_type='sale',
-                        reference_id=sale.id,
-                        notes=f"Vente {sale.reference}",
-                        created_by=self.context['request'].user
-                    )
+            from .services import SaleStockService
+            SaleStockService.apply_decrement(sale, self.context['request'].user)
         
         # Mettre à jour le solde client pour les ventes à crédit
         if sale.customer and sale.sale_type == 'credit' and sale.amount_due > 0:
@@ -743,66 +797,99 @@ class SaleCreateSerializer(serializers.ModelSerializer):
                 created_by=self.context['request'].user
             )
         
-        # Utiliser les points de fidélité si demandé
-        if points_used > 0 and sale.customer:
-            self._redeem_loyalty_points(sale, org, points_used)
-        
+        # Persister la consommation de points et la transaction loyalty maintenant
+        # que la vente est sauvegardée (FK loyalty_transaction.sale → sale.id).
+        if loyalty_resolution:
+            self._persist_loyalty_redemption(sale, loyalty_resolution)
+
         # Attribuer les points de fidélité si applicable
         if sale.status == 'completed' and sale.customer:
             self._award_loyalty_points(sale, org)
-        
+
         return sale
-    
-    def _redeem_loyalty_points(self, sale, organization, points_to_redeem):
-        """Utilise les points de fidélité du client pour une réduction."""
-        from apps.settings.models import LoyaltyProgram, CustomerLoyalty, LoyaltyTransaction
+
+    def _resolve_loyalty_redemption(self, customer, organization, points_used, tentative_total):
+        """
+        Calcule combien de points peuvent réellement être consommés et la valeur
+        monétaire correspondante, en respectant : solde points du client, minimum
+        configuré sur le programme, et total tentatif de la vente (pas de négatif).
+
+        Renvoie un dict {amount, points, loyalty, program} ou None si rien à faire.
+        Ne persiste rien : la persistance se fait après save() via
+        `_persist_loyalty_redemption`.
+        """
+        from apps.settings.models import LoyaltyProgram, CustomerLoyalty
         import logging
         logger = logging.getLogger(__name__)
-        
-        logger.info(f"[Loyalty] Attempting to redeem {points_to_redeem} points for sale {sale.reference}")
-        
+
+        if points_used <= 0 or not customer or tentative_total <= 0:
+            return None
+
         try:
             program = LoyaltyProgram.objects.get(organization=organization, is_active=True)
         except LoyaltyProgram.DoesNotExist:
-            logger.warning("[Loyalty] No active loyalty program found for redemption")
-            return
-        
-        # Vérifier le minimum de points requis
-        if points_to_redeem < program.min_points_to_redeem:
-            logger.warning(f"[Loyalty] Points to redeem ({points_to_redeem}) is less than minimum ({program.min_points_to_redeem})")
-            return
-        
-        # Obtenir le compte de fidélité du client
+            logger.info("[Loyalty] No active program — redemption skipped.")
+            return None
+
+        if points_used < program.min_points_to_redeem:
+            logger.info(
+                "[Loyalty] points_used (%s) < min_points_to_redeem (%s) — skipped.",
+                points_used, program.min_points_to_redeem,
+            )
+            return None
+
         try:
             loyalty = CustomerLoyalty.objects.get(
-                organization=organization,
-                customer=sale.customer
+                organization=organization, customer=customer,
             )
         except CustomerLoyalty.DoesNotExist:
-            logger.warning("[Loyalty] Customer loyalty account not found")
-            return
-        
-        # Vérifier que le client a assez de points
-        if loyalty.current_points < points_to_redeem:
-            logger.warning(f"[Loyalty] Insufficient points. Has: {loyalty.current_points}, Wants: {points_to_redeem}")
-            return
-        
-        # Utiliser les points
-        loyalty.redeem_points(points_to_redeem)
-        logger.info(f"[Loyalty] Points redeemed. New balance: {loyalty.current_points}")
-        
-        # Créer la transaction de fidélité
+            logger.info("[Loyalty] No loyalty account for customer — skipped.")
+            return None
+
+        point_value = program.point_value or Decimal('0')
+        if point_value <= 0:
+            logger.warning("[Loyalty] point_value <= 0 — skipped.")
+            return None
+
+        # Cap par solde dispo, et par la valeur monétaire qui ne dépasse pas le total.
+        max_by_balance = int(loyalty.current_points)
+        max_by_total = int(tentative_total / point_value)
+        points_to_use = min(int(points_used), max_by_balance, max_by_total)
+        if points_to_use < program.min_points_to_redeem:
+            return None
+
+        redemption_amount = (Decimal(points_to_use) * point_value).quantize(Decimal('0.01'))
+        if redemption_amount > tentative_total:
+            redemption_amount = tentative_total
+
+        return {
+            'amount': redemption_amount,
+            'points': points_to_use,
+            'loyalty': loyalty,
+            'program': program,
+        }
+
+    def _persist_loyalty_redemption(self, sale, resolution):
+        """Consomme les points et crée la LoyaltyTransaction associée."""
+        from apps.settings.models import LoyaltyTransaction
+
+        loyalty = resolution['loyalty']
+        points_to_consume = resolution['points']
+        # `redeem_points` met à jour current_points et save
+        loyalty.redeem_points(points_to_consume)
         LoyaltyTransaction.objects.create(
-            organization=organization,
+            organization=sale.organization,
             customer_loyalty=loyalty,
             transaction_type=LoyaltyTransaction.TransactionType.REDEEM,
-            points=-points_to_redeem,
+            points=-points_to_consume,
             balance_after=loyalty.current_points,
             sale=sale,
-            description=f"Points utilisés sur vente {sale.reference}",
-            created_by=self.context['request'].user
+            description=(
+                f"Points utilisés sur vente {sale.reference} "
+                f"(réduction {resolution['amount']} {sale.currency})"
+            ),
+            created_by=self.context['request'].user,
         )
-        logger.info(f"[Loyalty] Redemption transaction created")
     
     def _award_loyalty_points(self, sale, organization):
         """Attribue les points de fidélité au client pour une vente complétée."""

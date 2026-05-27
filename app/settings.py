@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from datetime import timedelta
 from decouple import config, Csv
+from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -17,6 +18,11 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = config('SECRET_KEY', default='django-insecure-change-me-in-production')
 DEBUG = config('DEBUG', default=False, cast=bool)
 ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='localhost,127.0.0.1', cast=Csv())
+
+if not DEBUG and SECRET_KEY.startswith('django-insecure'):
+    raise ImproperlyConfigured(
+        "SECRET_KEY must be set to a strong value (env var) when DEBUG=False."
+    )
 
 # =============================================================================
 # APPLICATION DEFINITION
@@ -369,6 +375,9 @@ MOKO_API_V2_URL = config(
 MOKO_API_KEY = config('MOKO_API_KEY', default='')
 # URL publique du backend pour le callback (MOKO doit pouvoir joindre cette URL)
 PUBLIC_BACKEND_URL = config('PUBLIC_BACKEND_URL', default='http://127.0.0.1:8000')
+# Secret partagé inclus en query param de l'URL de callback pour authentifier MOKO.
+# Si vide, la vérification est désactivée (à n'utiliser qu'en dev).
+MOKO_CALLBACK_SECRET = config('MOKO_CALLBACK_SECRET', default='')
 
 
 # =============================================================================
@@ -421,16 +430,22 @@ LOGGING = {
 # SECURITY SETTINGS (Production)
 # =============================================================================
 
-# if not DEBUG:
-#     SECURE_BROWSER_XSS_FILTER = True
-#     SECURE_CONTENT_TYPE_NOSNIFF = True
-#     X_FRAME_OPTIONS = 'DENY'
-#     SECURE_SSL_REDIRECT = True
-#     SESSION_COOKIE_SECURE = True
-#     CSRF_COOKIE_SECURE = True
-#     SECURE_HSTS_SECONDS = 31536000
-#     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
-#     SECURE_HSTS_PRELOAD = True
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_BROWSER_XSS_FILTER = True
+X_FRAME_OPTIONS = 'DENY'
+SECURE_REFERRER_POLICY = 'same-origin'
+
+if not DEBUG:
+    # HTTPS / cookies
+    SECURE_SSL_REDIRECT = config('SECURE_SSL_REDIRECT', default=True, cast=bool)
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
+    # HSTS
+    SECURE_HSTS_SECONDS = config('SECURE_HSTS_SECONDS', default=31536000, cast=int)
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
 
 # =============================================================================
 # SENTRY (Error Tracking)

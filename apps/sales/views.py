@@ -24,7 +24,8 @@ from apps.core.warehouse_scope import (
     get_membership_for_request,
 )
 from apps.core.api_permissions import (
-    IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission
+    IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission,
+    has_perm_code, is_manager_or_above,
 )
 from .models import (
     Register, RegisterSession, Sale, SaleItem, PaymentMethod, Payment,
@@ -143,13 +144,22 @@ class RegisterSessionViewSet(
 
     @action(detail=False, methods=['post'])
     def open(self, request):
-        """Ouvre une nouvelle session de caisse."""
+        """
+        Ouvre une nouvelle session de caisse.
+
+        - Bloque la création si une session est déjà ouverte sur cette caisse
+          (check applicatif + UniqueConstraint DB en filet de sécurité).
+        - Hérite `opening_balance` du `closing_balance` de la dernière session
+          fermée sur cette caisse (sinon 0).
+        """
+        from django.db import transaction, IntegrityError
+
         serializer = RegisterSessionOpenSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        
+
         organization = self.get_organization()
         register_id = serializer.validated_data['register']
-        
+
         # Caisse dans l'org, active, et dans le périmètre entrepôt du membre
         register_qs = Register.objects.filter(
             id=register_id,
@@ -168,29 +178,53 @@ class RegisterSessionViewSet(
                 {'error': 'Caisse non trouvée ou inactive'},
                 status=status.HTTP_404_NOT_FOUND
             )
-        
-        # Vérifier qu'il n'y a pas de session ouverte
-        existing_session = RegisterSession.objects.filter(
-            register=register,
-            status='open'
-        ).first()
-        
-        if existing_session:
+
+        try:
+            with transaction.atomic():
+                # Lock sur les sessions existantes de cette caisse pour exclure
+                # toute requête concurrente avant la vérification + insertion.
+                existing_session = (
+                    RegisterSession.objects.select_for_update()
+                    .filter(register=register, status='open')
+                    .first()
+                )
+                if existing_session:
+                    return Response(
+                        {'error': 'Une session est déjà ouverte sur cette caisse'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+                # Hériter le solde d'ouverture de la dernière session fermée
+                previous = (
+                    RegisterSession.objects.filter(
+                        register=register, status='closed'
+                    )
+                    .order_by('-closed_at', '-opened_at')
+                    .first()
+                )
+                inherited = Decimal('0.00')
+                if previous is not None:
+                    inherited = (
+                        previous.counted_balance
+                        if previous.counted_balance is not None
+                        else (previous.closing_balance or previous.expected_balance or Decimal('0.00'))
+                    )
+
+                session = RegisterSession.objects.create(
+                    organization=organization,
+                    register=register,
+                    opened_by=request.user,
+                    opening_balance=inherited,
+                    notes='',
+                    status='open',
+                )
+        except IntegrityError:
+            # UniqueConstraint DB : une autre requête a créé la session en parallèle
             return Response(
                 {'error': 'Une session est déjà ouverte sur cette caisse'},
-                status=status.HTTP_400_BAD_REQUEST
+                status=status.HTTP_400_BAD_REQUEST,
             )
-        
-        # Créer la session (pas de solde d'ouverture ni notes saisis : toujours 0 / vide)
-        session = RegisterSession.objects.create(
-            organization=organization,
-            register=register,
-            opened_by=request.user,
-            opening_balance=Decimal('0.00'),
-            notes='',
-            status='open'
-        )
-        
+
         return Response(
             RegisterSessionDetailSerializer(session).data,
             status=status.HTTP_201_CREATED
@@ -198,35 +232,66 @@ class RegisterSessionViewSet(
 
     @action(detail=True, methods=['post'])
     def close(self, request, pk=None):
-        """Ferme une session de caisse."""
+        """
+        Ferme une session de caisse.
+
+        - Refus si l'utilisateur n'est ni l'opener ni un manager+ (auditabilité).
+        - Accepte `counted_balance` optionnel (comptage manuel) ; calcule
+          `difference = counted_balance - expected_balance` si fourni.
+        - Si différence non nulle, `notes` est obligatoire.
+        """
         session = self.get_object()
-        
+
         if session.status != 'open':
             return Response(
                 {'error': 'Cette session est déjà fermée'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
+
+        # Auditabilité : seul l'opener ou un manager+ peut clôturer
+        if session.opened_by_id != request.user.id and not is_manager_or_above(request):
+            return Response(
+                {'error': "Seul le caissier qui a ouvert la session ou un gérant peut la fermer."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         serializer = RegisterSessionCloseSerializer(data=request.data if request.data else {})
         serializer.is_valid(raise_exception=True)
+        counted_balance = serializer.validated_data.get('counted_balance')
+        notes_input = (serializer.validated_data.get('notes') or '').strip()
 
-        # Solde théorique en espèces (pas de comptage manuel)
+        # Solde théorique en espèces (somme des Payment cash sur les ventes de la session)
         cash_payments = Payment.objects.filter(
             sale__session=session,
             payment_method__method_type='cash',
             status='completed'
         ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
 
-        expected_balance = session.opening_balance + cash_payments
-        closing_balance = expected_balance
+        expected_balance = (session.opening_balance + cash_payments).quantize(Decimal('0.01'))
+
+        if counted_balance is not None:
+            counted_balance = Decimal(counted_balance).quantize(Decimal('0.01'))
+            difference = (counted_balance - expected_balance).quantize(Decimal('0.01'))
+            closing_balance = counted_balance
+        else:
+            difference = Decimal('0.00')
+            closing_balance = expected_balance
+
+        # Notes obligatoires si écart non nul
+        if difference != 0 and not notes_input:
+            return Response(
+                {'notes': "Une note explicative est obligatoire lorsque le comptage diffère du solde attendu."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         session.closing_balance = closing_balance
         session.expected_balance = expected_balance
-        session.difference = Decimal('0.00')
+        session.counted_balance = counted_balance
+        session.difference = difference
         session.closed_by = request.user
         session.closed_at = timezone.now()
         session.status = 'closed'
-        session.notes = ''
+        session.notes = notes_input
         session.save()
 
         return Response(RegisterSessionDetailSerializer(session).data)
@@ -370,18 +435,26 @@ class SaleViewSet(
         return Response(detail_serializer.data, status=status.HTTP_201_CREATED)
 
     def get_queryset(self):
-        """Filtre supplémentaire par date."""
+        """
+        Filtres : (1) par date, (2) restriction aux ventes de l'utilisateur si
+        celui-ci n'a pas la permission `sales.view_all` (i.e. caissier).
+        """
         queryset = super().get_queryset()
-        
+
+        # Restriction par caissier : un cashier ne voit que ses propres ventes.
+        # Owner et manager ont `sales.view_all` et voient tout.
+        if not has_perm_code(self.request, 'sales.view_all'):
+            queryset = queryset.filter(sold_by=self.request.user)
+
         # Filtres de date
         date_from = self.request.query_params.get('date_from')
         date_to = self.request.query_params.get('date_to')
-        
+
         if date_from:
             queryset = queryset.filter(sale_date__date__gte=date_from)
         if date_to:
             queryset = queryset.filter(sale_date__date__lte=date_to)
-        
+
         return queryset
     
     def _award_loyalty_points(self, sale, user):
@@ -427,22 +500,47 @@ class SaleViewSet(
     def add_payment(self, request, pk=None):
         """Ajoute un paiement à une vente existante."""
         from django.db import transaction
-        from apps.inventory.models import Stock, StockMovement
-        
-        sale = self.get_object()
-        
-        if sale.status in ['completed', 'cancelled', 'refunded']:
+        from .services import SaleStockService
+
+        # Pré-validation hors transaction (permissions, statut grossier).
+        # Le sale qu'on lit ici sert uniquement à valider l'accès — le vrai
+        # objet utilisé pour la mise à jour est relu avec `select_for_update`
+        # à l'intérieur de la transaction pour bloquer les race conditions
+        # sur `amount_paid` quand deux add_payment concurrents arrivent.
+        sale_for_check = self.get_object()
+        if sale_for_check.sold_by_id != request.user.id and not is_manager_or_above(request):
+            return Response(
+                {'error': "Vous ne pouvez ajouter un paiement qu'à vos propres ventes."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if sale_for_check.status in ['completed', 'cancelled', 'refunded']:
             return Response(
                 {'error': 'Impossible d\'ajouter un paiement à cette vente'},
-                status=status.HTTP_400_BAD_REQUEST
+                status=status.HTTP_400_BAD_REQUEST,
             )
-        
+
         serializer = SalePaymentSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        
-        previous_status = sale.status
-        
+
         with transaction.atomic():
+            # Lock exclusif sur la Sale pour la durée du recalcul amount_paid /
+            # amount_due / status. Deux requêtes concurrentes sont sérialisées.
+            # `of=('self',)` lock UNIQUEMENT la table Sale (Postgres refuse
+            # FOR UPDATE sur le côté nullable d'un LEFT JOIN — customer/warehouse).
+            sale = (
+                Sale.objects.select_related('customer', 'organization', 'warehouse')
+                .select_for_update(of=('self',))
+                .get(pk=pk)
+            )
+            # Re-check sous lock (le statut a pu changer entre la pré-check et le lock).
+            if sale.status in ['completed', 'cancelled', 'refunded']:
+                return Response(
+                    {'error': 'Impossible d\'ajouter un paiement à cette vente'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            previous_status = sale.status
+
             # Gestion multi-devise : convertir le paiement dans la devise de la vente
             payment_amount = serializer.validated_data['amount']
             payment_currency = serializer.validated_data.get('currency', '').strip()
@@ -512,45 +610,10 @@ class SaleViewSet(
                     if default_wh:
                         sale.warehouse = default_wh
                         sale.save(update_fields=['warehouse'])
-                
-                if sale.warehouse:
-                    for item in sale.items.all():
-                        if item.product.track_inventory:
-                            product_cost = item.product.cost_price if item.product.cost_price else Decimal('0.00')
-                            cost = item.cost_price if item.cost_price and item.cost_price > 0 else product_cost
-                            stock, created = Stock.objects.select_for_update().get_or_create(
-                                organization=sale.organization,
-                                product=item.product,
-                                variant=item.variant,
-                                warehouse=sale.warehouse,
-                                defaults={'quantity': Decimal('0.000'), 'avg_cost': cost}
-                            )
-                            
-                            if not created and stock.avg_cost == 0 and cost > 0:
-                                stock.avg_cost = cost
-                            
-                            quantity_before = stock.quantity
-                            stock.quantity -= item.quantity
-                            stock.last_movement_at = timezone.now()
-                            stock.save()
-                            
-                            StockMovement.objects.create(
-                                organization=sale.organization,
-                                product=item.product,
-                                variant=item.variant,
-                                warehouse=sale.warehouse,
-                                batch=item.batch,
-                                movement_type='sale',
-                                quantity=-item.quantity,
-                                unit_cost=item.cost_price,
-                                quantity_before=quantity_before,
-                                quantity_after=stock.quantity,
-                                reference_type='sale',
-                                reference_id=sale.id,
-                                notes=f"Vente {sale.reference}",
-                                created_by=request.user
-                            )
-                
+
+                # Décrémentation centralisée (FIFO + re-check allow_negative + idempotent)
+                SaleStockService.apply_decrement(sale, request.user)
+
                 # Attribuer les points de fidélité si applicable
                 if sale.customer:
                     self._award_loyalty_points(sale, request.user)
@@ -600,70 +663,33 @@ class SaleViewSet(
 
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
-        """Annule une vente."""
+        """
+        Annule une vente.
+
+        Permission : sold_by (caissier auteur) OU manager+. Refusée pour les
+        ventes déjà annulées/remboursées.
+        """
         from django.db import transaction
-        from apps.inventory.models import Stock, StockMovement
-        
+        from .services import SaleStockService
+
         sale = self.get_object()
-        
+
+        if sale.sold_by_id != request.user.id and not is_manager_or_above(request):
+            return Response(
+                {'error': "Vous ne pouvez annuler que vos propres ventes."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         if sale.status in ['cancelled', 'refunded']:
             return Response(
                 {'error': 'Cette vente est déjà annulée'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
+
         with transaction.atomic():
-            # Remettre le stock si la vente était complétée
-            if sale.status == 'completed' and sale.warehouse:
-                for item in sale.items.all():
-                    if item.product.track_inventory:
-                        product_cost = item.product.cost_price if item.product.cost_price else Decimal('0.00')
-                        cost = item.cost_price if item.cost_price and item.cost_price > 0 else product_cost
-                        stock, created = Stock.objects.select_for_update().get_or_create(
-                            organization=sale.organization,
-                            product=item.product,
-                            variant=item.variant,
-                            warehouse=sale.warehouse,
-                            defaults={'quantity': Decimal('0.000'), 'avg_cost': cost}
-                        )
-                        
-                        if not created and stock.avg_cost == 0 and cost > 0:
-                            stock.avg_cost = cost
-                        
-                        quantity_before = stock.quantity
-                        
-                        # Mettre à jour le coût moyen pondéré pour le retour
-                        if cost > 0 and item.quantity > 0:
-                            if stock.quantity > 0:
-                                total_existing = stock.quantity * stock.avg_cost
-                                total_incoming = item.quantity * item.cost_price
-                                stock.avg_cost = (
-                                    (total_existing + total_incoming) /
-                                    (stock.quantity + item.quantity)
-                                ).quantize(Decimal('0.01'))
-                            else:
-                                stock.avg_cost = item.cost_price
-                        
-                        stock.quantity += item.quantity
-                        stock.last_movement_at = timezone.now()
-                        stock.save()
-                        
-                        StockMovement.objects.create(
-                            organization=sale.organization,
-                            product=item.product,
-                            variant=item.variant,
-                            warehouse=sale.warehouse,
-                            movement_type='return_in',
-                            quantity=item.quantity,
-                            unit_cost=item.cost_price,
-                            quantity_before=quantity_before,
-                            quantity_after=stock.quantity,
-                            reference_type='sale_cancel',
-                            reference_id=sale.id,
-                            notes=f"Annulation vente {sale.reference}",
-                            created_by=request.user
-                        )
-            
+            # Restitution centralisée (idempotente : ne fait rien si stock pas committed)
+            SaleStockService.revert(sale, request.user)
+
             # Enregistrer le mouvement de caisse (remboursement) si la vente avait été payée
             if sale.amount_paid > 0:
                 from apps.cashbook.services import record_sale_cancellation
@@ -673,17 +699,45 @@ class SaleViewSet(
                     amount=sale.amount_paid,
                     user=request.user,
                 )
-            
-            # Restaurer le solde client pour les ventes à crédit
-            if sale.customer and sale.sale_type == 'credit' and sale.amount_due > 0:
-                from apps.contacts.models import Customer
+
+            # Restaurer le solde client pour les ventes à crédit.
+            #
+            # Logique : à la création, on a fait `balance += amount_due_initial`.
+            # Chaque add_payment a fait `balance -= payment.amount`.
+            # L'impact NET courant sur le solde client est donc `sale.total - sale.amount_paid`
+            # (peut être négatif si le client a sur-payé → il a un crédit).
+            # Pour annuler proprement, on soustrait exactement cet impact net,
+            # ce qui ramène le solde à sa valeur d'avant la vente.
+            if sale.customer and sale.sale_type == 'credit':
+                from apps.contacts.models import Customer, CustomerTransaction
                 customer = Customer.objects.select_for_update().get(id=sale.customer.id)
-                customer.current_balance -= sale.amount_due
-                customer.save()
-            
+                net_balance_impact = (sale.total - sale.amount_paid).quantize(Decimal('0.01'))
+                if net_balance_impact != 0:
+                    balance_before = customer.current_balance
+                    customer.current_balance -= net_balance_impact
+                    customer.save()
+                    # `amount` du modèle CustomerTransaction est une magnitude
+                    # positive (>= 0.01). La direction est portée par
+                    # balance_before/after et le type 'adjustment'.
+                    CustomerTransaction.objects.create(
+                        organization=sale.organization,
+                        customer=customer,
+                        transaction_type=CustomerTransaction.TransactionType.ADJUSTMENT,
+                        amount=abs(net_balance_impact),
+                        balance_before=balance_before,
+                        balance_after=customer.current_balance,
+                        sale=sale,
+                        reference=sale.reference,
+                        notes=(
+                            f"Annulation vente {sale.reference} "
+                            f"(impact net solde : {-net_balance_impact:+})"
+                        ),
+                        created_by=request.user,
+                    )
+
             sale.status = 'cancelled'
             sale.save()
-        
+
         return Response({'status': 'cancelled'})
 
     @action(detail=False, methods=['get'])

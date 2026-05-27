@@ -31,6 +31,27 @@ def _get_membership(request):
     return getattr(request, cache_key)
 
 
+def has_perm_code(request, perm_code: str) -> bool:
+    """
+    Helper utilitaire : vérifie si l'utilisateur courant possède une permission
+    (rôle + extra_permissions) pour l'organisation portée par X-Organization-ID.
+
+    Utilisable dans les ViewSets pour des branches de logique conditionnelles
+    (ex : filtrer le queryset différemment selon `sales.view_all`).
+    """
+    membership = _get_membership(request)
+    if not membership:
+        return False
+    from apps.core.services import PermissionService
+    return perm_code in PermissionService.get_effective_permissions(membership)
+
+
+def is_manager_or_above(request) -> bool:
+    """Helper : True si l'utilisateur est manager ou owner dans l'org courante."""
+    membership = _get_membership(request)
+    return membership is not None and membership.role in ('owner', 'manager')
+
+
 class IsTenantMember(permissions.BasePermission):
     """
     Vérifie que l'utilisateur appartient à l'organisation demandée.

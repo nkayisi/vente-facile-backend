@@ -99,16 +99,23 @@ class RegisterSession(TenantModel):
         null=True,
         blank=True
     )
+    counted_balance = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Montant réel compté en caisse à la fermeture (saisie manuelle optionnelle)."
+    )
     difference = models.DecimalField(
         max_digits=15,
         decimal_places=2,
         null=True,
         blank=True
     )
-    
+
     opened_at = models.DateTimeField(auto_now_add=True)
     closed_at = models.DateTimeField(null=True, blank=True)
-    
+
     notes = models.TextField(blank=True)
 
     class Meta:
@@ -117,6 +124,14 @@ class RegisterSession(TenantModel):
         indexes = [
             models.Index(fields=['register', 'status']),
             models.Index(fields=['opened_at']),
+        ]
+        constraints = [
+            # Garantit DB-level qu'une seule session 'open' par caisse à la fois.
+            models.UniqueConstraint(
+                fields=['register'],
+                condition=models.Q(status='open'),
+                name='unique_open_session_per_register',
+            ),
         ]
 
     def __str__(self):
@@ -212,6 +227,14 @@ class Sale(TenantSoftDeleteModel):
         decimal_places=2,
         default=Decimal('0.00')
     )
+    # Réduction monétaire effectivement appliquée via points de fidélité (déjà
+    # incluse dans `discount_amount`). Champ traçant à part la part loyauté.
+    loyalty_redemption_amount = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        help_text="Montant déduit du total grâce à l'utilisation de points de fidélité."
+    )
     total = models.DecimalField(
         max_digits=15,
         decimal_places=2,
@@ -267,6 +290,11 @@ class Sale(TenantSoftDeleteModel):
             models.Index(fields=['organization', 'customer']),
             models.Index(fields=['sale_date']),
             models.Index(fields=['reference']),
+            # Filtre cashier : `get_queryset().filter(sold_by=user)` trié par date.
+            models.Index(
+                fields=['organization', 'sold_by', '-sale_date'],
+                name='sales_org_sold_by_date_idx',
+            ),
         ]
         constraints = [
             models.UniqueConstraint(

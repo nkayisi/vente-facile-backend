@@ -387,6 +387,10 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
 
         public_base = settings.PUBLIC_BACKEND_URL.rstrip('/')
         callback_url = f"{public_base}/api/v1/subscriptions/moko/callback/"
+        callback_secret = getattr(settings, 'MOKO_CALLBACK_SECRET', '') or ''
+        if callback_secret:
+            from urllib.parse import urlencode as _urlencode
+            callback_url = f"{callback_url}?{_urlencode({'token': callback_secret})}"
 
         metadata = {
             'plan_id': str(plan.id),
@@ -566,28 +570,26 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
     def moko_callback(self, request):
         """
         Callback MOKO v2 (notification asynchrone).
-        POST /api/v1/subscriptions/moko/callback/
-        
-        Format attendu (API v2):
-        {
-            "payment": {
-                "reference": "vf_sub_xxx",
-                "status": "Successful" | "Failed" | "Pending",
-                "amount": 10000.0,
-                ...
-            }
-        }
-        
-        Ou format legacy:
-        {
-            "Reference": "vf_sub_xxx",
-            "Trans_Status": "successful" | "failed",
-            ...
-        }
+        POST /api/v1/subscriptions/moko/callback/?token=<MOKO_CALLBACK_SECRET>
+
+        Durcissement :
+        - Si MOKO_CALLBACK_SECRET est configuré, le query param `token` doit matcher.
+        - La référence doit suivre notre convention (`vf_sub_*`).
+        - Si la payload contient un `amount`, il doit correspondre à `payment.amount`
+          (tolérance 0.01 pour les arrondis float côté Moko).
         """
+        # 1) Auth via secret partagé en query string (si configuré)
+        expected_secret = getattr(settings, 'MOKO_CALLBACK_SECRET', '') or ''
+        if expected_secret:
+            import hmac
+            provided = request.query_params.get('token', '') or ''
+            if not hmac.compare_digest(provided, expected_secret):
+                logger.warning('MOKO callback: invalid or missing token')
+                return Response({'detail': 'forbidden'}, status=status.HTTP_403_FORBIDDEN)
+
         payload = request.data
         logger.info('MOKO callback received: %s', payload)
-        
+
         if not isinstance(payload, dict):
             return Response({'detail': 'Invalid payload'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -595,20 +597,23 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
         ref = None
         moko_status = None
         description = ''
-        
-        # Format API v2: { "payment": { "reference": "...", "status": "..." } }
+        callback_amount = None
+
+        # Format API v2: { "payment": { "reference": "...", "status": "...", "amount": ... } }
         payment_data = payload.get('payment')
         if isinstance(payment_data, dict):
             ref = payment_data.get('reference')
             moko_status = payment_data.get('status')
             description = payment_data.get('description') or ''
-        
+            if 'amount' in payment_data:
+                callback_amount = payment_data.get('amount')
+
         # Format legacy: { "Reference": "...", "Trans_Status": "..." }
         if not ref:
             ref = payload.get('Reference') or payload.get('reference')
         if not moko_status:
             moko_status = (
-                payload.get('Trans_Status') 
+                payload.get('Trans_Status')
                 or payload.get('trans_status')
                 or payload.get('status')
                 or ''
@@ -620,15 +625,36 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
                 or payload.get('description')
                 or ''
             )
+        if callback_amount is None:
+            callback_amount = payload.get('amount') or payload.get('Amount')
 
         if not ref:
             logger.warning('MOKO callback: no reference in payload')
             return Response({'status': 'ignored', 'reason': 'no reference'}, status=status.HTTP_200_OK)
 
+        # 2) Format de référence attendu
+        if not str(ref).startswith('vf_sub_'):
+            logger.warning('MOKO callback: reference outside expected scope: %s', ref)
+            return Response({'status': 'ignored', 'reason': 'unexpected reference'}, status=status.HTTP_200_OK)
+
         payment = SubscriptionPayment.objects.filter(reference=str(ref)).first()
         if not payment:
             logger.warning('MOKO callback: unknown reference %s', ref)
             return Response({'status': 'ok'}, status=status.HTTP_200_OK)
+
+        # 3) Vérification du montant (si présent dans la payload)
+        if callback_amount is not None:
+            try:
+                cb_amt = Decimal(str(callback_amount))
+                if abs(cb_amt - payment.amount) > Decimal('0.01'):
+                    logger.warning(
+                        'MOKO callback: amount mismatch ref=%s expected=%s got=%s',
+                        ref, payment.amount, cb_amt,
+                    )
+                    return Response({'detail': 'amount mismatch'}, status=status.HTTP_400_BAD_REQUEST)
+            except (TypeError, ValueError):
+                logger.warning('MOKO callback: invalid amount in payload: %r', callback_amount)
+                return Response({'detail': 'invalid amount'}, status=status.HTTP_400_BAD_REQUEST)
 
         if payment.status != SubscriptionPayment.Status.PENDING:
             remove_pending_payment(str(ref))
