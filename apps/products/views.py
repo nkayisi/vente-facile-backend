@@ -115,6 +115,30 @@ class CategoryViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         if self.action != 'list':
             return queryset
 
+        # ``exclude_descendants_of`` : pour l'édition d'une catégorie X,
+        # exclure X et toute sa sous-arborescence de la liste des parents
+        # possibles (sinon création d'un cycle parent ↔ enfant).
+        exclude_root = self.request.query_params.get('exclude_descendants_of')
+        if exclude_root:
+            try:
+                root = Category.objects.filter(
+                    organization=self.get_organization(), id=exclude_root,
+                ).first()
+                if root:
+                    forbidden_ids = {root.id}
+                    # BFS sur les enfants pour collecter toute la descendance.
+                    pending = [root.id]
+                    while pending:
+                        children_ids = list(
+                            Category.objects.filter(parent_id__in=pending).values_list('id', flat=True)
+                        )
+                        new_ids = [cid for cid in children_ids if cid not in forbidden_ids]
+                        forbidden_ids.update(new_ids)
+                        pending = new_ids
+                    queryset = queryset.exclude(id__in=forbidden_ids)
+            except (ValueError, Category.DoesNotExist):
+                pass  # UUID invalide → on ignore le filtre, pas de fuite
+
         organization = self.get_organization()
         with_stock = _truthy_query_param(self.request.query_params.get('with_stock'))
         warehouse_id = self.request.query_params.get('warehouse')
