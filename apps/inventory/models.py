@@ -155,6 +155,34 @@ class Stock(TenantModel):
         """Quantity available for sale (excluding reserved)."""
         return self.quantity - self.reserved_quantity
 
+    def save(self, *args, **kwargs):
+        # Filet de sécurité : tout point d'entrée qui descend Stock.quantity
+        # sous zéro doit avoir vérifié warehouse.allow_negative_stock au
+        # préalable. Cette validation rejette les chemins qui auraient sauté
+        # la vérification (signal mort, import direct, script externe).
+        from django.core.exceptions import ValidationError
+
+        if self.quantity < 0:
+            allow_neg = (
+                bool(getattr(self.warehouse, 'allow_negative_stock', False))
+                if self.warehouse_id else False
+            )
+            if not allow_neg:
+                raise ValidationError({
+                    'quantity': (
+                        f"Stock négatif interdit pour {self.product_id} dans "
+                        f"l'entrepôt {self.warehouse_id}. Pour autoriser, "
+                        f"activer Warehouse.allow_negative_stock."
+                    )
+                })
+
+        if self.reserved_quantity < 0:
+            raise ValidationError({
+                'reserved_quantity': "La quantité réservée ne peut pas être négative."
+            })
+
+        super().save(*args, **kwargs)
+
 
 class StockBatch(TenantModel):
     """
@@ -225,6 +253,33 @@ class StockBatch(TenantModel):
         if self.expiry_date:
             return self.expiry_date < timezone.now().date()
         return False
+
+    def clean(self):
+        """
+        Valide la cohérence des dates :
+        - ``manufacturing_date <= expiry_date`` quand les deux sont fournies.
+        """
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
+        super().clean()
+
+        if (
+            self.manufacturing_date
+            and self.expiry_date
+            and self.manufacturing_date > self.expiry_date
+        ):
+            raise DjangoValidationError({
+                'expiry_date': (
+                    "La date d'expiration doit être postérieure ou égale à la "
+                    "date de fabrication."
+                )
+            })
+
+    def save(self, *args, **kwargs):
+        # Filet de sécurité : valider même quand le caller n'appelle pas
+        # full_clean (ORM direct, scripts d'import, admin).
+        self.clean()
+        super().save(*args, **kwargs)
 
 
 class StockMovement(TenantModel):

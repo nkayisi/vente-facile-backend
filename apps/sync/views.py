@@ -18,12 +18,28 @@ logger = logging.getLogger(__name__)
 
 
 def get_organization_from_request(request):
-    """Get organization from X-Organization-ID header."""
+    """
+    Retourne l'organisation associée au header ``X-Organization-ID``, après
+    avoir vérifié que ``request.user`` est membre actif de cette organisation.
+
+    Retourne ``None`` si :
+    - le header est absent ;
+    - l'UUID est invalide ;
+    - l'utilisateur n'est pas membre actif de l'organisation.
+
+    Vérifier la membership ici est critique : sans ce filtre, un utilisateur
+    authentifié peut tirer ou pousser les données de n'importe quelle org
+    en spoofant simplement le header (fuite/écrasement cross-tenant).
+    """
     org_id = request.headers.get('X-Organization-ID')
     if not org_id:
         return None
     try:
-        return Organization.objects.get(id=org_id, is_deleted=False)
+        return Organization.objects.filter(
+            memberships__user=request.user,
+            memberships__is_active=True,
+            is_deleted=False,
+        ).distinct().get(id=org_id)
     except (Organization.DoesNotExist, ValueError):
         return None
 
@@ -92,8 +108,8 @@ class SyncView(APIView):
         organization = get_organization_from_request(request)
         if not organization:
             return Response(
-                {'error': 'Organization header required'},
-                status=status.HTTP_400_BAD_REQUEST
+                {'error': 'Organisation manquante ou accès refusé'},
+                status=status.HTTP_403_FORBIDDEN
             )
         
         # Parse parameters
@@ -195,8 +211,8 @@ class SyncView(APIView):
         organization = get_organization_from_request(request)
         if not organization:
             return Response(
-                {'error': 'Organization header required'},
-                status=status.HTTP_400_BAD_REQUEST
+                {'error': 'Organisation manquante ou accès refusé'},
+                status=status.HTTP_403_FORBIDDEN
             )
         
         # Parse request body
@@ -267,8 +283,8 @@ class SyncStatusView(APIView):
         organization = get_organization_from_request(request)
         if not organization:
             return Response(
-                {'error': 'Organization header required'},
-                status=status.HTTP_400_BAD_REQUEST
+                {'error': 'Organisation manquante ou accès refusé'},
+                status=status.HTTP_403_FORBIDDEN
             )
         
         from django.apps import apps

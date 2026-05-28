@@ -217,7 +217,10 @@ REST_FRAMEWORK = {
         'rest_framework.filters.SearchFilter',
         'rest_framework.filters.OrderingFilter',
     ],
-    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    # Pagination custom : permet au client d'override via ?page_size=N
+    # (borné à max_page_size côté StandardResultsSetPagination). Sans cette
+    # surcharge, DRF ignore silencieusement page_size envoyé par le client.
+    'DEFAULT_PAGINATION_CLASS': 'apps.core.pagination.StandardResultsSetPagination',
     'PAGE_SIZE': 20,
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
     'DEFAULT_THROTTLE_CLASSES': [
@@ -227,6 +230,11 @@ REST_FRAMEWORK = {
     'DEFAULT_THROTTLE_RATES': {
         'anon': '100/hour',
         'user': '1000/hour',
+        # Throttle scoped sur les endpoints publics, actif même en DEBUG via
+        # ScopedRateThrottle déclaré explicitement par la view (le throttle
+        # par scope reste appliqué tant que la classe est attachée à l'action,
+        # indépendamment de DEFAULT_THROTTLE_CLASSES).
+        'moko_callback': '60/minute',
     },
     'EXCEPTION_HANDLER': 'rest_framework.views.exception_handler',
     'DEFAULT_RENDERER_CLASSES': [
@@ -313,8 +321,6 @@ CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
 # =============================================================================
 
 REDIS_URL = config('REDIS_URL', default='redis://127.0.0.1:6379/1')
-# DB dédiée MOKO (token + files d’attente côté code Redis brut) — par défaut même instance, autre logique possible via URL
-REDIS_URL = config('REDIS_URL', default=REDIS_URL)
 TOKEN_CACHE_TTL = config('TOKEN_CACHE_TTL', default=3600, cast=int)
 PENDING_META_TTL_SECONDS = config(
     'PENDING_META_TTL_SECONDS',

@@ -265,24 +265,67 @@ class CustomerLoyalty(TenantModel):
         return f"{self.customer.name} - {self.current_points} pts"
     
     def add_points(self, points: int, save: bool = True):
-        """Ajoute des points au compte du client."""
+        """
+        Ajoute des points au compte du client.
+
+        Atomique en base via ``F()`` expressions : deux ventes simultanées
+        du même client cumulent leurs points sans race condition.
+        """
+        from django.db.models import F
         from django.utils import timezone
-        self.current_points += points
-        self.total_points_earned += points
-        self.last_points_earned_at = timezone.now()
-        if save:
-            self.save()
-    
+
+        if not save:
+            # Modif in-memory uniquement (rare ; caller orchestre le save)
+            self.current_points += points
+            self.total_points_earned += points
+            self.last_points_earned_at = timezone.now()
+            return
+
+        now = timezone.now()
+        type(self).objects.filter(pk=self.pk).update(
+            current_points=F('current_points') + points,
+            total_points_earned=F('total_points_earned') + points,
+            last_points_earned_at=now,
+        )
+        # Resynchroniser l'instance en mémoire (nécessaire si le caller lit
+        # current_points après l'appel, ex. pour balance_after en log).
+        self.refresh_from_db(
+            fields=['current_points', 'total_points_earned', 'last_points_earned_at']
+        )
+
     def redeem_points(self, points: int, save: bool = True):
-        """Utilise des points du compte du client."""
+        """
+        Utilise des points du compte du client.
+
+        Sérialise les utilisations concurrentes via ``select_for_update`` :
+        le check ``points > current_points`` est verrouillé pour éviter
+        qu'un client dépense ses points deux fois en parallèle.
+        """
+        from django.db import transaction
         from django.utils import timezone
-        if points > self.current_points:
-            raise ValueError("Points insuffisants")
-        self.current_points -= points
-        self.total_points_redeemed += points
-        self.last_points_redeemed_at = timezone.now()
-        if save:
-            self.save()
+
+        if not save:
+            if points > self.current_points:
+                raise ValueError("Points insuffisants")
+            self.current_points -= points
+            self.total_points_redeemed += points
+            self.last_points_redeemed_at = timezone.now()
+            return
+
+        with transaction.atomic():
+            fresh = type(self).objects.select_for_update().get(pk=self.pk)
+            if points > fresh.current_points:
+                raise ValueError("Points insuffisants")
+            fresh.current_points -= points
+            fresh.total_points_redeemed += points
+            fresh.last_points_redeemed_at = timezone.now()
+            fresh.save(update_fields=[
+                'current_points', 'total_points_redeemed', 'last_points_redeemed_at'
+            ])
+            # Synchroniser l'instance qui a appelé la méthode
+            self.current_points = fresh.current_points
+            self.total_points_redeemed = fresh.total_points_redeemed
+            self.last_points_redeemed_at = fresh.last_points_redeemed_at
 
 
 class LoyaltyTransaction(TenantModel):
@@ -296,6 +339,11 @@ class LoyaltyTransaction(TenantModel):
         EXPIRE = 'expire', 'Points expirés'
         ADJUST = 'adjust', 'Ajustement manuel'
         BONUS = 'bonus', 'Bonus'
+        # Inversion explicite suite à l'annulation d'une vente. Distincts de
+        # EARN/REDEEM pour que l'historique client (et les rapports) montrent
+        # « Points retirés - annulation vente X » sans ambiguïté.
+        EARN_REVERSAL = 'earn_reversal', 'Annulation gain'
+        REDEEM_REVERSAL = 'redeem_reversal', 'Annulation utilisation'
     
     customer_loyalty = models.ForeignKey(
         CustomerLoyalty,
@@ -346,7 +394,18 @@ class LoyaltyTransaction(TenantModel):
     class Meta:
         db_table = 'loyalty_transactions'
         ordering = ['-created_at']
-    
+        constraints = [
+            # Idempotence : une vente ne peut donner les points qu'une seule
+            # fois. Une seconde tentative de _award_loyalty_points lèvera
+            # IntegrityError attrapée côté caller. Idem pour REDEEM (les
+            # points dépensés à la création de la vente).
+            models.UniqueConstraint(
+                fields=['sale', 'transaction_type'],
+                condition=models.Q(transaction_type__in=['earn', 'redeem', 'earn_reversal', 'redeem_reversal']),
+                name='loyalty_tx_unique_per_sale_type',
+            ),
+        ]
+
     def __str__(self):
         return f"{self.customer_loyalty.customer.name} - {self.points:+d} pts"
 

@@ -436,9 +436,9 @@ class SyncAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
     
     def test_pull_requires_organization(self):
-        """Pull endpoint requires organization header."""
+        """Pull endpoint requires organization header (403 si absent ou non-membre)."""
         response = self.client.get('/api/v1/sync/')
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
     
     def test_pull_initial_sync(self):
         """Initial sync returns all data."""
@@ -606,3 +606,94 @@ class MultiTenantSyncTests(TestCase):
         # Org2's customer should be unchanged
         self.customer2.refresh_from_db()
         self.assertEqual(self.customer2.name, 'Org 2 Customer')
+
+    def test_push_create_with_cross_tenant_fk_is_rejected(self):
+        """Push refusé si un FK pointe vers un objet d'une autre organisation."""
+        from apps.products.models import Category
+
+        # Catégorie créée dans org2 — on tente de la référencer depuis org1
+        cat_other = Category.objects.create(
+            organization=self.org2, name='Cat Org2', slug='cat-org2',
+        )
+        service = SyncPushService(self.org1, self.user1)
+
+        changes = {
+            'products': {
+                'created': [
+                    {
+                        'id': str(uuid.uuid4()),
+                        'name': 'Produit malveillant',
+                        'sku': 'EVIL-001',
+                        'category_id': str(cat_other.id),
+                        'cost_price': '100.00',
+                        'selling_price': '150.00',
+                    }
+                ],
+                'updated': [],
+                'deleted': [],
+            }
+        }
+
+        result = service.apply_changes(changes, get_server_timestamp())
+
+        # Doit avoir échoué (erreur enregistrée), pas créé
+        self.assertEqual(result['stats']['created'], 0)
+        self.assertEqual(result['stats']['errors'], 1)
+        self.assertTrue(
+            any('appartient pas' in e.get('error', '') for e in result['errors'])
+        )
+
+
+class SyncMembershipGuardTests(APITestCase):
+    """Tests pour la vérification de la membership dans get_organization_from_request."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.outsider = User.objects.create_user(
+            email='outsider@example.com', password='pw',
+        )
+        cls.member = User.objects.create_user(
+            email='member@example.com', password='pw',
+        )
+        cls.org = Organization.objects.create(name='Closed Org', slug='closed-org')
+        OrganizationMembership.objects.create(
+            user=cls.member, organization=cls.org, role='owner'
+        )
+
+    def test_pull_rejected_for_non_member(self):
+        """Un utilisateur authentifié mais non-membre reçoit 403 sur pull."""
+        self.client.force_authenticate(user=self.outsider)
+        response = self.client.get(
+            '/api/v1/sync/',
+            HTTP_X_ORGANIZATION_ID=str(self.org.id),
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_pull_accepted_for_active_member(self):
+        """Un membre actif accède bien à son organisation."""
+        self.client.force_authenticate(user=self.member)
+        response = self.client.get(
+            '/api/v1/sync/',
+            HTTP_X_ORGANIZATION_ID=str(self.org.id),
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_pull_rejected_when_membership_inactive(self):
+        """Une membership désactivée empêche l'accès."""
+        membership = OrganizationMembership.objects.get(
+            user=self.member, organization=self.org
+        )
+        membership.is_active = False
+        membership.save()
+        self.addCleanup(
+            lambda: OrganizationMembership.objects.filter(
+                user=self.member, organization=self.org
+            ).update(is_active=True)
+        )
+
+        self.client.force_authenticate(user=self.member)
+        response = self.client.get(
+            '/api/v1/sync/',
+            HTTP_X_ORGANIZATION_ID=str(self.org.id),
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)

@@ -223,7 +223,7 @@ class SaleItemSerializer(serializers.ModelSerializer):
 
 class SaleItemCreateSerializer(serializers.ModelSerializer):
     """Serializer pour la création de ligne de vente."""
-    
+
     class Meta:
         model = SaleItem
         fields = [
@@ -231,6 +231,36 @@ class SaleItemCreateSerializer(serializers.ModelSerializer):
             'quantity', 'unit_price',
             'discount_percentage', 'tax_rate', 'notes'
         ]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Scope FK par organisation : le serializer parent (SaleCreate)
+        # transmet son contexte via ``many=True``, donc le helper trouve la
+        # request et filtre Product/ProductVariant/StockBatch.
+        from apps.core.serializer_helpers import scope_fk_to_org
+        scope_fk_to_org(self, 'product', 'variant', 'batch')
+
+    def validate_tax_rate(self, value):
+        if value is not None and value < 0:
+            raise serializers.ValidationError("Le taux de taxe ne peut pas être négatif.")
+        if value is not None and value > 100:
+            raise serializers.ValidationError("Le taux de taxe ne peut pas dépasser 100%.")
+        return value
+
+    def validate_product(self, value):
+        # Bloque les produits désactivés ou non-vendables. La vérification
+        # cross-tenant est portée par ``scope_fk_to_org`` (queryset filtré).
+        if value is None:
+            return value
+        if not value.is_active:
+            raise serializers.ValidationError(
+                f"Le produit « {value.name} » est désactivé et ne peut pas être vendu."
+            )
+        if not value.is_sellable:
+            raise serializers.ValidationError(
+                f"Le produit « {value.name} » n'est pas marqué comme vendable."
+            )
+        return value
 
     def validate_quantity(self, value):
         if value <= 0:
@@ -287,10 +317,15 @@ class PaymentSerializer(serializers.ModelSerializer):
 
 class PaymentCreateSerializer(serializers.ModelSerializer):
     """Serializer pour la création de paiement."""
-    
+
     class Meta:
         model = Payment
         fields = ['payment_method', 'amount', 'currency', 'exchange_rate', 'reference', 'notes']
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from apps.core.serializer_helpers import scope_fk_to_org
+        scope_fk_to_org(self, 'payment_method')
 
     def validate_amount(self, value):
         if value <= 0:
@@ -382,7 +417,7 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         min_value=Decimal('0'),
         default=Decimal('0'),
     )
-    
+
     class Meta:
         model = Sale
         fields = [
@@ -392,10 +427,21 @@ class SaleCreateSerializer(serializers.ModelSerializer):
             'items', 'payments', 'points_used'
         ]
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from apps.core.serializer_helpers import scope_fk_to_org
+        scope_fk_to_org(
+            self, 'customer', 'register', 'warehouse', 'price_list'
+        )
+
     def validate_discount_percentage(self, value):
         v = value if value is not None else Decimal("0")
         if v < 0:
             raise serializers.ValidationError("La remise globale ne peut pas être négative.")
+        # Hard-cap absolu à 100% indépendant de la config org : une remise
+        # de 100% revient à offrir la vente, au-delà n'a aucun sens métier.
+        if v > Decimal("100"):
+            raise serializers.ValidationError("La remise globale ne peut pas dépasser 100%.")
         request = self.context.get("request")
         max_p = Decimal("50")
         if request:
@@ -503,16 +549,41 @@ class SaleCreateSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({
                     "payments": "Les montants de paiement ne peuvent pas être négatifs."
                 })
+            # Vérification cross-tenant : DRF n'injecte pas le context dans
+            # les serializers enfants instanciés via `many=True`, donc le
+            # scoping de queryset ne peut pas être fait au niveau de
+            # PaymentCreateSerializer. On rattrape ici.
+            pm = p.get("payment_method")
+            if pm is not None and getattr(pm, 'organization_id', None) and pm.organization_id != org.id:
+                raise serializers.ValidationError({
+                    'payments': "Mode de paiement invalide pour cette organisation."
+                })
+
+        # Idem : vérifier que chaque product appartient bien à l'org.
+        for item in items:
+            product = item.get('product')
+            if product is not None and product.organization_id != org.id:
+                raise serializers.ValidationError({
+                    'items': f"Produit « {product.name} » invalide pour cette organisation."
+                })
 
         # Règles métier sur le type de vente.
         sale_type = data.get('sale_type', 'retail')
         customer = data.get('customer')
 
-        # Une vente à crédit exige un client identifié.
-        if sale_type == 'credit' and not customer:
-            raise serializers.ValidationError({
-                'customer': "Un client est obligatoire pour une vente à crédit."
-            })
+        # Une vente à crédit exige un client identifié et actif.
+        if sale_type == 'credit':
+            if not customer:
+                raise serializers.ValidationError({
+                    'customer': "Un client est obligatoire pour une vente à crédit."
+                })
+            if not getattr(customer, 'is_active', True):
+                raise serializers.ValidationError({
+                    'customer': (
+                        f"Le client « {customer.name} » est suspendu ou désactivé "
+                        "et ne peut pas effectuer d'achat à crédit."
+                    )
+                })
 
         # Une vente comptant (retail/wholesale) doit avoir au moins un paiement.
         # Pour différer le règlement, le caissier doit basculer en sale_type='credit'.

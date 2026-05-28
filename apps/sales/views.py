@@ -294,6 +294,34 @@ class RegisterSessionViewSet(
         session.notes = notes_input
         session.save()
 
+        # Audit log de la fermeture — capture qui a fermé, montants comptés
+        # vs attendus, écart, et si un tiers (manager) a fermé une session
+        # ouverte par un autre cashier (cas sensible pour la comptabilité).
+        from apps.users.models import UserActivity
+
+        closed_by_other = session.opened_by_id != request.user.id
+        UserActivity.objects.create(
+            user=request.user,
+            organization=session.organization,
+            action=UserActivity.ActionType.UPDATE,
+            resource_type='register_session',
+            resource_id=str(session.id),
+            details={
+                'event': 'session_closed',
+                'register_id': str(session.register_id),
+                'opened_by_id': str(session.opened_by_id),
+                'closed_by_id': str(request.user.id),
+                'closed_by_other_user': closed_by_other,
+                'opening_balance': str(session.opening_balance),
+                'expected_balance': str(expected_balance),
+                'counted_balance': str(counted_balance) if counted_balance is not None else None,
+                'difference': str(difference),
+                'notes': notes_input,
+            },
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.META.get('HTTP_USER_AGENT', '')[:500],
+        )
+
         return Response(RegisterSessionDetailSerializer(session).data)
 
     @action(detail=False, methods=['get'])
@@ -458,43 +486,59 @@ class SaleViewSet(
         return queryset
     
     def _award_loyalty_points(self, sale, user):
-        """Attribue les points de fidélité au client pour une vente complétée."""
+        """Attribue les points de fidélité au client pour une vente complétée.
+
+        Idempotent : la contrainte unique ``(sale, transaction_type='earn')``
+        sur ``LoyaltyTransaction`` empêche un double-award en cas de retry
+        ou de race condition.
+        """
+        from django.db import IntegrityError
         from apps.settings.models import LoyaltyProgram, CustomerLoyalty, LoyaltyTransaction
-        
+
         try:
             program = LoyaltyProgram.objects.get(organization=sale.organization, is_active=True)
         except LoyaltyProgram.DoesNotExist:
             return  # Pas de programme de fidélité actif
-        
+
         # Vérifier si seuls les clients enregistrés peuvent gagner des points
         if program.only_registered_customers and not sale.customer:
             return
-        
+
         # Calculer les points gagnés
         points = program.calculate_points(sale.total)
         if points <= 0:
             return
-        
-        # Obtenir ou créer le compte de fidélité du client
-        loyalty, created = CustomerLoyalty.objects.get_or_create(
+
+        # Lock + idempotence : si une ligne EARN existe déjà pour cette
+        # vente, on sort sans rien faire (cas du retry).
+        if LoyaltyTransaction.objects.filter(
+            sale=sale, transaction_type=LoyaltyTransaction.TransactionType.EARN
+        ).exists():
+            return
+
+        loyalty, _ = CustomerLoyalty.objects.select_for_update().get_or_create(
             organization=sale.organization,
-            customer=sale.customer
+            customer=sale.customer,
         )
-        
-        # Ajouter les points
+
         loyalty.add_points(points)
-        
-        # Créer la transaction de fidélité
-        LoyaltyTransaction.objects.create(
-            organization=sale.organization,
-            customer_loyalty=loyalty,
-            transaction_type=LoyaltyTransaction.TransactionType.EARN,
-            points=points,
-            balance_after=loyalty.current_points,
-            sale=sale,
-            description=f"Points gagnés sur vente {sale.reference}",
-            created_by=user
-        )
+
+        try:
+            LoyaltyTransaction.objects.create(
+                organization=sale.organization,
+                customer_loyalty=loyalty,
+                transaction_type=LoyaltyTransaction.TransactionType.EARN,
+                points=points,
+                balance_after=loyalty.current_points,
+                sale=sale,
+                description=f"Points gagnés sur vente {sale.reference}",
+                created_by=user,
+            )
+        except IntegrityError:
+            # Race extrême : une autre transaction a créé la ligne EARN
+            # juste avant. On retire les points qu'on venait d'ajouter
+            # (la première transaction a déjà ajouté les siens).
+            loyalty.add_points(-points)
 
     @action(detail=True, methods=['post'], url_path='add-payment')
     def add_payment(self, request, pk=None):
@@ -687,6 +731,11 @@ class SaleViewSet(
             )
 
         with transaction.atomic():
+            # Si la vente provient d'un devis converti mais n'a pas encore
+            # été encaissée, libérer la réservation de stock. Idempotent :
+            # ne fait rien pour les ventes POS directes (stock_reserved=False).
+            SaleStockService.release_reservation(sale, request.user)
+
             # Restitution centralisée (idempotente : ne fait rien si stock pas committed)
             SaleStockService.revert(sale, request.user)
 
@@ -735,10 +784,62 @@ class SaleViewSet(
                         created_by=request.user,
                     )
 
+            # Reverser les transactions de fidélité liées à cette vente.
+            # Idempotent : on ne crée un REVERSAL que s'il n'existe pas déjà.
+            self._reverse_loyalty_transactions(sale, request.user)
+
             sale.status = 'cancelled'
             sale.save()
 
         return Response({'status': 'cancelled'})
+
+    def _reverse_loyalty_transactions(self, sale, user):
+        """
+        Inverse les transactions de fidélité d'une vente annulée :
+        - une ligne ``EARN`` → on retire les points et on crée ``EARN_REVERSAL``
+        - une ligne ``REDEEM`` → on restitue les points et on crée ``REDEEM_REVERSAL``
+
+        Idempotent : si un REVERSAL existe déjà pour cette vente, ne fait rien.
+        """
+        from apps.settings.models import CustomerLoyalty, LoyaltyTransaction
+
+        TxType = LoyaltyTransaction.TransactionType
+
+        for original_type, reversal_type, reversal_label in (
+            (TxType.EARN, TxType.EARN_REVERSAL, "Annulation des points gagnés"),
+            (TxType.REDEEM, TxType.REDEEM_REVERSAL, "Restitution des points utilisés"),
+        ):
+            if LoyaltyTransaction.objects.filter(
+                sale=sale, transaction_type=reversal_type
+            ).exists():
+                continue  # déjà reversé
+
+            original = LoyaltyTransaction.objects.filter(
+                sale=sale, transaction_type=original_type
+            ).first()
+            if not original:
+                continue
+
+            loyalty = CustomerLoyalty.objects.select_for_update().filter(
+                pk=original.customer_loyalty_id
+            ).first()
+            if not loyalty:
+                continue
+
+            # Inversion : on annule l'effet sur le solde de points.
+            # original.points est positif pour EARN, négatif pour REDEEM.
+            loyalty.add_points(-original.points)
+
+            LoyaltyTransaction.objects.create(
+                organization=sale.organization,
+                customer_loyalty=loyalty,
+                transaction_type=reversal_type,
+                points=-original.points,
+                balance_after=loyalty.current_points,
+                sale=sale,
+                description=f"{reversal_label} — annulation vente {sale.reference}",
+                created_by=user,
+            )
 
     @action(detail=False, methods=['get'])
     def today(self, request):
@@ -1039,7 +1140,8 @@ class QuotationViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         """Convertit un devis en vente."""
         from django.db import transaction
         from apps.inventory.models import Stock
-        
+        from .services import SaleStockService
+
         quotation = self.get_object()
         
         if quotation.status == 'converted':
@@ -1149,7 +1251,14 @@ class QuotationViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
             quotation.status = 'converted'
             quotation.converted_sale = sale
             quotation.save()
-        
+
+            # Réserver immédiatement le stock pour éviter qu'un autre cashier
+            # ne vende les mêmes unités pendant la fenêtre conversion →
+            # encaissement. Le décrément effectif sera fait par
+            # ``SaleStockService.apply_decrement`` lors du ``add_payment``.
+            if sale.warehouse:
+                SaleStockService.reserve_stock(sale, request.user)
+
         return Response({
             'status': 'converted',
             'sale_id': str(sale.id),
@@ -1169,7 +1278,12 @@ class QuotationViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         
         quotation.status = 'sent'
         quotation.save()
-        
-        # TODO: Envoyer par email si configuré
-        
+
+        # Email envoyé en best-effort : si l'API SMTP est down ou pas
+        # configurée, on continue (la vente / le devis reste créé). Le mode
+        # console (dev) affiche le mail en stdout pour vérification.
+        from apps.core.email_service import send_quotation_email
+        recipient = request.data.get('recipient_email') if hasattr(request, 'data') else None
+        send_quotation_email(quotation, recipient_email=recipient)
+
         return Response({'status': 'sent'})

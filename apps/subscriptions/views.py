@@ -11,6 +11,7 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
+from rest_framework.throttling import AnonRateThrottle
 
 from apps.core.api_permissions import IsTenantMember, IsTenantOwner, HasPermission
 
@@ -19,7 +20,6 @@ from .serializers import (
     PlanSerializer,
     PublicPlanSerializer,
     SubscriptionSerializer,
-    SubscriptionStatusSerializer,
     ActivateSubscriptionSerializer,
     MokoInitiateSerializer,
     SubscriptionPaymentSerializer,
@@ -34,11 +34,18 @@ from .moko_client import (
     is_payment_failed_v2,
     is_payment_pending_v2,
     MokoConfigurationError,
-    # Compatibilité
-    extract_paydrc_transaction_id,
-    initiate_payment,
 )
 from .moko_pending import enqueue_pending_payment, remove_pending_payment
+
+
+class MokoCallbackThrottle(AnonRateThrottle):
+    """Throttle dédié au webhook Moko (scope ``moko_callback``, 60/min/IP).
+
+    Actif même en DEBUG car attaché directement à l'action via
+    ``throttle_classes`` (n'est pas filtré par ``DEFAULT_THROTTLE_CLASSES``).
+    """
+    scope = 'moko_callback'
+
 
 logger = logging.getLogger(__name__)
 
@@ -566,25 +573,51 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
         url_path='moko/callback',
         permission_classes=[AllowAny],
         authentication_classes=[],
+        throttle_classes=[MokoCallbackThrottle],
     )
     def moko_callback(self, request):
         """
         Callback MOKO v2 (notification asynchrone).
-        POST /api/v1/subscriptions/moko/callback/?token=<MOKO_CALLBACK_SECRET>
+
+        Auth :
+        - Header ``Authorization: Bearer <secret>`` recommandé.
+        - Fallback header ``X-Webhook-Token: <secret>``.
+        - Fallback rétro-compat query string ``?token=<secret>`` (deprecated,
+          warning loggué — supprimer dès que Moko aura migré côté config).
+
+        Throttle :
+        - Scope ``moko_callback`` (60/min par IP) — actif même en DEBUG.
 
         Durcissement :
-        - Si MOKO_CALLBACK_SECRET est configuré, le query param `token` doit matcher.
-        - La référence doit suivre notre convention (`vf_sub_*`).
-        - Si la payload contient un `amount`, il doit correspondre à `payment.amount`
-          (tolérance 0.01 pour les arrondis float côté Moko).
+        - Si MOKO_CALLBACK_SECRET est configuré, le secret est obligatoire.
+        - La référence doit suivre notre convention (``vf_sub_*``).
+        - Si la payload contient un ``amount``, il doit correspondre à
+          ``payment.amount`` (tolérance 0.01 pour les arrondis Moko).
+        - Idempotence renforcée : si ``payment.status != PENDING`` mais que la
+          subscription n'a pas été activée, on retraite le callback.
         """
-        # 1) Auth via secret partagé en query string (si configuré)
+        # 1) Auth via secret partagé (header prioritaire, query en fallback)
         expected_secret = getattr(settings, 'MOKO_CALLBACK_SECRET', '') or ''
         if expected_secret:
             import hmac
-            provided = request.query_params.get('token', '') or ''
-            if not hmac.compare_digest(provided, expected_secret):
-                logger.warning('MOKO callback: invalid or missing token')
+
+            auth_header = request.headers.get('Authorization', '') or ''
+            provided = ''
+            if auth_header.lower().startswith('bearer '):
+                provided = auth_header[7:].strip()
+            if not provided:
+                provided = request.headers.get('X-Webhook-Token', '') or ''
+            if not provided:
+                # Rétro-compat : query string (signaler comme deprecated)
+                provided = request.query_params.get('token', '') or ''
+                if provided:
+                    logger.warning(
+                        'MOKO callback: secret reçu en query string (deprecated). '
+                        'Migrer côté Moko vers Authorization: Bearer.'
+                    )
+
+            if not provided or not hmac.compare_digest(provided, expected_secret):
+                logger.warning('MOKO callback: invalid or missing secret')
                 return Response({'detail': 'forbidden'}, status=status.HTTP_403_FORBIDDEN)
 
         payload = request.data
@@ -657,8 +690,25 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
                 return Response({'detail': 'invalid amount'}, status=status.HTTP_400_BAD_REQUEST)
 
         if payment.status != SubscriptionPayment.Status.PENDING:
-            remove_pending_payment(str(ref))
-            return Response({'status': 'Callback received successfully'}, status=status.HTTP_200_OK)
+            # Idempotence renforcée : si le payment est COMPLETED mais que la
+            # subscription n'a pas réellement été activée (cas d'un crash
+            # entre payment.save() et subscription.activate()), on retraite.
+            needs_reapply = (
+                payment.status == SubscriptionPayment.Status.COMPLETED
+                and payment.subscription_id is not None
+                and not getattr(payment.subscription, 'is_active', True)
+            )
+            if not needs_reapply:
+                remove_pending_payment(str(ref))
+                return Response(
+                    {'status': 'Callback received successfully'},
+                    status=status.HTTP_200_OK,
+                )
+            logger.warning(
+                'MOKO callback: re-applying terminal status for ref=%s '
+                '(payment completed but subscription not active)',
+                ref,
+            )
 
         if not moko_status:
             logger.info('MOKO callback: no status in payload for ref=%s', ref)

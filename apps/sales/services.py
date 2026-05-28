@@ -49,6 +49,13 @@ class SaleStockService:
         if not warehouse:
             return
 
+        # Si la vente provient d'une conversion de devis et a réservé du
+        # stock, libérer la réservation avant le décrément effectif. Sinon
+        # ``reserved_quantity`` resterait gonflée alors que ``quantity``
+        # baisse, biaisant ``available_quantity`` négativement.
+        if sale.stock_reserved:
+            SaleStockService.release_reservation(sale, user)
+
         org = sale.organization
 
         for item in sale.items.select_related('product', 'variant').all():
@@ -115,6 +122,120 @@ class SaleStockService:
                 notes=f"Vente {sale.reference}",
                 created_by=user,
             )
+
+    @staticmethod
+    @transaction.atomic
+    def reserve_stock(sale, user):
+        """
+        Réserve du stock pour une vente (conversion de devis).
+
+        Incrémente ``Stock.reserved_quantity`` pour chaque item, sous lock.
+        Marque ``sale.stock_reserved = True`` pour rendre l'opération
+        idempotente. Lève ``ValidationError`` si la quantité disponible
+        (``quantity - reserved_quantity``) est insuffisante et que
+        ``warehouse.allow_negative_stock`` est ``False``.
+
+        À appeler à la conversion d'un Quotation → Sale, pour empêcher
+        qu'un autre cashier ne vende les mêmes unités pendant la fenêtre
+        entre conversion et encaissement.
+        """
+        from apps.inventory.models import Stock
+
+        if sale.stock_reserved:
+            return
+
+        warehouse = sale.warehouse
+        if not warehouse:
+            return
+
+        org = sale.organization
+        allow_negative = getattr(warehouse, 'allow_negative_stock', False)
+
+        for item in sale.items.select_related('product', 'variant').all():
+            if not item.product.track_inventory:
+                continue
+
+            stock = Stock.objects.select_for_update().filter(
+                organization=org,
+                product=item.product,
+                variant=item.variant,
+                warehouse=warehouse,
+            ).first()
+
+            if stock is None:
+                if allow_negative:
+                    continue
+                raise ValidationError({
+                    'items': (
+                        f"Stock indisponible pour {item.product.name} "
+                        f"dans l'entrepôt {warehouse.name}."
+                    )
+                })
+
+            available = stock.quantity - stock.reserved_quantity
+            if item.quantity > available and not allow_negative:
+                raise ValidationError({
+                    'items': (
+                        f"Stock disponible insuffisant pour {item.product.name}. "
+                        f"Disponible (hors réservations) : {available}, "
+                        f"demandé : {item.quantity}."
+                    )
+                })
+
+            stock.reserved_quantity = stock.reserved_quantity + item.quantity
+            stock.save()
+
+        sale.stock_reserved = True
+        sale.save(update_fields=['stock_reserved'])
+
+    @staticmethod
+    @transaction.atomic
+    def release_reservation(sale, user):
+        """
+        Libère la réservation faite par ``reserve_stock``. Idempotent :
+        ne fait rien si ``sale.stock_reserved`` est ``False``.
+
+        À appeler :
+        - Avant la décrémentation effective (``apply_decrement``) pour
+          libérer la réservation avant que ``Stock.quantity`` soit modifié.
+        - À l'annulation d'une vente en pending qui n'avait pas encore été
+          encaissée mais avait réservé son stock.
+        """
+        from apps.inventory.models import Stock
+        from decimal import Decimal as _D
+
+        if not sale.stock_reserved:
+            return
+
+        warehouse = sale.warehouse
+        if not warehouse:
+            sale.stock_reserved = False
+            sale.save(update_fields=['stock_reserved'])
+            return
+
+        org = sale.organization
+
+        for item in sale.items.select_related('product', 'variant').all():
+            if not item.product.track_inventory:
+                continue
+
+            stock = Stock.objects.select_for_update().filter(
+                organization=org,
+                product=item.product,
+                variant=item.variant,
+                warehouse=warehouse,
+            ).first()
+
+            if stock is None:
+                continue
+
+            stock.reserved_quantity = max(
+                _D('0.000'), stock.reserved_quantity - item.quantity
+            )
+            stock.save()
+
+        sale.stock_reserved = False
+        sale.save(update_fields=['stock_reserved'])
 
     @staticmethod
     @transaction.atomic

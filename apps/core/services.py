@@ -14,41 +14,44 @@ class OrganizationService:
     def create_organization(user, name, business_type, **kwargs):
         """
         Create a new organization with the user as owner.
-        Also creates default branch, warehouse, and trial subscription.
+        Also creates default branch, warehouse, register, payment methods,
+        cashbook categories, currency, and trial subscription — l'utilisateur
+        peut immédiatement encaisser sans étape de configuration manuelle.
         """
         from django.utils.text import slugify
         from apps.inventory.models import Warehouse
-        from apps.sales.models import PaymentMethod
+        from apps.sales.models import PaymentMethod, Register
+        from apps.cashbook.models import IncomeCategory, ExpenseCategory
         from apps.subscriptions.services import SubscriptionService
         from apps.settings.models import Currency, OrganizationCurrency
-        
+
         slug = slugify(name)
         base_slug = slug
         counter = 1
         while Organization.objects.filter(slug=slug).exists():
             slug = f"{base_slug}-{counter}"
             counter += 1
-        
+
         organization = Organization.objects.create(
             name=name,
             slug=slug,
             business_type=business_type,
             **kwargs
         )
-        
+
         OrganizationMembership.objects.create(
             user=user,
             organization=organization,
             role=OrganizationMembership.Role.OWNER,
             is_active=True
         )
-        
+
         user.active_organization = organization
         user.save(update_fields=['active_organization'])
-        
+
         # Créer la subscription trial via le service centralisé
         SubscriptionService.create_trial(organization)
-        
+
         branch = Branch.objects.create(
             organization=organization,
             name='Principal',
@@ -56,8 +59,8 @@ class OrganizationService:
             is_main=True,
             is_active=True
         )
-        
-        Warehouse.objects.create(
+
+        warehouse = Warehouse.objects.create(
             organization=organization,
             name='Entrepôt Principal',
             code='WH-MAIN',
@@ -65,20 +68,64 @@ class OrganizationService:
             is_default=True,
             is_active=True
         )
-        
+
+        # Caisse par défaut : sans ce Register, un POS débutant ne peut pas
+        # ouvrir de session ni encaisser (Sale.is_pos exige register/session).
+        Register.objects.create(
+            organization=organization,
+            branch=branch,
+            warehouse=warehouse,
+            name='Caisse Principale',
+            code='REG-MAIN',
+            is_active=True,
+        )
+
         default_methods = [
             ('Espèces', 'CASH', PaymentMethod.MethodType.CASH, True),
             ('Mobile Money', 'MOMO', PaymentMethod.MethodType.MOBILE_MONEY, False),
             ('Carte Bancaire', 'CARD', PaymentMethod.MethodType.CARD, False),
         ]
-        for name, code, method_type, is_default in default_methods:
+        for pm_name, code, method_type, is_default in default_methods:
             PaymentMethod.objects.create(
                 organization=organization,
-                name=name,
+                name=pm_name,
                 code=code,
                 method_type=method_type,
                 is_default=is_default,
                 is_active=True
+            )
+
+        # Catégories d'entrées et de dépenses pour le livre de caisse — sans
+        # ces lignes, le user doit aller dans Paramètres > Cashbook avant de
+        # pouvoir enregistrer une dépense.
+        default_income = [
+            ('Vente comptant', 'SALE_CASH'),
+            ('Recouvrement crédit', 'CREDIT_COLLECT'),
+            ('Apport en capital', 'CAPITAL'),
+            ('Autres revenus', 'OTHER_INCOME'),
+        ]
+        for inc_name, inc_code in default_income:
+            IncomeCategory.objects.create(
+                organization=organization,
+                name=inc_name,
+                code=inc_code,
+                is_active=True,
+            )
+
+        default_expense = [
+            ('Loyer', 'RENT'),
+            ('Salaires', 'SALARY'),
+            ('Transport', 'TRANSPORT'),
+            ('Fournitures', 'SUPPLIES'),
+            ('Électricité & Eau', 'UTILITIES'),
+            ('Autres dépenses', 'OTHER_EXPENSE'),
+        ]
+        for exp_name, exp_code in default_expense:
+            ExpenseCategory.objects.create(
+                organization=organization,
+                name=exp_name,
+                code=exp_code,
+                is_active=True,
             )
         
         # Créer la devise principale de l'organisation

@@ -6,6 +6,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
+from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
 from decimal import Decimal
@@ -243,81 +244,32 @@ class GoodsReceiptViewSet(
     def complete(self, request, pk=None):
         """Valide la réception et met à jour le stock."""
         grn = self.get_object()
-        
+
         if grn.status != 'draft':
             return Response(
                 {'error': 'Cette réception est déjà validée'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
-        from apps.inventory.models import Stock, StockMovement, StockBatch
-        
-        for item in grn.items.all():
-            if item.quantity_accepted > 0:
-                # Créer ou mettre à jour le stock
-                stock, _ = Stock.objects.get_or_create(
-                    organization=grn.organization,
-                    product=item.product,
-                    variant=item.variant,
-                    warehouse=grn.warehouse,
-                    defaults={'quantity': 0, 'avg_cost': item.unit_cost}
-                )
-                
-                quantity_before = stock.quantity
-                
-                # Calculer le nouveau coût moyen pondéré
-                total_value = (stock.quantity * stock.avg_cost) + (item.quantity_accepted * item.unit_cost)
-                new_quantity = stock.quantity + item.quantity_accepted
-                if new_quantity > 0:
-                    stock.avg_cost = total_value / new_quantity
-                
-                stock.quantity = new_quantity
-                stock.last_movement_at = timezone.now()
-                stock.save()
-                
-                # Créer le lot si batch_number fourni
-                if item.batch_number:
-                    StockBatch.objects.create(
-                        organization=grn.organization,
-                        product=item.product,
-                        variant=item.variant,
-                        warehouse=grn.warehouse,
-                        batch_number=item.batch_number,
-                        quantity=item.quantity_accepted,
-                        cost_price=item.unit_cost,
-                        expiry_date=item.expiry_date
-                    )
-                
-                # Créer le mouvement de stock
-                StockMovement.objects.create(
-                    organization=grn.organization,
-                    product=item.product,
-                    variant=item.variant,
-                    warehouse=grn.warehouse,
-                    movement_type='purchase',
-                    quantity=item.quantity_accepted,
-                    unit_cost=item.unit_cost,
-                    quantity_before=quantity_before,
-                    quantity_after=stock.quantity,
-                    reference_type='goods_receipt',
-                    reference_id=grn.id,
-                    created_by=request.user
-                )
-        
-        # Mettre à jour le statut de la commande
-        po = grn.purchase_order
-        total_ordered = po.items.aggregate(total=Sum('quantity_ordered'))['total'] or 0
-        total_received = po.items.aggregate(total=Sum('quantity_received'))['total'] or 0
-        
-        if total_received >= total_ordered:
-            po.status = 'received'
-        else:
-            po.status = 'partially_received'
-        po.save()
-        
-        grn.status = 'completed'
-        grn.save()
-        
+
+        from .services import GoodsReceiptStockService
+
+        with transaction.atomic():
+            GoodsReceiptStockService.apply_increment(grn, request.user)
+
+            po = grn.purchase_order
+            totals = po.items.aggregate(
+                total_ordered=Sum('quantity_ordered'),
+                total_received=Sum('quantity_received'),
+            )
+            total_ordered = totals['total_ordered'] or Decimal('0.000')
+            total_received = totals['total_received'] or Decimal('0.000')
+
+            po.status = 'received' if total_received >= total_ordered else 'partially_received'
+            po.save()
+
+            grn.status = 'completed'
+            grn.save()
+
         return Response({'status': 'completed'})
 
     @action(detail=True, methods=['post'])

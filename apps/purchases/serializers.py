@@ -1,12 +1,16 @@
 """
 Serializers DRF pour l'app Purchases.
 """
+import logging
+
 from rest_framework import serializers
 from decimal import Decimal
 from .models import (
     PurchaseOrder, PurchaseOrderItem, GoodsReceipt, GoodsReceiptItem,
     SupplierPayment, SupplierPaymentAllocation, PurchaseReturn, PurchaseReturnItem
 )
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -322,7 +326,13 @@ class GoodsReceiptCreateSerializer(serializers.ModelSerializer):
         if last:
             try:
                 num = int(last.reference.split('-')[-1]) + 1
-            except:
+            except (ValueError, IndexError, AttributeError) as exc:
+                # Format de référence inattendu (ancienne convention, données
+                # migrées, ...). On loggue pour diagnostic et on repart à 1.
+                logger.warning(
+                    "Format de référence inattendu pour %s : %r (%s)",
+                    last.__class__.__name__, last.reference, exc,
+                )
                 num = 1
         else:
             num = 1
@@ -438,7 +448,13 @@ class SupplierPaymentCreateSerializer(serializers.ModelSerializer):
         if last:
             try:
                 num = int(last.reference.split('-')[-1]) + 1
-            except:
+            except (ValueError, IndexError, AttributeError) as exc:
+                # Format de référence inattendu (ancienne convention, données
+                # migrées, ...). On loggue pour diagnostic et on repart à 1.
+                logger.warning(
+                    "Format de référence inattendu pour %s : %r (%s)",
+                    last.__class__.__name__, last.reference, exc,
+                )
                 num = 1
         else:
             num = 1
@@ -580,7 +596,13 @@ class PurchaseReturnCreateSerializer(serializers.ModelSerializer):
         if last:
             try:
                 num = int(last.reference.split('-')[-1]) + 1
-            except:
+            except (ValueError, IndexError, AttributeError) as exc:
+                # Format de référence inattendu (ancienne convention, données
+                # migrées, ...). On loggue pour diagnostic et on repart à 1.
+                logger.warning(
+                    "Format de référence inattendu pour %s : %r (%s)",
+                    last.__class__.__name__, last.reference, exc,
+                )
                 num = 1
         else:
             num = 1

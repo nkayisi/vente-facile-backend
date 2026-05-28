@@ -293,14 +293,29 @@ class SyncPushService:
     def _create_record(self, model, table_name, data):
         """Create a new record from sync data."""
         record_id = data.get('id')
-        
-        # Check if record already exists (idempotence)
+        has_organization = hasattr(model, 'organization')
+
+        # Check if record already exists (idempotence).
+        # Important : scopée à l'organisation. Sans ce filtre, un UUID qui
+        # coïncide avec une row d'une autre org provoquerait un silent skip,
+        # ce qui empêcherait à jamais ce client de créer un objet avec cet ID.
         if record_id and is_valid_uuid(record_id):
-            existing = model.objects.filter(id=record_id).first()
-            if existing:
+            existing_qs = model.objects.filter(id=record_id)
+            if has_organization:
+                existing_qs = existing_qs.filter(organization=self.organization)
+            if existing_qs.exists():
                 logger.info(f"Record {record_id} already exists in {table_name}, skipping create")
                 return
-        
+
+            # Si l'ID existe dans une autre org, refuser la création
+            # (collision UUID inter-tenants — extrêmement improbable mais
+            # signalons-le proprement pour éviter une IntegrityError opaque).
+            if has_organization and model.objects.filter(id=record_id).exists():
+                raise ValueError(
+                    f"Conflit d'UUID : l'identifiant {record_id} existe déjà "
+                    f"dans une autre organisation."
+                )
+
         # Prepare data for creation
         create_data = self._prepare_record_data(model, table_name, data)
         create_data['organization'] = self.organization
@@ -407,52 +422,88 @@ class SyncPushService:
     def _prepare_record_data(self, model, table_name, data):
         """
         Prepare record data for creation/update.
-        
+
         Converts foreign key fields and handles special types.
+
+        Sécurité : pour chaque FK qui pointe vers un modèle multi-tenant
+        (avec un champ ``organization``), on vérifie que l'objet ciblé
+        appartient bien à ``self.organization``. Sans ce contrôle, un client
+        mobile pourrait pousser une vente référençant un Customer / Product
+        d'une autre organisation.
         """
         prepared = {}
-        
+
         # Get model field names
         field_names = {f.name for f in model._meta.get_fields()}
-        
+
         # Map of sync field names to model field names
         field_mapping = self._get_field_mapping(table_name)
-        
+
         for key, value in data.items():
             # Skip internal fields
             if key in ('id', 'organization', '_changed', '_status'):
                 if key == 'id' and value and is_valid_uuid(value):
                     prepared['id'] = value
                 continue
-            
+
             # Map field name if needed
             model_field = field_mapping.get(key, key)
-            
+
             # Skip if field doesn't exist on model
             if model_field not in field_names and not model_field.endswith('_id'):
                 continue
-            
+
             # Handle foreign key fields (ending with _id)
             if key.endswith('_id'):
                 fk_field = key[:-3]  # Remove _id suffix
                 if fk_field in field_names:
                     if value and is_valid_uuid(value):
+                        self._assert_fk_belongs_to_org(model, fk_field, value)
                         prepared[key] = value
                     else:
                         prepared[key] = None
                 continue
-            
+
             # Handle decimal fields
             if isinstance(value, str) and '.' in value:
                 try:
                     prepared[model_field] = Decimal(value)
                     continue
-                except:
-                    pass
-            
+                except (ValueError, TypeError) as e:
+                    logger.debug(f"Failed to parse decimal {value}: {e}")
+
             prepared[model_field] = value
-        
+
         return prepared
+
+    def _assert_fk_belongs_to_org(self, model, fk_field, fk_uuid):
+        """
+        Vérifie que la FK pointe vers un objet de la même organisation.
+
+        Ne vérifie rien si le modèle cible n'est pas multi-tenant (User,
+        Currency, etc.) — la cohérence est alors assurée par le modèle.
+        """
+        try:
+            field = model._meta.get_field(fk_field)
+        except Exception:
+            return
+
+        related_model = getattr(field, 'related_model', None)
+        if related_model is None:
+            return
+
+        # Modèle non-tenant : pas de vérification (ex: User, Currency)
+        related_field_names = {f.name for f in related_model._meta.get_fields()}
+        if 'organization' not in related_field_names:
+            return
+
+        if not related_model.objects.filter(
+            id=fk_uuid, organization=self.organization
+        ).exists():
+            raise ValueError(
+                f"FK {fk_field}={fk_uuid} n'appartient pas à l'organisation "
+                f"{self.organization.id} ou n'existe pas."
+            )
     
     def _get_field_mapping(self, table_name):
         """Get field name mapping for a table."""

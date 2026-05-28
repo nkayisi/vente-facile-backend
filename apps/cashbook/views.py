@@ -202,6 +202,17 @@ class ExpenseViewSet(
     def get_queryset(self):
         queryset = super().get_queryset()
 
+        # Scope explicite : les dépenses sans warehouse (org-level) ne sont
+        # visibles que pour les rôles owner/manager. Sans ce filtre, un
+        # caissier scopé sur un warehouse verrait tous les frais généraux
+        # (loyer, salaires, abonnements...) — inadapté pour un POS.
+        # ``warehouse_scope_include_null=True`` laisse passer ces lignes en
+        # base ; on les exclut ici pour les rôles non-managériaux.
+        from apps.core.api_permissions import is_manager_or_above
+
+        if not is_manager_or_above(self.request):
+            queryset = queryset.exclude(warehouse__isnull=True)
+
         # Filtres de date
         date_from = self.request.query_params.get('date_from')
         date_to = self.request.query_params.get('date_to')

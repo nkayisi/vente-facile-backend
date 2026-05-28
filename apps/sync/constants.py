@@ -37,8 +37,15 @@ SYNCABLE_MODELS_MAP = {
     for table_name, app_label, model_name, select_related in SYNCABLE_MODELS
 }
 
-# Tables that are read-only on mobile (can only be pulled, not pushed)
+# Tables that are read-only on mobile (can only be pulled, not pushed).
+# Reflète l'intention documentée ligne 10 ("Phase 1: Reference data (read-only
+# on mobile)") : ces référentiels sont gérés depuis le dashboard par
+# l'owner/manager — le cashier sur mobile sélectionne dans le catalogue
+# existant mais ne peut pas créer/modifier ces lignes.
 READ_ONLY_TABLES = {
+    'categories',
+    'brands',
+    'units',
     'warehouses',
     'payment_methods',
 }

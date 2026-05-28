@@ -1,6 +1,6 @@
 from django.db import models
 from django.conf import settings
-from django.core.validators import MinValueValidator
+from django.core.validators import MinValueValidator, MaxValueValidator
 from decimal import Decimal
 from apps.core.models import TenantModel, TenantSoftDeleteModel
 from apps.core.managers import TenantSoftDeleteManager
@@ -280,6 +280,11 @@ class Sale(TenantSoftDeleteModel):
     is_pos = models.BooleanField(default=True)
     receipt_printed = models.BooleanField(default=False)
 
+    # True dès qu'une réservation de stock a été appliquée (typiquement par
+    # conversion d'un devis). Sert de garde d'idempotence côté
+    # SaleStockService.release_reservation : on ne libère qu'une fois.
+    stock_reserved = models.BooleanField(default=False)
+
     objects = TenantSoftDeleteManager()
 
     class Meta:
@@ -294,6 +299,17 @@ class Sale(TenantSoftDeleteModel):
             models.Index(
                 fields=['organization', 'sold_by', '-sale_date'],
                 name='sales_org_sold_by_date_idx',
+            ),
+            # Rapports : statistiques journalières / périodiques par org.
+            # Évite le full-scan + sort sur la table à chaque dashboard ouvert.
+            models.Index(
+                fields=['organization', '-sale_date'],
+                name='sales_org_date_idx',
+            ),
+            # Filtre des ventes à crédit non soldées (rapport recouvrement).
+            models.Index(
+                fields=['organization', 'status', 'amount_due'],
+                name='sales_org_status_due_idx',
             ),
         ]
         constraints = [
@@ -391,7 +407,11 @@ class SaleItem(TenantModel):
     tax_rate = models.DecimalField(
         max_digits=5,
         decimal_places=2,
-        default=Decimal('0.00')
+        default=Decimal('0.00'),
+        validators=[
+            MinValueValidator(Decimal('0')),
+            MaxValueValidator(Decimal('100')),
+        ],
     )
     tax_amount = models.DecimalField(
         max_digits=15,

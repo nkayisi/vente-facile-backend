@@ -52,13 +52,57 @@ class Category(TenantSoftDeleteModel):
         return self.name
 
     def get_ancestors(self):
-        """Get all parent categories."""
+        """Get all parent categories. Safe even si un cycle existait
+        accidentellement (limite via set d'IDs visités)."""
         ancestors = []
+        seen = set()
         current = self.parent
-        while current:
+        while current and current.id not in seen:
             ancestors.append(current)
+            seen.add(current.id)
             current = current.parent
         return ancestors[::-1]
+
+    def clean(self):
+        """
+        Empêche les cycles parent → enfant → ... → soi-même.
+
+        Sans ce contrôle, ``get_ancestors`` (et toute fonction d'arbre)
+        peut boucler indéfiniment. La contrainte ``parent != self`` est
+        triviale ; les cycles indirects (A → B → A) sont détectés en
+        remontant la chaîne et en s'arrêtant si l'on retombe sur ``self.id``.
+        """
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
+        super().clean()
+
+        if self.parent_id is None:
+            return
+
+        if self.pk and self.parent_id == self.pk:
+            raise DjangoValidationError({
+                'parent': "Une catégorie ne peut pas être son propre parent."
+            })
+
+        if self.pk:
+            visited = {self.pk}
+            cursor = self.parent
+            while cursor is not None:
+                if cursor.pk in visited:
+                    raise DjangoValidationError({
+                        'parent': (
+                            "Cycle détecté dans la hiérarchie des catégories. "
+                            "Le parent choisi est déjà un descendant."
+                        )
+                    })
+                visited.add(cursor.pk)
+                cursor = cursor.parent
+
+    def save(self, *args, **kwargs):
+        # Exécuter la validation anti-cycle même si le caller n'appelle pas
+        # full_clean explicitement (ORM direct, scripts, admin).
+        self.clean()
+        super().save(*args, **kwargs)
 
 
 class Brand(TenantSoftDeleteModel):

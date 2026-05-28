@@ -909,9 +909,10 @@ class OrganizationInvitationViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             invited_by=request.user,
             expires_at=timezone.now() + timedelta(days=7)
         )
-        
-        # TODO: Envoyer l'email
-        
+
+        from apps.core.email_service import send_invitation_email
+        send_invitation_email(invitation)
+
         return Response(
             OrganizationInvitationSerializer(invitation).data,
             status=status.HTTP_201_CREATED
@@ -931,7 +932,8 @@ class OrganizationInvitationViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         # Prolonger l'expiration
         invitation.expires_at = timezone.now() + timedelta(days=7)
         invitation.save()
-        
-        # TODO: Renvoyer l'email
-        
+
+        from apps.core.email_service import send_invitation_email
+        send_invitation_email(invitation)
+
         return Response({'message': 'Invitation renvoyée'})
