@@ -17,6 +17,24 @@ def _get_last_balance(organization):
     return last.balance_after if last else Decimal('0.00')
 
 
+def get_open_session_for_user(organization, user):
+    """Session de caisse actuellement ouverte par ``user`` (ou ``None``).
+
+    Sert à rattacher un mouvement de caisse saisi au comptoir (dépense, apport,
+    retrait) à la session en cours, pour le calcul de la caisse nette.
+    """
+    if not user or not getattr(user, 'is_authenticated', False):
+        return None
+    from apps.sales.models import RegisterSession
+    return (
+        RegisterSession.objects.filter(
+            organization=organization, opened_by=user, status='open'
+        )
+        .order_by('-opened_at')
+        .first()
+    )
+
+
 def record_sale_income(organization, sale, amount, user):
     """
     Enregistre une entrée de caisse pour une vente (paiement reçu).
@@ -35,6 +53,7 @@ def record_sale_income(organization, sale, amount, user):
         amount=amount,
         description=f"Vente {sale.reference}",
         sale=sale,
+        session=getattr(sale, 'session', None),
         customer=sale.customer,
         balance_after=new_balance,
         movement_date=timezone.now(),
@@ -60,6 +79,7 @@ def record_sale_cancellation(organization, sale, amount, user):
         amount=amount,
         description=f"Annulation vente {sale.reference}",
         sale=sale,
+        session=getattr(sale, 'session', None),
         customer=sale.customer,
         balance_after=new_balance,
         movement_date=timezone.now(),
@@ -85,6 +105,7 @@ def record_debt_collection(organization, sale, amount, customer, user):
         amount=amount,
         description=f"Recouvrement dette - Vente {sale.reference}",
         sale=sale,
+        session=getattr(sale, 'session', None),
         customer=customer,
         balance_after=new_balance,
         movement_date=timezone.now(),

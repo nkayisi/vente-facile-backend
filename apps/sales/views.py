@@ -267,7 +267,23 @@ class RegisterSessionViewSet(
             status='completed'
         ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
 
-        expected_balance = (session.opening_balance + cash_payments).quantize(Decimal('0.01'))
+        # Dépenses en espèces réglées pendant la session : elles sortent de la
+        # caisse et doivent être déduites pour obtenir la valeur nette du tiroir.
+        # (payment_method NULL = considéré espèces au comptoir.)
+        from django.db.models import Q as _Q
+        from apps.cashbook.models import CashMovement
+        cash_expenses = CashMovement.objects.filter(
+            session=session,
+            direction='out',
+            movement_type='expense',
+            is_cancelled=False,
+        ).filter(
+            _Q(payment_method__isnull=True) | _Q(payment_method__method_type='cash')
+        ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+
+        expected_balance = (
+            session.opening_balance + cash_payments - cash_expenses
+        ).quantize(Decimal('0.01'))
 
         if counted_balance is not None:
             counted_balance = Decimal(counted_balance).quantize(Decimal('0.01'))
@@ -313,6 +329,8 @@ class RegisterSessionViewSet(
                 'closed_by_id': str(request.user.id),
                 'closed_by_other_user': closed_by_other,
                 'opening_balance': str(session.opening_balance),
+                'cash_payments': str(cash_payments),
+                'cash_expenses': str(cash_expenses),
                 'expected_balance': str(expected_balance),
                 'counted_balance': str(counted_balance) if counted_balance is not None else None,
                 'difference': str(difference),

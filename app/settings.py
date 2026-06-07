@@ -271,7 +271,7 @@ SIMPLE_JWT = {
 
 CORS_ALLOWED_ORIGINS = config(
     'CORS_ALLOWED_ORIGINS',
-    default='http://localhost:3000,http://127.0.0.1:3000',
+    default='http://localhost:3005,http://127.0.0.1:3005',
     cast=Csv()
 )
 CORS_ALLOW_CREDENTIALS = True
@@ -370,7 +370,7 @@ EMAIL_HOST_USER = config('EMAIL_HOST_USER', default='')
 EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD', default='')
 DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='noreply@ventefacile.com')
 
-FRONTEND_URL = config('FRONTEND_URL', default='http://localhost:3000')
+FRONTEND_URL = config('FRONTEND_URL', default='http://localhost:3005')
 PASSWORD_RESET_TIMEOUT = 3600  # 1 heure en secondes
 
 # MOKO / GoFreshPay v2 (abonnements)
@@ -380,7 +380,7 @@ MOKO_API_V2_URL = config(
 )
 MOKO_API_KEY = config('MOKO_API_KEY', default='')
 # URL publique du backend pour le callback (MOKO doit pouvoir joindre cette URL)
-PUBLIC_BACKEND_URL = config('PUBLIC_BACKEND_URL', default='http://127.0.0.1:8000')
+PUBLIC_BACKEND_URL = config('PUBLIC_BACKEND_URL', default='http://127.0.0.1:8005')
 # Secret partagé inclus en query param de l'URL de callback pour authentifier MOKO.
 # Si vide, la vérification est désactivée (à n'utiliser qu'en dev).
 MOKO_CALLBACK_SECRET = config('MOKO_CALLBACK_SECRET', default='')

@@ -7,7 +7,7 @@ import requests
 import json
 from pprint import pprint
 
-BASE_URL = "http://127.0.0.1:8000/api/v1"
+BASE_URL = "http://127.0.0.1:8005/api/v1"
 ADMIN_EMAIL = "admin@ventefacile.com"
 ADMIN_PASSWORD = "admin123"
 
@@ -176,11 +176,11 @@ class APITester:
         self.print_section("TEST 5: Documentation API (Swagger)")
         
         try:
-            response = requests.get("http://127.0.0.1:8000/api/docs/")
+            response = requests.get("http://127.0.0.1:8005/api/docs/")
             
             if response.status_code == 200:
                 self.print_result("Accès à Swagger UI", True, {
-                    "url": "http://127.0.0.1:8000/api/docs/",
+                    "url": "http://127.0.0.1:8005/api/docs/",
                     "status": "Accessible"
                 })
                 return True
@@ -241,9 +241,9 @@ class APITester:
         # Informations utiles
         print("📋 INFORMATIONS UTILES:")
         print(f"   - API Base URL: {BASE_URL}")
-        print(f"   - Documentation Swagger: http://127.0.0.1:8000/api/docs/")
-        print(f"   - Documentation ReDoc: http://127.0.0.1:8000/api/redoc/")
-        print(f"   - Admin Django: http://127.0.0.1:8000/admin/")
+        print(f"   - Documentation Swagger: http://127.0.0.1:8005/api/docs/")
+        print(f"   - Documentation ReDoc: http://127.0.0.1:8005/api/redoc/")
+        print(f"   - Admin Django: http://127.0.0.1:8005/admin/")
         print(f"   - Email admin: {ADMIN_EMAIL}")
         print(f"   - Password admin: {ADMIN_PASSWORD}")
         if self.org_id:

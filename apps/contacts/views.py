@@ -13,6 +13,7 @@ from apps.core.api_mixins import TenantViewSetMixin, AuditMixin
 from apps.core.api_permissions import (
     IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission
 )
+from apps.core.warehouse_scope import get_membership_for_request
 from .models import Customer, CustomerTransaction, Supplier, SupplierProduct
 from .serializers import (
     CustomerListSerializer, CustomerDetailSerializer,
@@ -113,7 +114,17 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         txns = CustomerTransaction.objects.filter(
             customer=customer
         ).select_related('created_by', 'sale').order_by('-created_at')
-        
+
+        # Visibilité : un caissier ne voit que les transactions qu'il a
+        # lui-même enregistrées. Les autres rôles (gérant/owner) voient
+        # l'historique complet du client (le crédit client n'est pas
+        # rattaché à un entrepôt).
+        from apps.organizations.models import OrganizationMembership
+
+        membership = get_membership_for_request(request)
+        if membership and membership.role == OrganizationMembership.Role.CASHIER:
+            txns = txns.filter(created_by=request.user)
+
         # Filtre optionnel par type
         txn_type = request.query_params.get('type')
         if txn_type:

@@ -3,6 +3,7 @@ ViewSets DRF pour l'app Products.
 Tous les ViewSets héritent de TenantViewSetMixin pour le filtrage multi-tenant.
 """
 from datetime import datetime
+from decimal import Decimal
 
 from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
@@ -10,7 +11,8 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser
 from django_filters.rest_framework import DjangoFilterBackend
-from django.db.models import Sum, Count, Q, F, Exists, OuterRef
+from django.db.models import Sum, Count, Q, F, Exists, OuterRef, DecimalField
+from django.db.models.functions import Coalesce
 from django.http import HttpResponse
 
 from apps.core.api_mixins import TenantViewSetMixin, BulkActionMixin, AuditMixin
@@ -44,13 +46,25 @@ def _truthy_query_param(value) -> bool:
 
 
 def _annotate_product_total_stock(queryset, wh_ids):
-    """Somme total_stock : restreinte aux entrepôts du membership si applicable."""
-    if wh_ids is not None:
-        warehouse_stock_filter = Q(stocks__warehouse_id__in=wh_ids)
-        return queryset.annotate(
-            total_stock=Sum('stocks__quantity', filter=warehouse_stock_filter)
-        )
-    return queryset.annotate(total_stock=Sum('stocks__quantity'))
+    """Annote ``total_stock`` = stock DISPONIBLE (quantité − réservé).
+
+    Le réservé correspond aux quantités déjà engagées par des ventes en attente
+    (cf. ``apps.sales.services``), donc non vendables. Le calcul est restreint
+    aux entrepôts du membership si applicable (``wh_ids`` non ``None``).
+    """
+    stock_filter = Q(stocks__warehouse_id__in=wh_ids) if wh_ids is not None else None
+    decimal_field = DecimalField(max_digits=15, decimal_places=3)
+    qty = Coalesce(
+        Sum('stocks__quantity', filter=stock_filter),
+        Decimal('0'),
+        output_field=decimal_field,
+    )
+    reserved = Coalesce(
+        Sum('stocks__reserved_quantity', filter=stock_filter),
+        Decimal('0'),
+        output_field=decimal_field,
+    )
+    return queryset.annotate(total_stock=qty - reserved)
 
 
 def _filter_products_by_membership_warehouses(queryset, wh_ids):

@@ -375,7 +375,11 @@ class ProductListSerializer(serializers.ModelSerializer):
         return stocks[0] if len(stocks) == 1 else None
 
     def get_stock_quantity(self, obj):
-        """Retourne le stock disponible (entrepôt filtré si ?warehouse=)."""
+        """Retourne le stock disponible = quantité − réservé (entrepôt filtré si ?warehouse=).
+
+        En liste, ``total_stock`` est annoté par le ViewSet déjà net du réservé ;
+        sinon on retombe sur ``available_quantity`` (idem net du réservé).
+        """
         if hasattr(obj, 'total_stock') and obj.total_stock is not None:
             return obj.total_stock
         stock = self._stock_for_warehouse(obj)

@@ -48,6 +48,54 @@ def accessible_warehouse_ids(membership: OrganizationMembership) -> Optional[lis
     return ids
 
 
+def restrict_visibility_for_membership(
+    queryset: QuerySet,
+    membership: Optional[OrganizationMembership],
+    *,
+    warehouse_field: str,
+    creator_field: str,
+    include_null_warehouse: bool = False,
+) -> QuerySet:
+    """Visibilité par rôle pour les données financières/opérationnelles.
+
+    - ``owner`` : voit tout (aucun filtre).
+    - ``cashier`` : voit uniquement ses propres enregistrements
+      (``creator_field == membership.user``), partout dans l'application.
+    - ``manager`` / ``stock_keeper`` : périmètre entrepôt (``assigned_warehouses``)
+      via ``warehouse_field``. Par défaut, les enregistrements sans entrepôt
+      (``NULL``) ne leur sont pas visibles (réservés au owner) — passer
+      ``include_null_warehouse=True`` pour les inclure (ex. ventes legacy).
+    """
+    if membership is None:
+        return queryset
+    role = membership.role
+    if role == OrganizationMembership.Role.OWNER:
+        return queryset
+    if role == OrganizationMembership.Role.CASHIER:
+        return queryset.filter(**{creator_field: membership.user})
+    return filter_queryset_by_related_warehouse(
+        queryset, membership, warehouse_field, include_null=include_null_warehouse
+    )
+
+
+def restrict_visibility_for_request(
+    queryset: QuerySet,
+    request,
+    *,
+    warehouse_field: str,
+    creator_field: str,
+    include_null_warehouse: bool = False,
+) -> QuerySet:
+    """Variante basée sur la requête (résout le membership via X-Organization-ID)."""
+    return restrict_visibility_for_membership(
+        queryset,
+        get_membership_for_request(request),
+        warehouse_field=warehouse_field,
+        creator_field=creator_field,
+        include_null_warehouse=include_null_warehouse,
+    )
+
+
 def filter_queryset_by_warehouse_ids(
     queryset: QuerySet,
     membership: OrganizationMembership,

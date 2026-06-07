@@ -15,7 +15,7 @@ from django.db.models import (
     When,
     Value,
 )
-from django.db.models.functions import Coalesce, TruncDate, TruncWeek, TruncMonth
+from django.db.models.functions import Coalesce, TruncDate, TruncWeek, TruncMonth, TruncHour
 from django.utils import timezone
 from collections import defaultdict
 from datetime import timedelta
@@ -28,6 +28,7 @@ from apps.core.warehouse_scope import (
     accessible_warehouse_ids,
     get_membership_for_request,
 )
+from apps.organizations.models import OrganizationMembership
 from apps.sales.models import Sale, SaleItem, Payment
 from apps.sales.profit_allocation import allocated_line_ht_revenues_for_sale, effective_unit_cost
 from apps.products.models import Product
@@ -113,7 +114,10 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     
     action_permissions = {
-        'summary': 'reports.view',
+        # Le résumé alimente la page d'accueil (dashboard) de tous les rôles :
+        # accessible via `dashboard.view`, les données restant scopées par rôle
+        # (entrepôt pour gérant/magasinier, propres données pour le caissier).
+        'summary': 'dashboard.view',
         'sales': 'reports.view',
         'sales_by_period': 'reports.view',
         'sales_by_category': 'reports.view',
@@ -129,6 +133,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         'customers': 'reports.view',
         'profit_margins': 'reports.view',
         'product_profits': 'reports.view',
+        'user_activity': 'reports.view',
     }
     
     def _accessible_warehouse_ids(self, request):
@@ -141,8 +146,28 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             return None
         return accessible_warehouse_ids(membership)
 
+    def _is_cashier(self, request):
+        """True si le membre courant est un caissier (visibilité = ses données)."""
+        membership = get_membership_for_request(request)
+        return (
+            membership is not None
+            and membership.role == OrganizationMembership.Role.CASHIER
+        )
+
+    def _apply_creator_scope(self, qs, request, creator_field):
+        """Restreint aux enregistrements créés par l'utilisateur si caissier.
+
+        Garantit que les KPIs/rapports d'un caissier n'agrègent que ses propres
+        données (ventes, dépenses, mouvements), conformément à la visibilité
+        par rôle. Sans effet pour owner/gérant/magasinier.
+        """
+        if self._is_cashier(request):
+            return qs.filter(**{creator_field: request.user})
+        return qs
+
     def _scope_sales(self, qs, request):
-        """Applique le filtre warehouse aux ventes."""
+        """Applique le filtre warehouse aux ventes (+ créateur si caissier)."""
+        qs = self._apply_creator_scope(qs, request, 'sold_by')
         wh_ids = self._accessible_warehouse_ids(request)
         if wh_ids is None:
             return qs
@@ -152,6 +177,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
 
     def _scope_sale_items(self, qs, request):
         """Applique le filtre warehouse aux items de vente via ``sale``."""
+        qs = self._apply_creator_scope(qs, request, 'sale__sold_by')
         wh_ids = self._accessible_warehouse_ids(request)
         if wh_ids is None:
             return qs
@@ -163,6 +189,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
 
     def _scope_payments(self, qs, request):
         """Applique le filtre warehouse aux paiements via ``sale``."""
+        qs = self._apply_creator_scope(qs, request, 'sale__sold_by')
         wh_ids = self._accessible_warehouse_ids(request)
         if wh_ids is None:
             return qs
@@ -176,8 +203,11 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         """Applique le filtre warehouse aux mouvements de caisse.
 
         Tolère les mouvements sans vente/dépense liée (apports, retraits) afin
-        de ne pas masquer les opérations générales aux non-owner.
+        de ne pas masquer les opérations générales aux non-owner. Pour un
+        caissier, restreint aux mouvements qu'il a créés.
         """
+        if self._is_cashier(request):
+            return qs.filter(created_by=request.user)
         wh_ids = self._accessible_warehouse_ids(request)
         if wh_ids is None:
             return qs
@@ -186,13 +216,16 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         return qs.filter(
             Q(sale__warehouse_id__in=wh_ids)
             | Q(expense__warehouse_id__in=wh_ids)
+            | Q(session__register__warehouse_id__in=wh_ids)
             | Q(sale__isnull=True, expense__isnull=True)
             | Q(sale__warehouse__isnull=True, expense__isnull=True)
             | Q(sale__isnull=True, expense__warehouse__isnull=True)
         )
 
     def _scope_expenses(self, qs, request):
-        """Applique le filtre warehouse aux dépenses (warehouse nullable toléré)."""
+        """Applique le filtre warehouse aux dépenses (+ créateur si caissier)."""
+        if self._is_cashier(request):
+            return qs.filter(created_by=request.user)
         wh_ids = self._accessible_warehouse_ids(request)
         if wh_ids is None:
             return qs
@@ -267,7 +300,153 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         prev_start_date = prev_end_date - timedelta(days=period_length - 1)
         
         return start_date, end_date, prev_start_date, prev_end_date
-    
+
+    @action(detail=False, methods=['get'])
+    def user_activity(self, request):
+        """Rapport d'activité d'un utilisateur sur une période (avec heures).
+
+        Params : ``user`` (id, requis), ``date_from``/``date_to`` ou ``period``,
+        ``group_by=hour|day`` (défaut ``day``). Réservé à ``reports.view``
+        (owner + gérant) ; les données restent scopées au périmètre du
+        demandeur (un gérant ne voit que l'activité dans ses entrepôts).
+        """
+        org = self.get_organization()
+        start_date, end_date, _, _ = self._parse_date_range(request)
+        group_by = request.query_params.get('group_by', 'day')
+
+        target_id = request.query_params.get('user')
+        if not target_id:
+            return Response(
+                {'user': "Le paramètre 'user' est requis."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        membership = OrganizationMembership.objects.filter(
+            organization=org, user_id=target_id
+        ).select_related('user').first()
+        if not membership:
+            return Response(
+                {'user': "Utilisateur introuvable dans cette organisation."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        target_user = membership.user
+
+        money = dict(output_field=DecimalField())
+
+        # --- Ventes de l'utilisateur (scopées au périmètre du demandeur) ---
+        sales = self._scope_sales(
+            Sale.objects.filter(
+                organization=org,
+                sold_by=target_user,
+                sale_date__date__gte=start_date,
+                sale_date__date__lte=end_date,
+            ),
+            request,
+        )
+        completed_sales = sales.filter(status__in=['completed', 'partially_paid'])
+        sales_agg = completed_sales.aggregate(
+            count=Count('id'),
+            total=Coalesce(Sum('total'), Decimal('0'), **money),
+        )
+
+        # Ventilation par méthode de paiement
+        payments = self._scope_payments(
+            Payment.objects.filter(
+                organization=org,
+                sale__sold_by=target_user,
+                status='completed',
+                created_at__date__gte=start_date,
+                created_at__date__lte=end_date,
+            ),
+            request,
+        ).select_related('payment_method')
+        by_method = {}
+        for p in payments:
+            name = p.payment_method.name if p.payment_method else 'Autre'
+            by_method[name] = by_method.get(name, Decimal('0')) + p.amount
+
+        # --- Dépenses créées par l'utilisateur ---
+        expenses = self._scope_expenses(
+            Expense.objects.filter(
+                organization=org,
+                created_by=target_user,
+                expense_date__gte=start_date,
+                expense_date__lte=end_date,
+            ),
+            request,
+        )
+        expenses_agg = expenses.aggregate(
+            count=Count('id'),
+            total=Coalesce(Sum('amount'), Decimal('0'), **money),
+        )
+
+        # --- Mouvements de caisse créés par l'utilisateur ---
+        movements = self._scope_cash_movements(
+            CashMovement.objects.filter(
+                organization=org,
+                created_by=target_user,
+                is_cancelled=False,
+                movement_date__date__gte=start_date,
+                movement_date__date__lte=end_date,
+            ),
+            request,
+        )
+        cash_in = movements.filter(direction='in').aggregate(
+            total=Coalesce(Sum('amount'), Decimal('0'), **money))['total']
+        cash_out = movements.filter(direction='out').aggregate(
+            total=Coalesce(Sum('amount'), Decimal('0'), **money))['total']
+
+        # --- Ventilation temporelle des ventes (heure ou jour) ---
+        trunc = TruncHour('sale_date') if group_by == 'hour' else TruncDate('sale_date')
+        breakdown_qs = (
+            completed_sales.annotate(bucket=trunc)
+            .values('bucket')
+            .annotate(
+                count=Count('id'),
+                total=Coalesce(Sum('total'), Decimal('0'), **money),
+            )
+            .order_by('bucket')
+        )
+        fmt = '%Y-%m-%d %H:00' if group_by == 'hour' else '%Y-%m-%d'
+        breakdown = [
+            {
+                'bucket': row['bucket'].strftime(fmt) if row['bucket'] else '',
+                'count': row['count'],
+                'total': row['total'],
+            }
+            for row in breakdown_qs
+        ]
+
+        return Response({
+            'user': {
+                'id': str(target_user.id),
+                'name': f"{target_user.first_name} {target_user.last_name}".strip() or target_user.email,
+                'email': target_user.email,
+                'role': membership.role,
+            },
+            'period': {
+                'start': start_date.strftime('%Y-%m-%d'),
+                'end': end_date.strftime('%Y-%m-%d'),
+                'group_by': group_by,
+            },
+            'sales': {
+                'count': sales_agg['count'],
+                'total': sales_agg['total'],
+                'by_payment_method': [
+                    {'method': k, 'total': v} for k, v in by_method.items()
+                ],
+            },
+            'expenses': {
+                'count': expenses_agg['count'],
+                'total': expenses_agg['total'],
+            },
+            'cash': {
+                'cash_in': cash_in,
+                'cash_out': cash_out,
+                'net': cash_in - cash_out,
+            },
+            'breakdown': breakdown,
+        })
+
     @action(detail=False, methods=['get'])
     def summary(self, request):
         """Résumé global pour le dashboard principal"""

@@ -14,12 +14,12 @@ from django_filters.rest_framework import DjangoFilterBackend
 from apps.core.api_mixins import (
     TenantViewSetMixin,
     AuditMixin,
-    WarehouseScopedQuerysetMixin,
     WarehouseAssertCreateMixin,
 )
 from apps.core.warehouse_scope import (
     accessible_warehouse_ids,
     get_membership_for_request,
+    restrict_visibility_for_request,
 )
 from apps.core.api_permissions import IsTenantMember, HasPermission
 
@@ -140,7 +140,6 @@ class ExpenseCategoryViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
 # =============================================================================
 
 class ExpenseViewSet(
-    WarehouseScopedQuerysetMixin,
     WarehouseAssertCreateMixin,
     TenantViewSetMixin,
     AuditMixin,
@@ -202,16 +201,18 @@ class ExpenseViewSet(
     def get_queryset(self):
         queryset = super().get_queryset()
 
-        # Scope explicite : les dépenses sans warehouse (org-level) ne sont
-        # visibles que pour les rôles owner/manager. Sans ce filtre, un
-        # caissier scopé sur un warehouse verrait tous les frais généraux
-        # (loyer, salaires, abonnements...) — inadapté pour un POS.
-        # ``warehouse_scope_include_null=True`` laisse passer ces lignes en
-        # base ; on les exclut ici pour les rôles non-managériaux.
-        from apps.core.api_permissions import is_manager_or_above
-
-        if not is_manager_or_above(self.request):
-            queryset = queryset.exclude(warehouse__isnull=True)
+        # Visibilité par rôle :
+        # - owner : toutes les dépenses ;
+        # - caissier : uniquement ses propres dépenses (created_by), partout ;
+        # - gérant / magasinier : dépenses de leurs entrepôts assignés. Les
+        #   dépenses « org-level » sans entrepôt (loyer, salaires...) restent
+        #   réservées au owner (include_null_warehouse=False).
+        queryset = restrict_visibility_for_request(
+            queryset,
+            self.request,
+            warehouse_field='warehouse_id',
+            creator_field='created_by',
+        )
 
         # Filtres de date
         date_from = self.request.query_params.get('date_from')
@@ -411,6 +412,7 @@ class ExpenseViewSet(
     def _create_cash_movement_for_expense(self, expense):
         """Crée un mouvement de caisse pour une dépense approuvée."""
         from apps.core.utils import ReferenceGenerator
+        from .services import get_open_session_for_user
         organization = expense.organization
 
         # Calculer le solde
@@ -422,6 +424,10 @@ class ExpenseViewSet(
         previous_balance = last_movement.balance_after if last_movement else Decimal('0.00')
         new_balance = previous_balance - expense.amount
 
+        # Rattache la sortie de caisse à la session ouverte de l'utilisateur
+        # qui paie (caissier au comptoir) pour le calcul de la caisse nette.
+        session = get_open_session_for_user(organization, self.request.user)
+
         CashMovement.objects.create(
             organization=organization,
             reference=ReferenceGenerator.generate_cash_movement_reference(organization),
@@ -431,6 +437,7 @@ class ExpenseViewSet(
             description=f"Dépense: {expense.description}",
             payment_method=expense.payment_method,
             expense=expense,
+            session=session,
             balance_after=new_balance,
             movement_date=timezone.now(),
             created_by=expense.created_by,
@@ -494,19 +501,32 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         return CashMovementDetailSerializer
 
     def _scope_cash_movements_to_membership(self, queryset):
-        """Restreint un queryset CashMovement au périmètre du membre courant."""
+        """Restreint un queryset CashMovement selon le rôle du membre courant.
+
+        - owner : tous les mouvements ;
+        - caissier : uniquement ceux qu'il a créés (``created_by``), partout ;
+        - gérant / magasinier : mouvements rattachés à leurs entrepôts, via la
+          vente liée, la dépense liée, ou la session de caisse (entrées/sorties
+          manuelles saisies en caisse).
+        """
+        from apps.organizations.models import OrganizationMembership
+
         membership = get_membership_for_request(self.request)
         if not membership:
             return queryset
-        allowed_ids = accessible_warehouse_ids(membership)
-        if allowed_ids is None:
+        role = membership.role
+        if role == OrganizationMembership.Role.OWNER:
             return queryset
+        if role == OrganizationMembership.Role.CASHIER:
+            return queryset.filter(created_by=membership.user)
+        allowed_ids = accessible_warehouse_ids(membership)
         if not allowed_ids:
             # Aucun entrepôt assigné => aucun mouvement visible.
             return queryset.none()
         return queryset.filter(
             Q(sale__warehouse_id__in=allowed_ids)
             | Q(expense__warehouse_id__in=allowed_ids)
+            | Q(session__register__warehouse_id__in=allowed_ids)
         )
 
     def get_queryset(self):
@@ -527,6 +547,7 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     def perform_create(self, serializer):
         """Créer un mouvement de caisse manuel."""
         from apps.core.utils import ReferenceGenerator
+        from .services import get_open_session_for_user
         organization = self.get_organization()
 
         # Calculer le solde
@@ -544,10 +565,15 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         else:
             new_balance = previous_balance - amount
 
+        # Rattache l'apport/retrait à la session ouverte du membre (caisse nette
+        # + visibilité entrepôt des mouvements manuels via session.register).
+        session = get_open_session_for_user(organization, self.request.user)
+
         serializer.save(
             organization=organization,
             reference=ReferenceGenerator.generate_cash_movement_reference(organization),
             balance_after=new_balance,
+            session=session,
             created_by=self.request.user,
         )
 

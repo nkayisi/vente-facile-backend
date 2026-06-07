@@ -366,18 +366,25 @@ class PermissionService:
         ],
         
         # CAISSIER (cashier) : ventes, livre de caisse, clients basique, dashboard
-        # Note: pas d'accès aux produits (products.view) ni au stock (stock.view) par défaut
-        # Ces permissions peuvent être accordées individuellement via extra_permissions
+        # Note: lecture seule sur les produits (products.view) — indispensable au POS
+        # pour lister/scanner les articles à vendre. Pas d'accès au stock (stock.view),
+        # ni à la création/édition de produits, par défaut. Ces permissions
+        # additionnelles peuvent être accordées individuellement via extra_permissions.
         OrganizationMembership.Role.CASHIER: [
             # Organisation
             'organization.view',
             # Ventes (créer, voir les siennes)
             'sales.view', 'sales.create',
             'payment_methods.view',
+            # Produits (lecture seule) — nécessaire pour le POS
+            'products.view',
             # Clients (créer + voir)
             'customers.view', 'customers.create',
-            # Livre de caisse (lecture seule + créer dépenses)
+            # Livre de caisse : créer des entrées/sorties + dépenses, et
+            # consulter SON rapport de caisse (auto-restreint à ses opérations
+            # via la visibilité par rôle). Pas d'annulation/suppression.
             'cashbook.view', 'cashbook.create_expense',
+            'cashbook.create_movement', 'cashbook.view_reports',
             # Dashboard
             'dashboard.view',
         ],

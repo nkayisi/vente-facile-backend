@@ -336,6 +336,18 @@ class CashMovement(TenantModel):
         related_name='cash_movements'
     )
 
+    # Session de caisse rattachée (apports/retraits/dépenses saisis pendant
+    # une session ouverte). Permet de calculer la caisse nette d'une session
+    # (ouverture + entrées espèces − sorties espèces) et de scoper les
+    # mouvements manuels par l'entrepôt de la caisse.
+    session = models.ForeignKey(
+        'sales.RegisterSession',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='cash_movements'
+    )
+
     # Solde de caisse après ce mouvement
     balance_after = models.DecimalField(
         max_digits=15,

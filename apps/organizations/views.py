@@ -427,6 +427,7 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         'partial_update': 'users.edit',
         'destroy': 'users.deactivate',
         'manage_permissions': 'users.edit',
+        'reset_password': 'users.edit',
     }
 
     def get_serializer_class(self):
@@ -680,6 +681,70 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             )
         
         return Response(OrganizationMembershipSerializer(membership).data)
+
+    @action(detail=True, methods=['post'], url_path='reset-password')
+    def reset_password(self, request, pk=None):
+        """Réinitialise le mot de passe d'un membre (admin / gérant selon hiérarchie).
+
+        Réservé aux rôles qui peuvent gérer le membre cible (owner → tous ;
+        gérant → magasinier/caissier). On ne réinitialise pas l'administrateur
+        principal ni son propre compte (utiliser « changer mon mot de passe »).
+        """
+        from django.contrib.auth.password_validation import validate_password
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
+        membership = self.get_object()
+
+        if membership.role == OrganizationMembership.Role.OWNER:
+            return Response(
+                {'detail': "Impossible de réinitialiser le mot de passe de l'administrateur principal."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if membership.user_id == request.user.id:
+            return Response(
+                {'detail': "Utilisez « changer mon mot de passe » pour votre propre compte."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        current_membership = _get_membership(request)
+        if not current_membership or not current_membership.can_manage_role(membership.role):
+            return Response(
+                {'detail': "Vous n'avez pas la permission de gérer cet utilisateur."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        new_password = (request.data or {}).get('new_password') or ''
+        try:
+            validate_password(new_password, user=membership.user)
+        except DjangoValidationError as exc:
+            return Response({'new_password': list(exc.messages)}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = membership.user
+        user.set_password(new_password)
+        user.save(update_fields=['password'])
+
+        # Invalide les refresh tokens en cours pour forcer une reconnexion.
+        try:
+            from rest_framework_simplejwt.token_blacklist.models import (
+                OutstandingToken, BlacklistedToken,
+            )
+            for token in OutstandingToken.objects.filter(user=user):
+                BlacklistedToken.objects.get_or_create(token=token)
+        except Exception:
+            pass  # token_blacklist non installé/migré : non bloquant
+
+        from apps.users.models import UserActivity
+        UserActivity.objects.create(
+            user=request.user,
+            organization=membership.organization,
+            action=UserActivity.ActionType.UPDATE,
+            resource_type='user',
+            resource_id=str(user.id),
+            details={'event': 'password_reset_by_admin', 'target_user_id': str(user.id)},
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.META.get('HTTP_USER_AGENT', '')[:500],
+        )
+        return Response({'detail': 'Mot de passe réinitialisé avec succès.'})
 
     @action(detail=True, methods=['get', 'patch'], url_path='permissions')
     def manage_permissions(self, request, pk=None):
