@@ -235,7 +235,11 @@ class RegisterSessionViewSet(
         """
         Ferme une session de caisse.
 
-        - Refus si l'utilisateur n'est ni l'opener ni un manager+ (auditabilité).
+        - Tout membre ayant accès à l'entrepôt de la caisse peut fermer la
+          session, y compris une session ouverte par un autre utilisateur
+          (``get_object`` est déjà filtré par périmètre entrepôt, donc on ne
+          peut fermer que les sessions de ses propres entrepôts). L'identité du
+          clôtureur est journalisée (voir ``UserActivity`` en fin de méthode).
         - Accepte `counted_balance` optionnel (comptage manuel) ; calcule
           `difference = counted_balance - expected_balance` si fourni.
         - Si différence non nulle, `notes` est obligatoire.
@@ -246,13 +250,6 @@ class RegisterSessionViewSet(
             return Response(
                 {'error': 'Cette session est déjà fermée'},
                 status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Auditabilité : seul l'opener ou un manager+ peut clôturer
-        if session.opened_by_id != request.user.id and not is_manager_or_above(request):
-            return Response(
-                {'error': "Seul le caissier qui a ouvert la session ou un gérant peut la fermer."},
-                status=status.HTTP_403_FORBIDDEN,
             )
 
         serializer = RegisterSessionCloseSerializer(data=request.data if request.data else {})

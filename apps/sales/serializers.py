@@ -33,23 +33,46 @@ class RegisterSerializer(serializers.ModelSerializer):
             'created_at'
         ]
         read_only_fields = ['id', 'created_at']
+        # La succursale n'est plus saisie dans l'UI : elle suit l'entrepôt et est
+        # dérivée côté serveur si absente (cf. validate).
+        extra_kwargs = {
+            'branch': {'required': False, 'allow_null': True},
+        }
+
+    @staticmethod
+    def _default_branch_for(organization_id):
+        """Succursale par défaut d'une organisation : la principale (``is_main``),
+        sinon la première par ordre alphabétique."""
+        from apps.organizations.models import Branch
+        qs = Branch.objects.filter(organization_id=organization_id, is_deleted=False)
+        return qs.filter(is_main=True).first() or qs.order_by('name').first()
 
     def validate(self, attrs):
         instance = getattr(self, 'instance', None)
-        if instance is not None:
-            branch = attrs.get('branch', instance.branch)
-            warehouse = attrs['warehouse'] if 'warehouse' in attrs else instance.warehouse
+
+        if 'warehouse' in attrs:
+            warehouse = attrs['warehouse']
         else:
-            branch = attrs.get('branch')
-            warehouse = attrs.get('warehouse')
+            warehouse = instance.warehouse if instance is not None else None
 
         if warehouse is None:
             raise serializers.ValidationError(
                 {'warehouse': 'Entrepôt requis.'}
             )
+
+        # La succursale suit l'entrepôt : succursale fournie > succursale de
+        # l'entrepôt > succursale principale de l'org > succursale existante.
+        branch = (
+            attrs.get('branch')
+            or warehouse.branch
+            or self._default_branch_for(warehouse.organization_id)
+        )
+        if branch is None and instance is not None:
+            branch = instance.branch
+
         if branch is None:
             raise serializers.ValidationError(
-                {'branch': 'Succursale requise.'}
+                {'branch': 'Aucune succursale disponible pour cette organisation.'}
             )
 
         if warehouse.organization_id != branch.organization_id:
@@ -64,6 +87,9 @@ class RegisterSerializer(serializers.ModelSerializer):
                 'warehouse': 'Cet entrepôt est rattaché à une autre succursale.'
             })
 
+        # Injecter la succursale dérivée pour qu'elle soit persistée même quand
+        # le client ne l'envoie pas.
+        attrs['branch'] = branch
         return attrs
 
     def get_current_session(self, obj):
