@@ -1,4 +1,8 @@
 #!/bin/sh
+# Fail-loud : toute commande qui échoue (notamment `migrate`) stoppe le
+# démarrage au lieu de lancer Gunicorn sur une base non migrée (ce qui produit
+# des 500 silencieux du type « column ... does not exist »).
+set -e
 
 echo "🔎 Waiting for database..."
 
