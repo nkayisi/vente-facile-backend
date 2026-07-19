@@ -3,6 +3,7 @@ Tests for WatermelonDB sync API.
 """
 import uuid
 from decimal import Decimal
+from datetime import timedelta
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APITestCase
@@ -12,8 +13,8 @@ from apps.organizations.models import Organization, OrganizationMembership
 from apps.users.models import User
 from apps.products.models import Category, Brand, Product
 from apps.contacts.models import Customer
-from apps.inventory.models import Warehouse
-from apps.sales.models import PaymentMethod
+from apps.inventory.models import Warehouse, Stock, StockMovement
+from apps.sales.models import PaymentMethod, Sale, SaleItem, Payment
 
 from .utils import parse_timestamp, get_server_timestamp, datetime_to_ms
 from .services import SyncPullService, SyncPushService, SyncService
@@ -697,3 +698,395 @@ class SyncMembershipGuardTests(APITestCase):
             HTTP_X_ORGANIZATION_ID=str(self.org.id),
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class SyncConflictResolutionTests(TestCase):
+    """
+    Résolution de conflit Last-Write-Wins (sur `sync_updated_at`).
+
+    Désormais ACTIVE : les modèles writable héritent de `SyncableModel`, donc
+    `_update_record` appelle `should_accept_sync_update`. Un update poussé avec
+    un horodatage plus ANCIEN que la version serveur est rejeté et compté en
+    conflit ; un update plus RÉCENT est appliqué. C'est la garantie sur laquelle
+    s'appuie la remontée de conflits côté mobile (performSync → SyncStatusCard).
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user(email='lww@example.com', password='pw')
+        cls.org = Organization.objects.create(name='LWW Org', slug='lww-org')
+        OrganizationMembership.objects.create(
+            user=cls.user, organization=cls.org, role='owner'
+        )
+
+    def _push_update(self, customer, name, incoming_iso=None):
+        record = {'id': str(customer.id), 'name': name}
+        if incoming_iso is not None:
+            record['updated_at'] = incoming_iso
+        changes = {
+            'customers': {'created': [], 'updated': [record], 'deleted': []}
+        }
+        return SyncPushService(self.org, self.user).apply_changes(
+            changes, get_server_timestamp()
+        )
+
+    def test_stale_update_is_rejected_as_conflict(self):
+        """Un update plus ancien que la version serveur est rejeté (conflit)."""
+        customer = Customer.objects.create(
+            organization=self.org, code='LWW-001', name='Original',
+        )
+        customer.refresh_from_db()  # récupère le sync_updated_at posé par save()
+        older = customer.sync_updated_at - timedelta(minutes=10)
+
+        result = self._push_update(customer, 'Stale Update', older.isoformat())
+
+        self.assertEqual(result['stats']['conflicts'], 1)
+        self.assertEqual(result['stats']['updated'], 0)
+        customer.refresh_from_db()
+        self.assertEqual(customer.name, 'Original')  # inchangé
+
+    def test_newer_update_is_accepted(self):
+        """Un update plus récent que la version serveur est appliqué."""
+        customer = Customer.objects.create(
+            organization=self.org, code='LWW-002', name='Original',
+        )
+        customer.refresh_from_db()
+        newer = customer.sync_updated_at + timedelta(minutes=10)
+
+        result = self._push_update(customer, 'Fresh Update', newer.isoformat())
+
+        self.assertEqual(result['stats']['conflicts'], 0)
+        self.assertEqual(result['stats']['updated'], 1)
+        customer.refresh_from_db()
+        self.assertEqual(customer.name, 'Fresh Update')
+        self.assertTrue(customer.synced_from_client)
+
+    def test_update_without_timestamp_is_applied(self):
+        """Sans horodatage entrant, l'update est appliqué (pas de conflit possible)."""
+        customer = Customer.objects.create(
+            organization=self.org, code='LWW-003', name='Original',
+        )
+
+        result = self._push_update(customer, 'No Timestamp', incoming_iso=None)
+
+        self.assertEqual(result['stats']['conflicts'], 0)
+        self.assertEqual(result['stats']['updated'], 1)
+        customer.refresh_from_db()
+        self.assertEqual(customer.name, 'No Timestamp')
+
+
+class SyncRoundTripTests(APITestCase):
+    """
+    Aller-retour complet create→push→pull via HTTP : un client crée un
+    enregistrement hors-ligne, le pousse, puis un pull delta le lui renvoie.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user(email='rt@example.com', password='pw')
+        cls.org = Organization.objects.create(name='RT Org', slug='rt-org')
+        OrganizationMembership.objects.create(
+            user=cls.user, organization=cls.org, role='owner'
+        )
+
+    def setUp(self):
+        self.client.force_authenticate(user=self.user)
+
+    def test_create_push_then_pull_returns_record(self):
+        before = get_server_timestamp()
+        customer_id = str(uuid.uuid4())
+
+        # 1) PUSH — création hors-ligne envoyée au serveur
+        push = self.client.post(
+            '/api/v1/sync/',
+            {
+                'changes': {
+                    'customers': {
+                        'created': [{
+                            'id': customer_id,
+                            'code': 'RT-001',
+                            'name': 'Round Trip',
+                            'customer_type': 'individual',
+                        }],
+                        'updated': [],
+                        'deleted': [],
+                    }
+                },
+                'last_pulled_at': before,
+                'pull_after_push': False,
+            },
+            format='json',
+            HTTP_X_ORGANIZATION_ID=str(self.org.id),
+        )
+        self.assertEqual(push.status_code, status.HTTP_200_OK)
+        self.assertTrue(push.data['push']['success'])
+        self.assertEqual(push.data['push']['stats']['created'], 1)
+
+        # 2) PULL delta depuis `before` — le client retrouve sa création
+        pull = self.client.get(
+            '/api/v1/sync/',
+            {'last_pulled_at': before},
+            HTTP_X_ORGANIZATION_ID=str(self.org.id),
+        )
+        self.assertEqual(pull.status_code, status.HTTP_200_OK)
+        created = pull.data['changes']['customers']['created']
+        record = next((c for c in created if c['id'] == customer_id), None)
+        self.assertIsNotNone(record, 'Le client poussé doit revenir au pull delta')
+        self.assertEqual(record['name'], 'Round Trip')
+
+
+class SyncSalePushRoundTripTests(TestCase):
+    """
+    Scénario POS hors-ligne : push d'une vente complète (vente + ligne + paiement
+    + mouvement de stock) en une seule transaction, comme le fait `createSale()`
+    côté mobile. Vérifie la persistance, le remplissage serveur de `sold_by`,
+    l'application au stock et l'idempotence par `reference_id`.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user(email='salepush@example.com', password='pw')
+        cls.org = Organization.objects.create(name='Sale Org', slug='sale-org')
+        OrganizationMembership.objects.create(
+            user=cls.user, organization=cls.org, role='owner'
+        )
+        cls.warehouse = Warehouse.objects.create(
+            organization=cls.org, name='Main', code='WH-1', is_default=True
+        )
+        cls.payment_method = PaymentMethod.objects.create(
+            organization=cls.org, name='Cash', code='CASH',
+            method_type='cash', is_default=True
+        )
+        cls.category = Category.objects.create(
+            organization=cls.org, name='Cat', slug='cat'
+        )
+        cls.product = Product.objects.create(
+            organization=cls.org, name='Prod', slug='prod', sku='PRD-1',
+            category=cls.category, selling_price=Decimal('1000.00')
+        )
+
+    def _sale_changes(self, *, sale_id, item_id, payment_id, movement_id):
+        return {
+            'sales': {'created': [{
+                'id': sale_id, 'reference': 'VT-RT-0001', 'status': 'completed',
+                'sale_type': 'retail', 'warehouse_id': str(self.warehouse.id),
+                'subtotal': '3000.00', 'total': '3000.00',
+                'amount_paid': '3000.00', 'amount_due': '0.00',
+            }], 'updated': [], 'deleted': []},
+            'sale_items': {'created': [{
+                'id': item_id, 'sale_id': sale_id, 'product_id': str(self.product.id),
+                'quantity': '3.000', 'unit_price': '1000.00',
+            }], 'updated': [], 'deleted': []},
+            'payments': {'created': [{
+                'id': payment_id, 'sale_id': sale_id,
+                'payment_method_id': str(self.payment_method.id),
+                'amount': '3000.00', 'status': 'completed',
+            }], 'updated': [], 'deleted': []},
+            'stock_movements': {'created': [{
+                'id': movement_id, 'product_id': str(self.product.id),
+                'warehouse_id': str(self.warehouse.id), 'movement_type': 'sale',
+                'quantity': '3.000', 'quantity_before': '10.000',
+                'quantity_after': '7.000', 'reference_type': 'sale',
+                'reference_id': sale_id,
+            }], 'updated': [], 'deleted': []},
+        }
+
+    def test_push_full_sale_persists_and_decrements_stock(self):
+        # Stock initial de 10 unités
+        Stock.objects.create(
+            organization=self.org, product=self.product, variant=None,
+            warehouse=self.warehouse, location=None, quantity=Decimal('10.000')
+        )
+
+        sale_id = str(uuid.uuid4())
+        changes = self._sale_changes(
+            sale_id=sale_id, item_id=str(uuid.uuid4()),
+            payment_id=str(uuid.uuid4()), movement_id=str(uuid.uuid4()),
+        )
+
+        result = SyncPushService(self.org, self.user).apply_changes(
+            changes, get_server_timestamp()
+        )
+
+        self.assertEqual(result['stats']['errors'], 0, msg=result['errors'])
+        self.assertTrue(result['success'])
+        self.assertEqual(result['stats']['created'], 4)
+
+        # Persistance + sold_by rempli côté serveur
+        sale = Sale.objects.get(id=sale_id)
+        self.assertEqual(sale.reference, 'VT-RT-0001')
+        self.assertEqual(sale.sold_by_id, self.user.id)
+        self.assertEqual(SaleItem.objects.filter(sale=sale).count(), 1)
+        self.assertEqual(Payment.objects.filter(sale=sale).count(), 1)
+
+        # Stock décrémenté : 10 - 3 = 7
+        stock = Stock.objects.get(
+            product=self.product, warehouse=self.warehouse,
+            variant=None, location=None,
+        )
+        self.assertEqual(stock.quantity, Decimal('7.000'))
+
+    def test_stock_movement_is_idempotent_by_reference_id(self):
+        """
+        Rejouer la même vente (même `reference_id`, autre UUID de mouvement) ne
+        décrémente le stock qu'une seule fois : un retry réseau du client ne
+        double pas les sorties de stock. Garanti par la dédup `reference_id`
+        dans `_handle_stock_movement_create` (et le fait que `_prepare_record_data`
+        ne jette plus la colonne non-relationnelle `reference_id`).
+        """
+        Stock.objects.create(
+            organization=self.org, product=self.product, variant=None,
+            warehouse=self.warehouse, location=None, quantity=Decimal('10.000')
+        )
+        sale_id = str(uuid.uuid4())
+
+        # 1er envoi
+        SyncPushService(self.org, self.user).apply_changes(
+            self._sale_changes(
+                sale_id=sale_id, item_id=str(uuid.uuid4()),
+                payment_id=str(uuid.uuid4()), movement_id=str(uuid.uuid4()),
+            ),
+            get_server_timestamp(),
+        )
+
+        # 2e envoi : nouveau mouvement (UUID différent) mais MÊME reference_id.
+        # Le 1er id-check est contourné ; la dédup par reference_id doit jouer.
+        StockMovement_count_before = StockMovement.objects.filter(
+            organization=self.org, reference_id=sale_id
+        ).count()
+
+        SyncPushService(self.org, self.user).apply_changes(
+            {'stock_movements': {'created': [{
+                'id': str(uuid.uuid4()), 'product_id': str(self.product.id),
+                'warehouse_id': str(self.warehouse.id), 'movement_type': 'sale',
+                'quantity': '3.000', 'quantity_before': '7.000',
+                'quantity_after': '4.000', 'reference_type': 'sale',
+                'reference_id': sale_id,
+            }], 'updated': [], 'deleted': []}},
+            get_server_timestamp(),
+        )
+
+        # Le stock reste à 7 (pas de seconde décrémentation)
+        stock = Stock.objects.get(
+            product=self.product, warehouse=self.warehouse,
+            variant=None, location=None,
+        )
+        self.assertEqual(stock.quantity, Decimal('7.000'))
+        # Aucun mouvement supplémentaire dédupliqué n'a été matérialisé
+        self.assertEqual(
+            StockMovement.objects.filter(
+                organization=self.org, reference_id=sale_id
+            ).count(),
+            StockMovement_count_before,
+        )
+
+    def test_server_recomputes_totals_ignoring_client_values(self):
+        """
+        Le serveur recalcule totaux/statut à partir des lignes et paiements
+        RÉELS, en ignorant les valeurs envoyées par le client (parité web +
+        sécurité). Le client ment ici (total=999999, payé=0, statut=draft) ;
+        le serveur rétablit total=3000, payé=3000, statut=completed.
+        """
+        sale_id = str(uuid.uuid4())
+        changes = {
+            'sales': {'created': [{
+                'id': sale_id, 'reference': 'VT-RECOMP-1', 'status': 'draft',
+                'sale_type': 'retail', 'warehouse_id': str(self.warehouse.id),
+                'subtotal': '5.00', 'tax_amount': '0.00', 'discount_amount': '0.00',
+                'total': '999999.00', 'amount_paid': '0.00', 'amount_due': '999999.00',
+                'change_amount': '0.00', 'exchange_rate': '1.00',
+            }], 'updated': [], 'deleted': []},
+            'sale_items': {'created': [{
+                'id': str(uuid.uuid4()), 'sale_id': sale_id,
+                'product_id': str(self.product.id),
+                'quantity': '3.000', 'unit_price': '1000.00',
+            }], 'updated': [], 'deleted': []},
+            'payments': {'created': [{
+                'id': str(uuid.uuid4()), 'sale_id': sale_id,
+                'payment_method_id': str(self.payment_method.id),
+                'amount': '3000.00', 'status': 'completed',
+            }], 'updated': [], 'deleted': []},
+        }
+
+        result = SyncPushService(self.org, self.user).apply_changes(
+            changes, get_server_timestamp()
+        )
+
+        self.assertEqual(result['stats']['errors'], 0, msg=result['errors'])
+        sale = Sale.objects.get(id=sale_id)
+        self.assertEqual(sale.subtotal, Decimal('3000.00'))
+        self.assertEqual(sale.total, Decimal('3000.00'))
+        self.assertEqual(sale.amount_paid, Decimal('3000.00'))
+        self.assertEqual(sale.amount_due, Decimal('0.00'))
+        self.assertEqual(sale.status, 'completed')
+
+    def test_nested_payload_does_not_crash(self):
+        """
+        Filet de sécurité : un payload à l'ancienne (items/payments IMBRIQUÉS
+        dans la vente — donc portant les noms des relations inverses) ne fait
+        plus échouer la création. Les tableaux imbriqués sont ignorés ; le
+        mobile pousse désormais ces records séparément.
+        """
+        sale_id = str(uuid.uuid4())
+        changes = {'sales': {'created': [{
+            'id': sale_id, 'reference': 'VT-NESTED-1', 'status': 'completed',
+            'sale_type': 'retail', 'warehouse_id': str(self.warehouse.id),
+            'subtotal': '1000.00', 'tax_amount': '0.00', 'discount_amount': '0.00',
+            'total': '1000.00', 'amount_paid': '1000.00', 'amount_due': '0.00',
+            'change_amount': '0.00', 'exchange_rate': '1.00',
+            'items': [{
+                'id': str(uuid.uuid4()), 'product_id': str(self.product.id),
+                'quantity': '1', 'unit_price': '1000',
+            }],
+            'payments': [{'id': str(uuid.uuid4()), 'amount': '1000'}],
+        }], 'updated': [], 'deleted': []}}
+
+        result = SyncPushService(self.org, self.user).apply_changes(
+            changes, get_server_timestamp()
+        )
+
+        self.assertEqual(result['stats']['errors'], 0, msg=result['errors'])
+        self.assertTrue(Sale.objects.filter(id=sale_id).exists())
+        # Les lignes imbriquées sont ignorées (poussées séparément dans le vrai flux).
+        self.assertEqual(SaleItem.objects.filter(sale_id=sale_id).count(), 0)
+
+    def test_decimal_fields_without_decimal_point_are_coerced(self):
+        """
+        Régression : le mobile envoie les décimales en chaîne, y compris les
+        entiers SANS point (quantity='1', unit_price='13409'). Le backend doit
+        les convertir en Decimal d'après le TYPE du champ — sinon `SaleItem.save()`
+        fait `'1' * '13409'` (str*str) et la ligne n'est jamais créée (la vente
+        se synchronise alors sans aucune ligne, total recalculé à 0).
+        """
+        sale_id = str(uuid.uuid4())
+        item_id = str(uuid.uuid4())
+        changes = {
+            'sales': {'created': [{
+                'id': sale_id, 'reference': 'VT-INT-DEC', 'status': 'completed',
+                'sale_type': 'retail', 'warehouse_id': str(self.warehouse.id),
+                'subtotal': '13409', 'total': '13409', 'amount_paid': '13409',
+            }], 'updated': [], 'deleted': []},
+            'sale_items': {'created': [{
+                'id': item_id, 'sale_id': sale_id, 'product_id': str(self.product.id),
+                'quantity': '1', 'unit_price': '13409',  # ENTIERS sans point
+            }], 'updated': [], 'deleted': []},
+            'payments': {'created': [{
+                'id': str(uuid.uuid4()), 'sale_id': sale_id,
+                'payment_method_id': str(self.payment_method.id),
+                'amount': '13409', 'status': 'completed',
+            }], 'updated': [], 'deleted': []},
+        }
+
+        result = SyncPushService(self.org, self.user).apply_changes(
+            changes, get_server_timestamp()
+        )
+
+        self.assertEqual(result['stats']['errors'], 0, msg=result['errors'])
+        item = SaleItem.objects.filter(sale_id=sale_id).first()
+        self.assertIsNotNone(item, "La ligne doit être créée malgré l'absence de point décimal")
+        self.assertEqual(item.quantity, Decimal('1'))
+        self.assertEqual(item.unit_price, Decimal('13409'))
+        # Recalcul serveur autoritaire : total = 1 × 13409
+        sale = Sale.objects.get(id=sale_id)
+        self.assertEqual(sale.total, Decimal('13409.00'))
+        self.assertEqual(sale.status, 'completed')

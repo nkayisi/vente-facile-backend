@@ -2,11 +2,11 @@ from django.db import models
 from django.conf import settings
 from django.core.validators import MinValueValidator
 from decimal import Decimal
-from apps.core.models import TenantModel, TenantSoftDeleteModel
+from apps.core.models import TenantModel, TenantSoftDeleteModel, TenantSyncableModel
 from apps.core.managers import TenantSoftDeleteManager
 
 
-class Customer(TenantSoftDeleteModel):
+class Customer(TenantSyncableModel):
     """
     Customer model.
     Particulier: customer_type, name, phone, email, address
@@ -166,7 +166,7 @@ class CustomerTransaction(TenantModel):
         return f"{self.get_transaction_type_display()} - {self.amount} ({self.customer.name})"
 
 
-class Supplier(TenantSoftDeleteModel):
+class Supplier(TenantSyncableModel):
     """
     Supplier/vendor model.
     """

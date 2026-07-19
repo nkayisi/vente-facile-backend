@@ -2,8 +2,9 @@
 Services for WatermelonDB sync operations.
 """
 import logging
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from django.db import transaction
+from django.db.models import Sum, DecimalField
 from django.utils import timezone
 from django.apps import apps
 
@@ -211,7 +212,7 @@ class SyncPushService:
             dict: Result with stats and any errors
         """
         timestamp = parse_timestamp(last_pulled_at)
-        
+
         # Process tables in dependency order
         for table_name, app_label, model_name, _ in SYNCABLE_MODELS:
             if table_name not in changes:
@@ -236,13 +237,70 @@ class SyncPushService:
                     'error': str(e),
                 })
                 self.stats['errors'] += 1
-        
+
+        # Recalcul autoritaire des totaux/statut des ventes touchées (parité web).
+        # Le client mobile calcule localement pour l'affichage immédiat, mais le
+        # serveur fait foi : les valeurs poussées (subtotal/total/amount_paid/
+        # status…) sont systématiquement recalculées à partir des lignes et des
+        # paiements réellement enregistrés.
+        self._recompute_affected_sales(changes)
+
         return {
             'success': len(self.errors) == 0,
             'stats': self.stats,
             'errors': self.errors,
             'timestamp': get_server_timestamp(),
         }
+
+    def _recompute_affected_sales(self, changes):
+        """
+        Recalcule, côté serveur, les totaux et le statut de chaque vente touchée
+        par ce push (création/mise à jour de la vente, de ses lignes ou de ses
+        paiements). Réplique l'autorité du chemin web : on ne fait jamais
+        confiance aux totaux fournis par le client.
+        """
+        sale_model = apps.get_model('sales', 'Sale')
+
+        sale_ids = set()
+        sales_changes = changes.get('sales', {})
+        for rec in list(sales_changes.get('created', [])) + list(sales_changes.get('updated', [])):
+            if isinstance(rec, dict) and rec.get('id'):
+                sale_ids.add(str(rec['id']))
+        for table in ('sale_items', 'payments'):
+            tch = changes.get(table, {})
+            for rec in list(tch.get('created', [])) + list(tch.get('updated', [])):
+                if isinstance(rec, dict) and rec.get('sale_id'):
+                    sale_ids.add(str(rec['sale_id']))
+
+        if not sale_ids:
+            return
+
+        sales = sale_model.objects.filter(
+            id__in=sale_ids, organization=self.organization
+        )
+        for sale in sales:
+            # Ne pas écraser un statut terminal (annulée/remboursée).
+            if sale.status in ('cancelled', 'refunded'):
+                continue
+
+            paid = sale.payments.filter(status='completed').aggregate(
+                total=Sum('amount')
+            )['total'] or Decimal('0.00')
+            sale.amount_paid = paid.quantize(Decimal('0.01'))
+
+            # Recalcule subtotal/tax/discount/total/amount_due/change depuis les
+            # lignes réellement enregistrées (SaleItem.save() les a quantizées).
+            sale.calculate_totals()
+
+            # Statut basé sur le paiement (règle identique au serializer web).
+            if sale.amount_paid >= sale.total:
+                sale.status = 'completed'
+            elif sale.amount_paid > 0:
+                sale.status = 'partially_paid'
+            else:
+                sale.status = 'pending'
+
+            sale.save()
     
     def _apply_table_changes(self, table_name, app_label, model_name, changes, last_pulled_at):
         """Apply changes for a specific table."""
@@ -433,15 +491,24 @@ class SyncPushService:
         """
         prepared = {}
 
-        # Get model field names
-        field_names = {f.name for f in model._meta.get_fields()}
+        # Champs CONCRETS uniquement (colonnes réelles). On exclut volontairement
+        # les relations inverses (ex. `items`, `payments` sur Sale) : si le client
+        # envoie un payload imbriqué, l'affecter à une relation inverse lèverait
+        # « Direct assignment to the reverse side of a related set is prohibited »
+        # et ferait échouer toute la création. On les ignore proprement à la place.
+        field_names = {f.name for f in model._meta.concrete_fields}
 
         # Map of sync field names to model field names
         field_mapping = self._get_field_mapping(table_name)
 
         for key, value in data.items():
-            # Skip internal fields
-            if key in ('id', 'organization', '_changed', '_status'):
+            # Skip internal fields + champs horodatage gérés par le modèle.
+            # created_at/updated_at sont auto_now_add/auto_now, et sync_updated_at
+            # est posé par le service : les accepter depuis le payload client
+            # provoquait soit un crash (Decimal sur une chaîne ISO contenant un
+            # '.'), soit l'écriture d'une chaîne dans un DateTimeField.
+            if key in ('id', 'organization', '_changed', '_status',
+                       'created_at', 'updated_at', 'sync_updated_at'):
                 if key == 'id' and value and is_valid_uuid(value):
                     prepared['id'] = value
                 continue
@@ -453,24 +520,57 @@ class SyncPushService:
             if model_field not in field_names and not model_field.endswith('_id'):
                 continue
 
+            # Valeur explicitement nulle pour un champ concret NON-nullable
+            # (hors FK `_id`, gérées plus bas) → on l'OMET pour laisser le défaut
+            # du modèle s'appliquer (ex. `notes` est NOT NULL default ''). Le
+            # client mobile envoie parfois `null` là où le modèle attend ''/un
+            # défaut, ce qui provoquait « null value violates not-null constraint ».
+            if value is None and not model_field.endswith('_id'):
+                try:
+                    if not model._meta.get_field(model_field).null:
+                        continue
+                except Exception:
+                    pass
+
             # Handle foreign key fields (ending with _id)
             if key.endswith('_id'):
                 fk_field = key[:-3]  # Remove _id suffix
                 if fk_field in field_names:
+                    # Vraie clé étrangère : valider l'appartenance à l'org.
                     if value and is_valid_uuid(value):
                         self._assert_fk_belongs_to_org(model, fk_field, value)
                         prepared[key] = value
                     else:
                         prepared[key] = None
-                continue
-
-            # Handle decimal fields
-            if isinstance(value, str) and '.' in value:
-                try:
-                    prepared[model_field] = Decimal(value)
                     continue
-                except (ValueError, TypeError) as e:
-                    logger.debug(f"Failed to parse decimal {value}: {e}")
+                if key not in field_names:
+                    # Ni FK, ni colonne réelle : champ inconnu, on ignore.
+                    continue
+                # Sinon : colonne concrète non-relationnelle qui finit par `_id`
+                # (ex: `reference_id`, un UUIDField). On NE doit PAS la jeter —
+                # elle suit le traitement normal ci-dessous. Sans ça, la
+                # déduplication des mouvements de stock par `reference_id` est
+                # cassée et un retry réseau re-décrémente le stock.
+
+            # Coercition décimale basée sur le TYPE du champ (et NON sur la
+            # présence d'un '.'). Le mobile envoie les décimales en chaîne, y
+            # compris les valeurs entières ('1', '13409') ; l'ancienne heuristique
+            # « chaîne contenant un '.' » les laissait en str, ce qui cassait les
+            # save() arithmétiques (ex. SaleItem.save : quantity * unit_price →
+            # 'str' * 'str'). On convertit donc toute chaîne destinée à un
+            # DecimalField, et seulement celle-là (les champs texte type `notes`
+            # contenant un '.' ne sont pas touchés).
+            if isinstance(value, str):
+                try:
+                    field_obj = model._meta.get_field(model_field)
+                except Exception:
+                    field_obj = None
+                if isinstance(field_obj, DecimalField):
+                    try:
+                        prepared[model_field] = Decimal(value)
+                        continue
+                    except (ValueError, TypeError, InvalidOperation) as e:
+                        logger.debug(f"Failed to parse decimal {value} for {model_field}: {e}")
 
             prepared[model_field] = value
 

@@ -2,7 +2,7 @@ from django.db import models
 from django.conf import settings
 from django.core.validators import MinValueValidator
 from decimal import Decimal
-from apps.core.models import TenantModel, TenantSoftDeleteModel
+from apps.core.models import TenantModel, TenantSoftDeleteModel, SyncableModel
 from apps.core.managers import TenantSoftDeleteManager
 
 
@@ -282,7 +282,7 @@ class StockBatch(TenantModel):
         super().save(*args, **kwargs)
 
 
-class StockMovement(TenantModel):
+class StockMovement(TenantModel, SyncableModel):
     """
     Records all stock movements for audit trail.
     Every change in stock creates a movement record.

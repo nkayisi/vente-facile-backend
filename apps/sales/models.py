@@ -2,7 +2,7 @@ from django.db import models
 from django.conf import settings
 from django.core.validators import MinValueValidator, MaxValueValidator
 from decimal import Decimal
-from apps.core.models import TenantModel, TenantSoftDeleteModel
+from apps.core.models import TenantModel, TenantSoftDeleteModel, TenantSyncableModel, SyncableModel
 from apps.core.managers import TenantSoftDeleteManager
 
 
@@ -138,7 +138,7 @@ class RegisterSession(TenantModel):
         return f"Session {self.register.name} - {self.opened_at.date()}"
 
 
-class Sale(TenantSoftDeleteModel):
+class Sale(TenantSyncableModel):
     """
     Main sale/invoice model.
     Represents a complete transaction.
@@ -352,7 +352,7 @@ class Sale(TenantSoftDeleteModel):
             self.amount_due = Decimal('0.00')
 
 
-class SaleItem(TenantModel):
+class SaleItem(TenantModel, SyncableModel):
     """Individual line items in a sale."""
     
     sale = models.ForeignKey(
@@ -491,7 +491,7 @@ class PaymentMethod(TenantModel):
         return self.name
 
 
-class Payment(TenantModel):
+class Payment(TenantModel, SyncableModel):
     """
     Payment records for sales.
     A sale can have multiple payments (split payment).

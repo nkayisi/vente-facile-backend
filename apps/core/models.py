@@ -96,17 +96,22 @@ class SyncableModel(models.Model):
 
     class Meta:
         abstract = True
-        indexes = [
-            models.Index(fields=['sync_updated_at']),
-        ]
 
     def save(self, *args, **kwargs):
         """
-        Override save to automatically set sync_updated_at if not provided.
-        This ensures the field is always populated for sync queries.
+        Rafraîchit ``sync_updated_at`` à chaque écriture serveur (sémantique
+        proche de ``auto_now``).
+
+        Indispensable au pull delta : sans ça, une édition web d'un
+        enregistrement déjà synchronisé (donc ``sync_updated_at`` non-null mais
+        ancien) ne serait jamais renvoyée au mobile, car le filtre delta
+        ``sync_updated_at__gt`` ne la verrait pas. Le push de sync place de
+        toute façon ce champ juste avant ``save()`` — la valeur reste cohérente.
+
+        La résolution de conflit (``should_accept_sync_update``) lit la valeur
+        STOCKÉE avant l'écriture, donc ce rafraîchissement n'interfère pas.
         """
-        if self.sync_updated_at is None:
-            self.sync_updated_at = timezone.now()
+        self.sync_updated_at = timezone.now()
         super().save(*args, **kwargs)
 
     def mark_synced(self, client_timestamp=None):

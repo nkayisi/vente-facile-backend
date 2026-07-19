@@ -2,7 +2,7 @@ from django.db import models
 from django.conf import settings
 from django.core.validators import MinValueValidator
 from decimal import Decimal
-from apps.core.models import TenantSoftDeleteModel, TenantModel
+from apps.core.models import TenantSoftDeleteModel, TenantModel, TenantSyncableModel
 from apps.core.managers import TenantSoftDeleteManager
 
 
@@ -172,7 +172,7 @@ class Unit(TenantModel):
         return f"{self.name} ({self.symbol})"
 
 
-class Product(TenantSoftDeleteModel):
+class Product(TenantSyncableModel):
     """
     Main product model.
     Supports variants, multiple prices, and inventory tracking.
@@ -340,7 +340,7 @@ class ProductImage(TenantModel):
         return f"Image for {self.product.name}"
 
 
-class ProductVariant(TenantSoftDeleteModel):
+class ProductVariant(TenantSyncableModel):
     """
     Product variants (e.g., size, color combinations).
     Each variant can have its own SKU, barcode, and price.
