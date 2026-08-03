@@ -83,7 +83,6 @@ class OrganizationService:
         default_methods = [
             ('Espèces', 'CASH', PaymentMethod.MethodType.CASH, True),
             ('Mobile Money', 'MOMO', PaymentMethod.MethodType.MOBILE_MONEY, False),
-            ('Carte Bancaire', 'CARD', PaymentMethod.MethodType.CARD, False),
         ]
         for pm_name, code, method_type, is_default in default_methods:
             PaymentMethod.objects.create(
