@@ -162,17 +162,26 @@ class OrganizationViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'])
     def dashboard(self, request, pk=None):
         """Statistiques complètes pour le dashboard avec données d'évolution."""
-        from django.db.models import Sum, Count, Avg, F
-        from django.db.models.functions import TruncDate, TruncWeek, TruncMonth
+        from django.core.cache import cache
+        from django.db.models import Sum, Count, Avg, F, Case, When, Value, DecimalField, ExpressionWrapper
+        from django.db.models.functions import TruncDate, TruncWeek, TruncMonth, Coalesce
         from decimal import Decimal
         from apps.products.models import Product
         from apps.contacts.models import Customer, Supplier
         from apps.sales.models import Sale, SaleItem, Payment
         from apps.inventory.models import Stock
-        
+
         organization = self.get_object()
         period = request.query_params.get('period', 'month')  # day, week, month, year
-        
+
+        # Cache court (60s) du payload dashboard par (org, période) : le dashboard
+        # est rafraîchi souvent et ces agrégations sont lourdes. Une péremption de
+        # 60s est acceptable pour des statistiques.
+        cache_key = f"vf:dash:{organization.id}:{period}"
+        cached_payload = cache.get(cache_key)
+        if cached_payload is not None:
+            return Response(cached_payload)
+
         today = timezone.now().date()
         
         # Définir les périodes
@@ -326,17 +335,27 @@ class OrganizationViewSet(viewsets.ModelViewSet):
             product__is_deleted=False
         ).count()
         
-        # Stock total value
-        stock_records = Stock.objects.filter(
+        # Valeur totale du stock — agrégée en base (une seule requête) au lieu de
+        # charger tous les stocks en mémoire et sommer en Python. Coût unitaire :
+        # avg_cost s'il est > 0, sinon le cost_price du produit (0 par défaut).
+        unit_cost = Case(
+            When(avg_cost__gt=0, then=F('avg_cost')),
+            default=Coalesce(F('product__cost_price'), Value(Decimal('0'))),
+            output_field=DecimalField(max_digits=20, decimal_places=4),
+        )
+        stock_value = Stock.objects.filter(
             organization=organization,
             product__is_deleted=False
-        ).select_related('product')
-        stock_value = sum(
-            s.quantity * (s.avg_cost if s.avg_cost > 0 else (s.product.cost_price or 0))
-            for s in stock_records
-        )
-        
-        return Response({
+        ).aggregate(
+            v=Sum(
+                ExpressionWrapper(
+                    F('quantity') * unit_cost,
+                    output_field=DecimalField(max_digits=24, decimal_places=4),
+                )
+            )
+        )['v'] or Decimal('0')
+
+        payload = {
             'cards': {
                 'total_sales': {
                     'value': str(current_total),
@@ -384,7 +403,10 @@ class OrganizationViewSet(viewsets.ModelViewSet):
                 'start': current_start.isoformat(),
                 'end': today.isoformat()
             }
-        })
+        }
+
+        cache.set(cache_key, payload, timeout=60)
+        return Response(payload)
 
 
 # =============================================================================

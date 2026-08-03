@@ -391,6 +391,12 @@ class SaleListSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'reference', 'sale_date']
 
     def get_items_count(self, obj):
+        # Utilise l'annotation `_items_count` posée par SaleViewSet.get_queryset
+        # pour la liste (évite un COUNT par ligne). Repli sur un count direct si
+        # le serializer est utilisé hors de ce contexte.
+        count = getattr(obj, '_items_count', None)
+        if count is not None:
+            return count
         return obj.items.count()
 
 

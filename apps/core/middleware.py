@@ -108,7 +108,9 @@ class SubscriptionMiddleware(MiddlewareMixin):
             return None
 
         from apps.subscriptions.services import SubscriptionService
-        status = SubscriptionService.get_subscription_status(organization)
+        # Chemin chaud : état de blocage léger et caché (~60s) au lieu de
+        # recalculer le statut complet (2-3 requêtes DB) à chaque requête métier.
+        status = SubscriptionService.get_cached_block_state(organization)
 
         if status['is_blocked']:
             # Permettre les requêtes de lecture (GET, HEAD, OPTIONS)

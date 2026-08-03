@@ -399,6 +399,18 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
         """
         queryset = super().get_queryset()
 
+        # Ajuste le préchargement selon l'action :
+        # - détail (retrieve) : ajoute prices → price_list, lus par
+        #   ProductDetailSerializer et absents du préchargement de classe (N+1).
+        # - liste : images/variants ne sont pas sérialisés par ProductListSerializer,
+        #   on les retire pour ne précharger que les stocks nécessaires.
+        if self.action == 'retrieve':
+            queryset = queryset.prefetch_related('prices__price_list')
+        elif self.action == 'list':
+            queryset = queryset.prefetch_related(None).prefetch_related(
+                'stocks__warehouse', 'stocks__location',
+            )
+
         m = get_membership_for_request(self.request)
         wh_ids = accessible_warehouse_ids(m) if m else None
         warehouse_param = self.request.query_params.get('warehouse')

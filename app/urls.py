@@ -5,6 +5,7 @@ from django.contrib import admin
 from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
+from django.http import HttpResponse
 from rest_framework_simplejwt.views import (
     TokenRefreshView,
     TokenBlacklistView,
@@ -41,9 +42,14 @@ api_v1_patterns = [
 ]
 
 urlpatterns = [
+    # Liveness léger pour les healthchecks Docker/orchestrateur.
+    # Hors /api/v1/ : non filtré par Tenant/Subscription middlewares. Ne touche
+    # pas la base (vérifie seulement que le process gunicorn répond).
+    path('healthz/', lambda request: HttpResponse('ok'), name='healthz'),
+
     # Admin
     path('admin/', admin.site.urls),
-    
+
     # API v1
     path('api/v1/', include(api_v1_patterns)),
     

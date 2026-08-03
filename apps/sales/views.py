@@ -433,8 +433,12 @@ class SaleViewSet(
     ordering_fields = ['sale_date', 'total', 'reference']
     ordering = ['-sale_date']
     
-    select_related_fields = ['customer', 'register', 'warehouse', 'sold_by', 'session']
-    prefetch_related_fields = ['items', 'items__product', 'payments']
+    # Champs relationnels communs à toutes les actions. La liste et le détail
+    # ayant des besoins différents, ils sont affinés par action dans
+    # get_queryset() — pour éviter à la fois le N+1 (détail) et le
+    # sur-préchargement des items/paiements (liste).
+    select_related_fields = ['customer', 'sold_by']
+    prefetch_related_fields = []
 
     # Filtre direct par ``warehouse_id`` ; les ventes legacy sans entrepôt
     # restent visibles aux non-owner pour ne pas masquer l'historique.
@@ -483,6 +487,20 @@ class SaleViewSet(
         celui-ci n'a pas la permission `sales.view_all` (i.e. caissier).
         """
         queryset = super().get_queryset()
+
+        # Optimisation des requêtes par action :
+        # - liste : compteur d'items via annotation `_items_count` (un seul COUNT
+        #   agrégé au lieu d'une requête par ligne), sans précharger items/paiements
+        #   que la liste ne sérialise pas.
+        # - détail : préchargement complet des relations lues par SaleDetailSerializer
+        #   (items → product/variant, payments → payment_method/received_by).
+        if self.action == 'list':
+            queryset = queryset.annotate(_items_count=Count('items'))
+        else:
+            queryset = queryset.select_related('register', 'warehouse', 'session').prefetch_related(
+                'items__product', 'items__variant',
+                'payments__payment_method', 'payments__received_by',
+            )
 
         # Restriction par caissier : un cashier ne voit que ses propres ventes.
         # Owner et manager ont `sales.view_all` et voient tout.

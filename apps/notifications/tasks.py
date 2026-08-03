@@ -9,53 +9,65 @@ from datetime import timedelta
 @shared_task
 def check_low_stock_alerts():
     """Check for products with low stock and create alerts."""
+    from django.db.models import Sum, F, Value, DecimalField
+    from django.db.models.functions import Coalesce
     from apps.products.models import Product
-    from apps.inventory.models import Stock
     from apps.notifications.models import Alert
-    
-    products = Product.objects.filter(
+
+    # Stock disponible total agrégé en base + filtre directement sur les produits
+    # sous le seuil (une requête au lieu d'une requête Stock par produit).
+    # Un produit sans ligne de stock → total 0 (out-of-stock), comme avant.
+    products = list(Product.objects.filter(
         is_active=True,
         is_deleted=False,
         track_inventory=True
-    ).select_related('organization')
-    
-    for product in products:
-        stocks = Stock.objects.filter(
-            product=product,
-            organization=product.organization
+    ).select_related('organization').annotate(
+        total_available=Coalesce(
+            Sum(F('stocks__quantity') - F('stocks__reserved_quantity')),
+            Value(0, output_field=DecimalField(max_digits=20, decimal_places=3)),
         )
-        
-        total_stock = sum(s.available_quantity for s in stocks)
-        
-        if total_stock <= product.reorder_point:
-            existing_alert = Alert.objects.filter(
-                organization=product.organization,
-                alert_type=Alert.AlertType.LOW_STOCK,
-                resource_type='product',
-                resource_id=product.id,
-                status=Alert.Status.ACTIVE
-            ).exists()
-            
-            if not existing_alert:
-                severity = Alert.Severity.CRITICAL if total_stock == 0 else Alert.Severity.HIGH
-                alert_type = Alert.AlertType.OUT_OF_STOCK if total_stock == 0 else Alert.AlertType.LOW_STOCK
-                
-                Alert.objects.create(
-                    organization=product.organization,
-                    alert_type=alert_type,
-                    severity=severity,
-                    title=f"Stock bas: {product.name}",
-                    message=f"Le produit {product.name} (SKU: {product.sku}) a un stock de {total_stock}. "
-                           f"Le seuil de réapprovisionnement est de {product.reorder_point}.",
-                    resource_type='product',
-                    resource_id=product.id,
-                    data={
-                        'product_id': str(product.id),
-                        'product_name': product.name,
-                        'current_stock': float(total_stock),
-                        'reorder_point': product.reorder_point
-                    }
-                )
+    ).filter(total_available__lte=F('reorder_point')))
+
+    if not products:
+        return
+
+    # Produits ayant déjà une alerte de stock ACTIVE (une seule requête).
+    # On couvre LOW_STOCK ET OUT_OF_STOCK : un produit à 0 génère une alerte
+    # OUT_OF_STOCK, donc filtrer sur le seul type LOW_STOCK recréerait un
+    # doublon à chaque exécution.
+    already_alerted = set(
+        Alert.objects.filter(
+            alert_type__in=[Alert.AlertType.LOW_STOCK, Alert.AlertType.OUT_OF_STOCK],
+            resource_type='product',
+            resource_id__in=[p.id for p in products],
+            status=Alert.Status.ACTIVE,
+        ).values_list('resource_id', flat=True)
+    )
+
+    for product in products:
+        if product.id in already_alerted:
+            continue
+
+        total_stock = product.total_available
+        severity = Alert.Severity.CRITICAL if total_stock == 0 else Alert.Severity.HIGH
+        alert_type = Alert.AlertType.OUT_OF_STOCK if total_stock == 0 else Alert.AlertType.LOW_STOCK
+
+        Alert.objects.create(
+            organization=product.organization,
+            alert_type=alert_type,
+            severity=severity,
+            title=f"Stock bas: {product.name}",
+            message=f"Le produit {product.name} (SKU: {product.sku}) a un stock de {total_stock}. "
+                   f"Le seuil de réapprovisionnement est de {product.reorder_point}.",
+            resource_type='product',
+            resource_id=product.id,
+            data={
+                'product_id': str(product.id),
+                'product_name': product.name,
+                'current_stock': float(total_stock),
+                'reorder_point': product.reorder_point
+            }
+        )
 
 
 @shared_task
@@ -117,7 +129,7 @@ def check_subscription_expiry():
         status=Subscription.Status.ACTIVE,
         current_period_end__lte=warning_date,
         current_period_end__gte=timezone.now()
-    ).select_related('organization')
+    ).select_related('organization', 'plan')
     
     for subscription in expiring_subscriptions:
         existing_alert = Alert.objects.filter(

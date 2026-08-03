@@ -124,6 +124,12 @@ class RegisterSession(TenantModel):
         indexes = [
             models.Index(fields=['register', 'status']),
             models.Index(fields=['opened_at']),
+            # Ouverture de session : dernière session fermée d'une caisse
+            # (filter register+status='closed' order_by -closed_at).
+            models.Index(
+                fields=['register', 'status', '-closed_at'],
+                name='regsess_status_closed_idx',
+            ),
         ]
         constraints = [
             # Garantit DB-level qu'une seule session 'open' par caisse à la fois.
@@ -310,6 +316,12 @@ class Sale(TenantSyncableModel):
             models.Index(
                 fields=['organization', 'status', 'amount_due'],
                 name='sales_org_status_due_idx',
+            ),
+            # Stats dashboard/journalières : filtre org + statut='completed' sur
+            # une plage de dates. Narrow org+status puis range sur sale_date.
+            models.Index(
+                fields=['organization', 'status', 'sale_date'],
+                name='sales_org_status_date_idx',
             ),
         ]
         constraints = [

@@ -66,6 +66,11 @@ class Customer(TenantSyncableModel):
             models.Index(fields=['organization', 'is_active']),
             models.Index(fields=['code']),
             models.Index(fields=['phone']),
+            # Dashboard « nouveaux clients » : filtre org + created_at sur une plage.
+            models.Index(
+                fields=['organization', 'created_at'],
+                name='customer_org_created_idx',
+            ),
         ]
         constraints = [
             models.UniqueConstraint(

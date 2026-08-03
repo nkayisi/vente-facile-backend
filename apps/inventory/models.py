@@ -145,6 +145,12 @@ class Stock(TenantModel):
         indexes = [
             models.Index(fields=['organization', 'product']),
             models.Index(fields=['warehouse']),
+            # Requêtes de stock à périmètre entrepôt (POS, valeur de stock,
+            # niveaux) filtrant org + warehouse.
+            models.Index(
+                fields=['organization', 'warehouse'],
+                name='stock_org_warehouse_idx',
+            ),
         ]
 
     def __str__(self):

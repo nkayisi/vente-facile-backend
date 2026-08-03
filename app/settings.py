@@ -18,6 +18,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = config('SECRET_KEY', default='django-insecure-change-me-in-production')
 DEBUG = config('DEBUG', default=False, cast=bool)
 ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='localhost,127.0.0.1', cast=Csv())
+# Toujours autoriser l'accès local pour les healthchecks Docker internes
+# (GET http://127.0.0.1:8001/healthz/ depuis le conteneur), quelle que soit la
+# valeur d'ALLOWED_HOSTS fournie en prod.
+for _local_host in ('127.0.0.1', 'localhost'):
+    if _local_host not in ALLOWED_HOSTS:
+        ALLOWED_HOSTS.append(_local_host)
 
 if not DEBUG and SECRET_KEY.startswith('django-insecure'):
     raise ImproperlyConfigured(
@@ -128,6 +134,9 @@ if DB_ENGINE == 'django.db.backends.postgresql':
         'HOST': config('DB_HOST', default='localhost'),
         'PORT': config('DB_PORT', default='5432'),
         'CONN_MAX_AGE': 60,
+        # Vérifie qu'une connexion persistante réutilisée est toujours vivante
+        # (évite les erreurs après un idle / une coupure réseau côté Postgres).
+        'CONN_HEALTH_CHECKS': True,
         'OPTIONS': {
             'connect_timeout': 10,
             'options': '-c statement_timeout=30000',  # 30s max par requête
@@ -236,7 +245,9 @@ REST_FRAMEWORK = {
         # indépendamment de DEFAULT_THROTTLE_CLASSES).
         'moko_callback': '60/minute',
     },
-    'EXCEPTION_HANDLER': 'rest_framework.views.exception_handler',
+    # Handler custom : garantit une réponse JSON structurée (jamais de 500 HTML)
+    # et logue/remonte les exceptions non gérées. Voir apps/core/exception_handler.py
+    'EXCEPTION_HANDLER': 'apps.core.exception_handler.api_exception_handler',
     'DEFAULT_RENDERER_CLASSES': [
         'rest_framework.renderers.JSONRenderer',
     ],
@@ -314,6 +325,13 @@ CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = TIME_ZONE
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT = 30 * 60
+# Limite douce : lève SoftTimeLimitExceeded (rattrapable) avant la limite dure,
+# pour couper une tâche qui traîne (ex : appel Moko lent) sans bloquer un worker.
+CELERY_TASK_SOFT_TIME_LIMIT = 120
+# VPS 2 cœurs : un worker ne précharge qu'une tâche à la fois (répartition plus
+# juste) et se recycle après 200 tâches (garde-fou contre les fuites mémoire).
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+CELERY_WORKER_MAX_TASKS_PER_CHILD = 200
 CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
 
 # =============================================================================

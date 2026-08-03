@@ -4,10 +4,19 @@ Centralise toute la logique métier liée aux subscriptions.
 """
 from datetime import timedelta
 from decimal import Decimal
+from django.core.cache import cache
 from django.db import transaction
 from django.utils import timezone
 
 from rest_framework.exceptions import ValidationError
+
+# Clés de cache par organisation (Redis en prod). TTL court : les données restent
+# fraîches à ~60s, et l'invalidation explicite (signals sur Subscription /
+# SubscriptionPayment) garantit une mise à jour immédiate lors d'un renouvellement
+# ou d'un blocage. Voir apps/subscriptions/signals.py.
+SUB_BLOCK_CACHE_KEY = "vf:sub:block:{org_id}"
+SUB_QUOTA_CACHE_KEY = "vf:sub:quota:{org_id}"
+SUB_CACHE_TTL = 60
 
 from apps.organizations.models import Organization, OrganizationInvitation
 from apps.settings.models import Currency
@@ -106,10 +115,44 @@ class SubscriptionService:
         }
 
     @staticmethod
+    def get_cached_block_state(organization):
+        """
+        État de blocage léger et sérialisable, destiné au CHEMIN CHAUD
+        (SubscriptionMiddleware, exécuté à chaque requête métier).
+
+        Ne renvoie que les primitifs utilisés par le middleware — jamais
+        l'instance modèle. Caché ~60s (Redis en prod) : retire ~2-3 requêtes
+        DB de chaque appel API. La transition d'état (EXPIRED/PAST_DUE) reste
+        assurée par get_subscription_status() lors des appels non cachés
+        (endpoint /subscriptions/status/, tâche périodique d'expiration).
+        """
+        key = SUB_BLOCK_CACHE_KEY.format(org_id=organization.id)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+
+        full = SubscriptionService.get_subscription_status(organization)
+        state = {
+            'is_blocked': full['is_blocked'],
+            'status': full['status'],
+            'message': full.get('message'),
+            'days_remaining': full.get('days_remaining', 0),
+        }
+        cache.set(key, state, timeout=SUB_CACHE_TTL)
+        return state
+
+    @staticmethod
+    def invalidate_org_cache(org_id):
+        """Purge les caches d'abonnement/quotas d'une organisation (appelé par les signals)."""
+        cache.delete_many([
+            SUB_BLOCK_CACHE_KEY.format(org_id=org_id),
+            SUB_QUOTA_CACHE_KEY.format(org_id=org_id),
+        ])
+
+    @staticmethod
     def is_blocked(organization):
         """Vérifie rapidement si l'organisation est bloquée."""
-        status = SubscriptionService.get_subscription_status(organization)
-        return status['is_blocked']
+        return SubscriptionService.get_cached_block_state(organization)['is_blocked']
 
     # ------------------------------------------------------------------ #
     # Quotas, paliers, checkout
@@ -136,7 +179,24 @@ class SubscriptionService:
 
     @staticmethod
     def get_quota_snapshot(organization):
-        """Comptages + plafonds + drapeaux UI (renouvellement / upgrade)."""
+        """
+        Comptages + plafonds + drapeaux UI (renouvellement / upgrade).
+
+        Caché ~60s par organisation : évite ~6 COUNT séquentiels à chaque
+        chargement dashboard/status. N'est utilisé QUE pour l'affichage — les
+        garde-fous réels (assert_can_add_user, etc.) recomptent en direct, donc
+        une légère péremption est sans risque fonctionnel.
+        """
+        key = SUB_QUOTA_CACHE_KEY.format(org_id=organization.id)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        snapshot = SubscriptionService._compute_quota_snapshot(organization)
+        cache.set(key, snapshot, timeout=SUB_CACHE_TTL)
+        return snapshot
+
+    @staticmethod
+    def _compute_quota_snapshot(organization):
         from apps.inventory.models import Warehouse
         from apps.products.models import Product
 
