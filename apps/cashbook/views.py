@@ -410,37 +410,28 @@ class ExpenseViewSet(
         })
 
     def _create_cash_movement_for_expense(self, expense):
-        """Crée un mouvement de caisse pour une dépense approuvée."""
-        from apps.core.utils import ReferenceGenerator
-        from .services import get_open_session_for_user
+        """Crée un mouvement de caisse pour une dépense approuvée (multi-devise)."""
+        from .services import get_open_session_for_user, _movement
         organization = expense.organization
-
-        # Calculer le solde
-        last_movement = CashMovement.objects.filter(
-            organization=organization,
-            is_cancelled=False,
-        ).order_by('-movement_date', '-created_at').first()
-
-        previous_balance = last_movement.balance_after if last_movement else Decimal('0.00')
-        new_balance = previous_balance - expense.amount
 
         # Rattache la sortie de caisse à la session ouverte de l'utilisateur
         # qui paie (caissier au comptoir) pour le calcul de la caisse nette.
         session = get_open_session_for_user(organization, self.request.user)
 
-        CashMovement.objects.create(
-            organization=organization,
-            reference=ReferenceGenerator.generate_cash_movement_reference(organization),
+        # La sortie de caisse hérite de la devise de la dépense ; `_movement`
+        # calcule `balance_after` par devise.
+        _movement(
+            organization,
             direction='out',
             movement_type='expense',
             amount=expense.amount,
+            currency=expense.currency,
+            exchange_rate=expense.exchange_rate,
             description=f"Dépense: {expense.description}",
             payment_method=expense.payment_method,
             expense=expense,
             session=session,
-            balance_after=new_balance,
-            movement_date=timezone.now(),
-            created_by=expense.created_by,
+            user=expense.created_by,
         )
 
 
@@ -545,25 +536,18 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         return queryset
 
     def perform_create(self, serializer):
-        """Créer un mouvement de caisse manuel."""
+        """Créer un mouvement de caisse manuel (multi-devise)."""
         from apps.core.utils import ReferenceGenerator
-        from .services import get_open_session_for_user
+        from .services import get_open_session_for_user, _get_last_balance, _primary_currency
         organization = self.get_organization()
 
-        # Calculer le solde
-        last_movement = CashMovement.objects.filter(
-            organization=organization,
-            is_cancelled=False,
-        ).order_by('-movement_date', '-created_at').first()
-
-        previous_balance = last_movement.balance_after if last_movement else Decimal('0.00')
         amount = serializer.validated_data['amount']
         direction = serializer.validated_data['direction']
+        currency = (serializer.validated_data.get('currency') or '').strip() or _primary_currency(organization)
 
-        if direction == 'in':
-            new_balance = previous_balance + amount
-        else:
-            new_balance = previous_balance - amount
+        # Solde courant DE LA DEVISE du mouvement (le tiroir est suivi par devise).
+        previous_balance = _get_last_balance(organization, currency)
+        new_balance = previous_balance + amount if direction == 'in' else previous_balance - amount
 
         # Rattache l'apport/retrait à la session ouverte du membre (caisse nette
         # + visibilité entrepôt des mouvements manuels via session.register).
@@ -572,6 +556,7 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         serializer.save(
             organization=organization,
             reference=ReferenceGenerator.generate_cash_movement_reference(organization),
+            currency=currency,
             balance_after=new_balance,
             session=session,
             created_by=self.request.user,

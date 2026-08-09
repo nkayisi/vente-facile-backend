@@ -304,3 +304,105 @@ class SaleStockService:
                 notes=f"Annulation vente {sale.reference}",
                 created_by=user,
             )
+
+
+# =============================================================================
+# MULTI-DEVISE : conversion des règlements et de la monnaie rendue
+# =============================================================================
+
+RATE_QUANTIZE = Decimal('0.000001')
+
+
+def resolve_tender(sale_currency, organization, tendered_amount, currency=None,
+                   exchange_rate=None):
+    """
+    Convertit un montant remis par le client (exprimé dans `currency`) vers la
+    devise de la vente `sale_currency`.
+
+    Convention de retour : ``exchange_rate`` = unités de devise de la VENTE pour
+    1 unité de ``currency`` ⇒ ``amount = tendered_amount × exchange_rate``.
+
+    - Si ``currency`` est vide ou identique à la devise de la vente : taux 1.
+    - Sinon, si un taux est fourni (front) et > 0 : on l'utilise tel quel.
+    - Sinon : conversion via ``CurrencyService`` (passe par la devise principale).
+
+    Retourne ``(amount_in_sale_currency, currency, exchange_rate)``.
+    """
+    tendered_amount = Decimal(tendered_amount)
+    currency = (currency or '').strip()
+
+    if not currency or currency == sale_currency:
+        return tendered_amount.quantize(TWO_PLACES), sale_currency, Decimal('1.000000')
+
+    if exchange_rate is not None and Decimal(exchange_rate) > 0:
+        rate = Decimal(exchange_rate)
+        return (tendered_amount * rate).quantize(TWO_PLACES), currency, rate
+
+    from apps.settings.services import CurrencyService
+    result = CurrencyService.convert(
+        tendered_amount, currency, sale_currency, organization
+    )
+    return result['converted_amount'], currency, result['exchange_rate']
+
+
+def create_payment(sale, user, *, payment_method=None, payment_method_id=None,
+                   tendered_amount=None, amount=None, currency=None,
+                   exchange_rate=None, reference='', notes='', status='completed'):
+    """
+    Crée un ``Payment`` pour ``sale`` en convertissant le montant remis dans la
+    devise de la vente. ``tendered_amount`` est prioritaire ; à défaut ``amount``
+    est traité comme le montant remis (rétro-compatibilité mono-devise).
+
+    Ne met PAS à jour ``sale.amount_paid`` — l'appelant agrège les ``payment.amount``.
+    Retourne le ``Payment`` créé.
+    """
+    from apps.sales.models import Payment
+
+    tendered = tendered_amount if tendered_amount is not None else amount
+    if tendered is None:
+        raise ValidationError("Montant du règlement manquant.")
+
+    applied, ccy, rate = resolve_tender(
+        sale.currency, sale.organization, tendered, currency, exchange_rate
+    )
+
+    if payment_method is not None and payment_method_id is None:
+        payment_method_id = getattr(payment_method, 'id', payment_method)
+
+    return Payment.objects.create(
+        sale=sale,
+        organization=sale.organization,
+        payment_method_id=payment_method_id,
+        amount=applied,
+        tendered_amount=Decimal(tendered).quantize(TWO_PLACES),
+        currency=ccy,
+        exchange_rate=rate,
+        reference=reference or '',
+        notes=notes or '',
+        received_by=user,
+        status=status,
+    )
+
+
+def resolve_change(sale, change_currency=None):
+    """
+    Calcule la monnaie à rendre à partir du surplus payé
+    (``amount_paid - total``, en devise de la vente), exprimée dans
+    ``change_currency`` (choix du caissier ; défaut = devise de la vente).
+
+    Retourne ``(change_amount, change_currency, exchange_rate_to_primary)`` où le
+    montant est exprimé dans ``change_currency``. ``(0, devise, 1)`` si pas de surplus.
+    """
+    change_currency = (change_currency or '').strip() or sale.currency
+    overpay = (sale.amount_paid - sale.total)
+    if overpay <= 0:
+        return Decimal('0.00'), change_currency, Decimal('1.000000')
+
+    if change_currency == sale.currency:
+        return overpay.quantize(TWO_PLACES), change_currency, Decimal('1.000000')
+
+    from apps.settings.services import CurrencyService
+    result = CurrencyService.convert(
+        overpay, sale.currency, change_currency, sale.organization
+    )
+    return result['converted_amount'], change_currency, result['exchange_rate']

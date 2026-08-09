@@ -23,11 +23,15 @@ class OrganizationCurrencySerializer(serializers.ModelSerializer):
     currency_code = serializers.CharField(source='currency.code', read_only=True)
     currency_name = serializers.CharField(source='currency.name', read_only=True)
     currency_symbol = serializers.CharField(source='currency.symbol', read_only=True)
-    
+    currency_decimal_places = serializers.IntegerField(
+        source='currency.decimal_places', read_only=True
+    )
+
     class Meta:
         model = OrganizationCurrency
         fields = [
             'id', 'currency', 'currency_code', 'currency_name', 'currency_symbol',
+            'currency_decimal_places',
             'is_primary', 'exchange_rate', 'is_active', 'last_rate_update'
         ]
         read_only_fields = ['id', 'last_rate_update']
@@ -282,9 +286,9 @@ class RedeemPointsSerializer(serializers.Serializer):
 class UpdateExchangeRateSerializer(serializers.Serializer):
     """Serializer for updating exchange rate."""
     exchange_rate = serializers.DecimalField(
-        max_digits=15,
-        decimal_places=6,
-        min_value=Decimal('0.000001')
+        max_digits=20,
+        decimal_places=12,
+        min_value=Decimal('0.000000000001')
     )
 
 
@@ -299,7 +303,7 @@ class CurrencyConversionSerializer(serializers.Serializer):
         read_only=True
     )
     exchange_rate = serializers.DecimalField(
-        max_digits=15,
-        decimal_places=6,
+        max_digits=20,
+        decimal_places=12,
         read_only=True
     )

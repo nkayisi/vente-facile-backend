@@ -119,7 +119,7 @@ class ExpenseListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'reference', 'category', 'category_name', 'category_color',
             'warehouse', 'warehouse_name',
-            'description', 'amount', 'status', 'beneficiary',
+            'description', 'amount', 'currency', 'exchange_rate', 'status', 'beneficiary',
             'payment_method', 'payment_method_name', 'payment_reference',
             'expense_date', 'due_date', 'paid_date',
             'is_recurring', 'recurrence_period',
@@ -144,7 +144,8 @@ class ExpenseCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Expense
         fields = [
-            'category', 'warehouse', 'description', 'amount', 'beneficiary',
+            'category', 'warehouse', 'description', 'amount', 'currency', 'exchange_rate',
+            'beneficiary',
             'payment_method', 'payment_reference',
             'expense_date', 'due_date',
             'is_recurring', 'recurrence_period',
@@ -177,7 +178,7 @@ class ExpenseDetailSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'reference', 'category', 'category_name', 'category_color',
             'warehouse', 'warehouse_name',
-            'description', 'amount', 'status', 'beneficiary',
+            'description', 'amount', 'currency', 'exchange_rate', 'status', 'beneficiary',
             'payment_method', 'payment_method_name', 'payment_reference',
             'expense_date', 'due_date', 'paid_date',
             'is_recurring', 'recurrence_period',
@@ -208,7 +209,8 @@ class ExpenseUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Expense
         fields = [
-            'category', 'warehouse', 'description', 'amount', 'beneficiary',
+            'category', 'warehouse', 'description', 'amount', 'currency', 'exchange_rate',
+            'beneficiary',
             'payment_method', 'payment_reference',
             'expense_date', 'due_date',
             'is_recurring', 'recurrence_period',
@@ -264,7 +266,7 @@ class CashMovementListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'reference', 'direction', 'direction_display',
             'movement_type', 'movement_type_display',
-            'amount', 'signed_amount', 'description',
+            'amount', 'currency', 'exchange_rate', 'signed_amount', 'description',
             'payment_method', 'payment_method_name',
             'income_category', 'income_category_name', 'income_category_color',
             'expense_category', 'expense_category_name', 'expense_category_color',
@@ -294,7 +296,8 @@ class CashMovementCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = CashMovement
         fields = [
-            'direction', 'movement_type', 'amount', 'description',
+            'direction', 'movement_type', 'amount', 'currency', 'exchange_rate',
+            'description',
             'payment_method', 'income_category', 'expense_category',
             'customer', 'supplier',
             'movement_date', 'notes',

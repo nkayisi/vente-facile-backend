@@ -1084,7 +1084,11 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             request,
         )
         
-        total_sales = sales.aggregate(total=Coalesce(Sum('total'), Decimal('0'), output_field=DecimalField()))['total']
+        # Montants convertis en devise principale (total × exchange_rate) pour
+        # additionner des ventes de devises différentes sans les mélanger.
+        total_sales = sales.aggregate(
+            total=Coalesce(Sum(F('total') * F('exchange_rate')), Decimal('0'), output_field=DecimalField())
+        )['total']
         total_sales_count = sales.count()
         
         # Paiements par type
@@ -1094,24 +1098,28 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
                 paid_at__date=report_date
             ),
             request,
-        ).select_related('payment_method')
-        
+        ).select_related('payment_method', 'sale')
+
         cash_sales = Decimal('0')
         mobile_money_sales = Decimal('0')
         card_sales = Decimal('0')
-        
+
         for payment in payments:
             method_name = payment.payment_method.name.lower() if payment.payment_method else ''
+            # payment.amount est dans la devise de la vente ; on convertit dans la
+            # devise principale (sale.exchange_rate = principale par unité de vente)
+            # afin de pouvoir additionner des ventes de devises différentes.
+            amount_primary = payment.amount * (payment.sale.exchange_rate if payment.sale else Decimal('1'))
             if 'cash' in method_name or 'espèce' in method_name or 'liquide' in method_name:
-                cash_sales += payment.amount
+                cash_sales += amount_primary
             elif 'mobile' in method_name or 'mpesa' in method_name or 'airtel' in method_name or 'orange' in method_name:
-                mobile_money_sales += payment.amount
+                mobile_money_sales += amount_primary
             elif 'card' in method_name or 'carte' in method_name or 'visa' in method_name:
-                card_sales += payment.amount
+                card_sales += amount_primary
         
-        # Ventes à crédit (montant restant dû)
+        # Ventes à crédit (montant restant dû, converti en devise principale)
         credit_sales = sales.filter(amount_due__gt=0).aggregate(
-            total=Coalesce(Sum('amount_due'), Decimal('0'), output_field=DecimalField())
+            total=Coalesce(Sum(F('amount_due') * F('exchange_rate')), Decimal('0'), output_field=DecimalField())
         )['total']
         
         # Recouvrements de créances

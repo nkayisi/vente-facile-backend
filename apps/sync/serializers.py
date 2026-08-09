@@ -190,15 +190,15 @@ class SaleSyncSerializer(BaseSyncSerializer):
     amount_paid = serializers.DecimalField(max_digits=15, decimal_places=2, coerce_to_string=True)
     amount_due = serializers.DecimalField(max_digits=15, decimal_places=2, coerce_to_string=True)
     change_amount = serializers.DecimalField(max_digits=15, decimal_places=2, coerce_to_string=True)
-    exchange_rate = serializers.DecimalField(max_digits=10, decimal_places=4, coerce_to_string=True)
-    
+    exchange_rate = serializers.DecimalField(max_digits=15, decimal_places=6, coerce_to_string=True)
+
     class Meta:
         model = Sale
         fields = [
             'id', 'reference', 'session_id', 'register_id', 'warehouse_id', 'customer_id',
             'sale_type', 'status',
             'subtotal', 'tax_amount', 'discount_amount', 'discount_percentage',
-            'total', 'amount_paid', 'amount_due', 'change_amount',
+            'total', 'amount_paid', 'amount_due', 'change_amount', 'change_currency',
             'currency', 'exchange_rate', 'notes',
             'sold_by_id', 'sale_date', 'due_date',
             'is_pos', 'receipt_printed', 'is_deleted',
@@ -243,12 +243,13 @@ class PaymentSyncSerializer(BaseSyncSerializer):
     received_by_id = serializers.UUIDField(source='received_by.id', allow_null=True, read_only=True)
     
     amount = serializers.DecimalField(max_digits=15, decimal_places=2, coerce_to_string=True)
-    exchange_rate = serializers.DecimalField(max_digits=10, decimal_places=4, coerce_to_string=True)
-    
+    tendered_amount = serializers.DecimalField(max_digits=15, decimal_places=2, coerce_to_string=True, allow_null=True)
+    exchange_rate = serializers.DecimalField(max_digits=15, decimal_places=6, coerce_to_string=True)
+
     class Meta:
         model = Payment
         fields = [
-            'id', 'sale_id', 'payment_method_id', 'amount',
+            'id', 'sale_id', 'payment_method_id', 'amount', 'tendered_amount',
             'currency', 'exchange_rate', 'reference', 'status',
             'received_by_id', 'paid_at', 'notes',
             'created_at', 'updated_at',

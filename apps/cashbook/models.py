@@ -124,6 +124,15 @@ class Expense(TenantModel):
         decimal_places=2,
         validators=[MinValueValidator(Decimal('0.01'))]
     )
+    # Devise de la dépense (défaut = devise principale de l'org). Permet de
+    # régler une dépense en devise étrangère ; le CashMovement généré en hérite.
+    currency = models.CharField(max_length=3, blank=True, default='')
+    exchange_rate = models.DecimalField(
+        max_digits=20,
+        decimal_places=12,
+        default=Decimal('1.000000'),
+        help_text="Unités de devise principale pour 1 unité de `currency`."
+    )
 
     status = models.CharField(
         max_length=20,
@@ -252,6 +261,7 @@ class CashMovement(TenantModel):
         FUND_IN = 'fund_in', 'Apport de fonds'
         FUND_OUT = 'fund_out', 'Retrait de fonds'
         ADJUSTMENT = 'adjustment', 'Ajustement de caisse'
+        CHANGE = 'change', 'Monnaie rendue'
         OTHER_IN = 'other_in', 'Autre entrée'
         OTHER_OUT = 'other_out', 'Autre sortie'
 
@@ -270,6 +280,15 @@ class CashMovement(TenantModel):
         max_digits=15,
         decimal_places=2,
         validators=[MinValueValidator(Decimal('0.01'))]
+    )
+    # Devise du mouvement (celle de `amount`). Défaut backfillé à la devise
+    # principale de l'org. Le solde `balance_after` est suivi PAR devise.
+    currency = models.CharField(max_length=3, blank=True, default='')
+    exchange_rate = models.DecimalField(
+        max_digits=20,
+        decimal_places=12,
+        default=Decimal('1.000000'),
+        help_text="Unités de devise principale pour 1 unité de `currency`."
     )
     description = models.CharField(max_length=500)
 

@@ -6,7 +6,8 @@ from rest_framework.exceptions import ValidationError as DRFValidationError
 from decimal import Decimal
 from django.db import transaction
 from .models import (
-    Register, RegisterSession, Sale, SaleItem, PaymentMethod, Payment,
+    Register, RegisterSession, RegisterSessionCurrencyBalance,
+    Sale, SaleItem, PaymentMethod, Payment,
     SaleReturn, SaleReturnItem, Quotation, QuotationItem
 )
 from .sale_validation import max_sale_discount_percent
@@ -109,9 +110,21 @@ class RegisterSerializer(serializers.ModelSerializer):
 # REGISTER SESSION SERIALIZERS
 # =============================================================================
 
+class RegisterSessionCurrencyBalanceSerializer(serializers.ModelSerializer):
+    """Solde de caisse d'une session, ventilé par devise."""
+
+    class Meta:
+        model = RegisterSessionCurrencyBalance
+        fields = [
+            'currency', 'opening_balance', 'expected_balance',
+            'counted_balance', 'difference',
+        ]
+
+
 class RegisterSessionListSerializer(serializers.ModelSerializer):
     """Serializer léger pour les listes de sessions."""
-    
+
+    currency_balances = RegisterSessionCurrencyBalanceSerializer(many=True, read_only=True)
     register_name = serializers.CharField(source='register.name', read_only=True)
     warehouse = serializers.CharField(source='register.warehouse.id', read_only=True)
     warehouse_name = serializers.CharField(source='register.warehouse.name', read_only=True)
@@ -129,6 +142,7 @@ class RegisterSessionListSerializer(serializers.ModelSerializer):
             'closed_by', 'closed_by_name',
             'status', 'opening_balance', 'closing_balance',
             'expected_balance', 'difference',
+            'currency_balances',
             'opened_at', 'closed_at',
             'sales_count', 'sales_total'
         ]
@@ -169,24 +183,32 @@ class RegisterSessionDetailSerializer(RegisterSessionListSerializer):
         ]
 
 
+class CurrencyAmountSerializer(serializers.Serializer):
+    """Couple (devise, montant) pour les saisies multi-devise de caisse."""
+    currency = serializers.CharField(max_length=3)
+    amount = serializers.DecimalField(max_digits=15, decimal_places=2)
+
+
 class RegisterSessionOpenSerializer(serializers.Serializer):
     """
-    Ouverture de session : uniquement la caisse.
+    Ouverture de session.
 
-    Le solde d'ouverture est hérité automatiquement du `closing_balance` de la
-    dernière session fermée sur cette caisse (ou 0 si aucune).
+    Le solde d'ouverture est hérité automatiquement, PAR DEVISE, de la dernière
+    session fermée sur cette caisse (ou 0). `opening_balances` permet de surcharger
+    les fonds d'ouverture par devise (ex. [{"currency": "USD", "amount": 20}]).
     """
 
     register = serializers.UUIDField()
+    opening_balances = CurrencyAmountSerializer(many=True, required=False)
 
 
 class RegisterSessionCloseSerializer(serializers.Serializer):
     """
-    Fermeture de session avec comptage manuel optionnel.
+    Fermeture de session avec comptage manuel optionnel, PAR DEVISE.
 
-    - `counted_balance` : montant réel compté en caisse (optionnel). Si fourni,
-      on calcule `difference = counted_balance - expected_balance`.
-    - `notes` : obligatoire si la différence est non nulle.
+    - `counted_balances` : comptage réel par devise (ex. [{"currency":"USD","amount":20}]).
+    - `counted_balance` : compat mono-devise (appliqué à la devise principale).
+    - `notes` : obligatoire si un écart est non nul dans une devise.
     """
 
     counted_balance = serializers.DecimalField(
@@ -195,6 +217,7 @@ class RegisterSessionCloseSerializer(serializers.Serializer):
         required=False,
         allow_null=True,
     )
+    counted_balances = CurrencyAmountSerializer(many=True, required=False)
     notes = serializers.CharField(
         required=False,
         allow_blank=True,
@@ -333,7 +356,7 @@ class PaymentSerializer(serializers.ModelSerializer):
         model = Payment
         fields = [
             'id', 'payment_method', 'payment_method_name',
-            'amount', 'currency', 'exchange_rate',
+            'amount', 'tendered_amount', 'currency', 'exchange_rate',
             'reference', 'status',
             'received_by', 'received_by_name',
             'paid_at', 'notes'
@@ -342,21 +365,41 @@ class PaymentSerializer(serializers.ModelSerializer):
 
 
 class PaymentCreateSerializer(serializers.ModelSerializer):
-    """Serializer pour la création de paiement."""
+    """
+    Serializer pour la création de paiement.
+
+    ``tendered_amount`` = montant réellement remis, dans ``currency``. Pour la
+    rétro-compatibilité, ``amount`` seul est accepté et traité comme le montant
+    remis. La conversion vers la devise de la vente est faite côté service.
+    """
+
+    amount = serializers.DecimalField(
+        max_digits=15, decimal_places=2, required=False, allow_null=True
+    )
+    tendered_amount = serializers.DecimalField(
+        max_digits=15, decimal_places=2, required=False, allow_null=True
+    )
 
     class Meta:
         model = Payment
-        fields = ['payment_method', 'amount', 'currency', 'exchange_rate', 'reference', 'notes']
+        fields = ['payment_method', 'amount', 'tendered_amount', 'currency', 'exchange_rate', 'reference', 'notes']
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         from apps.core.serializer_helpers import scope_fk_to_org
         scope_fk_to_org(self, 'payment_method')
 
-    def validate_amount(self, value):
-        if value <= 0:
+    def validate(self, data):
+        tendered = data.get('tendered_amount')
+        amount = data.get('amount')
+        effective = tendered if tendered is not None else amount
+        if effective is None:
+            raise serializers.ValidationError(
+                "Le montant du règlement (tendered_amount ou amount) est requis."
+            )
+        if effective <= 0:
             raise serializers.ValidationError("Le montant doit être strictement positif.")
-        return value
+        return data
 
     def validate_exchange_rate(self, value):
         if value is not None and value <= 0:
@@ -422,7 +465,7 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             'sale_type', 'status', 'price_list',
             'subtotal', 'tax_amount', 'discount_amount', 'discount_percentage',
             'loyalty_redemption_amount', 'total',
-            'amount_paid', 'amount_due', 'change_amount',
+            'amount_paid', 'amount_due', 'change_amount', 'change_currency',
             'currency', 'exchange_rate',
             'notes', 'internal_notes',
             'sold_by', 'sold_by_name',
@@ -455,6 +498,7 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         fields = [
             'register', 'warehouse', 'customer', 'sale_type', 'price_list',
             'discount_percentage', 'global_discount_amount', 'currency', 'exchange_rate',
+            'change_currency',
             'notes', 'internal_notes', 'due_date', 'is_pos',
             'items', 'payments', 'points_used'
         ]
@@ -576,7 +620,10 @@ class SaleCreateSerializer(serializers.ModelSerializer):
 
         payments = data.get("payments") or []
         for p in payments:
-            amt = p.get("amount")
+            # Montant effectivement remis : tendered_amount prioritaire, sinon amount.
+            amt = p.get("tendered_amount")
+            if amt is None:
+                amt = p.get("amount")
             if amt is not None and amt < 0:
                 raise serializers.ValidationError({
                     "payments": "Les montants de paiement ne peuvent pas être négatifs."
@@ -621,7 +668,8 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         # Pour différer le règlement, le caissier doit basculer en sale_type='credit'.
         if sale_type in ('retail', 'wholesale') and is_pos:
             total_paid = sum(
-                ((p.get('amount') or Decimal('0')) for p in payments),
+                ((p.get('tendered_amount') if p.get('tendered_amount') is not None
+                  else p.get('amount')) or Decimal('0') for p in payments),
                 Decimal('0'),
             )
             if total_paid <= 0:
@@ -822,40 +870,56 @@ class SaleCreateSerializer(serializers.ModelSerializer):
             raise DRFValidationError("Le total de la vente ne peut pas être négatif.")
         sale.amount_due = sale.total
 
-        # Créer les paiements
+        # Créer les paiements — conversion multi-devise centralisée : chaque
+        # règlement peut être dans une devise différente de la facture (le client
+        # peut même en cumuler deux). `create_payment` convertit `tendered_amount`
+        # (devise du règlement) vers la devise de la vente et remplit `amount`.
+        from .services import create_payment, resolve_change
+        user = self.context['request'].user
+        created_payments = []
         total_paid = Decimal('0.00')
         for payment_data in payments_data:
-            Payment.objects.create(
-                sale=sale,
-                organization=org,
-                received_by=self.context['request'].user,
-                **payment_data
+            payment = create_payment(
+                sale, user,
+                payment_method=payment_data.get('payment_method'),
+                tendered_amount=payment_data.get('tendered_amount'),
+                amount=payment_data.get('amount'),
+                currency=payment_data.get('currency'),
+                exchange_rate=payment_data.get('exchange_rate'),
+                reference=payment_data.get('reference', '') or '',
+                notes=payment_data.get('notes', '') or '',
             )
-            total_paid += payment_data['amount']
-        
+            created_payments.append(payment)
+            total_paid += payment.amount
+
         sale.amount_paid = total_paid.quantize(TWO_PLACES)
         sale.amount_due = (sale.total - sale.amount_paid).quantize(TWO_PLACES)
-        
+
+        change_amount = Decimal('0.00')
+        change_currency = sale.change_currency or sale.currency
         if sale.amount_paid >= sale.total:
-            sale.change_amount = (sale.amount_paid - sale.total).quantize(TWO_PLACES)
+            # Monnaie rendue dans la devise choisie par le caissier (défaut = vente).
+            change_amount, change_currency, _ = resolve_change(sale, change_currency)
+            sale.change_amount = change_amount
+            sale.change_currency = change_currency
             sale.amount_due = Decimal('0.00')
             sale.status = 'completed'
         elif sale.amount_paid > 0:
             sale.status = 'partially_paid'
         else:
             sale.status = 'pending'
-        
+
         sale.save()
-        
-        # Enregistrer le mouvement de caisse si paiement reçu
-        if total_paid > 0:
-            from apps.cashbook.services import record_sale_income
-            record_sale_income(
-                organization=org,
-                sale=sale,
-                amount=min(total_paid, sale.total),
-                user=self.context['request'].user,
-            )
+
+        # Mouvements de caisse : une ENTRÉE par règlement (dans la devise
+        # réellement remise) + la monnaie rendue en SORTIE. Le tiroir reflète
+        # ainsi chaque devise physiquement présente.
+        if created_payments:
+            from apps.cashbook.services import record_sale_payment_income, record_change
+            for payment in created_payments:
+                record_sale_payment_income(org, sale, payment, user)
+            if change_amount > 0:
+                record_change(org, sale, change_amount, change_currency, user)
         
         # Mettre à jour le stock si la vente est complétée et qu'un entrepôt est défini.
         # Décrémentation centralisée : FIFO sur les lots + re-check `allow_negative_stock`
@@ -1047,14 +1111,20 @@ class SaleCreateSerializer(serializers.ModelSerializer):
 
 
 class SalePaymentSerializer(serializers.Serializer):
-    """Serializer pour ajouter un paiement à une vente existante."""
-    
+    """Serializer pour ajouter un paiement à une vente existante.
+
+    ``amount`` = montant remis dans ``currency`` (compat historique). Un split
+    multi-devise se fait via plusieurs appels ``add-payment`` successifs.
+    ``change_currency`` : devise de la monnaie rendue si le règlement solde la vente.
+    """
+
     payment_method = serializers.UUIDField()
     amount = serializers.DecimalField(max_digits=15, decimal_places=2)
     currency = serializers.CharField(max_length=3, required=False, allow_blank=True)
     exchange_rate = serializers.DecimalField(
         max_digits=15, decimal_places=6, required=False
     )
+    change_currency = serializers.CharField(max_length=3, required=False, allow_blank=True)
     reference = serializers.CharField(required=False, allow_blank=True)
     notes = serializers.CharField(required=False, allow_blank=True)
 

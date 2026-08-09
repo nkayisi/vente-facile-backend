@@ -154,40 +154,31 @@ class OrganizationCurrencyViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
         from_code = serializer.validated_data['from_currency']
         to_code = serializer.validated_data['to_currency']
         
-        try:
-            from_currency = OrganizationCurrency.objects.get(
-                organization=org,
-                currency__code=from_code,
-                is_active=True
-            )
-            to_currency = OrganizationCurrency.objects.get(
-                organization=org,
-                currency__code=to_code,
-                is_active=True
-            )
-        except OrganizationCurrency.DoesNotExist:
+        # Vérifier que les deux devises sont configurées et actives.
+        currencies = OrganizationCurrency.objects.filter(
+            organization=org,
+            currency__code__in=[from_code, to_code],
+            is_active=True,
+        ).values_list('currency__code', flat=True)
+        if from_code not in currencies or to_code not in currencies:
             return Response(
                 {'error': "Devise non configurée pour cet établissement."},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
-        # Convertir via la devise principale
-        # amount_in_primary = amount / from_rate
-        # converted = amount_in_primary * to_rate
-        if from_currency.exchange_rate > 0:
-            amount_in_primary = amount / from_currency.exchange_rate
-            converted_amount = amount_in_primary * to_currency.exchange_rate
-            exchange_rate = to_currency.exchange_rate / from_currency.exchange_rate
-        else:
-            converted_amount = Decimal('0')
-            exchange_rate = Decimal('0')
-        
+
+        # Conversion via le service centralisé — convention UNIQUE partagée par
+        # tout l'app : exchange_rate = unités de devise principale pour 1 unité de
+        # cette devise. Vers la principale on multiplie, depuis la principale on
+        # divise (ex. USD→CDF = ×taux, CDF→USD = ÷taux).
+        from .services import CurrencyService
+        result = CurrencyService.convert(amount, from_code, to_code, org)
+
         return Response({
             'amount': amount,
             'from_currency': from_code,
             'to_currency': to_code,
-            'converted_amount': round(converted_amount, 2),
-            'exchange_rate': round(exchange_rate, 6)
+            'converted_amount': round(result['converted_amount'], 2),
+            'exchange_rate': round(result['exchange_rate'], 6),
         })
 
 

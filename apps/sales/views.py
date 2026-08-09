@@ -194,7 +194,11 @@ class RegisterSessionViewSet(
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-                # Hériter le solde d'ouverture de la dernière session fermée
+                from .models import RegisterSessionCurrencyBalance
+                primary = organization.currency or 'CDF'
+
+                # Hériter le solde d'ouverture, PAR DEVISE, de la dernière
+                # session fermée sur cette caisse.
                 previous = (
                     RegisterSession.objects.filter(
                         register=register, status='closed'
@@ -202,22 +206,43 @@ class RegisterSessionViewSet(
                     .order_by('-closed_at', '-opened_at')
                     .first()
                 )
-                inherited = Decimal('0.00')
+                inherited_by_ccy = {}
                 if previous is not None:
-                    inherited = (
-                        previous.counted_balance
-                        if previous.counted_balance is not None
-                        else (previous.closing_balance or previous.expected_balance or Decimal('0.00'))
-                    )
+                    for cb in previous.currency_balances.all():
+                        val = (
+                            cb.counted_balance if cb.counted_balance is not None
+                            else (cb.expected_balance or Decimal('0.00'))
+                        )
+                        inherited_by_ccy[cb.currency] = val
+                    if not inherited_by_ccy:
+                        # Session héritée sans ventilation par devise (legacy).
+                        inherited_by_ccy[primary] = (
+                            previous.counted_balance
+                            if previous.counted_balance is not None
+                            else (previous.closing_balance or previous.expected_balance or Decimal('0.00'))
+                        )
+
+                # Surcharge éventuelle des fonds d'ouverture par devise.
+                for item in serializer.validated_data.get('opening_balances') or []:
+                    inherited_by_ccy[item['currency']] = Decimal(item['amount'])
+
+                primary_opening = inherited_by_ccy.get(primary, Decimal('0.00'))
 
                 session = RegisterSession.objects.create(
                     organization=organization,
                     register=register,
                     opened_by=request.user,
-                    opening_balance=inherited,
+                    opening_balance=primary_opening,
                     notes='',
                     status='open',
                 )
+                for ccy, amount in inherited_by_ccy.items():
+                    RegisterSessionCurrencyBalance.objects.create(
+                        organization=organization,
+                        session=session,
+                        currency=ccy,
+                        opening_balance=amount,
+                    )
         except IntegrityError:
             # UniqueConstraint DB : une autre requête a créé la session en parallèle
             return Response(
@@ -254,62 +279,128 @@ class RegisterSessionViewSet(
 
         serializer = RegisterSessionCloseSerializer(data=request.data if request.data else {})
         serializer.is_valid(raise_exception=True)
-        counted_balance = serializer.validated_data.get('counted_balance')
         notes_input = (serializer.validated_data.get('notes') or '').strip()
 
-        # Solde théorique en espèces (somme des Payment cash sur les ventes de la session)
-        cash_payments = Payment.objects.filter(
+        from django.db.models import Q as _Q
+        from django.db.models.functions import Coalesce
+        from apps.cashbook.models import CashMovement
+        from .models import RegisterSessionCurrencyBalance
+
+        primary = session.organization.currency or 'CDF'
+        TWO = Decimal('0.01')
+
+        # Fonds d'ouverture PAR DEVISE : depuis les currency_balances de la session
+        # si présents (nouvelles sessions), sinon la devise principale = scalaire.
+        opening_by_ccy = {
+            cb.currency: cb.opening_balance
+            for cb in session.currency_balances.all()
+        }
+        if not opening_by_ccy:
+            opening_by_ccy = {primary: session.opening_balance}
+
+        # Entrées espèces par devise = somme des règlements cash (montant remis)
+        # des ventes de la session.
+        cash_in_rows = Payment.objects.filter(
             sale__session=session,
             payment_method__method_type='cash',
-            status='completed'
-        ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+            status='completed',
+        ).values('currency').annotate(
+            total=Sum(Coalesce('tendered_amount', 'amount'))
+        )
+        cash_in_by_ccy = {
+            (r['currency'] or primary): (r['total'] or Decimal('0.00'))
+            for r in cash_in_rows
+        }
 
-        # Dépenses en espèces réglées pendant la session : elles sortent de la
-        # caisse et doivent être déduites pour obtenir la valeur nette du tiroir.
-        # (payment_method NULL = considéré espèces au comptoir.)
-        from django.db.models import Q as _Q
-        from apps.cashbook.models import CashMovement
-        cash_expenses = CashMovement.objects.filter(
+        # Sorties espèces par devise = mouvements cash 'out' rattachés à la session
+        # (dépenses, monnaie rendue, retraits). payment_method NULL = espèces comptoir.
+        cash_out_rows = CashMovement.objects.filter(
             session=session,
             direction='out',
-            movement_type='expense',
             is_cancelled=False,
         ).filter(
             _Q(payment_method__isnull=True) | _Q(payment_method__method_type='cash')
-        ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        ).values('currency').annotate(total=Sum('amount'))
+        cash_out_by_ccy = {
+            (r['currency'] or primary): (r['total'] or Decimal('0.00'))
+            for r in cash_out_rows
+        }
 
-        expected_balance = (
-            session.opening_balance + cash_payments - cash_expenses
-        ).quantize(Decimal('0.01'))
+        # Comptage manuel par devise (+ compat scalaire = devise principale).
+        counted_by_ccy = {}
+        if serializer.validated_data.get('counted_balance') is not None:
+            counted_by_ccy[primary] = Decimal(serializer.validated_data['counted_balance'])
+        for item in serializer.validated_data.get('counted_balances') or []:
+            counted_by_ccy[item['currency']] = Decimal(item['amount'])
 
-        if counted_balance is not None:
-            counted_balance = Decimal(counted_balance).quantize(Decimal('0.01'))
-            difference = (counted_balance - expected_balance).quantize(Decimal('0.01'))
-            closing_balance = counted_balance
-        else:
-            difference = Decimal('0.00')
-            closing_balance = expected_balance
+        currencies = (
+            set(opening_by_ccy) | set(cash_in_by_ccy)
+            | set(cash_out_by_ccy) | set(counted_by_ccy)
+        )
 
-        # Notes obligatoires si écart non nul
-        if difference != 0 and not notes_input:
+        rows = []
+        any_diff = False
+        for ccy in sorted(currencies):
+            opening = opening_by_ccy.get(ccy, Decimal('0.00'))
+            cin = cash_in_by_ccy.get(ccy, Decimal('0.00'))
+            cout = cash_out_by_ccy.get(ccy, Decimal('0.00'))
+            expected = (opening + cin - cout).quantize(TWO)
+            counted = counted_by_ccy.get(ccy)
+            if counted is not None:
+                counted = counted.quantize(TWO)
+                diff = (counted - expected).quantize(TWO)
+            else:
+                diff = Decimal('0.00')
+            if diff != 0:
+                any_diff = True
+            rows.append({
+                'currency': ccy, 'opening_balance': opening,
+                'expected_balance': expected, 'counted_balance': counted,
+                'difference': diff,
+            })
+
+        # Notes obligatoires si un écart est non nul dans une devise.
+        if any_diff and not notes_input:
             return Response(
                 {'notes': "Une note explicative est obligatoire lorsque le comptage diffère du solde attendu."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        session.closing_balance = closing_balance
-        session.expected_balance = expected_balance
-        session.counted_balance = counted_balance
-        session.difference = difference
+        # Persister les soldes par devise.
+        for row in rows:
+            RegisterSessionCurrencyBalance.objects.update_or_create(
+                session=session, currency=row['currency'],
+                defaults={
+                    'organization': session.organization,
+                    'opening_balance': row['opening_balance'],
+                    'expected_balance': row['expected_balance'],
+                    'counted_balance': row['counted_balance'],
+                    'difference': row['difference'],
+                },
+            )
+
+        # Renseigner les champs scalaires (devise principale) pour compat ascendante.
+        primary_row = next((r for r in rows if r['currency'] == primary), None)
+        if primary_row is None:
+            primary_row = {
+                'opening_balance': session.opening_balance,
+                'expected_balance': session.opening_balance,
+                'counted_balance': None, 'difference': Decimal('0.00'),
+            }
+        session.expected_balance = primary_row['expected_balance']
+        session.counted_balance = primary_row['counted_balance']
+        session.difference = primary_row['difference']
+        session.closing_balance = (
+            primary_row['counted_balance'] if primary_row['counted_balance'] is not None
+            else primary_row['expected_balance']
+        )
         session.closed_by = request.user
         session.closed_at = timezone.now()
         session.status = 'closed'
         session.notes = notes_input
         session.save()
 
-        # Audit log de la fermeture — capture qui a fermé, montants comptés
-        # vs attendus, écart, et si un tiers (manager) a fermé une session
-        # ouverte par un autre cashier (cas sensible pour la comptabilité).
+        # Audit log de la fermeture — détail par devise inclus.
         from apps.users.models import UserActivity
 
         closed_by_other = session.opened_by_id != request.user.id
@@ -325,12 +416,16 @@ class RegisterSessionViewSet(
                 'opened_by_id': str(session.opened_by_id),
                 'closed_by_id': str(request.user.id),
                 'closed_by_other_user': closed_by_other,
-                'opening_balance': str(session.opening_balance),
-                'cash_payments': str(cash_payments),
-                'cash_expenses': str(cash_expenses),
-                'expected_balance': str(expected_balance),
-                'counted_balance': str(counted_balance) if counted_balance is not None else None,
-                'difference': str(difference),
+                'currency_balances': [
+                    {
+                        'currency': r['currency'],
+                        'opening_balance': str(r['opening_balance']),
+                        'expected_balance': str(r['expected_balance']),
+                        'counted_balance': str(r['counted_balance']) if r['counted_balance'] is not None else None,
+                        'difference': str(r['difference']),
+                    }
+                    for r in rows
+                ],
                 'notes': notes_input,
             },
             ip_address=request.META.get('REMOTE_ADDR'),
@@ -618,58 +713,36 @@ class SaleViewSet(
 
             previous_status = sale.status
 
-            # Gestion multi-devise : convertir le paiement dans la devise de la vente
-            payment_amount = serializer.validated_data['amount']
-            payment_currency = serializer.validated_data.get('currency', '').strip()
-            payment_exchange_rate = serializer.validated_data.get('exchange_rate')
-            
-            # Montant converti dans la devise principale (de la vente)
-            amount_in_sale_currency = payment_amount
-            
-            if payment_currency and payment_currency != sale.currency:
-                # Le client paie dans une devise différente de la facture
-                from apps.settings.services import CurrencyService
-                org = sale.organization
-                
-                if payment_exchange_rate and payment_exchange_rate > 0:
-                    # Utiliser le taux fourni par le frontend
-                    amount_in_sale_currency = (payment_amount * payment_exchange_rate).quantize(Decimal('0.01'))
-                else:
-                    # Calculer via le service de conversion
-                    result = CurrencyService.convert(
-                        payment_amount, payment_currency, sale.currency, org
-                    )
-                    amount_in_sale_currency = result['converted_amount']
-                    payment_exchange_rate = result['exchange_rate']
-            else:
-                payment_currency = sale.currency
-                payment_exchange_rate = Decimal('1.0000')
-            
-            # Créer le paiement avec les infos de devise
-            payment = Payment.objects.create(
-                sale=sale,
-                organization=sale.organization,
+            # Gestion multi-devise centralisée : `create_payment` convertit le
+            # montant remis (dans `currency`) vers la devise de la vente et
+            # renseigne `amount` + `tendered_amount`.
+            from .services import create_payment, resolve_change
+            payment = create_payment(
+                sale, request.user,
                 payment_method_id=serializer.validated_data['payment_method'],
-                amount=amount_in_sale_currency,
-                currency=payment_currency,
-                exchange_rate=payment_exchange_rate or Decimal('1.0000'),
+                tendered_amount=serializer.validated_data['amount'],
+                currency=serializer.validated_data.get('currency'),
+                exchange_rate=serializer.validated_data.get('exchange_rate'),
                 reference=serializer.validated_data.get('reference', ''),
                 notes=serializer.validated_data.get('notes', ''),
-                received_by=request.user,
-                status='completed'
             )
-            
+
             # Mettre à jour la vente (toujours en devise de la vente)
-            sale.amount_paid += amount_in_sale_currency
+            sale.amount_paid += payment.amount
             sale.amount_due = (sale.total - sale.amount_paid).quantize(Decimal('0.01'))
-            
+
+            change_amount = Decimal('0.00')
+            change_currency = sale.change_currency or sale.currency
             if sale.amount_paid >= sale.total:
-                sale.change_amount = (sale.amount_paid - sale.total).quantize(Decimal('0.01'))
+                change_currency = serializer.validated_data.get('change_currency') or change_currency
+                change_amount, change_currency, _ = resolve_change(sale, change_currency)
+                sale.change_amount = change_amount
+                sale.change_currency = change_currency
                 sale.amount_due = Decimal('0.00')
                 sale.status = 'completed'
             else:
                 sale.status = 'partially_paid'
-            
+
             sale.save()
             
             # Si la vente vient de passer en completed, mettre à jour le stock
@@ -695,22 +768,20 @@ class SaleViewSet(
                 if sale.customer:
                     self._award_loyalty_points(sale, request.user)
             
-            # Enregistrer le mouvement de caisse
-            from apps.cashbook.services import record_sale_income, record_debt_collection
+            # Enregistrer le mouvement de caisse dans la devise réellement remise
+            # (+ la monnaie rendue en sortie si la vente est soldée).
+            from apps.cashbook.services import (
+                record_sale_payment_income, record_debt_collection_payment, record_change,
+            )
             if sale.sale_type == 'credit' and sale.customer:
-                record_debt_collection(
-                    organization=sale.organization,
-                    sale=sale,
-                    amount=payment.amount,
-                    customer=sale.customer,
-                    user=request.user,
+                record_debt_collection_payment(
+                    sale.organization, sale, payment, sale.customer, request.user,
                 )
             else:
-                record_sale_income(
-                    organization=sale.organization,
-                    sale=sale,
-                    amount=payment.amount,
-                    user=request.user,
+                record_sale_payment_income(sale.organization, sale, payment, request.user)
+            if change_amount > 0:
+                record_change(
+                    sale.organization, sale, change_amount, change_currency, request.user,
                 )
             
             # Mettre à jour le solde client pour les ventes à crédit

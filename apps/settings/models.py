@@ -41,10 +41,10 @@ class OrganizationCurrency(TenantModel):
     )
     is_primary = models.BooleanField(default=False)
     exchange_rate = models.DecimalField(
-        max_digits=15,
-        decimal_places=6,
+        max_digits=20,
+        decimal_places=12,
         default=Decimal('1.000000'),
-        validators=[MinValueValidator(Decimal('0.000001'))],
+        validators=[MinValueValidator(Decimal('0.000000000001'))],
         help_text="Taux de change par rapport à la devise principale"
     )
     is_active = models.BooleanField(default=True)

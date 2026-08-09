@@ -144,6 +144,52 @@ class RegisterSession(TenantModel):
         return f"Session {self.register.name} - {self.opened_at.date()}"
 
 
+class RegisterSessionCurrencyBalance(TenantModel):
+    """
+    Solde de caisse d'une session, ventilé PAR DEVISE.
+
+    En RDC le tiroir contient physiquement plusieurs devises à la fois (ex. USD
+    et CDF). Chaque ligne suit une devise indépendamment : fonds d'ouverture,
+    attendu (calculé à la clôture), compté (saisie manuelle) et écart. Les champs
+    scalaires de RegisterSession restent renseignés avec la devise principale
+    pour compat ascendante.
+    """
+
+    session = models.ForeignKey(
+        RegisterSession,
+        on_delete=models.CASCADE,
+        related_name='currency_balances'
+    )
+    currency = models.CharField(max_length=3)
+
+    opening_balance = models.DecimalField(
+        max_digits=15, decimal_places=2, default=Decimal('0.00')
+    )
+    expected_balance = models.DecimalField(
+        max_digits=15, decimal_places=2, null=True, blank=True
+    )
+    counted_balance = models.DecimalField(
+        max_digits=15, decimal_places=2, null=True, blank=True,
+        help_text="Montant réel compté dans cette devise à la fermeture."
+    )
+    difference = models.DecimalField(
+        max_digits=15, decimal_places=2, null=True, blank=True
+    )
+
+    class Meta:
+        db_table = 'register_session_currency_balances'
+        ordering = ['currency']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['session', 'currency'],
+                name='unique_session_currency_balance',
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.session_id} · {self.currency}: {self.expected_balance}"
+
+
 class Sale(TenantSyncableModel):
     """
     Main sale/invoice model.
@@ -262,14 +308,21 @@ class Sale(TenantSyncableModel):
         decimal_places=2,
         default=Decimal('0.00')
     )
-    
+    # Devise dans laquelle la monnaie est rendue (choix du caissier). Peut différer
+    # de `currency` : le montant `change_amount` est exprimé dans cette devise.
+    change_currency = models.CharField(max_length=3, blank=True, default='')
+
     currency = models.CharField(max_length=3, default='CDF')
+    # Taux snapshot : unités de devise principale de l'org pour 1 unité de la
+    # devise de facture (`currency`). 12 décimales pour coller à
+    # OrganizationCurrency et éviter la perte sur les petits taux réciproques
+    # (ex. principale USD, 1 CDF = 0.000434782609 USD).
     exchange_rate = models.DecimalField(
-        max_digits=10,
-        decimal_places=4,
-        default=Decimal('1.0000')
+        max_digits=20,
+        decimal_places=12,
+        default=Decimal('1.000000')
     )
-    
+
     notes = models.TextField(blank=True)
     internal_notes = models.TextField(blank=True)
     
@@ -527,15 +580,29 @@ class Payment(TenantModel, SyncableModel):
         related_name='payments'
     )
     
+    # Valeur imputée à la facture, EXPRIMÉE DANS LA DEVISE DE LA VENTE
+    # (= tendered_amount × exchange_rate).
     amount = models.DecimalField(max_digits=15, decimal_places=2)
-    
-    currency = models.CharField(max_length=3, default='CDF')
-    exchange_rate = models.DecimalField(
-        max_digits=10,
-        decimal_places=4,
-        default=Decimal('1.0000')
+
+    # Montant réellement remis par le client, exprimé dans `currency` — c'est ce
+    # qui entre physiquement dans le tiroir-caisse. Nullable pour compat : les
+    # anciennes lignes sont backfillées à `amount` (mono-devise).
+    tendered_amount = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        null=True,
+        blank=True,
     )
-    
+
+    currency = models.CharField(max_length=3, default='CDF')
+    # Taux : unités de devise de la VENTE pour 1 unité de `currency` (devise du
+    # règlement) ⇒ amount = tendered_amount × exchange_rate. (=1 si même devise.)
+    exchange_rate = models.DecimalField(
+        max_digits=20,
+        decimal_places=12,
+        default=Decimal('1.000000')
+    )
+
     reference = models.CharField(max_length=100, blank=True)
     
     status = models.CharField(
