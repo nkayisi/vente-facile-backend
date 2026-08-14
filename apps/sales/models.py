@@ -312,7 +312,10 @@ class Sale(TenantSyncableModel):
     # de `currency` : le montant `change_amount` est exprimé dans cette devise.
     change_currency = models.CharField(max_length=3, blank=True, default='')
 
-    currency = models.CharField(max_length=3, default='CDF')
+    # Devise de facture. Défaut VIDE et non 'CDF' : la valeur est résolue dans
+    # `save()` vers la devise principale de l'organisation. Un défaut codé en dur
+    # estampillait les ventes 'CDF' même dans une org dont la principale est USD.
+    currency = models.CharField(max_length=3, blank=True, default='')
     # Taux snapshot : unités de devise principale de l'org pour 1 unité de la
     # devise de facture (`currency`). 12 décimales pour coller à
     # OrganizationCurrency et éviter la perte sur les petits taux réciproques
@@ -393,6 +396,24 @@ class Sale(TenantSyncableModel):
 
     def __str__(self):
         return f"Sale {self.reference}"
+
+    def save(self, *args, **kwargs):
+        """Garantit une devise et un taux cohérents, quel que soit l'appelant.
+
+        Deux chemins créent des ventes (le serializer POS et la conversion d'un
+        devis) et le second ne passait aucune devise : la vente héritait du
+        défaut du modèle. Résoudre ici couvre tous les appelants, présents et à
+        venir, plutôt que de dupliquer la logique à chaque site d'écriture.
+        """
+        if self.organization_id:
+            from apps.sales.services import resolve_sale_currency
+            self.currency, self.exchange_rate = resolve_sale_currency(
+                self.organization_id, self.currency, self.exchange_rate
+            )
+        # La monnaie est rendue dans la devise de la vente sauf choix explicite.
+        if not self.change_currency:
+            self.change_currency = self.currency
+        super().save(*args, **kwargs)
 
     def calculate_totals(self):
         """Recalculate sale totals from items."""
@@ -594,7 +615,9 @@ class Payment(TenantModel, SyncableModel):
         blank=True,
     )
 
-    currency = models.CharField(max_length=3, default='CDF')
+    # Devise du règlement. Défaut VIDE et non 'CDF' : résolue dans `save()` vers
+    # la devise de la vente (elle-même résolue vers la principale de l'org).
+    currency = models.CharField(max_length=3, blank=True, default='')
     # Taux : unités de devise de la VENTE pour 1 unité de `currency` (devise du
     # règlement) ⇒ amount = tendered_amount × exchange_rate. (=1 si même devise.)
     exchange_rate = models.DecimalField(
@@ -632,6 +655,17 @@ class Payment(TenantModel, SyncableModel):
 
     def __str__(self):
         return f"Payment {self.amount} for {self.sale.reference}"
+
+    def save(self, *args, **kwargs):
+        """Sans devise explicite, un règlement est dans la devise de la vente.
+
+        Le taux n'est pas déduit ici : une conversion vers la devise de vente
+        relève de `services.resolve_tender`, seul endroit qui connaît le montant
+        remis. Ici on garantit seulement qu'aucun règlement ne reste sans devise.
+        """
+        if not self.currency and self.sale_id:
+            self.currency = self.sale.currency
+        super().save(*args, **kwargs)
 
 
 class SaleReturn(TenantSoftDeleteModel):

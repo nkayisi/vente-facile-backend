@@ -232,3 +232,83 @@ class SessionCloseByCurrencyTests(_BaseMultiCurrencyTest):
         )
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST, resp.content)
         self.assertIn('notes', resp.data)
+
+
+class DefaultCurrencyResolutionTests(_BaseMultiCurrencyTest):
+    """La devise se résout TOUJOURS vers la principale de l'établissement.
+
+    `Sale.currency` et `Payment.currency` avaient un défaut codé en dur à 'CDF',
+    qui estampillait les ventes 'CDF' dans une org dont la principale est USD.
+    La résolution vit désormais dans `save()`, donc elle couvre tous les
+    appelants — y compris ceux qui ne passent aucune devise.
+    """
+
+    def test_sale_created_without_currency_uses_org_primary(self):
+        """Chemin « conversion de devis » : aucune devise passée au modèle."""
+        sale = Sale.objects.create(
+            organization=self.org,
+            reference='VT-TEST-0001',
+            warehouse=self.warehouse,
+            sale_type='retail',
+            status='pending',
+            subtotal=Decimal('2000.00'),
+            total=Decimal('2000.00'),
+            amount_due=Decimal('2000.00'),
+            sold_by=self.cashier_a,
+        )
+        self.assertEqual(sale.currency, 'CDF')          # principale de cette org
+        self.assertEqual(sale.exchange_rate, Decimal('1.000000'))
+        self.assertEqual(sale.change_currency, 'CDF')
+
+    def test_secondary_currency_without_rate_is_snapshotted_from_org(self):
+        """Un taux de 1 sur une devise secondaire est impossible : on le relit."""
+        sale = Sale.objects.create(
+            organization=self.org,
+            reference='VT-TEST-0002',
+            warehouse=self.warehouse,
+            sale_type='retail',
+            status='pending',
+            currency='USD',
+            subtotal=Decimal('10.00'),
+            total=Decimal('10.00'),
+            amount_due=Decimal('10.00'),
+            sold_by=self.cashier_a,
+        )
+        self.assertEqual(sale.currency, 'USD')
+        self.assertEqual(sale.exchange_rate, self.RATE_USD)
+
+    def test_explicit_rate_on_secondary_currency_is_preserved(self):
+        sale = Sale.objects.create(
+            organization=self.org,
+            reference='VT-TEST-0003',
+            warehouse=self.warehouse,
+            sale_type='retail',
+            status='pending',
+            currency='USD',
+            exchange_rate=Decimal('2750.000000'),
+            subtotal=Decimal('10.00'),
+            total=Decimal('10.00'),
+            amount_due=Decimal('10.00'),
+            sold_by=self.cashier_a,
+        )
+        self.assertEqual(sale.exchange_rate, Decimal('2750.000000'))
+
+    def test_payment_without_currency_inherits_sale_currency(self):
+        sale = Sale.objects.create(
+            organization=self.org,
+            reference='VT-TEST-0004',
+            warehouse=self.warehouse,
+            sale_type='retail',
+            status='pending',
+            currency='USD',
+            subtotal=Decimal('10.00'),
+            total=Decimal('10.00'),
+            amount_due=Decimal('10.00'),
+            sold_by=self.cashier_a,
+        )
+        payment = Payment.objects.create(
+            sale=sale, organization=self.org,
+            payment_method=self.payment_method,
+            amount=Decimal('10.00'), tendered_amount=Decimal('10.00'),
+        )
+        self.assertEqual(payment.currency, 'USD')
