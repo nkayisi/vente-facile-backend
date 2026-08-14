@@ -152,6 +152,11 @@ class ExpenseCreateSerializer(serializers.ModelSerializer):
             'notes',
         ]
 
+    def validate_exchange_rate(self, value):
+        if value is not None and value <= 0:
+            raise serializers.ValidationError("Le taux de change doit être supérieur à 0.")
+        return value
+
     def validate(self, data):
         if data.get('is_recurring') and not data.get('recurrence_period'):
             raise serializers.ValidationError({
@@ -216,6 +221,11 @@ class ExpenseUpdateSerializer(serializers.ModelSerializer):
             'is_recurring', 'recurrence_period',
             'notes',
         ]
+
+    def validate_exchange_rate(self, value):
+        if value is not None and value <= 0:
+            raise serializers.ValidationError("Le taux de change doit être supérieur à 0.")
+        return value
 
 
 # =============================================================================
@@ -303,13 +313,18 @@ class CashMovementCreateSerializer(serializers.ModelSerializer):
             'movement_date', 'notes',
         ]
 
+    def validate_exchange_rate(self, value):
+        if value is not None and value <= 0:
+            raise serializers.ValidationError("Le taux de change doit être supérieur à 0.")
+        return value
+
     def validate(self, data):
         direction = data.get('direction')
         movement_type = data.get('movement_type')
 
         # Valider la cohérence direction / type
         in_types = ['sale', 'supplier_refund', 'debt_collection', 'fund_in', 'other_in']
-        out_types = ['sale_return', 'expense', 'purchase', 'fund_out', 'other_out']
+        out_types = ['sale_return', 'expense', 'purchase', 'fund_out', 'other_out', 'change']
 
         if direction == 'in' and movement_type not in in_types + ['adjustment']:
             raise serializers.ValidationError({

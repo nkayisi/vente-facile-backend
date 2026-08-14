@@ -8,6 +8,8 @@ solde courant ``balance_after`` est suivi INDÉPENDAMMENT PAR DEVISE, de sorte
 que le tiroir-caisse reflète la réalité physique (ex. USD et CDF côte à côte).
 """
 from decimal import Decimal
+from django.db.models import DecimalField, F, Sum
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 from apps.core.utils import ReferenceGenerator
 
@@ -15,6 +17,103 @@ from apps.core.utils import ReferenceGenerator
 def _primary_currency(organization):
     """Code de la devise principale de l'organisation (fallback 'CDF')."""
     return getattr(organization, 'currency', None) or 'CDF'
+
+
+def resolve_currency_rate(organization, currency=None, exchange_rate=None, strict=True):
+    """
+    Résout le couple ``(currency, exchange_rate)`` d'une ligne de caisse.
+
+    ``exchange_rate`` retourné = unités de devise PRINCIPALE pour 1 unité de
+    ``currency`` (principale ⇒ 1). C'est la convention de tout le projet.
+
+    - ``currency`` vide ⇒ devise principale, taux 1 ;
+    - ``currency`` == principale ⇒ taux 1 (forcé, on ignore un taux fourni) ;
+    - taux fourni et > 0 ⇒ utilisé tel quel (le client fait autorité, cf. POS) ;
+    - sinon ⇒ lu depuis ``OrganizationCurrency`` (source de vérité serveur).
+
+    ``strict=True`` (saisie utilisateur : dépense, mouvement manuel) lève
+    ``ValidationError`` si la devise n'est pas configurée/active dans l'org.
+    ``strict=False`` (flux internes déclenchés par une vente/un achat déjà
+    validé ailleurs) retombe sur un taux 1 plutôt que de casser la transaction.
+    """
+    from rest_framework.exceptions import ValidationError
+    from apps.settings.services import CurrencyService
+
+    primary = _primary_currency(organization)
+    currency = (currency or '').strip() or primary
+
+    if currency == primary:
+        return currency, Decimal('1.000000')
+
+    oc = CurrencyService.get_org_currencies(organization).get(currency)
+    if oc is None:
+        if strict:
+            raise ValidationError({
+                'currency': f"La devise '{currency}' n'est pas activée pour cette organisation."
+            })
+        return currency, (
+            Decimal(exchange_rate)
+            if exchange_rate is not None and Decimal(exchange_rate) > 0
+            else Decimal('1.000000')
+        )
+
+    if exchange_rate is not None and Decimal(exchange_rate) > 0:
+        return currency, Decimal(exchange_rate)
+
+    return currency, oc.exchange_rate
+
+
+# ---------------------------------------------------------------------------
+# Agrégation COMPTABLE : conversion en devise principale.
+#
+# À n'utiliser QUE pour les rapports/P&L (bénéfice, flux, dashboard), où un
+# chiffre unique est attendu. Le livre de caisse, lui, reste ventilé par devise
+# (le tiroir physique ne convertit rien) — voir `CashMovementViewSet`.
+# ---------------------------------------------------------------------------
+
+def primary_sum(field='amount', filter=None):
+    """``Sum(field × exchange_rate)`` ⇒ montant total en devise principale."""
+    expr = Sum(
+        F(field) * F('exchange_rate'),
+        filter=filter,
+        output_field=DecimalField(max_digits=24, decimal_places=6),
+    )
+    return Coalesce(
+        expr,
+        Decimal('0'),
+        output_field=DecimalField(max_digits=24, decimal_places=6),
+    )
+
+
+def last_balance_by_currency(queryset):
+    """Dernier ``balance_after`` de CHAQUE devise ⇒ ``{code: (solde, taux)}``.
+
+    ``queryset`` doit être un queryset de ``CashMovement`` déjà filtré
+    (organisation, périmètre, annulations…).
+    """
+    # `.order_by()` neutralise l'ordering du modèle : sinon DISTINCT inclut les
+    # colonnes de tri et renvoie des devises en double.
+    codes = queryset.order_by().values_list('currency', flat=True).distinct()
+    result = {}
+    for ccy in codes:
+        last = queryset.filter(currency=ccy).order_by(
+            '-movement_date', '-created_at'
+        ).first()
+        if last:
+            result[ccy] = (last.balance_after, last.exchange_rate)
+    return result
+
+
+def balance_in_primary(queryset):
+    """Solde de caisse toutes devises confondues, converti en principale.
+
+    Somme les derniers ``balance_after`` de chaque devise × leur taux. Ne jamais
+    utiliser pour afficher le tiroir : c'est un chiffre comptable, pas physique.
+    """
+    return sum(
+        (bal * rate for bal, rate in last_balance_by_currency(queryset).values()),
+        Decimal('0'),
+    )
 
 
 def _get_last_balance(organization, currency):
@@ -40,17 +139,15 @@ def _movement(organization, *, direction, movement_type, amount, description,
     """
     from .models import CashMovement
 
-    currency = (currency or '').strip() or _primary_currency(organization)
     # `exchange_rate` sur un mouvement = unités de devise PRINCIPALE pour 1 unité
     # de `currency` (pour reconvertir en principale dans les rapports). Résolu
     # automatiquement depuis OrganizationCurrency si non fourni.
-    if exchange_rate is None:
-        if currency == _primary_currency(organization):
-            exchange_rate = Decimal('1.000000')
-        else:
-            from apps.settings.services import CurrencyService
-            oc = CurrencyService.get_org_currencies(organization).get(currency)
-            exchange_rate = oc.exchange_rate if oc else Decimal('1.000000')
+    # `strict=False` : `_movement` est appelé depuis des flux déjà validés
+    # (vente encaissée, paiement fournisseur) — on n'y casse pas la transaction
+    # si une devise historique n'est plus configurée.
+    currency, exchange_rate = resolve_currency_rate(
+        organization, currency, exchange_rate, strict=False
+    )
     amount = Decimal(amount)
 
     previous_balance = _get_last_balance(organization, currency)

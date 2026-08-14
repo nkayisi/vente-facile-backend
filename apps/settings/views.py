@@ -27,6 +27,7 @@ from .serializers import (
     AdjustLoyaltyPointsSerializer, RedeemPointsSerializer,
     UpdateExchangeRateSerializer, CurrencyConversionSerializer
 )
+from .services import CurrencyService
 
 
 class CurrencyViewSet(viewsets.ReadOnlyModelViewSet):
@@ -72,6 +73,16 @@ class OrganizationCurrencyViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
             return CurrencyConversionSerializer
         return OrganizationCurrencySerializer
     
+    # Toute mutation d'une devise invalide les caches 5 min de CurrencyService,
+    # sur lesquels s'appuie la résolution serveur des taux (caisse, dépenses).
+    def perform_create(self, serializer):
+        super().perform_create(serializer)
+        CurrencyService.invalidate_cache(self.get_organization())
+
+    def perform_update(self, serializer):
+        super().perform_update(serializer)
+        CurrencyService.invalidate_cache(self.get_organization())
+
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
         if instance.is_primary:
@@ -79,7 +90,9 @@ class OrganizationCurrencyViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
                 {'error': "Impossible de supprimer la devise principale."},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        return super().destroy(request, *args, **kwargs)
+        response = super().destroy(request, *args, **kwargs)
+        CurrencyService.invalidate_cache(self.get_organization())
+        return response
     
     @action(detail=True, methods=['post'])
     def set_primary(self, request, pk=None):
@@ -119,7 +132,11 @@ class OrganizationCurrencyViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
             Organization.objects.filter(id=org.id).update(
                 currency=instance.currency.code
             )
-        
+
+        # Sans cela, les caches 5 min de CurrencyService continueraient de servir
+        # l'ancienne devise principale aux résolutions de taux (caisse, dépenses).
+        CurrencyService.invalidate_cache(org)
+
         serializer = self.get_serializer(instance)
         return Response(serializer.data)
     
@@ -140,7 +157,11 @@ class OrganizationCurrencyViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
         instance.exchange_rate = serializer.validated_data['exchange_rate']
         instance.last_rate_update = timezone.now()
         instance.save()
-        
+
+        # Le nouveau taux doit être visible immédiatement par les résolutions
+        # serveur (dépenses, mouvements de caisse), pas dans 5 minutes.
+        CurrencyService.invalidate_cache(self.get_organization())
+
         return Response(OrganizationCurrencySerializer(instance).data)
     
     @action(detail=False, methods=['post'])

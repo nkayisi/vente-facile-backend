@@ -35,6 +35,14 @@ from apps.products.models import Product
 from apps.inventory.models import Stock, StockBatch
 from apps.contacts.models import Customer
 from apps.cashbook.models import CashMovement, Expense
+# Agrégations comptables : les montants de caisse/dépenses sont convertis en
+# devise principale (montant × exchange_rate) avant d'être sommés. Le livre de
+# caisse, lui, reste ventilé par devise — voir apps/cashbook/views.py.
+from apps.cashbook.services import (
+    balance_in_primary,
+    last_balance_by_currency,
+    primary_sum,
+)
 
 from .models import ReportTemplate, SavedReport, Dashboard
 from .serializers import (
@@ -374,9 +382,11 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             ),
             request,
         )
+        # Converti en devise principale : une dépense peut être en USD dans une
+        # org CDF, on ne somme jamais des montants bruts de devises différentes.
         expenses_agg = expenses.aggregate(
             count=Count('id'),
-            total=Coalesce(Sum('amount'), Decimal('0'), **money),
+            total=primary_sum('amount'),
         )
 
         # --- Mouvements de caisse créés par l'utilisateur ---
@@ -391,9 +401,9 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             request,
         )
         cash_in = movements.filter(direction='in').aggregate(
-            total=Coalesce(Sum('amount'), Decimal('0'), **money))['total']
+            total=primary_sum('amount'))['total']
         cash_out = movements.filter(direction='out').aggregate(
-            total=Coalesce(Sum('amount'), Decimal('0'), **money))['total']
+            total=primary_sum('amount'))['total']
 
         # --- Ventilation temporelle des ventes (heure ou jour) ---
         trunc = TruncHour('sale_date') if group_by == 'hour' else TruncDate('sale_date')
@@ -793,17 +803,13 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         else:
             trunc_func = TruncDate('movement_date')
         
+        # Montants convertis en devise principale : un flux de trésorerie est un
+        # chiffre comptable unique, il ne peut pas mélanger USD et CDF bruts.
         data = movements.annotate(
             period=trunc_func
         ).values('period').annotate(
-            income=Coalesce(
-                Sum('amount', filter=Q(direction='in')),
-                Decimal('0')
-            ),
-            expenses=Coalesce(
-                Sum('amount', filter=Q(direction='out')),
-                Decimal('0')
-            )
+            income=primary_sum('amount', filter=Q(direction='in')),
+            expenses=primary_sum('amount', filter=Q(direction='out')),
         ).order_by('period')
         
         all_data = list(data)
@@ -974,19 +980,31 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         if request is not None:
             movements = self._scope_cash_movements(movements, request)
         
+        # Convertis en devise principale (montant × taux) : sans cela, une
+        # dépense de 10 USD comptait pour 10 CDF.
         totals = movements.aggregate(
-            income=Coalesce(Sum('amount', filter=Q(direction='in')), Decimal('0'), output_field=DecimalField()),
-            expenses=Coalesce(Sum('amount', filter=Q(direction='out')), Decimal('0'), output_field=DecimalField())
+            income=primary_sum('amount', filter=Q(direction='in')),
+            expenses=primary_sum('amount', filter=Q(direction='out')),
         )
-        
-        # Solde actuel (dernier mouvement scopé au périmètre)
-        last_movement_qs = CashMovement.objects.filter(organization=org)
+
+        # Solde actuel : le tiroir est suivi PAR DEVISE, donc prendre le dernier
+        # mouvement toutes devises confondues renvoyait le solde de la devise qui
+        # a bougé en dernier. On somme le dernier solde de CHAQUE devise, converti.
+        last_movement_qs = CashMovement.objects.filter(
+            organization=org, is_cancelled=False
+        )
         if request is not None:
             last_movement_qs = self._scope_cash_movements(last_movement_qs, request)
-        last_movement = last_movement_qs.order_by('-movement_date', '-created_at').first()
-        
-        current_balance = last_movement.balance_after if last_movement else Decimal('0')
-        
+
+        balances = last_balance_by_currency(last_movement_qs)
+        current_balance = sum(
+            (bal * rate for bal, rate in balances.values()), Decimal('0')
+        )
+        balance_by_currency = [
+            {'currency': ccy, 'balance': bal}
+            for ccy, (bal, _rate) in sorted(balances.items())
+        ]
+
         # Dépenses en attente
         pending_expenses_qs = Expense.objects.filter(
             organization=org,
@@ -997,7 +1015,11 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         pending_expenses = pending_expenses_qs.count()
         
         return {
+            # Scalaires = devise principale (montants convertis).
+            'currency': org.currency or 'CDF',
             'current_balance': current_balance,
+            # Détail du tiroir : chaque devise avec son solde réel, non converti.
+            'balance_by_currency': balance_by_currency,
             'total_income': totals['income'],
             'total_expenses': totals['expenses'],
             'net_flow': totals['income'] - totals['expenses'],
@@ -1059,21 +1081,33 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             request,
         ).order_by('movement_date')
         
-        # Solde d'ouverture (dernier mouvement avant ce jour)
-        prev_movement = self._scope_cash_movements(
-            CashMovement.objects.filter(
-                organization=org,
-                movement_date__date__lt=report_date
-            ),
-            request,
-        ).order_by('-movement_date', '-created_at').first()
-        
-        opening_balance = prev_movement.balance_after if prev_movement else Decimal('0')
-        
-        # Solde de clôture (dernier mouvement du jour)
-        last_movement = movements.order_by('-movement_date', '-created_at').first()
-        closing_balance = last_movement.balance_after if last_movement else opening_balance
-        
+        # Soldes d'ouverture / clôture : le tiroir étant suivi PAR DEVISE, on
+        # somme le dernier solde de CHAQUE devise converti en principale (avant :
+        # le solde de la dernière devise ayant bougé, toutes devises confondues).
+        opening_balance = balance_in_primary(
+            self._scope_cash_movements(
+                CashMovement.objects.filter(
+                    organization=org,
+                    is_cancelled=False,
+                    movement_date__date__lt=report_date,
+                ),
+                request,
+            )
+        )
+
+        # Sans mouvement jusqu'à cette date, `balance_in_primary` renvoie 0, ce
+        # qui est aussi la valeur d'ouverture : pas de cas particulier à traiter.
+        closing_balance = balance_in_primary(
+            self._scope_cash_movements(
+                CashMovement.objects.filter(
+                    organization=org,
+                    is_cancelled=False,
+                    movement_date__date__lte=report_date,
+                ),
+                request,
+            )
+        )
+
         # Ventes du jour
         sales = self._scope_sales(
             Sale.objects.filter(
@@ -1122,18 +1156,19 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             total=Coalesce(Sum(F('amount_due') * F('exchange_rate')), Decimal('0'), output_field=DecimalField())
         )['total']
         
-        # Recouvrements de créances
+        # Mouvements de caisse convertis en devise principale, comme les ventes
+        # ci-dessus (un mouvement en USD ne peut pas être sommé brut avec du CDF).
         debt_collections = movements.filter(
             movement_type='debt_collection'
-        ).aggregate(total=Coalesce(Sum('amount'), Decimal('0'), output_field=DecimalField()))['total']
-        
+        ).aggregate(total=primary_sum('amount'))['total']
+
         # Dépenses
         expenses_movements = movements.filter(direction='out')
-        expenses_total = expenses_movements.aggregate(total=Coalesce(Sum('amount'), Decimal('0'), output_field=DecimalField()))['total']
+        expenses_total = expenses_movements.aggregate(total=primary_sum('amount'))['total']
         expenses_count = expenses_movements.count()
-        
+
         # Flux net
-        income = movements.filter(direction='in').aggregate(total=Coalesce(Sum('amount'), Decimal('0'), output_field=DecimalField()))['total']
+        income = movements.filter(direction='in').aggregate(total=primary_sum('amount'))['total']
         net_cash_flow = income - expenses_total
         
         report_data = {
@@ -1238,7 +1273,8 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         gross_profit = total_revenue - total_cost
         gross_margin = (gross_profit / total_revenue * 100) if total_revenue > 0 else Decimal('0')
         
-        # Dépenses de la période
+        # Dépenses de la période, converties en devise principale (montant × taux)
+        # pour être soustraites d'un chiffre d'affaires lui aussi en principale.
         expenses = self._scope_expenses(
             Expense.objects.filter(
                 organization=org,
@@ -1247,7 +1283,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
                 status='paid'
             ),
             request,
-        ).aggregate(total=Coalesce(Sum('amount'), Decimal('0'), output_field=DecimalField()))['total']
+        ).aggregate(total=primary_sum('amount'))['total']
         
         # Bénéfice net
         net_profit = gross_profit - expenses

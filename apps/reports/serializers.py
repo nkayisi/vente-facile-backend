@@ -111,9 +111,22 @@ class StockStatsSerializer(serializers.Serializer):
     expiring_soon_count = serializers.IntegerField()
 
 
+class CurrencyBalanceSerializer(serializers.Serializer):
+    """Solde d'UNE devise du tiroir (montant brut, non converti)."""
+    currency = serializers.CharField()
+    balance = serializers.DecimalField(max_digits=15, decimal_places=2)
+
+
 class CashbookStatsSerializer(serializers.Serializer):
-    """Statistiques de la caisse"""
+    """Statistiques de la caisse.
+
+    Les montants scalaires sont exprimés en devise principale (`currency`) :
+    chaque mouvement est converti via son `exchange_rate` avant agrégation.
+    `balance_by_currency` donne le détail réel du tiroir, devise par devise.
+    """
+    currency = serializers.CharField(required=False)
     current_balance = serializers.DecimalField(max_digits=15, decimal_places=2)
+    balance_by_currency = CurrencyBalanceSerializer(many=True, required=False)
     total_income = serializers.DecimalField(max_digits=15, decimal_places=2)
     total_expenses = serializers.DecimalField(max_digits=15, decimal_places=2)
     net_flow = serializers.DecimalField(max_digits=15, decimal_places=2)

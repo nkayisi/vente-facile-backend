@@ -371,26 +371,25 @@ class SupplierPaymentViewSet(
         supplier.current_balance += payment.amount
         supplier.save()
         
-        # Enregistrer le mouvement de caisse inverse (remboursement fournisseur)
-        from apps.cashbook.services import _get_last_balance
-        from apps.cashbook.models import CashMovement as CM
-        from apps.core.utils import ReferenceGenerator
-        from django.utils import timezone as tz
-        previous_balance = _get_last_balance(payment.organization)
-        new_balance = previous_balance + payment.amount
+        # Enregistrer le mouvement de caisse inverse (remboursement fournisseur).
+        # Passe par `_movement` comme tous les autres flux : la devise et le taux
+        # y sont résolus, et `balance_after` est suivi PAR DEVISE.
+        #
+        # Devise volontairement laissée à la principale, pour rester SYMÉTRIQUE
+        # de `record_purchase_payment` (création). `SupplierPayment.currency` a
+        # un défaut 'USD' indépendant de la devise de l'organisation : s'y fier
+        # créerait des mouvements USD pour des montants réellement en CDF.
+        from apps.cashbook.services import _movement
         first_alloc = payment.allocations.first()
-        CM.objects.create(
-            organization=payment.organization,
-            reference=ReferenceGenerator.generate_cash_movement_reference(payment.organization),
+        _movement(
+            payment.organization,
             direction='in',
             movement_type='supplier_refund',
             amount=payment.amount,
             description=f"Annulation paiement fournisseur {payment.reference} - {supplier.name}",
             purchase_order=first_alloc.purchase_order if first_alloc else None,
             supplier=supplier,
-            balance_after=new_balance,
-            movement_date=tz.now(),
-            created_by=request.user,
+            user=request.user,
         )
         
         payment.status = 'cancelled'

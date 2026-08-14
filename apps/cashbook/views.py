@@ -2,8 +2,8 @@
 ViewSets pour le module Livre de Caisse.
 """
 from decimal import Decimal
-from django.db.models import Sum, Count, Q, F
-from django.db.models.functions import TruncDate, TruncMonth
+from django.db.models import Sum, Count, Q, F, DecimalField
+from django.db.models.functions import Coalesce, TruncDate, TruncMonth
 from django.utils import timezone
 from rest_framework import viewsets, filters, status
 from rest_framework.decorators import action
@@ -70,17 +70,23 @@ class IncomeCategoryViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
 
     def get_queryset(self):
         queryset = super().get_queryset()
-        # Annoter avec le nombre de mouvements et le total des entrées
+        # Annoter avec le nombre de mouvements et le total des entrées.
+        # `total_amount` est CONVERTI en devise principale (montant × taux) :
+        # une catégorie peut agréger des entrées de devises différentes, qu'on
+        # ne peut pas additionner brutes. Le détail par devise est disponible
+        # dans les rapports de caisse (`summary`, `daily-report`…).
+        in_filter = Q(cash_movements__is_cancelled=False, cash_movements__direction='in')
         queryset = queryset.annotate(
-            movement_count=Count(
-                'cash_movements',
-                filter=Q(cash_movements__is_cancelled=False, cash_movements__direction='in')
+            movement_count=Count('cash_movements', filter=in_filter),
+            total_amount=Coalesce(
+                Sum(
+                    F('cash_movements__amount') * F('cash_movements__exchange_rate'),
+                    filter=in_filter,
+                    output_field=DecimalField(max_digits=24, decimal_places=6),
+                ),
+                Decimal('0'),
+                output_field=DecimalField(max_digits=24, decimal_places=6),
             ),
-            total_amount=Sum(
-                'cash_movements__amount',
-                filter=Q(cash_movements__is_cancelled=False, cash_movements__direction='in'),
-                default=Decimal('0.00')
-            )
         )
         return queryset
 
@@ -120,17 +126,21 @@ class ExpenseCategoryViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
 
     def get_queryset(self):
         queryset = super().get_queryset()
-        # Annoter avec le nombre de dépenses et le total dépensé
+        # Annoter avec le nombre de dépenses et le total dépensé.
+        # `total_spent` est CONVERTI en devise principale (montant × taux) pour
+        # rester comparable à `budget_monthly`, qui est exprimé en principale.
+        paid_filter = Q(expenses__status__in=['approved', 'paid'])
         queryset = queryset.annotate(
-            expense_count=Count(
-                'expenses',
-                filter=Q(expenses__status__in=['approved', 'paid'])
+            expense_count=Count('expenses', filter=paid_filter),
+            total_spent=Coalesce(
+                Sum(
+                    F('expenses__amount') * F('expenses__exchange_rate'),
+                    filter=paid_filter,
+                    output_field=DecimalField(max_digits=24, decimal_places=6),
+                ),
+                Decimal('0'),
+                output_field=DecimalField(max_digits=24, decimal_places=6),
             ),
-            total_spent=Sum(
-                'expenses__amount',
-                filter=Q(expenses__status__in=['approved', 'paid']),
-                default=Decimal('0.00')
-            )
         )
         return queryset
 
@@ -160,7 +170,7 @@ class ExpenseViewSet(
     queryset = Expense.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['status', 'category', 'is_recurring', 'warehouse']
+    filterset_fields = ['status', 'category', 'is_recurring', 'warehouse', 'currency']
     search_fields = ['reference', 'description', 'beneficiary', 'notes']
     ordering_fields = ['expense_date', 'amount', 'created_at']
     ordering = ['-expense_date']
@@ -224,15 +234,37 @@ class ExpenseViewSet(
 
         return queryset
 
+    @staticmethod
+    def _resolve_currency(serializer, organization):
+        """Devise + taux d'une dépense, résolus côté serveur.
+
+        ``Expense.exchange_rate`` a un défaut modèle de 1.000000, donc
+        ``validated_data`` en contient toujours un : on ne considère un taux
+        comme « fourni par le client » que s'il est présent dans le payload
+        brut. Sinon une dépense en USD serait enregistrée au taux 1.
+        """
+        from .services import resolve_currency_rate
+        rate = (
+            serializer.validated_data.get('exchange_rate')
+            if 'exchange_rate' in serializer.initial_data
+            else None
+        )
+        return resolve_currency_rate(
+            organization, serializer.validated_data.get('currency'), rate
+        )
+
     def perform_create(self, serializer):
         # Vérifie le périmètre warehouse avant de générer la référence.
         self._assert_warehouse_on_save(serializer)
         from apps.core.utils import ReferenceGenerator
         organization = self.get_organization()
         reference = ReferenceGenerator.generate_expense_reference(organization)
+        currency, exchange_rate = self._resolve_currency(serializer, organization)
         serializer.save(
             organization=organization,
             reference=reference,
+            currency=currency,
+            exchange_rate=exchange_rate,
             created_by=self.request.user,
         )
 
@@ -243,7 +275,13 @@ class ExpenseViewSet(
             raise ValidationError("Seules les dépenses en brouillon ou en attente peuvent être modifiées.")
         if 'warehouse' in serializer.validated_data:
             self._assert_warehouse_on_save(serializer)
-        serializer.save()
+        # Une modification de devise doit re-résoudre le taux : on repart de la
+        # devise du payload si fournie, sinon de celle déjà enregistrée.
+        organization = self.get_organization()
+        if 'currency' not in serializer.validated_data:
+            serializer.validated_data['currency'] = expense.currency
+        currency, exchange_rate = self._resolve_currency(serializer, organization)
+        serializer.save(currency=currency, exchange_rate=exchange_rate)
 
     @action(detail=True, methods=['post'])
     def submit(self, request, pk=None):
@@ -380,30 +418,45 @@ class ExpenseViewSet(
         if date_to:
             queryset = queryset.filter(expense_date__lte=date_to)
 
-        # Total
+        from .services import primary_sum
+        primary = organization.currency or 'CDF'
+
+        # Totaux PAR DEVISE (le tiroir ne mélange jamais les devises) ET total
+        # converti en devise principale (chiffre comptable, pour le budget/P&L).
+        by_currency = list(
+            queryset.values('currency').annotate(
+                total=Sum('amount', default=Decimal('0.00')),
+                count=Count('id'),
+            ).order_by('currency')
+        )
         totals = queryset.aggregate(
-            total=Sum('amount', default=Decimal('0.00')),
+            total_primary=primary_sum('amount'),
             count=Count('id'),
         )
 
-        # Par catégorie
+        # Par catégorie (ventilé par devise)
         by_category = queryset.values(
-            'category__name', 'category__color'
+            'currency', 'category__name', 'category__color'
         ).annotate(
             total=Sum('amount', default=Decimal('0.00')),
             count=Count('id'),
         ).order_by('-total')
 
-        # Par mois
+        # Par mois (ventilé par devise)
         by_month = queryset.annotate(
             month=TruncMonth('expense_date')
-        ).values('month').annotate(
+        ).values('month', 'currency').annotate(
             total=Sum('amount', default=Decimal('0.00')),
             count=Count('id'),
-        ).order_by('month')
+        ).order_by('month', 'currency')
 
         return Response({
-            'total': totals['total'],
+            'currency': primary,
+            'by_currency': by_currency,
+            'total_primary': totals['total_primary'],
+            # `total` = rétro-compat : désormais le total CONVERTI en devise
+            # principale, plus jamais une somme de devises hétérogènes.
+            'total': totals['total_primary'],
             'count': totals['count'],
             'by_category': list(by_category),
             'by_month': list(by_month),
@@ -456,7 +509,7 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     queryset = CashMovement.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['direction', 'movement_type', 'is_cancelled']
+    filterset_fields = ['direction', 'movement_type', 'is_cancelled', 'currency']
     search_fields = ['reference', 'description', 'notes']
     ordering_fields = ['movement_date', 'amount', 'created_at']
     ordering = ['-movement_date']
@@ -520,6 +573,76 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             | Q(session__register__warehouse_id__in=allowed_ids)
         )
 
+    # ------------------------------------------------------------------
+    # Agrégation PAR DEVISE (jamais de somme inter-devises, jamais de
+    # conversion : une caisse multi-devise reflète le tiroir physique où
+    # chaque devise se cumule séparément).
+    # ------------------------------------------------------------------
+    def _primary_currency(self):
+        return (self.get_organization().currency or 'CDF')
+
+    @staticmethod
+    def _currencies_in(qs):
+        # `.order_by()` neutralise l'ordering par défaut du modèle : sinon
+        # DISTINCT inclut les colonnes de tri et renvoie des devises en double.
+        return list(
+            qs.order_by().values_list('currency', flat=True).distinct()
+        )
+
+    def _last_balance_by_currency(self, qs):
+        """Solde courant (`balance_after` du dernier mouvement) par devise."""
+        result = {}
+        for ccy in self._currencies_in(qs):
+            last = qs.filter(currency=ccy).order_by(
+                '-movement_date', '-created_at'
+            ).first()
+            result[ccy] = last.balance_after if last else Decimal('0.00')
+        return result
+
+    @staticmethod
+    def _totals_by_currency(qs):
+        """Entrées/sorties/net/count regroupés par devise."""
+        rows = qs.values('currency').annotate(
+            total_in=Sum('amount', filter=Q(direction='in'), default=Decimal('0.00')),
+            total_out=Sum('amount', filter=Q(direction='out'), default=Decimal('0.00')),
+            count=Count('id'),
+        ).order_by('currency')
+        return [
+            {
+                'currency': r['currency'],
+                'total_in': r['total_in'],
+                'total_out': r['total_out'],
+                'net': r['total_in'] - r['total_out'],
+                'count': r['count'],
+            }
+            for r in rows
+        ]
+
+    def _report_by_currency(self, base_qs, period_qs, before_date):
+        """Ouverture / entrées / sorties / clôture PAR DEVISE pour une période.
+
+        ``before_date`` : les mouvements strictement antérieurs déterminent le
+        solde d'ouverture de chaque devise (0 si la devise n'existait pas encore).
+        """
+        prev_qs = base_qs.filter(movement_date__date__lt=before_date)
+        opening_map = self._last_balance_by_currency(prev_qs)
+        period_totals = {r['currency']: r for r in self._totals_by_currency(period_qs)}
+        rows = []
+        for ccy in sorted(set(opening_map) | set(period_totals)):
+            opening = opening_map.get(ccy, Decimal('0.00'))
+            t = period_totals.get(ccy)
+            tin = t['total_in'] if t else Decimal('0.00')
+            tout = t['total_out'] if t else Decimal('0.00')
+            rows.append({
+                'currency': ccy,
+                'opening_balance': opening,
+                'total_in': tin,
+                'total_out': tout,
+                'net': tin - tout,
+                'closing_balance': opening + tin - tout,
+            })
+        return rows
+
     def get_queryset(self):
         queryset = super().get_queryset()
 
@@ -538,12 +661,26 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     def perform_create(self, serializer):
         """Créer un mouvement de caisse manuel (multi-devise)."""
         from apps.core.utils import ReferenceGenerator
-        from .services import get_open_session_for_user, _get_last_balance, _primary_currency
+        from .services import (
+            get_open_session_for_user, _get_last_balance, resolve_currency_rate,
+        )
         organization = self.get_organization()
 
         amount = serializer.validated_data['amount']
         direction = serializer.validated_data['direction']
-        currency = (serializer.validated_data.get('currency') or '').strip() or _primary_currency(organization)
+
+        # Devise + taux résolus côté serveur (le taux sert à reconvertir en
+        # devise principale dans les rapports comptables). Le défaut modèle de
+        # `exchange_rate` étant 1.000000, on ne retient un taux client que s'il
+        # figure explicitement dans le payload.
+        rate = (
+            serializer.validated_data.get('exchange_rate')
+            if 'exchange_rate' in serializer.initial_data
+            else None
+        )
+        currency, exchange_rate = resolve_currency_rate(
+            organization, serializer.validated_data.get('currency'), rate
+        )
 
         # Solde courant DE LA DEVISE du mouvement (le tiroir est suivi par devise).
         previous_balance = _get_last_balance(organization, currency)
@@ -557,6 +694,7 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             organization=organization,
             reference=ReferenceGenerator.generate_cash_movement_reference(organization),
             currency=currency,
+            exchange_rate=exchange_rate,
             balance_after=new_balance,
             session=session,
             created_by=self.request.user,
@@ -583,33 +721,49 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def balance(self, request):
-        """Solde actuel de la caisse."""
+        """Solde actuel de la caisse, ventilé PAR DEVISE (tiroir physique)."""
         organization = self.get_organization()
+        primary = self._primary_currency()
 
         scoped_qs = self._scope_cash_movements_to_membership(
             CashMovement.objects.filter(organization=organization, is_cancelled=False)
         )
 
-        last_movement = scoped_qs.order_by('-movement_date', '-created_at').first()
+        # Solde courant par devise (dernier balance_after de chaque devise).
+        balances = self._last_balance_by_currency(scoped_qs)
 
-        balance = last_movement.balance_after if last_movement else Decimal('0.00')
-
-        # Totaux du jour
+        # Totaux du jour par devise.
         today = timezone.now().date()
-        today_movements = scoped_qs.filter(movement_date__date=today)
+        today_totals = {
+            r['currency']: r
+            for r in self._totals_by_currency(scoped_qs.filter(movement_date__date=today))
+        }
 
-        today_in = today_movements.filter(direction='in').aggregate(
-            total=Sum('amount', default=Decimal('0.00'))
-        )['total']
-        today_out = today_movements.filter(direction='out').aggregate(
-            total=Sum('amount', default=Decimal('0.00'))
-        )['total']
+        currencies = sorted(set(balances) | set(today_totals))
+        by_currency = []
+        for ccy in currencies:
+            bal = balances.get(ccy, Decimal('0.00'))
+            t = today_totals.get(ccy)
+            tin = t['total_in'] if t else Decimal('0.00')
+            tout = t['total_out'] if t else Decimal('0.00')
+            by_currency.append({
+                'currency': ccy,
+                'balance': bal,
+                'today_in': tin,
+                'today_out': tout,
+                'today_net': tin - tout,
+            })
 
+        # Champs scalaires = devise principale uniquement (rétro-compat ; plus
+        # jamais une somme mélangée de devises différentes).
+        primary_row = next((r for r in by_currency if r['currency'] == primary), None)
         return Response({
-            'balance': balance,
-            'today_in': today_in,
-            'today_out': today_out,
-            'today_net': today_in - today_out,
+            'by_currency': by_currency,
+            'currency': primary,
+            'balance': primary_row['balance'] if primary_row else Decimal('0.00'),
+            'today_in': primary_row['today_in'] if primary_row else Decimal('0.00'),
+            'today_out': primary_row['today_out'] if primary_row else Decimal('0.00'),
+            'today_net': primary_row['today_net'] if primary_row else Decimal('0.00'),
         })
 
     @action(detail=False, methods=['get'])
@@ -628,33 +782,41 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         if date_to:
             queryset = queryset.filter(movement_date__date__lte=date_to)
 
-        # Totaux globaux
-        totals = queryset.aggregate(
-            total_in=Sum('amount', filter=Q(direction='in'), default=Decimal('0.00')),
-            total_out=Sum('amount', filter=Q(direction='out'), default=Decimal('0.00')),
-            count=Count('id'),
-        )
-        totals['net'] = totals['total_in'] - totals['total_out']
+        primary = self._primary_currency()
 
-        # Par type de mouvement
+        # Totaux PAR DEVISE (jamais de somme inter-devises).
+        by_currency = self._totals_by_currency(queryset)
+
+        # Par type de mouvement (ventilé par devise).
         by_type = queryset.values(
-            'movement_type', 'direction'
+            'currency', 'movement_type', 'direction'
         ).annotate(
             total=Sum('amount', default=Decimal('0.00')),
             count=Count('id'),
-        ).order_by('-total')
+        ).order_by('currency', '-total')
 
-        # Par jour
+        # Par jour (ventilé par devise).
         by_day = queryset.annotate(
             day=TruncDate('movement_date')
-        ).values('day').annotate(
+        ).values('day', 'currency').annotate(
             total_in=Sum('amount', filter=Q(direction='in'), default=Decimal('0.00')),
             total_out=Sum('amount', filter=Q(direction='out'), default=Decimal('0.00')),
             count=Count('id'),
-        ).order_by('day')
+        ).order_by('day', 'currency')
 
+        # Scalaires = devise principale (rétro-compat).
+        primary_totals = next(
+            (r for r in by_currency if r['currency'] == primary),
+            {'total_in': Decimal('0.00'), 'total_out': Decimal('0.00'),
+             'net': Decimal('0.00'), 'count': 0},
+        )
         return Response({
-            **totals,
+            'currency': primary,
+            'total_in': primary_totals['total_in'],
+            'total_out': primary_totals['total_out'],
+            'net': primary_totals['net'],
+            'count': primary_totals['count'],
+            'by_currency': by_currency,
             'by_type': list(by_type),
             'by_day': list(by_day),
         })
@@ -675,47 +837,45 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             'payment_method', 'sale', 'expense', 'customer', 'supplier', 'created_by'
         ).order_by('movement_date')
 
-        # Solde d'ouverture (dernier mouvement avant cette date)
-        opening_movement = base_qs.filter(
-            movement_date__date__lt=date_str,
-        ).order_by('-movement_date', '-created_at').first()
+        primary = self._primary_currency()
 
-        opening_balance = opening_movement.balance_after if opening_movement else Decimal('0.00')
+        # Ouverture / totaux / clôture PAR DEVISE.
+        by_currency = self._report_by_currency(base_qs, movements, date_str)
 
-        # Totaux
-        totals = movements.aggregate(
-            total_in=Sum('amount', filter=Q(direction='in'), default=Decimal('0.00')),
-            total_out=Sum('amount', filter=Q(direction='out'), default=Decimal('0.00')),
-        )
-
-        closing_balance = opening_balance + totals['total_in'] - totals['total_out']
-
-        # Par type
+        # Par type (ventilé par devise).
         by_type = movements.values(
-            'movement_type', 'direction'
+            'currency', 'movement_type', 'direction'
         ).annotate(
             total=Sum('amount', default=Decimal('0.00')),
             count=Count('id'),
-        ).order_by('direction', '-total')
+        ).order_by('currency', 'direction', '-total')
 
         # Pagination des mouvements
         page = int(request.query_params.get('page', 1))
         page_size = int(request.query_params.get('page_size', 20))
-        
+
         all_movements = list(movements)
         total_movements = len(all_movements)
-        
+
         start_idx = (page - 1) * page_size
         end_idx = start_idx + page_size
         paginated_movements = all_movements[start_idx:end_idx]
 
+        # Scalaires = devise principale (rétro-compat).
+        primary_row = next(
+            (r for r in by_currency if r['currency'] == primary),
+            {'opening_balance': Decimal('0.00'), 'closing_balance': Decimal('0.00'),
+             'total_in': Decimal('0.00'), 'total_out': Decimal('0.00'), 'net': Decimal('0.00')},
+        )
         return Response({
             'date': date_str,
-            'opening_balance': opening_balance,
-            'closing_balance': closing_balance,
-            'total_in': totals['total_in'],
-            'total_out': totals['total_out'],
-            'net': totals['total_in'] - totals['total_out'],
+            'currency': primary,
+            'opening_balance': primary_row['opening_balance'],
+            'closing_balance': primary_row['closing_balance'],
+            'total_in': primary_row['total_in'],
+            'total_out': primary_row['total_out'],
+            'net': primary_row['net'],
+            'by_currency': by_currency,
             'by_type': list(by_type),
             'movements': {
                 'results': CashMovementListSerializer(paginated_movements, many=True).data,
@@ -733,6 +893,7 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         year = int(request.query_params.get('year', timezone.now().year))
         month = int(request.query_params.get('month', timezone.now().month))
 
+        primary = self._primary_currency()
         base_qs = self._scope_cash_movements_to_membership(
             CashMovement.objects.filter(organization=organization, is_cancelled=False)
         )
@@ -741,60 +902,60 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             movement_date__month=month,
         )
 
-        # Totaux globaux du mois
-        totals = movements.aggregate(
-            total_in=Sum('amount', filter=Q(direction='in'), default=Decimal('0.00')),
-            total_out=Sum('amount', filter=Q(direction='out'), default=Decimal('0.00')),
-            count=Count('id'),
-        )
+        import datetime
+        first_day = datetime.date(year, month, 1)
 
-        # Par jour
+        # Ouverture / totaux / clôture PAR DEVISE.
+        by_currency = self._report_by_currency(base_qs, movements, first_day)
+
+        # Par jour (ventilé par devise).
         by_day = movements.annotate(
             day=TruncDate('movement_date')
-        ).values('day').annotate(
+        ).values('day', 'currency').annotate(
             total_in=Sum('amount', filter=Q(direction='in'), default=Decimal('0.00')),
             total_out=Sum('amount', filter=Q(direction='out'), default=Decimal('0.00')),
             count=Count('id'),
-        ).order_by('day')
+        ).order_by('day', 'currency')
 
-        # Par type
+        # Par type (ventilé par devise)
         by_type = movements.values(
-            'movement_type', 'direction'
+            'currency', 'movement_type', 'direction'
         ).annotate(
             total=Sum('amount', default=Decimal('0.00')),
             count=Count('id'),
-        ).order_by('direction', '-total')
+        ).order_by('currency', 'direction', '-total')
 
-        # Par catégorie de dépense
+        # Par catégorie de dépense (ventilé par devise)
         expense_by_category = movements.filter(
             movement_type='expense',
             expense__isnull=False,
         ).values(
-            'expense__category__name', 'expense__category__color'
+            'currency', 'expense__category__name', 'expense__category__color'
         ).annotate(
             total=Sum('amount', default=Decimal('0.00')),
             count=Count('id'),
         ).order_by('-total')
 
-        # Solde d'ouverture du mois
-        import datetime
-        first_day = datetime.date(year, month, 1)
-        opening_movement = base_qs.filter(
-            movement_date__date__lt=first_day,
-        ).order_by('-movement_date', '-created_at').first()
-
-        opening_balance = opening_movement.balance_after if opening_movement else Decimal('0.00')
-        closing_balance = opening_balance + totals['total_in'] - totals['total_out']
+        # Scalaires = devise principale (rétro-compat).
+        primary_row = next(
+            (r for r in by_currency if r['currency'] == primary),
+            {'opening_balance': Decimal('0.00'), 'closing_balance': Decimal('0.00'),
+             'total_in': Decimal('0.00'), 'total_out': Decimal('0.00'), 'net': Decimal('0.00')},
+        )
+        opening_balance = primary_row['opening_balance']
+        closing_balance = primary_row['closing_balance']
 
         return Response({
             'year': year,
             'month': month,
+            'currency': primary,
             'opening_balance': opening_balance,
             'closing_balance': closing_balance,
-            'total_in': totals['total_in'],
-            'total_out': totals['total_out'],
-            'net': totals['total_in'] - totals['total_out'],
-            'count': totals['count'],
+            'total_in': primary_row['total_in'],
+            'total_out': primary_row['total_out'],
+            'net': primary_row['net'],
+            'count': movements.count(),
+            'by_currency': by_currency,
             'by_day': list(by_day),
             'by_type': list(by_type),
             'expense_by_category': list(expense_by_category),
@@ -806,64 +967,62 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         organization = self.get_organization()
         year = int(request.query_params.get('year', timezone.now().year))
 
+        primary = self._primary_currency()
         base_qs = self._scope_cash_movements_to_membership(
             CashMovement.objects.filter(organization=organization, is_cancelled=False)
         )
         movements = base_qs.filter(movement_date__year=year)
 
-        # Totaux globaux de l'année
-        totals = movements.aggregate(
-            total_in=Sum('amount', filter=Q(direction='in'), default=Decimal('0.00')),
-            total_out=Sum('amount', filter=Q(direction='out'), default=Decimal('0.00')),
-            count=Count('id'),
-        )
+        import datetime
+        first_day = datetime.date(year, 1, 1)
 
-        # Par mois
+        # Ouverture / totaux / clôture PAR DEVISE.
+        by_currency = self._report_by_currency(base_qs, movements, first_day)
+
+        # Par mois (ventilé par devise)
         by_month = movements.annotate(
             month=TruncMonth('movement_date')
-        ).values('month').annotate(
+        ).values('month', 'currency').annotate(
             total_in=Sum('amount', filter=Q(direction='in'), default=Decimal('0.00')),
             total_out=Sum('amount', filter=Q(direction='out'), default=Decimal('0.00')),
             count=Count('id'),
-        ).order_by('month')
+        ).order_by('month', 'currency')
 
-        # Par type
+        # Par type (ventilé par devise)
         by_type = movements.values(
-            'movement_type', 'direction'
+            'currency', 'movement_type', 'direction'
         ).annotate(
             total=Sum('amount', default=Decimal('0.00')),
             count=Count('id'),
-        ).order_by('direction', '-total')
+        ).order_by('currency', 'direction', '-total')
 
-        # Par catégorie de dépense
+        # Par catégorie de dépense (ventilé par devise)
         expense_by_category = movements.filter(
             movement_type='expense',
             expense__isnull=False,
         ).values(
-            'expense__category__name', 'expense__category__color'
+            'currency', 'expense__category__name', 'expense__category__color'
         ).annotate(
             total=Sum('amount', default=Decimal('0.00')),
             count=Count('id'),
         ).order_by('-total')
 
-        # Solde d'ouverture de l'année
-        import datetime
-        first_day = datetime.date(year, 1, 1)
-        opening_movement = base_qs.filter(
-            movement_date__date__lt=first_day,
-        ).order_by('-movement_date', '-created_at').first()
-
-        opening_balance = opening_movement.balance_after if opening_movement else Decimal('0.00')
-        closing_balance = opening_balance + totals['total_in'] - totals['total_out']
-
+        # Scalaires = devise principale (rétro-compat).
+        primary_row = next(
+            (r for r in by_currency if r['currency'] == primary),
+            {'opening_balance': Decimal('0.00'), 'closing_balance': Decimal('0.00'),
+             'total_in': Decimal('0.00'), 'total_out': Decimal('0.00'), 'net': Decimal('0.00')},
+        )
         return Response({
             'year': year,
-            'opening_balance': opening_balance,
-            'closing_balance': closing_balance,
-            'total_in': totals['total_in'],
-            'total_out': totals['total_out'],
-            'net': totals['total_in'] - totals['total_out'],
-            'count': totals['count'],
+            'currency': primary,
+            'opening_balance': primary_row['opening_balance'],
+            'closing_balance': primary_row['closing_balance'],
+            'total_in': primary_row['total_in'],
+            'total_out': primary_row['total_out'],
+            'net': primary_row['net'],
+            'count': movements.count(),
+            'by_currency': by_currency,
             'by_month': list(by_month),
             'by_type': list(by_type),
             'expense_by_category': list(expense_by_category),
@@ -882,6 +1041,7 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        primary = self._primary_currency()
         base_qs = self._scope_cash_movements_to_membership(
             CashMovement.objects.filter(organization=organization, is_cancelled=False)
         )
@@ -890,58 +1050,54 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             movement_date__date__lte=date_to,
         )
 
-        # Totaux globaux
-        totals = movements.aggregate(
-            total_in=Sum('amount', filter=Q(direction='in'), default=Decimal('0.00')),
-            total_out=Sum('amount', filter=Q(direction='out'), default=Decimal('0.00')),
-            count=Count('id'),
-        )
+        # Ouverture / totaux / clôture PAR DEVISE.
+        by_currency = self._report_by_currency(base_qs, movements, date_from)
 
-        # Par jour
+        # Par jour (ventilé par devise)
         by_day = movements.annotate(
             day=TruncDate('movement_date')
-        ).values('day').annotate(
+        ).values('day', 'currency').annotate(
             total_in=Sum('amount', filter=Q(direction='in'), default=Decimal('0.00')),
             total_out=Sum('amount', filter=Q(direction='out'), default=Decimal('0.00')),
             count=Count('id'),
-        ).order_by('day')
+        ).order_by('day', 'currency')
 
-        # Par type
+        # Par type (ventilé par devise)
         by_type = movements.values(
-            'movement_type', 'direction'
+            'currency', 'movement_type', 'direction'
         ).annotate(
             total=Sum('amount', default=Decimal('0.00')),
             count=Count('id'),
-        ).order_by('direction', '-total')
+        ).order_by('currency', 'direction', '-total')
 
-        # Par catégorie de dépense
+        # Par catégorie de dépense (ventilé par devise)
         expense_by_category = movements.filter(
             movement_type='expense',
             expense__isnull=False,
         ).values(
-            'expense__category__name', 'expense__category__color'
+            'currency', 'expense__category__name', 'expense__category__color'
         ).annotate(
             total=Sum('amount', default=Decimal('0.00')),
             count=Count('id'),
         ).order_by('-total')
 
-        # Solde d'ouverture
-        opening_movement = base_qs.filter(
-            movement_date__date__lt=date_from,
-        ).order_by('-movement_date', '-created_at').first()
-
-        opening_balance = opening_movement.balance_after if opening_movement else Decimal('0.00')
-        closing_balance = opening_balance + totals['total_in'] - totals['total_out']
-
+        # Scalaires = devise principale (rétro-compat).
+        primary_row = next(
+            (r for r in by_currency if r['currency'] == primary),
+            {'opening_balance': Decimal('0.00'), 'closing_balance': Decimal('0.00'),
+             'total_in': Decimal('0.00'), 'total_out': Decimal('0.00'), 'net': Decimal('0.00')},
+        )
         return Response({
             'date_from': date_from,
             'date_to': date_to,
-            'opening_balance': opening_balance,
-            'closing_balance': closing_balance,
-            'total_in': totals['total_in'],
-            'total_out': totals['total_out'],
-            'net': totals['total_in'] - totals['total_out'],
-            'count': totals['count'],
+            'currency': primary,
+            'opening_balance': primary_row['opening_balance'],
+            'closing_balance': primary_row['closing_balance'],
+            'total_in': primary_row['total_in'],
+            'total_out': primary_row['total_out'],
+            'net': primary_row['net'],
+            'count': movements.count(),
+            'by_currency': by_currency,
             'by_day': list(by_day),
             'by_type': list(by_type),
             'expense_by_category': list(expense_by_category),
