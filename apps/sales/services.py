@@ -317,37 +317,13 @@ def resolve_sale_currency(organization_id, currency=None, exchange_rate=None):
     """
     Devise de facture + taux snapshot d'une vente, résolus côté serveur.
 
-    Retourne ``(currency, exchange_rate)`` où ``exchange_rate`` = unités de
-    devise PRINCIPALE de l'org pour 1 unité de ``currency``.
-
-    - devise absente ⇒ devise principale de l'organisation, taux 1 ;
-    - devise = principale ⇒ taux 1 (forcé) ;
-    - devise secondaire avec un taux de 1 ⇒ le taux est (re)lu depuis
-      ``OrganizationCurrency`` : 1 est impossible pour une devise secondaire,
-      c'est la marque d'un taux jamais renseigné, qui fausserait les rapports.
+    Délègue à ``CurrencyService.resolve``, point d'entrée unique du projet.
+    Non strict : une vente ne doit jamais échouer parce qu'une devise
+    historique a été désactivée depuis.
     """
-    from apps.organizations.models import Organization
     from apps.settings.services import CurrencyService
 
-    primary = (
-        Organization.objects.filter(id=organization_id)
-        .values_list('currency', flat=True)
-        .first()
-    ) or 'CDF'
-    currency = (currency or '').strip() or primary
-
-    if currency == primary:
-        return currency, Decimal('1.000000')
-
-    if exchange_rate is None or Decimal(exchange_rate) in (Decimal('0'), Decimal('1')):
-        oc = CurrencyService.get_org_currencies(
-            Organization.objects.get(id=organization_id)
-        ).get(currency)
-        if oc is not None:
-            return currency, oc.exchange_rate
-        return currency, Decimal('1.000000')
-
-    return currency, Decimal(exchange_rate)
+    return CurrencyService.resolve(organization_id, currency, exchange_rate)
 
 
 def resolve_tender(sale_currency, organization, tendered_amount, currency=None,

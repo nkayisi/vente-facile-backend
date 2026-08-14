@@ -267,3 +267,89 @@ class MonoCurrencyRegressionTests(APITestCase):
         self.assertEqual(Decimal(stats.data['total']), Decimal('250000'))
         self.assertEqual(len(stats.data['by_currency']), 1)
         self.assertEqual(stats.data['by_currency'][0]['currency'], 'CDF')
+
+
+class OtherModelsCurrencyDefaultTests(_BaseCashbookCurrencyTest):
+    """Achats, fournisseurs et abonnements : plus aucune devise codée en dur.
+
+    `PurchaseOrder`, `SupplierPayment` et `Supplier` avaient un défaut 'USD'
+    sans rapport avec l'établissement ; les modèles de facturation SaaS avaient
+    un défaut 'USD' au lieu de suivre la devise du plan souscrit.
+    """
+
+    def test_purchase_order_without_currency_uses_org_primary(self):
+        from apps.contacts.models import Supplier
+        from apps.purchases.models import PurchaseOrder
+
+        supplier = Supplier.objects.create(organization=self.org, name='Fournisseur A')
+        order = PurchaseOrder.objects.create(
+            organization=self.org,
+            reference='PO-TEST-0001',
+            supplier=supplier,
+            warehouse=self.warehouse,
+            order_date='2026-08-14',
+            total=Decimal('1000.00'),
+        )
+        self.assertEqual(order.currency, 'CDF')          # principale, pas 'USD'
+        self.assertEqual(order.exchange_rate, Decimal('1.000000'))
+
+    def test_purchase_order_in_usd_snapshots_rate(self):
+        from apps.contacts.models import Supplier
+        from apps.purchases.models import PurchaseOrder
+
+        supplier = Supplier.objects.create(organization=self.org, name='Fournisseur B')
+        order = PurchaseOrder.objects.create(
+            organization=self.org,
+            reference='PO-TEST-0002',
+            supplier=supplier,
+            warehouse=self.warehouse,
+            order_date='2026-08-14',
+            currency='USD',
+            total=Decimal('10.00'),
+        )
+        self.assertEqual(order.currency, 'USD')
+        self.assertEqual(order.exchange_rate, self.RATE_USD)
+
+    def test_supplier_without_currency_uses_org_primary(self):
+        from apps.contacts.models import Supplier
+
+        supplier = Supplier.objects.create(organization=self.org, name='Fournisseur C')
+        self.assertEqual(supplier.currency, 'CDF')
+
+    def test_supplier_payment_without_currency_uses_org_primary(self):
+        from apps.contacts.models import Supplier
+        from apps.purchases.models import SupplierPayment
+
+        supplier = Supplier.objects.create(organization=self.org, name='Fournisseur D')
+        payment = SupplierPayment.objects.create(
+            organization=self.org,
+            reference='SP-TEST-0001',
+            supplier=supplier,
+            amount=Decimal('500.00'),
+            payment_date='2026-08-14',
+        )
+        self.assertEqual(payment.currency, 'CDF')
+        self.assertEqual(payment.exchange_rate, Decimal('1.000000'))
+
+    def test_subscription_follows_plan_currency_not_org_currency(self):
+        """La facturation SaaS suit le plan, pas la devise d'exploitation."""
+        from apps.settings.models import Currency
+        from apps.subscriptions.models import Plan, Subscription
+        from django.utils import timezone
+
+        usd = Currency.objects.get(code='USD')
+        plan = Plan.objects.create(
+            name='Pro', code='pro-test', price_monthly=Decimal('20.00'),
+            price_yearly=Decimal('200.00'), currency=usd, tier=2, is_active=True,
+        )
+        now = timezone.now()
+        subscription = Subscription.objects.create(
+            organization=self.org, plan=plan,
+            status=Subscription.Status.ACTIVE,
+            billing_cycle=Plan.BillingCycle.MONTHLY,
+            price=Decimal('20.00'),
+            current_period_start=now, current_period_end=now,
+        )
+        # L'org vend en CDF, mais le plan est tarifé en USD.
+        self.assertEqual(self.org.currency, 'CDF')
+        self.assertEqual(subscription.currency, 'USD')

@@ -493,6 +493,12 @@ class SupplierPaymentCreateSerializer(serializers.ModelSerializer):
             purchase_order=first_po,
             amount=payment.amount,
             supplier=supplier,
+            # La sortie de caisse est dans la devise réellement décaissée.
+            # `SupplierPayment.save()` l'a résolue vers une devise activée de
+            # l'organisation, elle est donc fiable (auparavant le champ portait
+            # un défaut 'USD' sans rapport, qu'on ne pouvait pas suivre).
+            currency=payment.currency,
+            exchange_rate=payment.exchange_rate,
             user=self.context['request'].user,
         )
         

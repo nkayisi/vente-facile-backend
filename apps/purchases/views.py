@@ -375,10 +375,8 @@ class SupplierPaymentViewSet(
         # Passe par `_movement` comme tous les autres flux : la devise et le taux
         # y sont résolus, et `balance_after` est suivi PAR DEVISE.
         #
-        # Devise volontairement laissée à la principale, pour rester SYMÉTRIQUE
-        # de `record_purchase_payment` (création). `SupplierPayment.currency` a
-        # un défaut 'USD' indépendant de la devise de l'organisation : s'y fier
-        # créerait des mouvements USD pour des montants réellement en CDF.
+        # Devise du règlement annulé, pour rester symétrique de l'entrée créée
+        # par `record_purchase_payment`.
         from apps.cashbook.services import _movement
         first_alloc = payment.allocations.first()
         _movement(
@@ -386,6 +384,8 @@ class SupplierPaymentViewSet(
             direction='in',
             movement_type='supplier_refund',
             amount=payment.amount,
+            currency=payment.currency,
+            exchange_rate=payment.exchange_rate,
             description=f"Annulation paiement fournisseur {payment.reference} - {supplier.name}",
             purchase_order=first_alloc.purchase_order if first_alloc else None,
             supplier=supplier,

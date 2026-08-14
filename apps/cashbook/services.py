@@ -21,46 +21,15 @@ def _primary_currency(organization):
 
 def resolve_currency_rate(organization, currency=None, exchange_rate=None, strict=True):
     """
-    Résout le couple ``(currency, exchange_rate)`` d'une ligne de caisse.
+    Devise + taux d'une ligne de caisse (dépense, mouvement).
 
-    ``exchange_rate`` retourné = unités de devise PRINCIPALE pour 1 unité de
-    ``currency`` (principale ⇒ 1). C'est la convention de tout le projet.
-
-    - ``currency`` vide ⇒ devise principale, taux 1 ;
-    - ``currency`` == principale ⇒ taux 1 (forcé, on ignore un taux fourni) ;
-    - taux fourni et > 0 ⇒ utilisé tel quel (le client fait autorité, cf. POS) ;
-    - sinon ⇒ lu depuis ``OrganizationCurrency`` (source de vérité serveur).
-
-    ``strict=True`` (saisie utilisateur : dépense, mouvement manuel) lève
-    ``ValidationError`` si la devise n'est pas configurée/active dans l'org.
-    ``strict=False`` (flux internes déclenchés par une vente/un achat déjà
-    validé ailleurs) retombe sur un taux 1 plutôt que de casser la transaction.
+    Délègue à ``CurrencyService.resolve``, point d'entrée unique du projet. Le
+    défaut ``strict=True`` reflète l'usage local : ces lignes viennent d'une
+    saisie utilisateur, une devise non activée doit être refusée.
     """
-    from rest_framework.exceptions import ValidationError
     from apps.settings.services import CurrencyService
 
-    primary = _primary_currency(organization)
-    currency = (currency or '').strip() or primary
-
-    if currency == primary:
-        return currency, Decimal('1.000000')
-
-    oc = CurrencyService.get_org_currencies(organization).get(currency)
-    if oc is None:
-        if strict:
-            raise ValidationError({
-                'currency': f"La devise '{currency}' n'est pas activée pour cette organisation."
-            })
-        return currency, (
-            Decimal(exchange_rate)
-            if exchange_rate is not None and Decimal(exchange_rate) > 0
-            else Decimal('1.000000')
-        )
-
-    if exchange_rate is not None and Decimal(exchange_rate) > 0:
-        return currency, Decimal(exchange_rate)
-
-    return currency, oc.exchange_rate
+    return CurrencyService.resolve(organization, currency, exchange_rate, strict=strict)
 
 
 # ---------------------------------------------------------------------------

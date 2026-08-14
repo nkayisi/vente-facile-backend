@@ -77,11 +77,17 @@ class PurchaseOrder(TenantSoftDeleteModel):
         default=Decimal('0.00')
     )
     
-    currency = models.CharField(max_length=3, default='USD')
+    # Devise de la commande. Défaut VIDE et non 'USD' : résolue dans `save()`
+    # vers la devise principale de l'organisation. Un défaut codé en dur, sans
+    # rapport avec l'établissement, estampillait toutes les commandes en USD.
+    currency = models.CharField(max_length=3, blank=True, default='')
+    # Unités de devise principale pour 1 unité de `currency`. 12 décimales pour
+    # s'aligner sur OrganizationCurrency : à 4 décimales, un taux réciproque
+    # (principale USD, 1 CDF = 0.000434782609) était tronqué à 0.0004.
     exchange_rate = models.DecimalField(
-        max_digits=10,
-        decimal_places=4,
-        default=Decimal('1.0000')
+        max_digits=20,
+        decimal_places=12,
+        default=Decimal('1.000000')
     )
     
     order_date = models.DateField()
@@ -128,6 +134,20 @@ class PurchaseOrder(TenantSoftDeleteModel):
 
     def __str__(self):
         return f"PO {self.reference}"
+
+    def save(self, *args, **kwargs):
+        """Résout la devise vers celle de l'établissement, quel que soit l'appelant.
+
+        Comme pour `Sale`, la résolution vit dans `save()` et non dans un
+        serializer : plusieurs chemins créent ces lignes, et le défaut codé en
+        dur les estampillait 'USD' sans rapport avec l'organisation.
+        """
+        if self.organization_id:
+            from apps.settings.services import CurrencyService
+            self.currency, self.exchange_rate = CurrencyService.resolve(
+                self.organization_id, self.currency, self.exchange_rate
+            )
+        super().save(*args, **kwargs)
 
 
 class PurchaseOrderItem(TenantModel):
@@ -332,11 +352,14 @@ class SupplierPayment(TenantModel):
     
     amount = models.DecimalField(max_digits=15, decimal_places=2)
     
-    currency = models.CharField(max_length=3, default='USD')
+    # Devise du règlement fournisseur, résolue dans `save()` (cf. PurchaseOrder).
+    currency = models.CharField(max_length=3, blank=True, default='')
+    # Unités de devise principale pour 1 unité de `currency` (précision alignée
+    # sur OrganizationCurrency).
     exchange_rate = models.DecimalField(
-        max_digits=10,
-        decimal_places=4,
-        default=Decimal('1.0000')
+        max_digits=20,
+        decimal_places=12,
+        default=Decimal('1.000000')
     )
     
     payment_method = models.ForeignKey(
@@ -373,6 +396,20 @@ class SupplierPayment(TenantModel):
 
     def __str__(self):
         return f"Payment {self.reference} to {self.supplier.name}"
+
+    def save(self, *args, **kwargs):
+        """Résout la devise vers celle de l'établissement, quel que soit l'appelant.
+
+        Comme pour `Sale`, la résolution vit dans `save()` et non dans un
+        serializer : plusieurs chemins créent ces lignes, et le défaut codé en
+        dur les estampillait 'USD' sans rapport avec l'organisation.
+        """
+        if self.organization_id:
+            from apps.settings.services import CurrencyService
+            self.currency, self.exchange_rate = CurrencyService.resolve(
+                self.organization_id, self.currency, self.exchange_rate
+            )
+        super().save(*args, **kwargs)
 
 
 class SupplierPaymentAllocation(TenantModel):

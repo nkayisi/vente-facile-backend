@@ -48,6 +48,79 @@ class CurrencyService:
         """Invalide le cache de devise pour une organisation."""
         cache.delete(f'primary_currency_{organization.id}')
         cache.delete(f'org_currencies_{organization.id}')
+
+    @classmethod
+    def primary_code(cls, organization):
+        """Code de la devise principale d'une org (accepte une instance ou un id)."""
+        from apps.organizations.models import Organization
+
+        if isinstance(organization, Organization):
+            return organization.currency or 'CDF'
+        return (
+            Organization.objects.filter(id=organization)
+            .values_list('currency', flat=True)
+            .first()
+        ) or 'CDF'
+
+    @classmethod
+    def resolve(cls, organization, currency=None, exchange_rate=None, strict=False):
+        """
+        Résout ``(currency, exchange_rate)`` d'une ligne monétaire d'un tenant.
+
+        Point d'entrée UNIQUE de la résolution de devise : ventes, caisse,
+        dépenses, achats et fournisseurs passent tous par ici, pour qu'aucun
+        module ne réinvente une devise par défaut codée en dur.
+
+        ``exchange_rate`` retourné = unités de devise PRINCIPALE de l'org pour
+        1 unité de ``currency`` (la principale vaut toujours 1).
+
+        - devise absente ⇒ devise principale de l'organisation, taux 1 ;
+        - devise = principale ⇒ taux 1 (forcé) ;
+        - devise secondaire avec un taux absent, nul OU égal à 1 ⇒ taux relu
+          depuis ``OrganizationCurrency``. Un taux de 1 sur une devise
+          secondaire est impossible (seule la principale vaut 1) : c'est la
+          signature d'un taux jamais renseigné, qui fausserait les rapports ;
+        - devise secondaire avec un taux explicite ⇒ conservé tel quel.
+
+        ``strict=True`` (saisie utilisateur) lève ``ValidationError`` si la
+        devise n'est pas activée pour l'organisation. ``strict=False`` (flux
+        internes déjà validés ailleurs) retombe sur un taux de 1 plutôt que de
+        casser la transaction.
+        """
+        from apps.organizations.models import Organization
+
+        primary = cls.primary_code(organization)
+        currency = (currency or '').strip() or primary
+
+        if currency == primary:
+            return currency, Decimal('1.000000')
+
+        if not isinstance(organization, Organization):
+            organization = Organization.objects.filter(id=organization).first()
+            if organization is None:
+                return currency, Decimal('1.000000')
+
+        org_currency = cls.get_org_currencies(organization).get(currency)
+        if org_currency is None:
+            if strict:
+                from rest_framework.exceptions import ValidationError
+                raise ValidationError({
+                    'currency': f"La devise '{currency}' n'est pas activée pour cette organisation."
+                })
+            return currency, cls._trusted_rate(exchange_rate)
+
+        if cls._trusted_rate(exchange_rate) != Decimal('1.000000'):
+            return currency, Decimal(exchange_rate)
+
+        return currency, org_currency.exchange_rate
+
+    @staticmethod
+    def _trusted_rate(exchange_rate):
+        """Taux exploitable, ou 1 s'il est absent, nul, négatif ou égal à 1."""
+        if exchange_rate is None:
+            return Decimal('1.000000')
+        rate = Decimal(exchange_rate)
+        return rate if rate > 0 and rate != Decimal('1') else Decimal('1.000000')
     
     @staticmethod
     def get_org_currencies(organization):

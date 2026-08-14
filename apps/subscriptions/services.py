@@ -522,7 +522,10 @@ class SubscriptionService:
             status=Subscription.Status.TRIAL,
             billing_cycle=Plan.BillingCycle.MONTHLY,
             price=Decimal('0.00'),
-            currency=organization.currency or 'USD',
+            # Devise du PLAN, pas celle d'exploitation du marchand : le prix
+            # vient du plan. `activate_subscription` faisait déjà ainsi, d'où
+            # une devise qui basculait à la conversion de l'essai.
+            currency=trial_plan.currency.code,
             trial_start=now,
             trial_end=end,
             current_period_start=now,

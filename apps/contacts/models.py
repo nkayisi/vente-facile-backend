@@ -190,7 +190,10 @@ class Supplier(TenantSyncableModel):
     
     tax_id = models.CharField(max_length=50, blank=True)
     
-    currency = models.CharField(max_length=3, default='USD')
+    # Devise de facturation du fournisseur (celle de `current_balance`). Défaut
+    # VIDE et non 'USD' : résolue dans `save()` vers la devise principale de
+    # l'organisation, comme partout ailleurs.
+    currency = models.CharField(max_length=3, blank=True, default='')
     
     current_balance = models.DecimalField(
         max_digits=15,
@@ -230,12 +233,26 @@ class Supplier(TenantSyncableModel):
     def __str__(self):
         return self.name
 
+    def save(self, *args, **kwargs):
+        """Résout la devise vers celle de l'établissement, quel que soit l'appelant."""
+        if self.organization_id:
+            from apps.settings.services import CurrencyService
+            self.currency, _rate = CurrencyService.resolve(
+                self.organization_id, self.currency
+            )
+        super().save(*args, **kwargs)
+
     def get_total_purchases(self):
+        """Total acheté, CONVERTI en devise principale (montant × taux).
+
+        Les commandes peuvent être libellées dans des devises différentes : les
+        sommer brutes additionnerait des USD et des CDF.
+        """
+        from apps.cashbook.services import primary_sum
+
         return self.purchase_orders.filter(
             status__in=['received', 'partially_received']
-        ).aggregate(
-            total=models.Sum('total')
-        )['total'] or Decimal('0.00')
+        ).aggregate(total=primary_sum('total'))['total'] or Decimal('0.00')
 
 
 class SupplierProduct(TenantModel):

@@ -139,7 +139,10 @@ class Subscription(TimeStampedModel, UUIDModel):
         decimal_places=2,
         default=Decimal('0.00')
     )
-    currency = models.CharField(max_length=3, default='USD')
+    # Devise de FACTURATION SaaS : celle du plan souscrit, pas la devise
+    # d'exploitation du marchand (un plan tarifé en USD se facture en USD,
+    # même à une boutique qui vend en CDF). Défaut vide, résolu dans `save()`.
+    currency = models.CharField(max_length=3, blank=True, default='')
     
     trial_start = models.DateTimeField(null=True, blank=True)
     trial_end = models.DateTimeField(null=True, blank=True)
@@ -164,6 +167,12 @@ class Subscription(TimeStampedModel, UUIDModel):
 
     def __str__(self):
         return f"{self.organization.name} - {self.plan.name}"
+
+    def save(self, *args, **kwargs):
+        """La devise d'un abonnement est celle de son plan, jamais un défaut."""
+        if not self.currency and self.plan_id:
+            self.currency = self.plan.currency.code
+        super().save(*args, **kwargs)
 
     @property
     def is_active(self):
@@ -297,7 +306,10 @@ class Invoice(TimeStampedModel, UUIDModel):
         default=Decimal('0.00')
     )
     
-    currency = models.CharField(max_length=3, default='USD')
+    # Devise de FACTURATION SaaS : celle du plan souscrit, pas la devise
+    # d'exploitation du marchand (un plan tarifé en USD se facture en USD,
+    # même à une boutique qui vend en CDF). Défaut vide, résolu dans `save()`.
+    currency = models.CharField(max_length=3, blank=True, default='')
     
     issue_date = models.DateField()
     due_date = models.DateField()
@@ -322,6 +334,12 @@ class Invoice(TimeStampedModel, UUIDModel):
 
     def __str__(self):
         return f"Invoice {self.invoice_number}"
+
+    def save(self, *args, **kwargs):
+        """Une facture est libellée dans la devise de l'abonnement facturé."""
+        if not self.currency and self.subscription_id:
+            self.currency = self.subscription.currency
+        super().save(*args, **kwargs)
 
 
 class InvoiceItem(TimeStampedModel, UUIDModel):
@@ -387,7 +405,10 @@ class SubscriptionPayment(TimeStampedModel, UUIDModel):
     )
     
     amount = models.DecimalField(max_digits=10, decimal_places=2)
-    currency = models.CharField(max_length=3, default='USD')
+    # Devise de FACTURATION SaaS : celle du plan souscrit, pas la devise
+    # d'exploitation du marchand (un plan tarifé en USD se facture en USD,
+    # même à une boutique qui vend en CDF). Défaut vide, résolu dans `save()`.
+    currency = models.CharField(max_length=3, blank=True, default='')
     
     payment_method = models.CharField(
         max_length=20,
@@ -427,6 +448,12 @@ class SubscriptionPayment(TimeStampedModel, UUIDModel):
 
     def __str__(self):
         return f"Payment {self.amount} {self.currency} - {self.organization.name}"
+
+    def save(self, *args, **kwargs):
+        """Un règlement d'abonnement est dans la devise de l'abonnement réglé."""
+        if not self.currency and self.subscription_id:
+            self.currency = self.subscription.currency
+        super().save(*args, **kwargs)
 
 
 class GlobalConfig(models.Model):
