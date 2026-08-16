@@ -47,7 +47,7 @@ class PlanAdmin(admin.ModelAdmin):
     def currency_symbol_display(self, obj):
         if getattr(obj, 'currency_id', None) and obj.currency:
             return f"{obj.currency.symbol} ({obj.currency.code})"
-        return '—'
+        return '-'
     
     fieldsets = (
         (None, {

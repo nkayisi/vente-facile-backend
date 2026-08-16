@@ -4,7 +4,7 @@ Aligne la devise de facturation SaaS sur celle du plan souscrit.
 Abonnements, factures et règlements portaient un défaut codé en dur à 'USD', et
 `create_trial_subscription` utilisait la devise d'EXPLOITATION du marchand
 (`Organization.currency`) alors que `activate_subscription` utilisait celle du
-plan — d'où une devise qui basculait à la conversion de l'essai.
+plan : d'où une devise qui basculait à la conversion de l'essai.
 
 La source de vérité est le plan : c'est lui qui porte le prix. Une boutique qui
 vend en CDF reste facturée dans la devise de son plan.

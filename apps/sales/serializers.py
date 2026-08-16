@@ -256,30 +256,69 @@ class SaleItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_sku = serializers.CharField(source='product.sku', read_only=True)
     variant_name = serializers.CharField(source='variant.name', read_only=True)
-    
+    loose_quantity = serializers.DecimalField(
+        max_digits=15, decimal_places=3, read_only=True
+    )
+    quantity_display = serializers.SerializerMethodField()
+    package_unit_name = serializers.CharField(
+        source='product.packaging_unit.name', read_only=True
+    )
+    unit_name = serializers.CharField(source='product.unit.name', read_only=True)
+
     class Meta:
         model = SaleItem
         fields = [
             'id', 'product', 'product_name', 'product_sku',
             'variant', 'variant_name', 'batch',
             'description', 'quantity', 'unit_price', 'cost_price',
+            'package_quantity', 'package_unit_price', 'packaging_factor',
+            'loose_quantity', 'quantity_display',
+            'package_unit_name', 'unit_name',
             'discount_amount', 'discount_percentage',
             'tax_rate', 'tax_amount',
             'subtotal', 'total', 'notes'
         ]
         read_only_fields = ['id', 'subtotal', 'total', 'tax_amount']
 
+    def get_quantity_display(self, obj):
+        """
+        Ligne lisible pour le client : « 2 paquets + 3 bouteilles ».
+
+        Calculée ici pour que le ticket, la fiche de vente et l'historique
+        disent la même chose sans réimplémenter la mise en forme.
+        """
+        from apps.inventory.packaging import PackagingService
+
+        if not obj.package_quantity or not obj.packaging_factor:
+            return PackagingService.format_quantity(obj.product, obj.quantity)
+        return PackagingService.format_quantity(
+            obj.product, obj.quantity, obj.loose_quantity
+        )
+
 
 class SaleItemCreateSerializer(serializers.ModelSerializer):
-    """Serializer pour la création de ligne de vente."""
+    """
+    Serializer pour la création de ligne de vente.
+
+    Pour un produit vendu en gros, le caissier envoie ``package_quantity`` et
+    ``loose_quantity`` ; le serveur en déduit ``quantity`` (unité de base) et
+    fige le conditionnement du moment. Une ligne peut mêler les deux formes -
+    « 2 paquets + 3 bouteilles ».
+    """
+
+    loose_quantity = serializers.DecimalField(
+        max_digits=15, decimal_places=3, required=False, write_only=True
+    )
 
     class Meta:
         model = SaleItem
         fields = [
             'product', 'variant', 'batch',
             'quantity', 'unit_price',
+            'package_quantity', 'package_unit_price', 'loose_quantity',
             'discount_percentage', 'tax_rate', 'notes'
         ]
+        extra_kwargs = {'quantity': {'required': False}}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -320,6 +359,91 @@ class SaleItemCreateSerializer(serializers.ModelSerializer):
         if value is not None and value < 0:
             raise serializers.ValidationError("Le prix unitaire ne peut pas être négatif.")
         return value
+
+    def validate(self, data):
+        """Convertit la saisie en conditionnements vers l'unité de base."""
+        from apps.inventory.packaging import PackagingService
+
+        product = data.get('product')
+        package_quantity = data.get('package_quantity') or Decimal('0.000')
+        loose_quantity = data.pop('loose_quantity', None)
+        factor = PackagingService.factor(product) if product else None
+
+        if package_quantity > 0 and factor is None:
+            raise serializers.ValidationError({
+                'package_quantity': (
+                    f"« {product.name} » n'est pas vendu par conditionnement."
+                )
+            })
+
+        if factor is not None and (package_quantity > 0 or loose_quantity is not None):
+            loose_quantity = loose_quantity or Decimal('0.000')
+
+            if product.selling_mode == 'wholesale_only' and loose_quantity > 0:
+                raise serializers.ValidationError({
+                    'loose_quantity': (
+                        f"« {product.name} » se vend uniquement par "
+                        f"conditionnement entier."
+                    )
+                })
+
+            # Le facteur est un entier : vendre une fraction d'unité de détail
+            # rendrait le partage scellé/vrac incalculable.
+            if package_quantity % 1 or loose_quantity % 1:
+                raise serializers.ValidationError({
+                    'quantity': (
+                        f"« {product.name} » se vend par unités entières."
+                    )
+                })
+
+            data['quantity'] = PackagingService.to_base(
+                product, package_quantity, loose_quantity
+            )
+            # Snapshot posé par le serveur : jamais accepté du client, sinon un
+            # appel forgé pourrait réécrire le contenu d'un conditionnement.
+            data['packaging_factor'] = factor
+            data['package_quantity'] = package_quantity
+
+        if not data.get('quantity'):
+            raise serializers.ValidationError({
+                'quantity': "Indiquez une quantité."
+            })
+
+        self._validate_package_price(data, factor)
+        return data
+
+    def _validate_package_price(self, data, factor):
+        """
+        Garde-fou sur le prix du conditionnement.
+
+        Le prix ne peut pas être relu depuis le produit : le POS convertit les
+        prix dans la devise de facture avant de les envoyer, et un prix relu en
+        devise principale serait faux sur une facture en devise étrangère. On
+        vérifie donc une règle métier vraie dans **toute** devise : un
+        conditionnement ne coûte jamais plus cher que la somme de son contenu.
+        """
+        package_quantity = data.get('package_quantity') or Decimal('0.000')
+        if package_quantity <= 0 or not factor:
+            return
+
+        package_unit_price = data.get('package_unit_price')
+        if package_unit_price is None:
+            raise serializers.ValidationError({
+                'package_unit_price': "Indiquez le prix du conditionnement."
+            })
+        if package_unit_price < 0:
+            raise serializers.ValidationError({
+                'package_unit_price': "Le prix ne peut pas être négatif."
+            })
+
+        unit_price = data.get('unit_price') or Decimal('0.00')
+        if unit_price > 0 and package_unit_price > unit_price * factor:
+            raise serializers.ValidationError({
+                'package_unit_price': (
+                    "Le prix du conditionnement dépasse le prix de son contenu "
+                    "vendu à l'unité."
+                )
+            })
 
     def validate_discount_percentage(self, value):
         if value < 0:
@@ -454,7 +578,8 @@ class SaleDetailSerializer(serializers.ModelSerializer):
     
     items = SaleItemSerializer(many=True, read_only=True)
     payments = PaymentSerializer(many=True, read_only=True)
-    
+    unpacking_notices = serializers.SerializerMethodField()
+
     class Meta:
         model = Sale
         fields = [
@@ -470,10 +595,67 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             'notes', 'internal_notes',
             'sold_by', 'sold_by_name',
             'sale_date', 'due_date', 'is_pos', 'receipt_printed',
-            'items', 'payments',
+            'items', 'payments', 'unpacking_notices',
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'reference', 'sale_date', 'created_at', 'updated_at']
+
+    def get_unpacking_notices(self, obj):
+        """
+        Emballages ouverts automatiquement pour servir cette vente.
+
+        Le caissier est informé sans être interrompu : l'opération a déjà eu
+        lieu. Le message est reconstitué depuis les mouvements enregistrés, il
+        reste donc consultable après coup sur la fiche de vente.
+        """
+        from apps.inventory.models import Stock, StockMovement
+        from apps.inventory.packaging import PackagingService, _plural
+
+        movements = StockMovement.objects.filter(
+            reference_type='sale',
+            reference_id=obj.id,
+            movement_type='unpack',
+        ).select_related('product', 'product__unit', 'product__packaging_unit')
+
+        notices = []
+        for movement in movements:
+            product = movement.product
+            opened = int(movement.input_package_quantity or 0)
+            factor = movement.packaging_factor or 0
+            package_word = _plural(
+                PackagingService.package_unit_label(product) or 'conditionnement',
+                opened,
+            )
+
+            remaining = None
+            stock = Stock.objects.filter(
+                organization=obj.organization,
+                product=product,
+                variant=movement.variant,
+                warehouse=movement.warehouse,
+            ).first()
+            if stock:
+                remaining = PackagingService.format_quantity(
+                    product, stock.quantity, stock.loose_quantity
+                )
+
+            message = (
+                f"Stock détail insuffisant : {opened} {package_word} "
+                f"{'ont' if opened > 1 else 'a'} été "
+                f"{'ouverts' if opened > 1 else 'ouvert'} automatiquement "
+                f"({opened * factor} "
+                f"{PackagingService.retail_unit_label(product) or 'unités'})."
+            )
+            if remaining:
+                message += f" Il reste {remaining}."
+
+            notices.append({
+                'product': str(product.id),
+                'product_name': product.name,
+                'packages_opened': opened,
+                'message': message,
+            })
+        return notices
 
 
 class SaleCreateSerializer(serializers.ModelSerializer):
@@ -600,9 +782,13 @@ class SaleCreateSerializer(serializers.ModelSerializer):
                          f"Veuillez attendre la fin de l'inventaire pour effectuer cette vente."
             })
         
-        # Vérifier le stock si nécessaire
+        # Vérifier le stock si nécessaire.
+        # Contrôle d'ergonomie : il refuse tôt et avec un message clair, mais ne
+        # garantit rien - la vérité est établie sous verrou dans
+        # `SaleStockService.apply_decrement`.
         if warehouse:
             from apps.inventory.models import Stock
+            from apps.inventory.packaging import PackagingService
             for item in items:
                 product = item['product']
                 if product.track_inventory and not product.allow_negative_stock:
@@ -611,12 +797,33 @@ class SaleCreateSerializer(serializers.ModelSerializer):
                         variant=item.get('variant'),
                         warehouse=warehouse
                     ).first()
-                    
+
                     available = stock.available_quantity if stock else 0
+                    package_quantity = item.get('package_quantity') or 0
+
                     if item['quantity'] > available:
-                        raise serializers.ValidationError({
-                            'items': f"Stock insuffisant pour {product.name}. Disponible: {available}"
-                        })
+                        readable = PackagingService.format_quantity(
+                            product, available,
+                            stock.loose_quantity if stock else 0,
+                        )
+                        message = (
+                            f"Stock insuffisant pour {product.name}. "
+                            f"Disponible : {readable}."
+                        )
+                        # Refuser une vente en gros sans dire ce qu'il reste
+                        # laisserait le vendeur sans solution devant son client.
+                        if package_quantity > 0 and available > 0:
+                            message += (
+                                f" Vous pouvez vendre ce qu'il reste au détail."
+                            )
+                        raise serializers.ValidationError({'items': message})
+
+                    # Vente en gros : on ne reconditionne pas des unités déjà
+                    # sorties de leur emballage.
+                    if package_quantity > 0 and stock is not None:
+                        PackagingService.assert_sealed_available(
+                            stock, product, package_quantity
+                        )
 
         payments = data.get("payments") or []
         for p in payments:
@@ -772,7 +979,7 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         from apps.inventory.services import FIFOService
         TWO_PLACES = Decimal('0.01')
         
-        # Créer les items — SaleItem.save() calcule et arrondit tous les montants
+        # Créer les items - SaleItem.save() calcule et arrondit tous les montants
         for item_data in items_data:
             product = item_data['product']
             variant = item_data.get('variant')
@@ -819,6 +1026,11 @@ class SaleCreateSerializer(serializers.ModelSerializer):
                 quantity=quantity,
                 unit_price=unit_price,
                 cost_price=cost_price,
+                # Conditionnement : `packaging_factor` est le snapshot posé par
+                # le serializer, jamais une valeur du client.
+                package_quantity=item_data.get('package_quantity') or Decimal('0.000'),
+                package_unit_price=item_data.get('package_unit_price'),
+                packaging_factor=item_data.get('packaging_factor'),
                 discount_percentage=discount_pct,
                 tax_rate=tax_rate,
                 notes=item_data.get('notes', '')
@@ -870,7 +1082,7 @@ class SaleCreateSerializer(serializers.ModelSerializer):
             raise DRFValidationError("Le total de la vente ne peut pas être négatif.")
         sale.amount_due = sale.total
 
-        # Créer les paiements — conversion multi-devise centralisée : chaque
+        # Créer les paiements - conversion multi-devise centralisée : chaque
         # règlement peut être dans une devise différente de la facture (le client
         # peut même en cumuler deux). `create_payment` convertit `tendered_amount`
         # (devise du règlement) vers la devise de la vente et remplit `amount`.
@@ -995,12 +1207,12 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         try:
             program = LoyaltyProgram.objects.get(organization=organization, is_active=True)
         except LoyaltyProgram.DoesNotExist:
-            logger.info("[Loyalty] No active program — redemption skipped.")
+            logger.info("[Loyalty] No active program - redemption skipped.")
             return None
 
         if points_used < program.min_points_to_redeem:
             logger.info(
-                "[Loyalty] points_used (%s) < min_points_to_redeem (%s) — skipped.",
+                "[Loyalty] points_used (%s) < min_points_to_redeem (%s) - skipped.",
                 points_used, program.min_points_to_redeem,
             )
             return None
@@ -1010,12 +1222,12 @@ class SaleCreateSerializer(serializers.ModelSerializer):
                 organization=organization, customer=customer,
             )
         except CustomerLoyalty.DoesNotExist:
-            logger.info("[Loyalty] No loyalty account for customer — skipped.")
+            logger.info("[Loyalty] No loyalty account for customer - skipped.")
             return None
 
         point_value = program.point_value or Decimal('0')
         if point_value <= 0:
-            logger.warning("[Loyalty] point_value <= 0 — skipped.")
+            logger.warning("[Loyalty] point_value <= 0 - skipped.")
             return None
 
         # Cap par solde dispo, et par la valeur monétaire qui ne dépasse pas le total.

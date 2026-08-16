@@ -46,6 +46,7 @@ class GoodsReceiptStockService:
         Idempotent : ne fait rien si ``is_committed(grn)`` est vrai.
         """
         from apps.inventory.models import Stock, StockMovement
+        from apps.inventory.packaging import PackagingService
         from apps.inventory.services import FIFOService
 
         if GoodsReceiptStockService.is_committed(grn):
@@ -81,8 +82,18 @@ class GoodsReceiptStockService:
             elif stock.avg_cost == 0 and unit_cost > 0:
                 stock.avg_cost = unit_cost
 
-            stock.quantity = new_quantity
-            stock.last_movement_at = timezone.now()
+            # Ce qui arrive scellé reste scellé : seule la part reçue hors
+            # contenant vient grossir le vrac. Une réception partiellement
+            # refusée voit sa part scellée replafonnée par `loose_share`.
+            loose_accepted = PackagingService.loose_share(
+                item.product, item.quantity_accepted, item.loose_quantity
+            )
+            PackagingService.apply_delta(
+                stock, item.product,
+                delta_base=item.quantity_accepted,
+                delta_loose=loose_accepted,
+            )
+            PackagingService.touch(stock)
             stock.save()
 
             batch = None
@@ -110,6 +121,14 @@ class GoodsReceiptStockService:
                 unit_cost=unit_cost,
                 quantity_before=quantity_before,
                 quantity_after=stock.quantity,
+                input_package_quantity=(
+                    (item.quantity_accepted - loose_accepted) / item.packaging_factor
+                    if item.packaging_factor else Decimal('0.000')
+                ),
+                input_loose_quantity=(
+                    loose_accepted if item.packaging_factor else Decimal('0.000')
+                ),
+                packaging_factor=item.packaging_factor,
                 reference_type='goods_receipt',
                 reference_id=grn.id,
                 notes=f"Réception {grn.reference}",
@@ -129,6 +148,7 @@ class GoodsReceiptStockService:
         Ne fait rien si le stock n'avait pas été incrémenté.
         """
         from apps.inventory.models import Stock, StockMovement
+        from apps.inventory.packaging import PackagingService
 
         if not GoodsReceiptStockService.is_committed(grn):
             return
@@ -163,8 +183,17 @@ class GoodsReceiptStockService:
                     )
                 })
 
-            stock.quantity = new_quantity
-            stock.last_movement_at = timezone.now()
+            # Symétrique exact de l'entrée : on retire du vrac ce qui y était
+            # entré, le reste des contenants repart scellé.
+            loose_accepted = PackagingService.loose_share(
+                item.product, item.quantity_accepted, item.loose_quantity
+            )
+            PackagingService.apply_delta(
+                stock, item.product,
+                delta_base=-item.quantity_accepted,
+                delta_loose=-loose_accepted,
+            )
+            PackagingService.touch(stock)
             stock.save()
 
             StockMovement.objects.create(
@@ -177,6 +206,14 @@ class GoodsReceiptStockService:
                 unit_cost=item.unit_cost or Decimal('0.00'),
                 quantity_before=quantity_before,
                 quantity_after=stock.quantity,
+                input_package_quantity=(
+                    (item.quantity_accepted - loose_accepted) / item.packaging_factor
+                    if item.packaging_factor else Decimal('0.000')
+                ),
+                input_loose_quantity=(
+                    loose_accepted if item.packaging_factor else Decimal('0.000')
+                ),
+                packaging_factor=item.packaging_factor,
                 reference_type='goods_receipt_cancel',
                 reference_id=grn.id,
                 notes=f"Annulation réception {grn.reference}",

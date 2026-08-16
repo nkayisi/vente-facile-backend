@@ -9,7 +9,7 @@ from apps.products.models import Category
 from .models import (
     Warehouse, StockLocation, Stock, StockBatch, StockMovement,
     StockTransfer, StockTransferItem, StockAdjustment, StockAdjustmentItem,
-    InventorySession, InventoryCount
+    InventorySession, InventoryCount, STOCK_IN_MOVEMENT_TYPES
 )
 
 
@@ -135,14 +135,21 @@ class StockListSerializer(serializers.ModelSerializer):
     )
     avg_cost = serializers.SerializerMethodField()
     stock_value = serializers.SerializerMethodField()
-    
+    unit_symbol = serializers.CharField(source='product.unit.symbol', read_only=True)
+    product_image = serializers.ImageField(source='product.image', read_only=True)
+    stock_display = serializers.SerializerMethodField()
+    stock_packages = serializers.SerializerMethodField()
+    stock_loose = serializers.SerializerMethodField()
+
     class Meta:
         model = Stock
         fields = [
-            'id', 'product', 'product_name', 'product_sku',
+            'id', 'product', 'product_name', 'product_sku', 'product_image',
             'variant', 'variant_name',
             'warehouse', 'warehouse_name',
             'quantity', 'reserved_quantity', 'available_quantity',
+            'loose_quantity', 'stock_display', 'stock_packages', 'stock_loose',
+            'unit_symbol',
             'avg_cost', 'stock_value',
             'last_movement_at'
         ]
@@ -156,6 +163,31 @@ class StockListSerializer(serializers.ModelSerializer):
 
     def get_stock_value(self, obj):
         return str(obj.quantity * self._get_effective_cost(obj))
+
+    def get_stock_display(self, obj):
+        """Quantité prête à afficher : « 1 paquet + 10 bouteilles »."""
+        from apps.inventory.packaging import PackagingService
+
+        return PackagingService.format_quantity(
+            obj.product, obj.quantity,
+            min(obj.loose_quantity, max(obj.quantity, Decimal('0.000'))),
+        )
+
+    def _split(self, obj):
+        from apps.inventory.packaging import PackagingService
+
+        factor = PackagingService.factor(obj.product)
+        if factor is None:
+            return None
+        return PackagingService.split(obj.quantity, obj.loose_quantity, factor)
+
+    def get_stock_packages(self, obj):
+        split = self._split(obj)
+        return split[0] if split else None
+
+    def get_stock_loose(self, obj):
+        split = self._split(obj)
+        return str(split[1]) if split else None
 
 
 class StockDetailSerializer(serializers.ModelSerializer):
@@ -173,15 +205,22 @@ class StockDetailSerializer(serializers.ModelSerializer):
     stock_value = serializers.SerializerMethodField()
     recent_movements = serializers.SerializerMethodField()
     batches = serializers.SerializerMethodField()
-    
+    unit_symbol = serializers.CharField(source='product.unit.symbol', read_only=True)
+    product_image = serializers.ImageField(source='product.image', read_only=True)
+    stock_display = serializers.SerializerMethodField()
+    stock_packages = serializers.SerializerMethodField()
+    stock_loose = serializers.SerializerMethodField()
+
     class Meta:
         model = Stock
         fields = [
-            'id', 'product', 'product_name', 'product_sku',
+            'id', 'product', 'product_name', 'product_sku', 'product_image',
             'variant', 'variant_name',
             'warehouse', 'warehouse_name',
             'location', 'location_name',
             'quantity', 'reserved_quantity', 'available_quantity',
+            'loose_quantity', 'stock_display', 'stock_packages', 'stock_loose',
+            'unit_symbol',
             'avg_cost', 'stock_value', 'last_counted_at', 'last_movement_at',
             'recent_movements', 'batches',
             'created_at', 'updated_at'
@@ -197,11 +236,19 @@ class StockDetailSerializer(serializers.ModelSerializer):
     def get_stock_value(self, obj):
         return str(obj.quantity * self._get_effective_cost(obj))
 
+    # Partage scellé/vrac - même logique que la liste, déléguée au service.
+    get_stock_display = StockListSerializer.get_stock_display
+    _split = StockListSerializer._split
+    get_stock_packages = StockListSerializer.get_stock_packages
+    get_stock_loose = StockListSerializer.get_stock_loose
+
     def get_recent_movements(self, obj):
         """Retourne les 10 derniers mouvements."""
         movements = StockMovement.objects.filter(
             product=obj.product,
             warehouse=obj.warehouse
+        ).select_related(
+            'product__unit', 'product__packaging_unit', 'warehouse', 'created_by'
         ).order_by('-created_at')[:10]
         return StockMovementListSerializer(movements, many=True).data
 
@@ -258,37 +305,61 @@ class StockMovementListSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.name', read_only=True)
     warehouse_name = serializers.CharField(source='warehouse.name', read_only=True)
     created_by_name = serializers.CharField(source='created_by.full_name', read_only=True)
+    product_sku = serializers.CharField(source='product.sku', read_only=True)
     movement_type_display = serializers.CharField(
         source='get_movement_type_display', read_only=True
     )
-    
+    # Quantité telle qu'elle a été saisie : « 10 cartons + 5 bouteilles ».
+    # `quantity` reste la valeur en unité de base et fait foi pour tout calcul.
+    quantity_display = serializers.SerializerMethodField()
+
     class Meta:
         model = StockMovement
         fields = [
-            'id', 'product', 'product_name', 'variant',
+            'id', 'product', 'product_name', 'product_sku', 'variant',
             'warehouse', 'warehouse_name',
             'movement_type', 'movement_type_display',
-            'quantity', 'unit_cost',
+            'quantity', 'quantity_display', 'unit_cost',
             'quantity_before', 'quantity_after',
+            'packaging_factor',
             'reference_type', 'reference_id',
+            'notes',
             'created_by', 'created_by_name',
             'created_at'
         ]
         read_only_fields = ['id', 'created_at']
 
+    def get_quantity_display(self, obj):
+        from .packaging import PackagingService
+
+        return PackagingService.format_movement_quantity(obj)
+
 
 class StockMovementDetailSerializer(StockMovementListSerializer):
     """Serializer complet pour le détail d'un mouvement."""
-    
+
     batch_number = serializers.CharField(source='batch.batch_number', read_only=True)
-    
+
     class Meta(StockMovementListSerializer.Meta):
-        fields = StockMovementListSerializer.Meta.fields + ['batch', 'batch_number', 'notes']
+        fields = StockMovementListSerializer.Meta.fields + ['batch', 'batch_number']
 
 
 class StockMovementCreateSerializer(serializers.ModelSerializer):
-    """Serializer pour la création manuelle de mouvement."""
-    
+    """
+    Serializer pour la création manuelle de mouvement.
+
+    Pour les produits vendus en gros, l'approvisionnement peut se saisir en
+    conditionnements, en unités, ou dans les deux à la fois. La conversion vers
+    l'unité de base est faite **ici**, dans ``validate()`` : tout l'aval
+    (``perform_create``, lots FIFO, coût moyen pondéré, quantité du mouvement)
+    continue de raisonner en unité de base sans modification.
+
+    Les prix suivent la même logique : le marchand saisit ce qu'il a payé dans
+    les termes où il l'a payé (au carton, à la bouteille, ou les deux), et le
+    serializer en déduit le coût unitaire unique que porte le mouvement.
+    Optionnellement, ces prix remontent sur la fiche produit.
+    """
+
     # Champs additionnels pour la création de lots lors des approvisionnements
     location = serializers.PrimaryKeyRelatedField(
         queryset=StockLocation.objects.all(),
@@ -297,33 +368,257 @@ class StockMovementCreateSerializer(serializers.ModelSerializer):
         write_only=True
     )
     expiry_date = serializers.DateField(required=False, allow_null=True, write_only=True)
-    
+
+    # Saisie en conditionnement. `quantity` devient optionnelle dès que l'une
+    # de ces valeurs est fournie.
+    package_quantity = serializers.DecimalField(
+        max_digits=15, decimal_places=3, required=False, write_only=True
+    )
+    loose_quantity = serializers.DecimalField(
+        max_digits=15, decimal_places=3, required=False, write_only=True
+    )
+    package_unit_cost = serializers.DecimalField(
+        max_digits=15, decimal_places=2, required=False, allow_null=True, write_only=True
+    )
+
+    # Report des prix sur la fiche produit. Les noms sont ceux de `Product` :
+    # toute autre convention imposerait un mapping mental à chaque relecture.
+    update_product_prices = serializers.BooleanField(
+        required=False, default=False, write_only=True
+    )
+    selling_price = serializers.DecimalField(
+        max_digits=15, decimal_places=2, required=False, allow_null=True, write_only=True
+    )
+    wholesale_price = serializers.DecimalField(
+        max_digits=15, decimal_places=2, required=False, allow_null=True, write_only=True
+    )
+
     class Meta:
         model = StockMovement
         fields = [
             'product', 'variant', 'warehouse', 'batch',
             'movement_type', 'quantity', 'unit_cost', 'notes',
-            'location', 'expiry_date'
+            'location', 'expiry_date',
+            'package_quantity', 'loose_quantity', 'package_unit_cost',
+            'update_product_prices', 'selling_price', 'wholesale_price',
         ]
+        extra_kwargs = {'quantity': {'required': False}}
 
     def validate(self, data):
-        """Valide le mouvement de stock."""
+        """Valide le mouvement de stock et convertit la saisie en unité de base."""
+        from apps.inventory.packaging import PackagingService
+
         movement_type = data.get('movement_type')
-        quantity = data.get('quantity')
-        
+
+        # Un déconditionnement n'est pas un mouvement de quantité : il déplace du
+        # scellé vers le vrac. `perform_create` ne saurait pas maintenir ce
+        # partage, seul `PackagingService` en est capable.
+        if movement_type == StockMovement.MovementType.UNPACK:
+            raise serializers.ValidationError({
+                'movement_type': (
+                    "Le déconditionnement ne se saisit pas comme un mouvement. "
+                    "Utilisez l'action « Ouvrir un conditionnement »."
+                )
+            })
+
+        product = data.get('product')
+        package_quantity = data.pop('package_quantity', None)
+        loose_quantity = data.pop('loose_quantity', None)
+        package_unit_cost = data.pop('package_unit_cost', None)
+        update_product_prices = data.pop('update_product_prices', False)
+        selling_price = data.pop('selling_price', None)
+        wholesale_price = data.pop('wholesale_price', None)
+
+        factor = PackagingService.factor(product) if product else None
+
+        if package_quantity is not None or loose_quantity is not None:
+            if factor is None:
+                raise serializers.ValidationError({
+                    'package_quantity': (
+                        "Ce produit n'est pas vendu par conditionnement : "
+                        "saisissez une quantité simple."
+                    )
+                })
+            package_quantity = package_quantity or Decimal('0.000')
+            loose_quantity = loose_quantity or Decimal('0.000')
+            data['quantity'] = PackagingService.to_base(
+                product, package_quantity, loose_quantity
+            )
+            data['input_package_quantity'] = package_quantity
+            data['input_loose_quantity'] = loose_quantity
+            data['packaging_factor'] = factor
+
+        if data.get('quantity') is None:
+            raise serializers.ValidationError({
+                'quantity': "Indiquez une quantité."
+            })
+
+        if package_unit_cost is not None and not factor:
+            raise serializers.ValidationError({
+                'package_unit_cost': (
+                    "Ce produit n'est pas vendu par conditionnement."
+                )
+            })
+
+        # Le coût du mouvement se calcule avant l'inversion de signe des
+        # sorties, sur les quantités saisies, qui sont positives.
+        loose_unit_cost = data.get('unit_cost')
+        self._apply_costs(
+            data,
+            factor=factor,
+            package_quantity=package_quantity,
+            loose_quantity=loose_quantity,
+            package_unit_cost=package_unit_cost,
+            loose_unit_cost=loose_unit_cost,
+        )
+
+        if update_product_prices:
+            data['_product_prices'] = self._validate_product_prices(
+                product=product,
+                movement_type=movement_type,
+                cost_price=data.get('input_loose_unit_cost'),
+                package_cost_price=data.get('input_package_unit_cost'),
+                selling_price=selling_price,
+                wholesale_price=wholesale_price,
+            )
+
+        quantity = data['quantity']
+
         # Les mouvements sortants doivent avoir une quantité négative
         outgoing_types = ['sale', 'return_out', 'transfer_out', 'adjustment_out', 'damage', 'expired']
         if movement_type in outgoing_types and quantity > 0:
             data['quantity'] = -abs(quantity)
-        
+
         return data
+
+    def _apply_costs(
+        self, data, *, factor, package_quantity, loose_quantity,
+        package_unit_cost, loose_unit_cost,
+    ):
+        """
+        Déduit le coût unitaire du mouvement des prix saisis, et fige ces prix.
+
+        Le marchand peut avoir payé au conditionnement, à l'unité, ou les deux
+        dans la même livraison : « 2 cartons à 6 000 et 3 bouteilles à 550 ».
+        Le mouvement ne porte qu'un coût unitaire, qui vaut alors « ce que j'ai
+        payé divisé par ce que j'ai reçu ». Quand un seul prix est saisi, on
+        complète l'autre par conversion et la pondération se réduit exactement
+        à la division d'avant.
+        """
+        from apps.inventory.packaging import PackagingService
+
+        # Un prix nul vaut « non saisi » : le formulaire envoie 0 par défaut, et
+        # figer ce zéro ferait croire à un achat gratuit tout en écrasant la
+        # pondération. C'est déjà la convention de `perform_create`, qui retombe
+        # sur le prix du produit quand le coût saisi est nul.
+        package_unit_cost = package_unit_cost or None
+        loose_unit_cost = loose_unit_cost or None
+
+        if package_unit_cost is None and loose_unit_cost is None:
+            return
+
+        # Prix réellement saisis, avant toute conversion : c'est eux qui rendent
+        # l'historique relisible.
+        data['input_package_unit_cost'] = package_unit_cost
+        data['input_loose_unit_cost'] = loose_unit_cost
+
+        if not factor:
+            return
+
+        if package_unit_cost is None:
+            package_unit_cost = PackagingService.package_cost_from_unit(
+                loose_unit_cost, factor
+            )
+        if loose_unit_cost is None:
+            loose_unit_cost = PackagingService.unit_cost_from_package(
+                package_unit_cost, factor
+            )
+
+        data['unit_cost'] = PackagingService.blended_unit_cost(
+            package_quantity=package_quantity,
+            package_cost=package_unit_cost,
+            loose_quantity=loose_quantity,
+            loose_cost=loose_unit_cost,
+            factor=factor,
+        )
+
+    def _validate_product_prices(
+        self, *, product, movement_type, cost_price, package_cost_price,
+        selling_price, wholesale_price,
+    ):
+        """
+        Contrôle la demande de report des prix sur la fiche produit.
+
+        Le refus est une erreur de champ et non un 403 : créer le mouvement
+        reste autorisé, seul cet effet de bord optionnel ne l'est pas. Un 403
+        afficherait « vous n'avez pas la permission de créer un mouvement », ce
+        qui est faux et bloquerait un opérateur qui n'a qu'à décocher la case.
+        """
+        from apps.core.services import PermissionService
+        from apps.products.pricing import ProductPricingService
+
+        if movement_type not in STOCK_IN_MOVEMENT_TYPES:
+            raise serializers.ValidationError({
+                'update_product_prices': (
+                    "Les prix de la fiche produit ne se mettent à jour que sur "
+                    "une entrée de stock."
+                )
+            })
+
+        request = self.context.get('request')
+        view = self.context.get('view')
+        organization = (
+            view.get_organization()
+            if view is not None and hasattr(view, 'get_organization')
+            else None
+        )
+        if request and organization and not PermissionService.has_permission(
+            request.user, organization, 'products.edit'
+        ):
+            raise serializers.ValidationError({
+                'update_product_prices': (
+                    "Vous n'avez pas la permission de modifier les prix de la "
+                    "fiche produit."
+                )
+            })
+
+        selling_mode = getattr(product, 'selling_mode', 'retail_only')
+        prices = ProductPricingService.resolve_and_validate(
+            selling_mode=selling_mode,
+            units_per_package=getattr(product, 'units_per_package', None),
+            cost_price=cost_price,
+            package_cost_price=package_cost_price,
+            selling_price=selling_price,
+            wholesale_price=wholesale_price,
+            # Le prix de vente au conditionnement est déjà enregistré sur la
+            # fiche : ne pas l'exiger à nouveau à chaque approvisionnement.
+            require_wholesale=False,
+        )
+
+        # `wholesale_price` garde son sens historique de prix de gros à la pièce
+        # en vente au détail seule : l'écraser depuis un approvisionnement y
+        # changerait la sémantique en silence.
+        if selling_mode == 'retail_only':
+            prices.pop('wholesale_price', None)
+            prices.pop('package_cost_price', None)
+        elif selling_mode == 'wholesale_only':
+            prices.pop('selling_price', None)
+
+        if not prices:
+            raise serializers.ValidationError({
+                'update_product_prices': (
+                    "Indiquez au moins un prix à reporter sur la fiche produit."
+                )
+            })
+        return prices
 
     def create(self, validated_data):
         """Crée le mouvement en extrayant les champs write_only."""
         # Extraire les champs qui ne font pas partie du modèle StockMovement
         validated_data.pop('location', None)
         validated_data.pop('expiry_date', None)
-        
+        validated_data.pop('_product_prices', None)
+
         # Créer le mouvement normalement
         return super().create(validated_data)
 
@@ -333,19 +628,75 @@ class StockMovementCreateSerializer(serializers.ModelSerializer):
 # =============================================================================
 
 class StockTransferItemSerializer(serializers.ModelSerializer):
-    """Serializer pour les articles de transfert."""
-    
+    """
+    Serializer pour les articles de transfert.
+
+    Un transfert se prépare comme il se charge : « 4 cartons + 3 bouteilles ».
+    ``quantity_requested`` reste la quantité en unité de détail et continue de
+    piloter l'expédition et la réception.
+    """
+
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_sku = serializers.CharField(source='product.sku', read_only=True)
-    
+    requested_display = serializers.SerializerMethodField()
+
     class Meta:
         model = StockTransferItem
         fields = [
             'id', 'product', 'product_name', 'product_sku', 'variant', 'batch',
             'quantity_requested', 'quantity_shipped', 'quantity_received',
-            'notes'
+            'package_quantity', 'loose_quantity', 'packaging_factor',
+            'requested_display', 'notes'
         ]
-        read_only_fields = ['id']
+        read_only_fields = ['id', 'packaging_factor']
+        extra_kwargs = {'quantity_requested': {'required': False}}
+
+    def get_requested_display(self, obj):
+        from apps.inventory.packaging import PackagingService
+
+        return PackagingService.format_quantity(
+            obj.product, obj.quantity_requested, obj.loose_quantity
+        )
+
+    def validate(self, data):
+        """Recompose la quantité demandée à partir de la saisie en contenants."""
+        from apps.inventory.packaging import PackagingService
+
+        product = data.get('product') or getattr(self.instance, 'product', None)
+        factor = PackagingService.factor(product) if product else None
+
+        packages = data.get('package_quantity')
+        loose = data.get('loose_quantity')
+
+        if packages or loose:
+            if factor is None:
+                raise serializers.ValidationError({
+                    'package_quantity': (
+                        "Ce produit ne se vend pas par contenant : "
+                        "indiquez une quantité simple."
+                    )
+                })
+            packages = packages or Decimal('0.000')
+            loose = loose or Decimal('0.000')
+            if product.selling_mode == 'wholesale_only' and loose > 0:
+                raise serializers.ValidationError({
+                    'loose_quantity': (
+                        f"{product.name} ne se transfère que par contenant entier."
+                    )
+                })
+            data['package_quantity'] = packages
+            data['loose_quantity'] = loose
+            data['packaging_factor'] = factor
+            data['quantity_requested'] = PackagingService.to_base(
+                product, packages, loose
+            )
+
+        if not data.get('quantity_requested'):
+            raise serializers.ValidationError({
+                'quantity_requested': "Indiquez une quantité à transférer."
+            })
+
+        return data
 
 
 class StockTransferListSerializer(serializers.ModelSerializer):
@@ -469,19 +820,90 @@ class StockTransferCreateSerializer(serializers.ModelSerializer):
 # =============================================================================
 
 class StockAdjustmentItemSerializer(serializers.ModelSerializer):
-    """Serializer pour les articles d'ajustement."""
-    
+    """
+    Serializer pour les articles d'ajustement.
+
+    Un produit vendu par contenant se compte comme il se range : « 3 cartons +
+    2 bouteilles ». La recomposition vers l'unité de base se fait ici, si bien
+    que l'approbation, les écarts et les valorisations continuent de ne
+    connaître que ``quantity_counted``.
+    """
+
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_sku = serializers.CharField(source='product.sku', read_only=True)
-    
+    counted_display = serializers.SerializerMethodField()
+    expected_display = serializers.SerializerMethodField()
+    package_unit_cost = serializers.DecimalField(
+        max_digits=15, decimal_places=2, required=False, write_only=True
+    )
+
     class Meta:
         model = StockAdjustmentItem
         fields = [
             'id', 'product', 'product_name', 'product_sku', 'variant', 'batch',
             'quantity_counted', 'quantity_expected', 'quantity_difference',
-            'unit_cost', 'notes'
+            'counted_package_quantity', 'counted_loose_quantity',
+            'packaging_factor', 'counted_display', 'expected_display',
+            'unit_cost', 'package_unit_cost', 'notes'
         ]
-        read_only_fields = ['id', 'quantity_difference']
+        read_only_fields = ['id', 'quantity_difference', 'packaging_factor']
+        extra_kwargs = {'quantity_counted': {'required': False}}
+
+    def get_counted_display(self, obj):
+        from apps.inventory.packaging import PackagingService
+
+        return PackagingService.format_quantity(
+            obj.product, obj.quantity_counted, obj.counted_loose_quantity
+        )
+
+    def get_expected_display(self, obj):
+        from apps.inventory.packaging import PackagingService
+
+        return PackagingService.format_quantity(obj.product, obj.quantity_expected)
+
+    def validate(self, data):
+        """Recompose la quantité comptée et le coût unitaire de base."""
+        from apps.inventory.packaging import PackagingService
+
+        product = data.get('product') or getattr(self.instance, 'product', None)
+        factor = PackagingService.factor(product) if product else None
+
+        packages = data.get('counted_package_quantity')
+        loose = data.get('counted_loose_quantity')
+        package_unit_cost = data.pop('package_unit_cost', None)
+
+        if packages is not None or loose is not None:
+            if factor is None:
+                raise serializers.ValidationError({
+                    'counted_package_quantity': (
+                        "Ce produit ne se vend pas par contenant : "
+                        "indiquez une quantité simple."
+                    )
+                })
+            packages = packages or Decimal('0.000')
+            loose = loose or Decimal('0.000')
+            data['counted_package_quantity'] = packages
+            data['counted_loose_quantity'] = loose
+            data['packaging_factor'] = factor
+            data['quantity_counted'] = PackagingService.to_base(
+                product, packages, loose
+            )
+
+        if data.get('quantity_counted') is None:
+            raise serializers.ValidationError({
+                'quantity_counted': "Indiquez la quantité comptée."
+            })
+
+        if package_unit_cost is not None:
+            if factor is None:
+                raise serializers.ValidationError({
+                    'package_unit_cost': "Ce produit ne se vend pas par contenant."
+                })
+            data['unit_cost'] = (
+                Decimal(package_unit_cost) / factor
+            ).quantize(Decimal('0.01'))
+
+        return data
 
 
 class StockAdjustmentListSerializer(serializers.ModelSerializer):
@@ -598,13 +1020,22 @@ class InventoryCountSerializer(serializers.ModelSerializer):
     variant_name = serializers.CharField(source='variant.name', read_only=True, default=None)
     counted_by_name = serializers.SerializerMethodField()
     unit_name = serializers.SerializerMethodField()
-    
+    package_unit_name = serializers.CharField(
+        source='product.packaging_unit.name', read_only=True, default=None
+    )
+    expected_display = serializers.SerializerMethodField()
+    counted_display = serializers.SerializerMethodField()
+
     class Meta:
         model = InventoryCount
         fields = [
             'id', 'session', 'product', 'product_name', 'product_sku',
             'product_category_name', 'variant', 'variant_name',
             'quantity_expected', 'quantity_counted', 'quantity_difference',
+            'expected_loose_quantity', 'counted_package_quantity',
+            'counted_loose_quantity', 'packaging_factor',
+            'expected_display', 'counted_display',
+            'package_unit_name',
             'unit_cost', 'difference_value',
             'is_counted', 'counted_by', 'counted_by_name', 'counted_at',
             'unit_name', 'notes',
@@ -629,6 +1060,23 @@ class InventoryCountSerializer(serializers.ModelSerializer):
         if obj.product.unit:
             return obj.product.unit.symbol
         return None
+
+    def get_expected_display(self, obj):
+        """Attendu en clair : « 3 paquets + 1 bouteille »."""
+        from apps.inventory.packaging import PackagingService
+
+        return PackagingService.format_quantity(
+            obj.product, obj.quantity_expected, obj.expected_loose_quantity
+        )
+
+    def get_counted_display(self, obj):
+        from apps.inventory.packaging import PackagingService
+
+        if not obj.is_counted:
+            return None
+        return PackagingService.format_quantity(
+            obj.product, obj.quantity_counted, obj.counted_loose_quantity
+        )
 
 
 class InventorySessionListSerializer(serializers.ModelSerializer):

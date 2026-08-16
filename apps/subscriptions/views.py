@@ -406,7 +406,7 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
             'moko_method': data['method'],
             'user_id': str(request.user.id),
         }
-        notes = f"MOKO {data['method']} — en attente"
+        notes = f"MOKO {data['method']} - en attente"
 
         pending = SubscriptionPayment.objects.create(
             organization=organization,
@@ -583,10 +583,10 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
         - Header ``Authorization: Bearer <secret>`` recommandé.
         - Fallback header ``X-Webhook-Token: <secret>``.
         - Fallback rétro-compat query string ``?token=<secret>`` (deprecated,
-          warning loggué — supprimer dès que Moko aura migré côté config).
+          warning loggué - supprimer dès que Moko aura migré côté config).
 
         Throttle :
-        - Scope ``moko_callback`` (60/min par IP) — actif même en DEBUG.
+        - Scope ``moko_callback`` (60/min par IP) - actif même en DEBUG.
 
         Durcissement :
         - Si MOKO_CALLBACK_SECRET est configuré, le secret est obligatoire.

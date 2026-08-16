@@ -63,7 +63,7 @@ def restrict_visibility_for_membership(
       (``creator_field == membership.user``), partout dans l'application.
     - ``manager`` / ``stock_keeper`` : périmètre entrepôt (``assigned_warehouses``)
       via ``warehouse_field``. Par défaut, les enregistrements sans entrepôt
-      (``NULL``) ne leur sont pas visibles (réservés au owner) — passer
+      (``NULL``) ne leur sont pas visibles (réservés au owner) - passer
       ``include_null_warehouse=True`` pour les inclure (ex. ventes legacy).
     """
     if membership is None:
@@ -171,7 +171,7 @@ def assert_warehouse_allowed_for_request(
 ):
     """
     Vérifie que ``warehouse_id`` est dans le périmètre du membership courant.
-    ``warehouse_id`` peut être None si ``allow_none`` (ex. legacy réservé owner — éviter si possible).
+    ``warehouse_id`` peut être None si ``allow_none`` (ex. legacy réservé owner - éviter si possible).
     """
     if warehouse_id is None:
         if allow_none:

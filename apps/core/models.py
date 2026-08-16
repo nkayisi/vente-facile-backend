@@ -106,7 +106,7 @@ class SyncableModel(models.Model):
         enregistrement déjà synchronisé (donc ``sync_updated_at`` non-null mais
         ancien) ne serait jamais renvoyée au mobile, car le filtre delta
         ``sync_updated_at__gt`` ne la verrait pas. Le push de sync place de
-        toute façon ce champ juste avant ``save()`` — la valeur reste cohérente.
+        toute façon ce champ juste avant ``save()`` - la valeur reste cohérente.
 
         La résolution de conflit (``should_accept_sync_update``) lit la valeur
         STOCKÉE avant l'écriture, donc ce rafraîchissement n'interfère pas.

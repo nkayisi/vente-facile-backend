@@ -335,7 +335,7 @@ class OrganizationViewSet(viewsets.ModelViewSet):
             product__is_deleted=False
         ).count()
         
-        # Valeur totale du stock — agrégée en base (une seule requête) au lieu de
+        # Valeur totale du stock - agrégée en base (une seule requête) au lieu de
         # charger tous les stocks en mémoire et sommer en Python. Coût unitaire :
         # avg_cost s'il est > 0, sinon le cost_price du produit (0 par défaut).
         unit_cost = Case(

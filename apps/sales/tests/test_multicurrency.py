@@ -240,7 +240,7 @@ class DefaultCurrencyResolutionTests(_BaseMultiCurrencyTest):
     `Sale.currency` et `Payment.currency` avaient un défaut codé en dur à 'CDF',
     qui estampillait les ventes 'CDF' dans une org dont la principale est USD.
     La résolution vit désormais dans `save()`, donc elle couvre tous les
-    appelants — y compris ceux qui ne passent aucune devise.
+    appelants - y compris ceux qui ne passent aucune devise.
     """
 
     def test_sale_created_without_currency_uses_org_primary(self):

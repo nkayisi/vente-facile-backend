@@ -8,7 +8,7 @@ l'expérience (message d'erreur illisible, comportement imprévisible).
 
 Comportement :
 1. On délègue d'abord au handler DRF par défaut (gère APIException, 404, 403,
-   validation, throttling, etc. — inchangé).
+   validation, throttling, etc. - inchangé).
 2. Si le handler retourne None (exception NON gérée, ex: KeyError/AttributeError
    dans une vue), on logue l'exception (remontée à Sentry si configuré) et on
    renvoie une réponse JSON 500 propre au lieu de laisser Django produire une

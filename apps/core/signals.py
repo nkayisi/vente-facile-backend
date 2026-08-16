@@ -1,5 +1,5 @@
 """
-Aucun signal n'est utilisé dans le projet — toutes les opérations qui
+Aucun signal n'est utilisé dans le projet - toutes les opérations qui
 seraient naturellement candidates à un signal sont déclenchées explicitement
 depuis les serializers, viewsets ou services dédiés.
 

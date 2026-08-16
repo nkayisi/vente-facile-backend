@@ -43,7 +43,7 @@ class Organization(TimeStampedModel, UUIDModel, SoftDeleteModel):
     
     is_active = models.BooleanField(default=True)
 
-    #: Plus haut palier (Plan.tier) déjà souscrit — interdit de repasser à un plan de tier inférieur.
+    #: Plus haut palier (Plan.tier) déjà souscrit - interdit de repasser à un plan de tier inférieur.
     subscription_floor_tier = models.PositiveIntegerField(default=0)
     
     settings = models.JSONField(default=dict, blank=True)

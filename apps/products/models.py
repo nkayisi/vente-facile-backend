@@ -176,7 +176,30 @@ class Product(TenantSyncableModel):
     """
     Main product model.
     Supports variants, multiple prices, and inventory tracking.
+
+    Conditionnement (vente en gros et en détail)
+    -------------------------------------------
+    Un produit peut être vendu à la pièce, par conditionnement (paquet, carton,
+    casier…), ou dans les deux formes. Quel que soit le mode :
+
+    - ``unit`` est l'unité de **détail**, qui est aussi l'unité de base du stock ;
+    - ``packaging_unit`` est l'unité de **gros** ;
+    - ``units_per_package`` est le nombre d'unités de détail dans un conditionnement ;
+    - ``selling_price`` est le prix à l'unité de détail ;
+    - ``wholesale_price`` est le prix d'un conditionnement entier **dès lors que
+      ``selling_mode`` n'est pas ``retail_only``**. Pour les produits en vente au
+      détail seule, ce champ conserve son usage historique de prix de gros
+      indicatif à la pièce.
+
+    Le stock reste **toujours** exprimé en unité de détail, y compris en mode
+    ``wholesale_only`` : c'est ce qui garantit que les lots FIFO, le coût moyen
+    pondéré et les rapports restent cohérents entre les modes.
     """
+
+    class SellingMode(models.TextChoices):
+        RETAIL_ONLY = 'retail_only', 'Vente au détail uniquement'
+        WHOLESALE_ONLY = 'wholesale_only', 'Vente en gros uniquement'
+        WHOLESALE_AND_RETAIL = 'wholesale_and_retail', 'Vente en gros et au détail'
 
     name = models.CharField(max_length=255)
     slug = models.SlugField(max_length=255)
@@ -206,7 +229,34 @@ class Product(TenantSyncableModel):
         blank=True,
         related_name='products'
     )
-    
+
+    selling_mode = models.CharField(
+        max_length=20,
+        choices=SellingMode.choices,
+        default=SellingMode.RETAIL_ONLY,
+        help_text="Forme sous laquelle ce produit est vendu."
+    )
+    packaging_unit = models.ForeignKey(
+        Unit,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='packaged_products',
+        help_text="Unité de gros (paquet, carton, casier…)."
+    )
+    units_per_package = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Nombre d'unités de détail contenues dans un conditionnement."
+    )
+    allow_auto_unpacking = models.BooleanField(
+        default=True,
+        help_text=(
+            "Autorise l'ouverture automatique d'un conditionnement lorsque le "
+            "stock à l'unité est insuffisant pour servir une vente au détail."
+        )
+    )
+
     cost_price = models.DecimalField(
         max_digits=15,
         decimal_places=2,
@@ -225,6 +275,18 @@ class Product(TenantSyncableModel):
         null=True,
         blank=True,
         validators=[MinValueValidator(Decimal('0.00'))]
+    )
+    package_cost_price = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal('0.00'))],
+        help_text=(
+            "Prix d'achat d'un conditionnement entier. Confort de saisie pour "
+            "le marchand qui achète au carton ; `cost_price` (à l'unité) reste "
+            "la valeur utilisée pour le coût moyen pondéré et les marges."
+        )
     )
     
     tax_rate = models.DecimalField(
@@ -294,6 +356,23 @@ class Product(TenantSyncableModel):
                 fields=['organization', 'slug'],
                 condition=models.Q(is_deleted=False),
                 name='unique_product_slug_per_org'
+            ),
+            # Garde-fous de conditionnement au niveau base : l'import Excel
+            # (`ProductExcelService`) écrit des produits hors DRF, la validation
+            # des serializers ne suffit donc pas.
+            models.CheckConstraint(
+                condition=(
+                    models.Q(units_per_package__isnull=True)
+                    | models.Q(units_per_package__gte=2)
+                ),
+                name='product_units_per_package_gte_2',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(selling_mode='retail_only')
+                    | models.Q(units_per_package__isnull=False)
+                ),
+                name='product_packaging_requires_units_per_package',
             ),
         ]
         permissions = [

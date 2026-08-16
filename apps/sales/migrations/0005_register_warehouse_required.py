@@ -1,4 +1,4 @@
-# Generated manually — rattache les caisses sans entrepôt à l’entrepôt par défaut,
+# Generated manually - rattache les caisses sans entrepôt à l’entrepôt par défaut,
 # puis rend la FK obligatoire (PROTECT).
 
 import django.db.models.deletion

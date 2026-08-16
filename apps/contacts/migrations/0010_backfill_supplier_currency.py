@@ -7,7 +7,7 @@ libellé USD alors que les montants étaient en CDF.
 
 Le modèle n'a pas de taux : on ne peut pas distinguer un choix délibéré d'un
 défaut hérité. On ne réaligne donc QUE les fournisseurs dont la devise n'est pas
-activée dans l'organisation — un cas où la valeur ne peut être qu'un artefact,
+activée dans l'organisation - un cas où la valeur ne peut être qu'un artefact,
 puisqu'aucun taux ne permettrait de l'exploiter.
 """
 from django.db import migrations

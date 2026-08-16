@@ -5,7 +5,7 @@ Toute la résolution de devise repose sur deux sources qui doivent concorder :
 `Organization.currency` (le code de la principale) et la ligne
 `OrganizationCurrency` marquée `is_primary` (qui porte le taux). Une org créée
 avant le multi-devise, ou par un chemin qui n'appelait pas le service de
-création, pouvait n'avoir aucune ligne — auquel cas aucune devise secondaire
+création, pouvait n'avoir aucune ligne - auquel cas aucune devise secondaire
 n'est résoluble et tout retombe silencieusement sur un taux de 1.
 
 Cette migration est idempotente : elle crée la ligne manquante, réaligne le

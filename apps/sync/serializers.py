@@ -113,6 +113,10 @@ class ProductSyncSerializer(BaseSyncSerializer):
         fields = [
             'id', 'name', 'slug', 'sku', 'barcode', 'short_description',
             'category_id', 'brand_id', 'unit_id',
+            # Conditionnement : exposé dès maintenant pour que le mobile puisse
+            # reconnaître ces produits et refuser de les vendre tant qu'il ne
+            # sait pas les traiter. WatermelonDB ignore les colonnes inconnues.
+            'selling_mode', 'units_per_package',
             'cost_price', 'selling_price', 'wholesale_price',
             'tax_rate', 'is_taxable',
             'track_inventory', 'allow_negative_stock', 'has_expiry_date',

@@ -28,7 +28,7 @@ services:
     image: redis:7-alpine
     container_name: vente_facile_redis
     # Borne la mémoire Redis. Politique volatile-lru : n'évince QUE les clés avec
-    # TTL (nos caches abonnement/quotas/dashboard) — les messages du broker Celery
+    # TTL (nos caches abonnement/quotas/dashboard) - les messages du broker Celery
     # (sans TTL) sont préservés, donc aucune tâche n'est perdue sous pression.
     command: redis-server --maxmemory 400mb --maxmemory-policy volatile-lru
     mem_limit: 512m

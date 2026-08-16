@@ -37,7 +37,7 @@ def resolve_currency_rate(organization, currency=None, exchange_rate=None, stric
 #
 # À n'utiliser QUE pour les rapports/P&L (bénéfice, flux, dashboard), où un
 # chiffre unique est attendu. Le livre de caisse, lui, reste ventilé par devise
-# (le tiroir physique ne convertit rien) — voir `CashMovementViewSet`.
+# (le tiroir physique ne convertit rien) - voir `CashMovementViewSet`.
 # ---------------------------------------------------------------------------
 
 def primary_sum(field='amount', filter=None):
@@ -112,7 +112,7 @@ def _movement(organization, *, direction, movement_type, amount, description,
     # de `currency` (pour reconvertir en principale dans les rapports). Résolu
     # automatiquement depuis OrganizationCurrency si non fourni.
     # `strict=False` : `_movement` est appelé depuis des flux déjà validés
-    # (vente encaissée, paiement fournisseur) — on n'y casse pas la transaction
+    # (vente encaissée, paiement fournisseur) - on n'y casse pas la transaction
     # si une devise historique n'est plus configurée.
     currency, exchange_rate = resolve_currency_rate(
         organization, currency, exchange_rate, strict=False

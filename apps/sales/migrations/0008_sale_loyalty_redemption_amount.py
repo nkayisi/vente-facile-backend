@@ -1,4 +1,4 @@
-# Generated manually — ajoute le champ Sale.loyalty_redemption_amount.
+# Generated manually - ajoute le champ Sale.loyalty_redemption_amount.
 # Trace la part du discount qui vient des points de fidélité, pour qu'on puisse
 # distinguer une remise commerciale d'une déduction loyauté dans les rapports.
 

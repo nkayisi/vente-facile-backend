@@ -187,7 +187,7 @@ class OrganizationCurrencyViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Conversion via le service centralisé — convention UNIQUE partagée par
+        # Conversion via le service centralisé - convention UNIQUE partagée par
         # tout l'app : exchange_rate = unités de devise principale pour 1 unité de
         # cette devise. Vers la principale on multiplie, depuis la principale on
         # divise (ex. USD→CDF = ×taux, CDF→USD = ÷taux).

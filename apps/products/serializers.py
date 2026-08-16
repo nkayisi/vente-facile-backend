@@ -339,21 +339,35 @@ class ProductListSerializer(serializers.ModelSerializer):
     category_name = serializers.CharField(source='category.name', read_only=True)
     brand_name = serializers.CharField(source='brand.name', read_only=True)
     unit_symbol = serializers.CharField(source='unit.symbol', read_only=True)
+    unit_name = serializers.CharField(source='unit.name', read_only=True)
+    packaging_unit_name = serializers.CharField(
+        source='packaging_unit.name', read_only=True
+    )
+    packaging_unit_symbol = serializers.CharField(
+        source='packaging_unit.symbol', read_only=True
+    )
     stock_quantity = serializers.SerializerMethodField()
     stock_location = serializers.SerializerMethodField()
     warehouse_name = serializers.SerializerMethodField()
-    
+    stock_packages = serializers.SerializerMethodField()
+    stock_loose = serializers.SerializerMethodField()
+    stock_display = serializers.SerializerMethodField()
+
     class Meta:
         model = Product
         fields = [
             'id', 'name', 'sku', 'barcode', 'image',
             'category', 'category_name', 'brand', 'brand_name',
-            'unit', 'unit_symbol',
+            'unit', 'unit_symbol', 'unit_name',
+            'selling_mode', 'packaging_unit',
+            'packaging_unit_name', 'packaging_unit_symbol',
+            'units_per_package', 'allow_auto_unpacking', 'wholesale_price', 'package_cost_price',
             'selling_price', 'cost_price',
             'is_taxable', 'tax_rate',
             'is_active', 'is_featured', 'track_inventory',
             'allow_negative_stock', 'reorder_point',
             'stock_quantity', 'stock_location', 'warehouse_name',
+            'stock_packages', 'stock_loose', 'stock_display',
         ]
         read_only_fields = ['id']
 
@@ -401,6 +415,48 @@ class ProductListSerializer(serializers.ModelSerializer):
             return stock.warehouse.name
         return None
 
+    def _packaging_split(self, obj):
+        """
+        Partage scellé/vrac du stock, ou ``None``.
+
+        Volontairement limité au chemin « un entrepôt identifié » : en liste,
+        ``stock_quantity`` peut provenir de l'annotation ``total_stock``, qui
+        somme plusieurs entrepôts. Un nombre de paquets n'a alors aucun sens et
+        surtout ne peut pas être reconstitué. On renvoie ``None`` plutôt que
+        ``0`` : à l'écran, ``0`` ferait croire au caissier qu'aucun paquet n'est
+        disponible. Le POS interroge toujours avec ``?warehouse=``, il obtient
+        donc bien la valeur.
+        """
+        from apps.inventory.packaging import PackagingService
+
+        factor = PackagingService.factor(obj)
+        if factor is None:
+            return None
+        stock = self._stock_for_warehouse(obj)
+        if stock is None:
+            return None
+        return PackagingService.available_split(stock, factor)
+
+    def get_stock_packages(self, obj):
+        split = self._packaging_split(obj)
+        return split[0] if split else None
+
+    def get_stock_loose(self, obj):
+        split = self._packaging_split(obj)
+        return str(split[1]) if split else None
+
+    def get_stock_display(self, obj):
+        """Quantité prête à afficher : « 1 paquet + 10 bouteilles »."""
+        from apps.inventory.packaging import PackagingService
+
+        stock = self._stock_for_warehouse(obj)
+        if stock is None:
+            quantity = self.get_stock_quantity(obj)
+            return PackagingService.format_quantity(obj, quantity or 0)
+        available = stock.available_quantity
+        loose = min(stock.loose_quantity, max(available, 0))
+        return PackagingService.format_quantity(obj, available, loose)
+
 
 class ProductDetailSerializer(serializers.ModelSerializer):
     """
@@ -412,7 +468,14 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     brand_name = serializers.CharField(source='brand.name', read_only=True)
     unit_name = serializers.CharField(source='unit.name', read_only=True)
     unit_symbol = serializers.CharField(source='unit.symbol', read_only=True)
-    
+    packaging_unit_name = serializers.CharField(
+        source='packaging_unit.name', read_only=True
+    )
+    packaging_unit_symbol = serializers.CharField(
+        source='packaging_unit.symbol', read_only=True
+    )
+    packaging_summary = serializers.SerializerMethodField()
+
     images = ProductImageSerializer(many=True, read_only=True)
     variants = ProductVariantSerializer(many=True, read_only=True)
     prices = ProductPriceSerializer(many=True, read_only=True)
@@ -431,7 +494,10 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             'category', 'category_name',
             'brand', 'brand_name',
             'unit', 'unit_name', 'unit_symbol',
-            'cost_price', 'selling_price', 'wholesale_price',
+            'selling_mode', 'packaging_unit',
+            'packaging_unit_name', 'packaging_unit_symbol',
+            'units_per_package', 'allow_auto_unpacking', 'packaging_summary',
+            'cost_price', 'selling_price', 'wholesale_price', 'package_cost_price',
             'tax_rate', 'is_taxable', 'price_with_tax',
             'profit_margin',
             'track_inventory', 'allow_negative_stock', 'has_expiry_date',
@@ -450,8 +516,39 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     def get_price_with_tax(self, obj):
         return str(obj.get_price_with_tax())
 
+    def get_packaging_summary(self, obj):
+        """
+        Phrase de confirmation affichée sous le bloc conditionnement.
+
+        Produite côté serveur pour que le formulaire, le POS et les écrans de
+        stock disent tous exactement la même chose.
+        """
+        from apps.inventory.packaging import PackagingService, _plural
+
+        factor = PackagingService.factor(obj)
+        if factor is None:
+            return None
+
+        package = PackagingService.package_unit_label(obj) or 'conditionnement'
+        retail = PackagingService.retail_unit_label(obj) or 'unité'
+        # Pluriel délégué au service : lui seul respecte la casse du libellé
+        # saisi, sans quoi « PIECE » devenait « PIECEs ».
+        plural_retail = _plural(retail, 2)
+
+        if obj.selling_mode == Product.SellingMode.WHOLESALE_ONLY:
+            return (
+                f"Ce produit sera vendu uniquement par {package} "
+                f"de {factor} {plural_retail}."
+            )
+        return (
+            f"Ce produit sera vendu par {package} de {factor} "
+            f"{plural_retail}, ou à l'unité ({retail})."
+        )
+
     def get_stock_by_warehouse(self, obj):
         """Retourne le stock par entrepôt, filtré par le scope warehouse du membership."""
+        from apps.inventory.packaging import PackagingService
+
         stocks = obj.stocks.select_related('warehouse').all()
 
         request = self.context.get('request')
@@ -462,16 +559,26 @@ class ProductDetailSerializer(serializers.ModelSerializer):
                 if wh_ids is not None:
                     stocks = stocks.filter(warehouse_id__in=wh_ids)
 
-        return [
-            {
+        factor = PackagingService.factor(obj)
+        result = []
+        for stock in stocks:
+            entry = {
                 'warehouse_id': str(stock.warehouse_id),
                 'warehouse_name': stock.warehouse.name,
                 'quantity': str(stock.quantity),
                 'available': str(stock.available_quantity),
                 'reserved': str(stock.reserved_quantity),
+                'display': PackagingService.format_quantity(
+                    obj, stock.available_quantity,
+                    min(stock.loose_quantity, max(stock.available_quantity, 0)),
+                ),
             }
-            for stock in stocks
-        ]
+            if factor is not None:
+                sealed, loose = PackagingService.available_split(stock, factor)
+                entry['packages'] = sealed
+                entry['loose'] = str(loose)
+            result.append(entry)
+        return result
 
 
 class ProductCreateSerializer(serializers.ModelSerializer):
@@ -485,10 +592,15 @@ class ProductCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Product
         fields = [
+            # `id` est indispensable dans la réponse : l'appelant redirige vers
+            # la fiche du produit qu'il vient de créer.
+            'id',
             'name', 'slug', 'sku', 'barcode',
             'short_description',
             'category', 'brand', 'unit',
-            'cost_price', 'selling_price', 'wholesale_price',
+            'selling_mode', 'packaging_unit', 'units_per_package',
+            'allow_auto_unpacking',
+            'cost_price', 'selling_price', 'wholesale_price', 'package_cost_price',
             'tax_rate', 'is_taxable',
             'track_inventory', 'allow_negative_stock', 'has_expiry_date',
             'min_stock_level', 'max_stock_level',
@@ -499,6 +611,7 @@ class ProductCreateSerializer(serializers.ModelSerializer):
             'expiry_tracking', 'batch_tracking', 'serial_tracking',
             'attributes'
         ]
+        read_only_fields = ['id']
 
     def validate_sku(self, value):
         """Vérifie l'unicité du SKU dans l'organisation."""
@@ -540,15 +653,117 @@ class ProductCreateSerializer(serializers.ModelSerializer):
 
     def validate(self, data):
         """Validations globales."""
-        cost_price = data.get('cost_price', 0)
-        selling_price = data.get('selling_price', 0)
-        
-        if selling_price and cost_price and selling_price < cost_price:
-            raise serializers.ValidationError({
-                'selling_price': "Le prix de vente ne peut pas être inférieur au prix d'achat."
-            })
-        
+        self._validate_packaging(data)
         return data
+
+    def _resolve(self, data, field):
+        """Valeur soumise, ou valeur existante en mise à jour partielle."""
+        if field in data:
+            return data[field]
+        return getattr(self.instance, field, None) if self.instance else None
+
+    def _validate_packaging(self, data):
+        """
+        Cohérence du conditionnement et des prix.
+
+        Les contrôles de structure (unités, nombre par conditionnement) restent
+        ici : ils ne concernent que la fiche produit. Les règles de prix sont
+        déléguées à `ProductPricingService`, partagé avec l'approvisionnement et
+        l'import Excel, pour qu'il n'existe qu'une seule vérité.
+
+        Les libellés sont volontairement dépourvus de jargon : le vendeur ne
+        doit jamais lire « facteur de conversion ».
+        """
+        from apps.products.pricing import ProductPricingService
+
+        selling_mode = self._resolve(data, 'selling_mode') or Product.SellingMode.RETAIL_ONLY
+        units_per_package = self._resolve(data, 'units_per_package')
+        is_packaged = selling_mode != Product.SellingMode.RETAIL_ONLY
+
+        errors = {}
+        if is_packaged:
+            if not self._resolve(data, 'unit'):
+                errors['unit'] = (
+                    "Précisez l'unité de détail (bouteille, pièce, sachet…) pour "
+                    "un produit vendu en gros."
+                )
+            if not self._resolve(data, 'packaging_unit'):
+                errors['packaging_unit'] = (
+                    "Précisez l'unité de gros (paquet, carton, casier…)."
+                )
+            if not units_per_package or int(units_per_package) < 2:
+                errors['units_per_package'] = (
+                    "Indiquez combien d'unités contient un conditionnement (au moins 2)."
+                )
+
+        # Le marchand achète au carton : s'il n'a saisi que ce prix-là, on en
+        # déduit le coût unitaire, seule grandeur avec laquelle le coût moyen
+        # pondéré et les marges savent travailler.
+        resolved = ProductPricingService.resolve(
+            selling_mode=selling_mode,
+            units_per_package=units_per_package,
+            cost_price=data.get('cost_price'),
+            package_cost_price=data.get('package_cost_price'),
+        )
+        if 'cost_price' in resolved:
+            data['cost_price'] = resolved['cost_price']
+
+        errors.update(ProductPricingService.collect_errors(
+            selling_mode=selling_mode,
+            cost_price=data.get('cost_price'),
+            selling_price=self._resolve(data, 'selling_price'),
+            wholesale_price=self._resolve(data, 'wholesale_price'),
+        ))
+
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        if is_packaged:
+            self._validate_packaging_change(units_per_package)
+
+    def _validate_packaging_change(self, units_per_package):
+        """
+        Interdit de changer le nombre d'unités par conditionnement quand cela
+        réinterpréterait des données déjà enregistrées.
+
+        On ne bloque pas dès qu'il existe du stock : activer le mode gros sur un
+        produit déjà approvisionné est le cas d'usage le plus courant, et il est
+        sans danger - le stock est en unité de détail et le partage scellé/vrac
+        se déduit. On bloque seulement quand un emballage a déjà été ouvert ou
+        quand des ventes en gros ont été enregistrées : leur relecture
+        deviendrait fausse. L'historique n'est jamais recalculé.
+        """
+        if not self.instance:
+            return
+        previous = self.instance.units_per_package
+        if previous is None or int(previous) == int(units_per_package):
+            return
+
+        from apps.inventory.models import Stock
+        from apps.sales.models import SaleItem
+
+        if Stock.objects.filter(
+            product=self.instance, loose_quantity__gt=0
+        ).exists():
+            raise serializers.ValidationError({
+                'units_per_package': (
+                    "Impossible de modifier le conditionnement : des unités "
+                    "sont déjà sorties d'un emballage. Écoulez ou régularisez "
+                    "ce stock par un inventaire avant de le changer."
+                )
+            })
+
+        if SaleItem.objects.filter(
+            product=self.instance, package_quantity__gt=0
+        ).exists():
+            raise serializers.ValidationError({
+                'units_per_package': (
+                    "Impossible de modifier le conditionnement : des ventes en "
+                    "gros ont déjà été enregistrées avec l'ancien "
+                    "conditionnement. Créez un nouveau produit pour le nouveau "
+                    "format."
+                )
+            })
 
     def create(self, validated_data):
         """Génère automatiquement un slug unique si non fourni."""

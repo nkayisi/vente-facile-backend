@@ -111,7 +111,7 @@ class Command(BaseCommand):
                 continue
 
             self.stdout.write(self.style.MIGRATE_HEADING(
-                f"\nOrg « {org.name} » ({org.id}) — entrepôt principal : "
+                f"\nOrg « {org.name} » ({org.id}) - entrepôt principal : "
                 f"{principal.name} ({principal.id})"
             ))
 

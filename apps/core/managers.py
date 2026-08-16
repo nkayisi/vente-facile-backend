@@ -10,13 +10,13 @@ class TenantManager(models.Manager):
     ``.for_organization(org)`` ou via ``TenantViewSetMixin`` qui re-filtre dans
     ``get_queryset()`` à partir du header ``X-Organization-ID``.
 
-    Conséquence — règle stricte à respecter :
+    Conséquence - règle stricte à respecter :
     - **Dans les ViewSets DRF** : ``TenantViewSetMixin`` fait le filtrage.
       Aucune action requise.
     - **Hors ViewSets** (tâches Celery, commandes management, signals,
       admin Django, scripts, code interne) : **toujours utiliser
       ``Model.objects.for_organization(org)``**. Un ``Model.objects.all()``
-      renverra des données toutes orgs confondues — fuite cross-tenant
+      renverra des données toutes orgs confondues - fuite cross-tenant
       silencieuse.
 
     Pour un accès volontaire à toutes les organisations (ex. tâches de

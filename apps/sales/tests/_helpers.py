@@ -45,12 +45,12 @@ def make_org_with_users():
         m = OrganizationMembership.objects.create(
             user=u, organization=org, role=role, is_active=True,
         )
-        # Donner accès au warehouse principal — sinon WarehouseScopedQuerysetMixin
+        # Donner accès au warehouse principal : sinon WarehouseScopedQuerysetMixin
         # filtre toutes les ventes/sessions (sauf pour les owners qui ont scope global).
         if hasattr(m, 'assigned_warehouses') and role != OrganizationMembership.Role.OWNER:
             m.assigned_warehouses.add(warehouse)
 
-    # Abonnement actif — sinon `HasActiveSubscription` rejette toutes les
+    # Abonnement actif : sinon `HasActiveSubscription` rejette toutes les
     # requêtes en test (DEBUG=False par défaut dans le test runner Django).
     from apps.subscriptions.models import Plan, Subscription
     from apps.settings.models import Currency

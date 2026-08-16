@@ -7,7 +7,7 @@ Tous les envois passent par ce module pour garantir :
 - des liens absolus construits à partir de ``FRONTEND_URL``
 
 En dev avec ``EMAIL_BACKEND=...console.EmailBackend`` (défaut), les mails
-sont affichés en stdout — pratique pour vérifier sans configurer SMTP.
+sont affichés en stdout - pratique pour vérifier sans configurer SMTP.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def _send(subject: str, recipient: str, text_body: str, html_body: Optional[str]
     Ne lève jamais d'exception : un échec d'envoi (SMTP down, credentials
     invalides, etc.) est loggué mais ne propage pas. Les flows métier
     (création d'invitation, finalisation de vente) restent fonctionnels
-    même si l'email échoue — l'invitation/le reçu peut être renvoyé.
+    même si l'email échoue - l'invitation/le reçu peut être renvoyé.
     """
     if not recipient:
         logger.warning("Email skipped : pas de destinataire pour %r", subject)
@@ -73,7 +73,7 @@ def send_invitation_email(invitation) -> bool:
         f"Pour accepter cette invitation, cliquez sur le lien ci-dessous (valide 7 jours) :\n"
         f"{accept_url}\n\n"
         f"Si vous ne vous attendiez pas à cette invitation, vous pouvez ignorer ce message.\n\n"
-        f"— L'équipe Vente Facile"
+        f"- L'équipe Vente Facile"
     )
     html_body = (
         f"<p>Bonjour,</p>"
@@ -106,7 +106,7 @@ def send_quotation_email(quotation, recipient_email: Optional[str] = None) -> bo
     currency = getattr(quotation, 'currency', 'CDF')
     valid_until = quotation.valid_until.strftime('%d/%m/%Y') if getattr(quotation, 'valid_until', None) else 'N/A'
 
-    subject = f"Devis {quotation.reference} — {org.name}"
+    subject = f"Devis {quotation.reference} - {org.name}"
     text_body = (
         f"Bonjour,\n\n"
         f"Veuillez trouver ci-joint le devis {quotation.reference} émis par {org.name}.\n\n"
@@ -134,7 +134,7 @@ def send_receipt_email(sale, recipient_email: Optional[str] = None) -> bool:
     currency = getattr(sale, 'currency', 'CDF')
     date_str = timezone.localtime(sale.sale_date).strftime('%d/%m/%Y %H:%M') if sale.sale_date else 'N/A'
 
-    subject = f"Reçu {sale.reference} — {org.name}"
+    subject = f"Reçu {sale.reference} - {org.name}"
     text_body = (
         f"Bonjour,\n\n"
         f"Merci pour votre achat chez {org.name} le {date_str}.\n\n"

@@ -27,7 +27,7 @@ from apps.subscriptions.services import SubscriptionService
 from .models import (
     Warehouse, StockLocation, Stock, StockBatch, StockMovement,
     StockTransfer, StockTransferItem, StockAdjustment, StockAdjustmentItem,
-    InventorySession, InventoryCount
+    InventorySession, InventoryCount, STOCK_IN_MOVEMENT_TYPES
 )
 from .serializers import (
     WarehouseListSerializer, WarehouseDetailSerializer, WarehouseCreateSerializer,
@@ -205,7 +205,12 @@ class StockViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, viewsets.Mo
     ordering_fields = ['quantity', 'last_movement_at']
     ordering = ['-last_movement_at']
     
-    select_related_fields = ['product', 'variant', 'warehouse', 'location']
+    # Les unités alimentent `stock_display` (« 12 cartons + 3 bouteilles ») :
+    # sans elles, deux requêtes de plus par ligne de stock.
+    select_related_fields = [
+        'product', 'product__unit', 'product__packaging_unit',
+        'variant', 'warehouse', 'location',
+    ]
     
     action_permissions = {
         'list': 'stock.view',
@@ -214,15 +219,78 @@ class StockViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, viewsets.Mo
         'by_warehouse': 'stock.view',
         'low_stock': 'stock.view',
         'expiring': 'stock.view',
+        'unpack': 'stock_movements.create',
     }
-    
-    # Stock est en lecture seule - les modifications passent par les mouvements
-    http_method_names = ['get', 'head', 'options']
+
+    # Stock est en lecture seule - les modifications passent par les mouvements.
+    # `post` n'est autorisé que pour l'action `unpack` ci-dessous ; `create` est
+    # explicitement refusé.
+    http_method_names = ['get', 'post', 'head', 'options']
+
+    def create(self, request, *args, **kwargs):
+        return Response(
+            {'error': "Le stock ne se modifie pas directement : passez par un mouvement."},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
 
     def get_serializer_class(self):
         if self.action == 'list':
             return StockListSerializer
         return StockDetailSerializer
+
+    @action(detail=True, methods=['post'])
+    def unpack(self, request, pk=None):
+        """
+        Ouvre un ou plusieurs conditionnements sans attendre une vente.
+
+        Sert au vendeur qui anticipe, et débloque le cas où le
+        déconditionnement automatique est désactivé sur le produit.
+
+        Corps : ``{"packages": 1}``
+        """
+        from .packaging import PackagingService
+
+        try:
+            packages = int(request.data.get('packages', 1))
+        except (TypeError, ValueError):
+            packages = 0
+        if packages < 1:
+            return Response(
+                {'error': "Indiquez combien de conditionnements ouvrir."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        stock = self.get_object()
+        product = stock.product
+        factor = PackagingService.factor(product)
+        if factor is None:
+            return Response(
+                {'error': "Ce produit n'est pas vendu par conditionnement."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            locked = Stock.objects.select_for_update().get(pk=stock.pk)
+            _, loose = PackagingService.split(
+                locked.quantity, locked.loose_quantity, factor
+            )
+            opened, _movement = PackagingService.ensure_loose_available(
+                locked, product,
+                needed_loose=loose + packages * factor,
+                user=request.user,
+                reference_type='manual_unpack',
+                force=True,
+            )
+            locked.last_movement_at = timezone.now()
+            locked.save()
+
+        locked.refresh_from_db()
+        return Response({
+            'packages_opened': opened,
+            'stock_display': PackagingService.format_quantity(
+                product, locked.quantity, locked.loose_quantity
+            ),
+        })
 
     @action(detail=False, methods=['get'], url_path='by-product/(?P<product_id>[^/.]+)')
     def by_product(self, request, product_id=None):
@@ -271,7 +339,9 @@ class StockViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, viewsets.Mo
             organization=organization,
             quantity__lte=F('product__reorder_point'),
             product__track_inventory=True
-        ).select_related('product', 'warehouse')
+        ).select_related(
+            'product', 'product__unit', 'product__packaging_unit', 'warehouse'
+        )
         m = get_membership_for_request(request)
         if m:
             stocks = filter_queryset_by_warehouse_ids(stocks, m, 'warehouse_id')
@@ -403,8 +473,13 @@ class StockMovementViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, vie
     ordering_fields = ['created_at', 'quantity']
     ordering = ['-created_at']
     
-    select_related_fields = ['product', 'variant', 'warehouse', 'batch', 'created_by']
-    
+    # `product__unit` et `product__packaging_unit` alimentent `quantity_display`
+    # (« 10 cartons + 5 bouteilles ») : sans eux, deux requêtes par ligne.
+    select_related_fields = [
+        'product', 'product__unit', 'product__packaging_unit',
+        'variant', 'warehouse', 'batch', 'created_by',
+    ]
+
     action_permissions = {
         'list': 'stock_movements.view',
         'retrieve': 'stock_movements.view',
@@ -421,8 +496,9 @@ class StockMovementViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, vie
     @transaction.atomic
     def perform_create(self, serializer):
         """Crée un mouvement et met à jour le stock."""
+        from .packaging import PackagingService
         from .services import FIFOService
-        
+
         organization = self.get_organization()
         data = serializer.validated_data
         assert_warehouse_allowed_for_request(self.request, data['warehouse'].id)
@@ -448,7 +524,7 @@ class StockMovementViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, vie
         
         # Pour les entrées de stock (approvisionnements), créer un lot
         batch = data.get('batch')
-        if data['quantity'] > 0 and movement_type in ['purchase', 'initial', 'return_in', 'transfer_in', 'adjustment_in', 'production_in']:
+        if data['quantity'] > 0 and movement_type in STOCK_IN_MOVEMENT_TYPES:
             # Créer un lot avec numéro auto-généré
             location = data.get('location')
             expiry_date = data.get('expiry_date')
@@ -500,10 +576,25 @@ class StockMovementViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, vie
             else:
                 stock.avg_cost = unit_cost
         
-        stock.quantity += data['quantity']
+        # Part de la saisie exprimée à l'unité : elle alimente (ou prélève) le
+        # vrac. Une entrée en conditionnements entiers laisse le vrac inchangé,
+        # puisque les emballages arrivent scellés.
+        delta_loose = data.get('input_loose_quantity')
+        if delta_loose is None:
+            # Saisie en quantité simple : sans indication de conditionnement, on
+            # considère qu'elle porte sur des unités hors emballage.
+            delta_loose = data['quantity']
+        elif data['quantity'] < 0:
+            delta_loose = -abs(delta_loose)
+
+        PackagingService.apply_delta(
+            stock, product,
+            delta_base=data['quantity'],
+            delta_loose=delta_loose,
+        )
         stock.last_movement_at = timezone.now()
         stock.save()
-        
+
         # Créer le mouvement
         serializer.save(
             organization=organization,
@@ -512,6 +603,20 @@ class StockMovementViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, vie
             quantity_after=stock.quantity,
             created_by=self.request.user
         )
+
+        # Report des prix sur la fiche produit, en dernier et dans la même
+        # transaction. En dernier parce que l'initialisation de `avg_cost`
+        # ci-dessus lit `product.cost_price` : écrire la fiche avant ferait
+        # démarrer un stock neuf au nouveau prix au lieu de l'ancien.
+        product_prices = serializer.validated_data.get('_product_prices')
+        if product_prices:
+            from apps.products.models import Product
+            from apps.products.pricing import ProductPricingService
+
+            # Verrou pris après celui du stock : ordre d'acquisition constant,
+            # sinon deux approvisionnements simultanés peuvent s'interbloquer.
+            locked_product = Product.objects.select_for_update().get(pk=product.pk)
+            ProductPricingService.apply(locked_product, product_prices)
 
 
 # =============================================================================
@@ -603,9 +708,11 @@ class StockTransferViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+        from .packaging import PackagingService
+
         with transaction.atomic():
             # Déduire le stock de l'entrepôt source
-            for item in transfer.items.all():
+            for item in transfer.items.select_related('product').all():
                 product_cost = item.product.cost_price if item.product.cost_price else Decimal('0.00')
                 stock, created = Stock.objects.select_for_update().get_or_create(
                     organization=transfer.organization,
@@ -614,15 +721,39 @@ class StockTransferViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
                     warehouse=transfer.source_warehouse,
                     defaults={'quantity': Decimal('0.000'), 'avg_cost': product_cost}
                 )
-                
+
                 if not created and stock.avg_cost == 0 and product_cost > 0:
                     stock.avg_cost = product_cost
-                
+
                 quantity_before = stock.quantity
-                stock.quantity -= item.quantity_requested
-                stock.last_movement_at = timezone.now()
+
+                # Conditionnement : on ne charge pas un contenant scellé qui
+                # n'existe pas, et servir la part au détail peut exiger d'en
+                # ouvrir un. Le stock est déjà verrouillé, contrat exigé par
+                # `ensure_loose_available`.
+                loose_shipped = PackagingService.loose_share(
+                    item.product, item.quantity_requested, item.loose_quantity
+                )
+                PackagingService.assert_sealed_available(
+                    stock, item.product, item.package_quantity,
+                    action_label='transférer',
+                )
+                if loose_shipped > 0:
+                    PackagingService.ensure_loose_available(
+                        stock, item.product, loose_shipped,
+                        user=request.user,
+                        reference_type='stock_transfer',
+                        reference_id=transfer.id,
+                    )
+
+                PackagingService.apply_delta(
+                    stock, item.product,
+                    delta_base=-item.quantity_requested,
+                    delta_loose=-loose_shipped,
+                )
+                PackagingService.touch(stock)
                 stock.save()
-                
+
                 # Créer le mouvement sortant
                 StockMovement.objects.create(
                     organization=transfer.organization,
@@ -634,12 +765,15 @@ class StockTransferViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
                     unit_cost=stock.avg_cost,
                     quantity_before=quantity_before,
                     quantity_after=stock.quantity,
+                    input_package_quantity=item.package_quantity,
+                    input_loose_quantity=item.loose_quantity,
+                    packaging_factor=item.packaging_factor,
                     reference_type='stock_transfer',
                     reference_id=transfer.id,
                     notes=f"Transfert {transfer.reference}",
                     created_by=request.user
                 )
-                
+
                 item.quantity_shipped = item.quantity_requested
                 item.save()
             
@@ -661,22 +795,45 @@ class StockTransferViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
             )
         
         received_items = request.data.get('items', [])
-        
+
+        from .packaging import PackagingService
+
         with transaction.atomic():
-            for item in transfer.items.all():
-                # Chercher la quantité reçue dans les données
+            for item in transfer.items.select_related('product').all():
+                # Chercher la quantité reçue dans les données. Elle peut arriver
+                # en contenants (« 3 cartons + 2 bouteilles ») : c'est la forme
+                # sous laquelle le magasinier compte ce qu'il décharge.
                 received_qty = None
+                received_loose = None
                 for ri in received_items:
-                    if str(ri.get('id')) == str(item.id):
+                    if str(ri.get('id')) != str(item.id):
+                        continue
+                    packages = ri.get('package_quantity')
+                    loose = ri.get('loose_quantity')
+                    if packages is not None or loose is not None:
+                        received_loose = Decimal(str(loose or 0))
+                        received_qty = PackagingService.to_base(
+                            item.product, Decimal(str(packages or 0)), received_loose
+                        )
+                    elif ri.get('quantity_received') is not None:
                         received_qty = Decimal(str(ri.get('quantity_received')))
-                        break
-                
+                    break
+
                 if received_qty is None:
                     received_qty = item.quantity_shipped
-                
+
                 item.quantity_received = received_qty
                 item.save()
-                
+
+                # Une réception partielle ne conserve pas forcément le partage
+                # d'origine : `loose_share` replafonne la part scellée sur ce qui
+                # arrive vraiment.
+                loose_received = PackagingService.loose_share(
+                    item.product,
+                    received_qty,
+                    received_loose if received_loose is not None else item.loose_quantity,
+                )
+
                 # Récupérer le coût moyen de la source
                 product_cost = item.product.cost_price if item.product.cost_price else Decimal('0.00')
                 source_stock = Stock.objects.filter(
@@ -713,10 +870,14 @@ class StockTransferViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
                     else:
                         stock.avg_cost = source_avg_cost
                 
-                stock.quantity += received_qty
-                stock.last_movement_at = timezone.now()
+                PackagingService.apply_delta(
+                    stock, item.product,
+                    delta_base=received_qty,
+                    delta_loose=loose_received,
+                )
+                PackagingService.touch(stock)
                 stock.save()
-                
+
                 # Créer le mouvement entrant
                 StockMovement.objects.create(
                     organization=transfer.organization,
@@ -728,6 +889,12 @@ class StockTransferViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
                     unit_cost=source_avg_cost,
                     quantity_before=quantity_before,
                     quantity_after=stock.quantity,
+                    input_package_quantity=(
+                        (received_qty - loose_received) / item.packaging_factor
+                        if item.packaging_factor else Decimal('0.000')
+                    ),
+                    input_loose_quantity=loose_received if item.packaging_factor else Decimal('0.000'),
+                    packaging_factor=item.packaging_factor,
                     reference_type='stock_transfer',
                     reference_id=transfer.id,
                     notes=f"Transfert {transfer.reference}",
@@ -751,10 +918,12 @@ class StockTransferViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+        from .packaging import PackagingService
+
         with transaction.atomic():
             # Si déjà expédié, remettre le stock
             if transfer.status == 'in_transit':
-                for item in transfer.items.all():
+                for item in transfer.items.select_related('product').all():
                     product_cost = item.product.cost_price if item.product.cost_price else Decimal('0.00')
                     stock, created = Stock.objects.select_for_update().get_or_create(
                         organization=transfer.organization,
@@ -769,10 +938,22 @@ class StockTransferViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
                     
                     quantity_before = stock.quantity
                     quantity_to_restore = item.quantity_shipped or Decimal('0.000')
-                    stock.quantity += quantity_to_restore
-                    stock.last_movement_at = timezone.now()
+
+                    # Annuler une expédition, c'est décharger le camion : les
+                    # contenants qui n'ont jamais été ouverts reviennent scellés.
+                    # Le partage restitué est donc l'exact symétrique de celui
+                    # retiré à l'expédition.
+                    loose_to_restore = PackagingService.loose_share(
+                        item.product, quantity_to_restore, item.loose_quantity
+                    )
+                    PackagingService.apply_delta(
+                        stock, item.product,
+                        delta_base=quantity_to_restore,
+                        delta_loose=loose_to_restore,
+                    )
+                    PackagingService.touch(stock)
                     stock.save()
-                    
+
                     # Créer le mouvement de retour
                     if quantity_to_restore > 0:
                         StockMovement.objects.create(
@@ -784,6 +965,9 @@ class StockTransferViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
                             quantity=quantity_to_restore,
                             quantity_before=quantity_before,
                             quantity_after=stock.quantity,
+                            input_package_quantity=item.package_quantity,
+                            input_loose_quantity=item.loose_quantity,
+                            packaging_factor=item.packaging_factor,
                             reference_type='stock_transfer_cancel',
                             reference_id=transfer.id,
                             notes=f"Annulation transfert {transfer.reference}",
@@ -864,9 +1048,11 @@ class StockAdjustmentViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, A
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+        from .packaging import PackagingService
+
         with transaction.atomic():
             # Appliquer les ajustements
-            for item in adjustment.items.all():
+            for item in adjustment.items.select_related('product').all():
                 product_cost = item.product.cost_price if item.product.cost_price else Decimal('0.00')
                 stock, created = Stock.objects.select_for_update().get_or_create(
                     organization=adjustment.organization,
@@ -894,16 +1080,31 @@ class StockAdjustmentViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, A
                         stock.avg_cost = item.unit_cost
                 
                 stock.quantity = item.quantity_counted
+                # Même règle que l'inventaire : le comptage physique fait foi
+                # sur la part hors emballage quand elle a été relevée.
+                if item.counted_loose_quantity is not None:
+                    stock.loose_quantity = item.counted_loose_quantity
                 stock.last_counted_at = timezone.now()
                 stock.last_movement_at = timezone.now()
                 stock.save()
-                
+
                 # Déterminer le type de mouvement
                 if item.quantity_difference > 0:
                     movement_type = 'adjustment_in'
                 else:
                     movement_type = 'adjustment_out'
-                
+
+                # L'écart se relit en contenants dans l'historique : « il
+                # manquait 2 cartons + 1 bouteille » parle au marchand, « -25 »
+                # non. Le signe reste porté par `quantity`.
+                factor = item.packaging_factor or PackagingService.factor(item.product)
+                gap = abs(item.quantity_difference)
+                loose_gap = (
+                    PackagingService.loose_share(item.product, gap)
+                    if factor else Decimal('0.000')
+                )
+                package_gap = (gap - loose_gap) / factor if factor else Decimal('0.000')
+
                 # Créer le mouvement
                 StockMovement.objects.create(
                     organization=adjustment.organization,
@@ -915,6 +1116,9 @@ class StockAdjustmentViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, A
                     unit_cost=item.unit_cost,
                     quantity_before=quantity_before,
                     quantity_after=stock.quantity,
+                    input_package_quantity=package_gap,
+                    input_loose_quantity=loose_gap,
+                    packaging_factor=factor,
                     reference_type='stock_adjustment',
                     reference_id=adjustment.id,
                     notes=f"Ajustement {adjustment.reference}: {adjustment.get_adjustment_type_display()}",
@@ -1077,12 +1281,19 @@ class InventorySessionViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, 
                 elif product.cost_price:
                     unit_cost = product.cost_price
                 
+                from .packaging import PackagingService
+                factor = PackagingService.factor(product)
+
                 count_objects.append(InventoryCount(
                     organization=session.organization,
                     session=session,
                     product=product,
                     variant=None,
                     quantity_expected=current_qty,
+                    expected_loose_quantity=(
+                        stock.loose_quantity if stock else Decimal('0.000')
+                    ),
+                    packaging_factor=factor,
                     unit_cost=unit_cost,
                 ))
             
@@ -1134,7 +1345,17 @@ class InventorySessionViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, 
                         id=count_id,
                         session=session,
                     )
-                    count.quantity_counted = Decimal(str(quantity_counted))
+                    # Comptage en « X conditionnements + Y unités » : le modèle
+                    # recompose la quantité de base. La saisie simple reste
+                    # acceptée pour les produits vendus à l'unité.
+                    packages = item.get('counted_package_quantity')
+                    loose = item.get('counted_loose_quantity')
+                    if count.packaging_factor and (packages is not None or loose is not None):
+                        count.counted_package_quantity = Decimal(str(packages or 0))
+                        count.counted_loose_quantity = Decimal(str(loose or 0))
+                    else:
+                        count.quantity_counted = Decimal(str(quantity_counted))
+                        count.counted_loose_quantity = Decimal(str(quantity_counted))
                     count.is_counted = True
                     count.counted_by = request.user
                     count.counted_at = timezone.now()
@@ -1225,6 +1446,11 @@ class InventorySessionViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, 
                 
                 quantity_before = stock.quantity
                 stock.quantity = count.quantity_counted
+                # Le comptage physique constate ce qui est réellement hors
+                # emballage : sa valeur écrase l'ancienne, sinon l'affichage
+                # continuerait d'annoncer des paquets qui n'existent plus.
+                if count.packaging_factor:
+                    stock.loose_quantity = count.counted_loose_quantity
                 stock.last_counted_at = timezone.now()
                 stock.last_movement_at = timezone.now()
                 stock.save()

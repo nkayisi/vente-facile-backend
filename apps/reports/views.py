@@ -33,11 +33,12 @@ from apps.sales.models import Sale, SaleItem, Payment
 from apps.sales.profit_allocation import allocated_line_ht_revenues_for_sale, effective_unit_cost
 from apps.products.models import Product
 from apps.inventory.models import Stock, StockBatch
+from apps.inventory.packaging import PackagingService
 from apps.contacts.models import Customer
 from apps.cashbook.models import CashMovement, Expense
 # Agrégations comptables : les montants de caisse/dépenses sont convertis en
 # devise principale (montant × exchange_rate) avant d'être sommés. Le livre de
-# caisse, lui, reste ventilé par devise — voir apps/cashbook/views.py.
+# caisse, lui, reste ventilé par devise - voir apps/cashbook/views.py.
 from apps.cashbook.services import (
     balance_in_primary,
     last_balance_by_currency,
@@ -141,6 +142,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         'customers': 'reports.view',
         'profit_margins': 'reports.view',
         'product_profits': 'reports.view',
+        'sales_by_packaging': 'reports.view',
         'user_activity': 'reports.view',
     }
     
@@ -1302,6 +1304,96 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         serializer = ProfitMarginSerializer(data)
         return Response(serializer.data)
     
+    @action(detail=False, methods=['get'], url_path='sales-by-packaging')
+    def sales_by_packaging(self, request):
+        """
+        Chiffre d'affaires et marge ventilés entre vente en gros et vente au détail.
+
+        La marge n'est pas la même selon la forme de vente : c'est ce que ce
+        rapport rend visible. Une ligne mixte (« 2 paquets + 3 bouteilles ») est
+        répartie **au prorata** de chaque part, de sorte que la somme des deux
+        colonnes égale exactement le chiffre d'affaires de la période.
+        """
+        from apps.sales.profit_allocation import (
+            allocated_line_ht_revenues_for_sale, effective_unit_cost,
+        )
+
+        org = self.get_organization()
+        start_date, end_date, _, _ = self._parse_date_range(request)
+
+        sales = self._scope_sales(
+            Sale.objects.filter(
+                organization=org,
+                sale_date__date__gte=start_date,
+                sale_date__date__lte=end_date,
+                status__in=['completed', 'partially_paid'],
+            ),
+            request,
+        ).prefetch_related('items__product')
+
+        buckets = {
+            'wholesale': {'revenue': Decimal('0'), 'cost': Decimal('0'), 'quantity': Decimal('0')},
+            'retail': {'revenue': Decimal('0'), 'cost': Decimal('0'), 'quantity': Decimal('0')},
+        }
+
+        for sale in sales:
+            for item, line_revenue in allocated_line_ht_revenues_for_sale(sale):
+                unit_cost = effective_unit_cost(item)
+                line_cost = (item.quantity * unit_cost).quantize(Decimal('0.01'))
+
+                packaged_units = (
+                    (item.package_quantity or Decimal('0')) * (item.packaging_factor or 0)
+                )
+                if packaged_units <= 0:
+                    buckets['retail']['revenue'] += line_revenue
+                    buckets['retail']['cost'] += line_cost
+                    buckets['retail']['quantity'] += item.quantity
+                    continue
+
+                if packaged_units >= item.quantity:
+                    buckets['wholesale']['revenue'] += line_revenue
+                    buckets['wholesale']['cost'] += line_cost
+                    buckets['wholesale']['quantity'] += item.quantity
+                    continue
+
+                # Ligne mixte : répartition au prorata du nombre d'unités, pour
+                # que les deux colonnes se recollent au total de la vente.
+                share = packaged_units / item.quantity
+                wholesale_revenue = (line_revenue * share).quantize(Decimal('0.01'))
+                wholesale_cost = (line_cost * share).quantize(Decimal('0.01'))
+
+                buckets['wholesale']['revenue'] += wholesale_revenue
+                buckets['wholesale']['cost'] += wholesale_cost
+                buckets['wholesale']['quantity'] += packaged_units
+                buckets['retail']['revenue'] += line_revenue - wholesale_revenue
+                buckets['retail']['cost'] += line_cost - wholesale_cost
+                buckets['retail']['quantity'] += item.quantity - packaged_units
+
+        def summarize(key, label):
+            revenue = buckets[key]['revenue'].quantize(Decimal('0.01'))
+            cost = buckets[key]['cost'].quantize(Decimal('0.01'))
+            profit = revenue - cost
+            margin = (profit / revenue * 100) if revenue > 0 else Decimal('0')
+            return {
+                'sale_form': key,
+                'label': label,
+                'revenue': revenue,
+                'cost': cost,
+                'gross_profit': profit,
+                'margin_percentage': round(margin, 2),
+                'quantity': buckets[key]['quantity'].quantize(Decimal('0.001')),
+            }
+
+        results = [
+            summarize('wholesale', 'Vente en gros'),
+            summarize('retail', 'Vente au détail'),
+        ]
+        return Response({
+            'results': results,
+            'total_revenue': sum((r['revenue'] for r in results), Decimal('0')),
+            'total_gross_profit': sum((r['gross_profit'] for r in results), Decimal('0')),
+        })
+
     @action(detail=False, methods=['get'])
     def product_profits(self, request):
         """Bénéfices par produit avec pagination"""
@@ -1397,13 +1489,18 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         page = int(request.query_params.get('page', 1))
         page_size = int(request.query_params.get('page_size', 20))
         
+        # `product__unit` et `product__packaging_unit` alimentent l'affichage
+        # « 12 cartons + 3 bouteilles » : sans eux, deux requêtes par ligne.
         stocks = self._scope_stocks(
             Stock.objects.filter(
                 organization=org,
                 product__is_active=True
             ),
             request,
-        ).select_related('product', 'product__category')
+        ).select_related(
+            'product', 'product__category',
+            'product__unit', 'product__packaging_unit',
+        )
         
         result = []
         for stock in stocks:
@@ -1430,14 +1527,24 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
                 elif filter_status == 'available' and status != 'available':
                     continue
             
+            # Le stock d'un produit vendu en gros se lit en contenants : « 147 »
+            # ne dit pas au gérant s'il peut honorer une commande de 10 cartons.
+            loose = Decimal(str(stock.loose_quantity or 0))
+            stock_display = PackagingService.format_quantity(stock.product, qty, loose)
+            available_display = PackagingService.format_quantity(
+                stock.product, available, min(loose, max(available, Decimal('0')))
+            )
+
             result.append({
                 'product_id': stock.product.id,
                 'product_name': stock.product.name,
                 'product_sku': stock.product.sku,
                 'category_name': stock.product.category.name if stock.product.category else None,
                 'current_stock': qty,
+                'stock_display': stock_display,
                 'reserved_stock': reserved,
                 'available_stock': available,
+                'available_display': available_display,
                 'min_stock_level': min_level,
                 'cost_price': cost,
                 'stock_value': qty * cost,

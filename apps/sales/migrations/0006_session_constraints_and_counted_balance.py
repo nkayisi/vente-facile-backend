@@ -1,4 +1,4 @@
-# Generated manually — durcit RegisterSession (UniqueConstraint open + counted_balance)
+# Generated manually - durcit RegisterSession (UniqueConstraint open + counted_balance)
 # et ajoute un index sur Sale.sold_by pour le filtre par caissier.
 
 from decimal import Decimal

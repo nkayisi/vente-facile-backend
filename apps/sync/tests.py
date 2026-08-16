@@ -612,7 +612,7 @@ class MultiTenantSyncTests(TestCase):
         """Push refusé si un FK pointe vers un objet d'une autre organisation."""
         from apps.products.models import Category
 
-        # Catégorie créée dans org2 — on tente de la référencer depuis org1
+        # Catégorie créée dans org2 - on tente de la référencer depuis org1
         cat_other = Category.objects.create(
             organization=self.org2, name='Cat Org2', slug='cat-org2',
         )
@@ -796,7 +796,7 @@ class SyncRoundTripTests(APITestCase):
         before = get_server_timestamp()
         customer_id = str(uuid.uuid4())
 
-        # 1) PUSH — création hors-ligne envoyée au serveur
+        # 1) PUSH - création hors-ligne envoyée au serveur
         push = self.client.post(
             '/api/v1/sync/',
             {
@@ -822,7 +822,7 @@ class SyncRoundTripTests(APITestCase):
         self.assertTrue(push.data['push']['success'])
         self.assertEqual(push.data['push']['stats']['created'], 1)
 
-        # 2) PULL delta depuis `before` — le client retrouve sa création
+        # 2) PULL delta depuis `before` - le client retrouve sa création
         pull = self.client.get(
             '/api/v1/sync/',
             {'last_pulled_at': before},
@@ -1023,7 +1023,7 @@ class SyncSalePushRoundTripTests(TestCase):
     def test_nested_payload_does_not_crash(self):
         """
         Filet de sécurité : un payload à l'ancienne (items/payments IMBRIQUÉS
-        dans la vente — donc portant les noms des relations inverses) ne fait
+        dans la vente : donc portant les noms des relations inverses) ne fait
         plus échouer la création. Les tableaux imbriqués sont ignorés ; le
         mobile pousse désormais ces records séparément.
         """
@@ -1054,7 +1054,7 @@ class SyncSalePushRoundTripTests(TestCase):
         """
         Régression : le mobile envoie les décimales en chaîne, y compris les
         entiers SANS point (quantity='1', unit_price='13409'). Le backend doit
-        les convertir en Decimal d'après le TYPE du champ — sinon `SaleItem.save()`
+        les convertir en Decimal d'après le TYPE du champ : sinon `SaleItem.save()`
         fait `'1' * '13409'` (str*str) et la ligne n'est jamais créée (la vente
         se synchronise alors sans aucune ligne, total recalculé à 0).
         """

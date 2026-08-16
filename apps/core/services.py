@@ -15,7 +15,7 @@ class OrganizationService:
         """
         Create a new organization with the user as owner.
         Also creates default branch, warehouse, register, payment methods,
-        cashbook categories, currency, and trial subscription — l'utilisateur
+        cashbook categories, currency, and trial subscription - l'utilisateur
         peut immédiatement encaisser sans étape de configuration manuelle.
         """
         from django.utils.text import slugify
@@ -94,7 +94,7 @@ class OrganizationService:
                 is_active=True
             )
 
-        # Catégories d'entrées et de dépenses pour le livre de caisse — sans
+        # Catégories d'entrées et de dépenses pour le livre de caisse - sans
         # ces lignes, le user doit aller dans Paramètres > Cashbook avant de
         # pouvoir enregistrer une dépense.
         default_income = [
@@ -237,7 +237,7 @@ class PermissionService:
     
     Chaque permission est une chaîne au format 'module.action', ex: 'products.view'.
     Les permissions sont déterminées par le rôle du membre dans l'organisation.
-    Pas besoin de django-guardian pour ce système — le rôle suffit.
+    Pas besoin de django-guardian pour ce système - le rôle suffit.
     """
     
     # =========================================================================
@@ -365,7 +365,7 @@ class PermissionService:
         ],
         
         # CAISSIER (cashier) : ventes, livre de caisse, clients basique, dashboard
-        # Note: lecture seule sur les produits (products.view) — indispensable au POS
+        # Note: lecture seule sur les produits (products.view) - indispensable au POS
         # pour lister/scanner les articles à vendre. Pas d'accès au stock (stock.view),
         # ni à la création/édition de produits, par défaut. Ces permissions
         # additionnelles peuvent être accordées individuellement via extra_permissions.
@@ -375,7 +375,7 @@ class PermissionService:
             # Ventes (créer, voir les siennes)
             'sales.view', 'sales.create',
             'payment_methods.view',
-            # Produits (lecture seule) — nécessaire pour le POS
+            # Produits (lecture seule) - nécessaire pour le POS
             'products.view',
             # Clients (créer + voir)
             'customers.view', 'customers.create',

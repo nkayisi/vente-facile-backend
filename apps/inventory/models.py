@@ -1,9 +1,14 @@
+import logging
+
 from django.db import models
 from django.conf import settings
 from django.core.validators import MinValueValidator
 from decimal import Decimal
 from apps.core.models import TenantModel, TenantSoftDeleteModel, SyncableModel
 from apps.core.managers import TenantSoftDeleteManager
+
+
+logger = logging.getLogger(__name__)
 
 
 class Warehouse(TenantSoftDeleteModel):
@@ -129,13 +134,24 @@ class Stock(TenantModel):
         decimal_places=3,
         default=Decimal('0.000')
     )
-    
+    loose_quantity = models.DecimalField(
+        max_digits=15,
+        decimal_places=3,
+        default=Decimal('0.000'),
+        help_text=(
+            "Part de `quantity` qui se trouve hors emballage scellé, pour les "
+            "produits vendus en gros et au détail. Alimentée par les "
+            "déconditionnements et les entrées saisies à l'unité. Sans objet "
+            "pour les produits vendus au détail uniquement."
+        )
+    )
+
     avg_cost = models.DecimalField(
         max_digits=15,
         decimal_places=2,
         default=Decimal('0.00')
     )
-    
+
     last_counted_at = models.DateTimeField(null=True, blank=True)
     last_movement_at = models.DateTimeField(null=True, blank=True)
 
@@ -186,6 +202,24 @@ class Stock(TenantModel):
             raise ValidationError({
                 'reserved_quantity': "La quantité réservée ne peut pas être négative."
             })
+
+        # Part en vrac : on corrige silencieusement au lieu de lever. Ce `save()`
+        # est sur le chemin de tous les écrivains de stock, dont plusieurs
+        # ignorent encore le conditionnement (transferts, réceptions, sync
+        # mobile) : y ajouter une exception ferait tomber des flux qui
+        # fonctionnent aujourd'hui. Une valeur hors bornes est une imprécision
+        # d'affichage, jamais une raison de refuser une vente.
+        clamped = max(
+            Decimal('0.000'),
+            min(self.loose_quantity, max(self.quantity, Decimal('0.000'))),
+        )
+        if clamped != self.loose_quantity:
+            logger.warning(
+                "Stock %s : loose_quantity %s hors bornes (quantity=%s), "
+                "ramenée à %s.",
+                self.pk, self.loose_quantity, self.quantity, clamped,
+            )
+            self.loose_quantity = clamped
 
         super().save(*args, **kwargs)
 
@@ -308,6 +342,7 @@ class StockMovement(TenantModel, SyncableModel):
         INITIAL = 'initial', 'Stock initial'
         PRODUCTION_IN = 'production_in', 'Production entrante'
         PRODUCTION_OUT = 'production_out', 'Production sortante'
+        UNPACK = 'unpack', 'Déconditionnement'
 
     product = models.ForeignKey(
         'products.Product',
@@ -345,7 +380,48 @@ class StockMovement(TenantModel, SyncableModel):
     
     quantity_before = models.DecimalField(max_digits=15, decimal_places=3)
     quantity_after = models.DecimalField(max_digits=15, decimal_places=3)
-    
+
+    # Saisie d'origine, pour que l'historique reste lisible par un humain :
+    # « 10 paquets + 5 bouteilles » plutôt que « 125 ». `quantity` reste la
+    # quantité en unité de base et fait toujours foi pour le calcul du stock.
+    # Un mouvement `unpack` porte `quantity = 0` (le total ne bouge pas, seul
+    # le partage scellé/vrac change) et `input_package_quantity = k`.
+    input_package_quantity = models.DecimalField(
+        max_digits=15,
+        decimal_places=3,
+        default=Decimal('0.000')
+    )
+    input_loose_quantity = models.DecimalField(
+        max_digits=15,
+        decimal_places=3,
+        default=Decimal('0.000')
+    )
+    packaging_factor = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Nombre d'unités par conditionnement au moment du mouvement."
+    )
+
+    # Prix d'achat tels qu'ils ont été saisis, pour la même raison que les
+    # quantités ci-dessus : `unit_cost` est une moyenne pondérée, opération
+    # irréversible. De « 505,56 » personne ne retrouve « 2 cartons à 6 000 +
+    # 3 bouteilles à 550 ». `null` signifie « non saisi », à distinguer d'un
+    # prix nul.
+    input_package_unit_cost = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Prix d'achat d'un conditionnement, tel que saisi."
+    )
+    input_loose_unit_cost = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Prix d'achat d'une unité de détail, tel que saisi."
+    )
+
     reference_type = models.CharField(max_length=50, blank=True)
     reference_id = models.UUIDField(null=True, blank=True)
     
@@ -370,6 +446,22 @@ class StockMovement(TenantModel, SyncableModel):
 
     def __str__(self):
         return f"{self.movement_type} - {self.product.name}: {self.quantity}"
+
+
+# Types de mouvement qui font entrer du stock. Ils partagent trois traitements :
+# la création d'un lot FIFO, la valorisation au coût saisi, et le report
+# éventuel des prix sur la fiche produit. La liste symétrique des sorties n'est
+# volontairement pas définie ici : les deux chemins qui la manipulent aujourd'hui
+# n'ont pas exactement le même périmètre, les unifier sans tests dédiés
+# changerait des comportements.
+STOCK_IN_MOVEMENT_TYPES = [
+    StockMovement.MovementType.PURCHASE,
+    StockMovement.MovementType.INITIAL,
+    StockMovement.MovementType.RETURN_IN,
+    StockMovement.MovementType.TRANSFER_IN,
+    StockMovement.MovementType.ADJUSTMENT_IN,
+    StockMovement.MovementType.PRODUCTION_IN,
+]
 
 
 class StockTransfer(TenantSoftDeleteModel):
@@ -477,7 +569,26 @@ class StockTransferItem(TenantModel):
         null=True,
         blank=True
     )
-    
+
+    # Demande saisie en « X contenants + Y unités ». `quantity_requested` en est
+    # la somme en unité de détail et reste la valeur qui fait foi : le partage
+    # ci-dessous ne sert qu'à savoir ce qui part scellé et ce qui part en vrac.
+    package_quantity = models.DecimalField(
+        max_digits=15,
+        decimal_places=3,
+        default=Decimal('0.000')
+    )
+    loose_quantity = models.DecimalField(
+        max_digits=15,
+        decimal_places=3,
+        default=Decimal('0.000')
+    )
+    packaging_factor = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Nombre d'unités par contenant au moment de la demande."
+    )
+
     notes = models.TextField(blank=True)
 
     class Meta:
@@ -584,7 +695,24 @@ class StockAdjustmentItem(TenantModel):
     quantity_counted = models.DecimalField(max_digits=15, decimal_places=3)
     quantity_expected = models.DecimalField(max_digits=15, decimal_places=3)
     quantity_difference = models.DecimalField(max_digits=15, decimal_places=3)
-    
+
+    # Part comptée hors emballage scellé. Elle fait autorité à l'approbation :
+    # un comptage physique constate le vrac réel, il ne le déduit pas.
+    counted_loose_quantity = models.DecimalField(
+        max_digits=15, decimal_places=3, null=True, blank=True
+    )
+    # Nombre de contenants scellés comptés. `quantity_counted` en est la somme
+    # avec la part vrac, recomposée par le serializer : le marchand compte
+    # « 3 cartons + 2 bouteilles », jamais 38.
+    counted_package_quantity = models.DecimalField(
+        max_digits=15, decimal_places=3, null=True, blank=True
+    )
+    packaging_factor = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Nombre d'unités par contenant au moment du comptage."
+    )
+
     unit_cost = models.DecimalField(
         max_digits=15,
         decimal_places=2,
@@ -864,11 +992,28 @@ class InventoryCount(TenantModel):
         max_digits=15, decimal_places=3, default=Decimal('0.000')
     )
     
+    # Part attendue hors emballage scellé, figée au démarrage de la session :
+    # sans elle, la feuille de comptage afficherait « 37 » au lieu de
+    # « 3 paquets + 1 bouteille », et le compteur ne pourrait rien rapprocher.
+    expected_loose_quantity = models.DecimalField(
+        max_digits=15, decimal_places=3, default=Decimal('0.000')
+    )
+
     # User-entered count
     quantity_counted = models.DecimalField(
         max_digits=15, decimal_places=3, default=Decimal('0.000')
     )
-    
+
+    # Comptage saisi en « X conditionnements + Y unités ». `quantity_counted`
+    # en est la somme, recalculée dans `save()`.
+    counted_package_quantity = models.DecimalField(
+        max_digits=15, decimal_places=3, default=Decimal('0.000')
+    )
+    counted_loose_quantity = models.DecimalField(
+        max_digits=15, decimal_places=3, default=Decimal('0.000')
+    )
+    packaging_factor = models.PositiveIntegerField(null=True, blank=True)
+
     # Computed difference (counted - expected)
     quantity_difference = models.DecimalField(
         max_digits=15, decimal_places=3, default=Decimal('0.000')
@@ -912,6 +1057,16 @@ class InventoryCount(TenantModel):
         return f"{name}: attendu={self.quantity_expected}, compté={self.quantity_counted}"
 
     def save(self, *args, **kwargs):
+        # Comptage saisi en conditionnements : on recompose la quantité de base
+        # ici, ce qui laisse intacte toute la machinerie d'écart et de totaux.
+        if self.packaging_factor and (
+            self.counted_package_quantity or self.counted_loose_quantity
+        ):
+            self.quantity_counted = (
+                self.counted_package_quantity * self.packaging_factor
+                + self.counted_loose_quantity
+            )
+
         if self.is_counted:
             self.quantity_difference = self.quantity_counted - self.quantity_expected
             self.difference_value = self.quantity_difference * self.unit_cost

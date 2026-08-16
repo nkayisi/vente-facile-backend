@@ -53,7 +53,31 @@ class Command(BaseCommand):
         total = stocks.count()
         self.stdout.write(f"Analyse de {total} lignes Stock…")
 
+        avertissements = []
+
         for stock in stocks.iterator(chunk_size=500):
+            # Conditionnement : signalements informatifs, jamais bloquants.
+            # La part en vrac est une aide à l'affichage, elle se recalcule
+            # d'elle-même au mouvement suivant - un écart ici ne remet pas en
+            # cause la quantité totale, qui reste la seule source de vérité.
+            if stock.location_id is not None:
+                avertissements.append(
+                    f"  Stock {stock.id} ({stock.product.name}) porte un "
+                    f"emplacement : les services agrègent sur la ligne sans "
+                    f"emplacement et ignoreront cette ligne."
+                )
+
+            factor = getattr(stock.product, 'units_per_package', None)
+            if factor and factor > 1 and stock.loose_quantity is not None:
+                reste = (stock.quantity - stock.loose_quantity) % factor
+                if reste:
+                    avertissements.append(
+                        f"  Stock {stock.id} ({stock.product.name} @ "
+                        f"{stock.warehouse.name}) : {reste} unité(s) hors "
+                        f"conditionnement complet - rattachées au vrac à "
+                        f"l'affichage."
+                    )
+
             batches_total = StockBatch.objects.filter(
                 organization=stock.organization,
                 product=stock.product,
@@ -109,6 +133,14 @@ class Command(BaseCommand):
                 self.stdout.write(self.style.SUCCESS(
                     "✓ Aucune divergence Stock ↔ StockMovement détectée."
                 ))
+
+        if avertissements:
+            self.stdout.write(self.style.WARNING(
+                f"\n{len(avertissements)} signalement(s) sur le conditionnement "
+                f"(informatif, sans incidence sur les quantités) :"
+            ))
+            for line in avertissements:
+                self.stdout.write(line)
 
         if has_error:
             self.stdout.write(self.style.WARNING(

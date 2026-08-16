@@ -120,7 +120,7 @@ class SubscriptionService:
         État de blocage léger et sérialisable, destiné au CHEMIN CHAUD
         (SubscriptionMiddleware, exécuté à chaque requête métier).
 
-        Ne renvoie que les primitifs utilisés par le middleware — jamais
+        Ne renvoie que les primitifs utilisés par le middleware - jamais
         l'instance modèle. Caché ~60s (Redis en prod) : retire ~2-3 requêtes
         DB de chaque appel API. La transition d'état (EXPIRED/PAST_DUE) reste
         assurée par get_subscription_status() lors des appels non cachés
@@ -183,7 +183,7 @@ class SubscriptionService:
         Comptages + plafonds + drapeaux UI (renouvellement / upgrade).
 
         Caché ~60s par organisation : évite ~6 COUNT séquentiels à chaque
-        chargement dashboard/status. N'est utilisé QUE pour l'affichage — les
+        chargement dashboard/status. N'est utilisé QUE pour l'affichage - les
         garde-fous réels (assert_can_add_user, etc.) recomptent en direct, donc
         une légère péremption est sans risque fonctionnel.
         """

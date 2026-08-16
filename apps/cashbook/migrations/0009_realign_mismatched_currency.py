@@ -2,7 +2,7 @@
 Réaligne les mouvements et dépenses mal estampillés sur la devise principale.
 
 Les migrations 0006 et 0008 ne traitaient que `currency=''`. Restent les lignes
-portant une devise DIFFÉRENTE de la principale avec un `exchange_rate` de 1 —
+portant une devise DIFFÉRENTE de la principale avec un `exchange_rate` de 1 -
 combinaison impossible pour une vraie ligne en devise étrangère (seule la
 principale vaut 1), donc signature d'une devise héritée d'un défaut plutôt que
 choisie.

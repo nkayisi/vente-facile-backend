@@ -366,7 +366,7 @@ class SyncPushService:
                 return
 
             # Si l'ID existe dans une autre org, refuser la création
-            # (collision UUID inter-tenants — extrêmement improbable mais
+            # (collision UUID inter-tenants - extrêmement improbable mais
             # signalons-le proprement pour éviter une IntegrityError opaque).
             if has_organization and model.objects.filter(id=record_id).exists():
                 raise ValueError(
@@ -384,6 +384,13 @@ class SyncPushService:
         if hasattr(model, 'sync_updated_at'):
             create_data['sync_updated_at'] = timezone.now()
         
+        # L'application mobile ne sait pas encore traiter le conditionnement :
+        # elle calcule ses ventes et son stock hors ligne en supposant une unité
+        # unique. Accepter ces enregistrements produirait des quantités et des
+        # prix faux après synchronisation. On refuse bruyamment plutôt que de
+        # laisser passer une donnée silencieusement fausse.
+        self._assert_not_packaged_product(table_name, create_data)
+
         # Handle special cases
         if table_name == 'sales':
             self._handle_sale_create(model, create_data, data)
@@ -429,6 +436,20 @@ class SyncPushService:
         
         # Prepare and apply update
         update_data = self._prepare_record_data(model, table_name, data)
+
+        # Le mobile envoie systématiquement `wholesale_price`, à `null` quand il
+        # n'en connaît pas la valeur. Ce champ étant nullable, `_prepare_record_data`
+        # ne l'écarte pas et l'écriture efface la valeur du serveur. Sur un
+        # produit vendu en gros, c'est le prix du conditionnement qui
+        # disparaîtrait : donc une vente au mauvais tarif. Tant que le mobile ne
+        # gère pas le conditionnement, ce champ lui est retiré.
+        if (
+            table_name == 'products'
+            and getattr(existing, 'selling_mode', 'retail_only') != 'retail_only'
+        ):
+            update_data.pop('wholesale_price', None)
+            update_data.pop('units_per_package', None)
+            update_data.pop('selling_mode', None)
         
         for field, value in update_data.items():
             setattr(existing, field, value)
@@ -547,7 +568,7 @@ class SyncPushService:
                     # Ni FK, ni colonne réelle : champ inconnu, on ignore.
                     continue
                 # Sinon : colonne concrète non-relationnelle qui finit par `_id`
-                # (ex: `reference_id`, un UUIDField). On NE doit PAS la jeter —
+                # (ex: `reference_id`, un UUIDField). On NE doit PAS la jeter -
                 # elle suit le traitement normal ci-dessous. Sans ça, la
                 # déduplication des mouvements de stock par `reference_id` est
                 # cassée et un retry réseau re-décrémente le stock.
@@ -581,7 +602,7 @@ class SyncPushService:
         Vérifie que la FK pointe vers un objet de la même organisation.
 
         Ne vérifie rien si le modèle cible n'est pas multi-tenant (User,
-        Currency, etc.) — la cohérence est alors assurée par le modèle.
+        Currency, etc.) - la cohérence est alors assurée par le modèle.
         """
         try:
             field = model._meta.get_field(fk_field)
@@ -648,6 +669,35 @@ class SyncPushService:
         
         return sale
     
+    def _assert_not_packaged_product(self, table_name, create_data):
+        """
+        Refuse une ligne de vente ou un mouvement portant un produit vendu en gros.
+
+        Garde-fou temporaire, à retirer quand le mobile saura gérer le
+        conditionnement (il devra alors répliquer le déconditionnement hors
+        ligne et résoudre les conflits sur la part en vrac).
+        """
+        if table_name not in ('sale_items', 'stock_movements'):
+            return
+
+        product_id = create_data.get('product_id')
+        if not product_id:
+            return
+
+        from apps.products.models import Product
+
+        selling_mode = (
+            Product.objects.filter(id=product_id)
+            .values_list('selling_mode', flat=True)
+            .first()
+        )
+        if selling_mode and selling_mode != 'retail_only':
+            raise ValueError(
+                "Ce produit est vendu par conditionnement et n'est pas encore "
+                "pris en charge par l'application mobile. Enregistrez cette "
+                "opération depuis le point de vente sur ordinateur."
+            )
+
     def _handle_stock_movement_create(self, model, create_data, original_data):
         """Handle special logic for creating a stock movement."""
         # Check for duplicate by reference_id (idempotence)

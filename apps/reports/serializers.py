@@ -236,8 +236,11 @@ class StockDetailSerializer(serializers.Serializer):
     product_sku = serializers.CharField()
     category_name = serializers.CharField(allow_null=True)
     current_stock = serializers.DecimalField(max_digits=15, decimal_places=3)
+    # Le même stock dans les mots du marchand : « 12 cartons + 3 bouteilles »
+    stock_display = serializers.CharField()
     reserved_stock = serializers.DecimalField(max_digits=15, decimal_places=3)
     available_stock = serializers.DecimalField(max_digits=15, decimal_places=3)
+    available_display = serializers.CharField()
     min_stock_level = serializers.DecimalField(max_digits=15, decimal_places=3, allow_null=True)
     cost_price = serializers.DecimalField(max_digits=15, decimal_places=2, allow_null=True)
     stock_value = serializers.DecimalField(max_digits=15, decimal_places=2)

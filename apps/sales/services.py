@@ -40,6 +40,7 @@ class SaleStockService:
         Idempotent : ne fait rien si `is_committed(sale)` est True.
         """
         from apps.inventory.models import Stock, StockMovement
+        from apps.inventory.packaging import PackagingService
         from apps.inventory.services import FIFOService
 
         if SaleStockService.is_committed(sale):
@@ -58,7 +59,7 @@ class SaleStockService:
 
         org = sale.organization
 
-        for item in sale.items.select_related('product', 'variant').all():
+        for item in sale.items.select_related('product', 'variant').order_by('product_id'):
             if not item.product.track_inventory:
                 continue
 
@@ -91,6 +92,28 @@ class SaleStockService:
                 stock.avg_cost = cost
 
             quantity_before = stock.quantity
+
+            # Conditionnement - sous le verrou pris ci-dessus, ce qui empêche
+            # deux ventes simultanées d'ouvrir chacune un emballage pour le
+            # même besoin.
+            package_quantity = item.package_quantity or Decimal('0.000')
+            loose_needed = item.loose_quantity
+
+            # Vendre en gros exige des emballages encore scellés : on ne remet
+            # pas des unités déjà sorties dans un emballage neuf.
+            PackagingService.assert_sealed_available(
+                stock, item.product, package_quantity
+            )
+
+            # Servir au détail : ouvrir juste ce qu'il faut, sans interrompre le
+            # caissier. Les mouvements créés sont rattachés à la vente et
+            # remontés dans la réponse pour l'informer.
+            if loose_needed > 0:
+                PackagingService.ensure_loose_available(
+                    stock, item.product, loose_needed, user=user,
+                    reference_type='sale', reference_id=sale.id,
+                )
+
             new_quantity = quantity_before - item.quantity
             allow_negative = getattr(warehouse, 'allow_negative_stock', False)
             if new_quantity < 0 and not allow_negative:
@@ -102,7 +125,11 @@ class SaleStockService:
                     )
                 })
 
-            stock.quantity = new_quantity
+            PackagingService.apply_delta(
+                stock, item.product,
+                delta_base=-item.quantity,
+                delta_loose=-loose_needed,
+            )
             stock.last_movement_at = timezone.now()
             stock.save()
 
@@ -117,6 +144,9 @@ class SaleStockService:
                 unit_cost=item.cost_price,
                 quantity_before=quantity_before,
                 quantity_after=stock.quantity,
+                input_package_quantity=package_quantity,
+                input_loose_quantity=loose_needed,
+                packaging_factor=item.packaging_factor,
                 reference_type='sale',
                 reference_id=sale.id,
                 notes=f"Vente {sale.reference}",
@@ -151,7 +181,7 @@ class SaleStockService:
         org = sale.organization
         allow_negative = getattr(warehouse, 'allow_negative_stock', False)
 
-        for item in sale.items.select_related('product', 'variant').all():
+        for item in sale.items.select_related('product', 'variant').order_by('product_id'):
             if not item.product.track_inventory:
                 continue
 
@@ -215,7 +245,7 @@ class SaleStockService:
 
         org = sale.organization
 
-        for item in sale.items.select_related('product', 'variant').all():
+        for item in sale.items.select_related('product', 'variant').order_by('product_id'):
             if not item.product.track_inventory:
                 continue
 
@@ -243,8 +273,13 @@ class SaleStockService:
         """
         Ré-incrémente le stock pour chaque item (mouvements `return_in`).
         Ne fait rien si le stock n'avait pas été décrémenté.
+
+        Les mouvements de déconditionnement de la vente ne sont **pas** annulés :
+        un emballage ouvert le reste. Ils portent `quantity = 0`, ils
+        n'influencent donc aucun total.
         """
         from apps.inventory.models import Stock, StockMovement
+        from apps.inventory.packaging import PackagingService
 
         if not SaleStockService.is_committed(sale):
             return
@@ -255,7 +290,7 @@ class SaleStockService:
 
         org = sale.organization
 
-        for item in sale.items.select_related('product', 'variant').all():
+        for item in sale.items.select_related('product', 'variant').order_by('product_id'):
             if not item.product.track_inventory:
                 continue
 
@@ -285,7 +320,14 @@ class SaleStockService:
                 else:
                     stock.avg_cost = item.cost_price
 
-            stock.quantity += item.quantity
+            # Les unités reviennent en vrac : un client qui rend 2 bouteilles ne
+            # reconstitue pas un emballage scellé, même si la ligne d'origine
+            # portait sur des conditionnements entiers.
+            PackagingService.apply_delta(
+                stock, item.product,
+                delta_base=item.quantity,
+                delta_loose=item.quantity,
+            )
             stock.last_movement_at = timezone.now()
             stock.save()
 
@@ -302,6 +344,97 @@ class SaleStockService:
                 reference_type='sale_cancel',
                 reference_id=sale.id,
                 notes=f"Annulation vente {sale.reference}",
+                created_by=user,
+            )
+
+    @staticmethod
+    @transaction.atomic
+    def apply_return(sale_return, user):
+        """
+        Remet en stock les articles d'un retour client approuvé.
+
+        Extrait de ``SaleReturnViewSet.approve``, où il dupliquait le recalcul de
+        coût moyen de ``revert``. Les garder séparés aurait obligé à maintenir
+        la mise à jour du vrac à deux endroits.
+
+        Les unités reviennent **en vrac** : un client qui rend 2 bouteilles ne
+        reconstitue pas un emballage scellé.
+        """
+        from apps.inventory.models import Stock, StockMovement
+        from apps.inventory.packaging import PackagingService
+
+        original_sale = sale_return.original_sale
+        warehouse = original_sale.warehouse
+        if not warehouse:
+            return
+
+        org = sale_return.organization
+
+        items = (
+            sale_return.items.filter(restock=True)
+            .select_related('original_item__product', 'original_item__variant')
+            .order_by('original_item__product_id')
+        )
+
+        for item in items:
+            original_item = item.original_item
+            product = original_item.product
+            if not product.track_inventory:
+                continue
+
+            product_cost = product.cost_price or Decimal('0.00')
+            cost = (
+                original_item.cost_price
+                if original_item.cost_price and original_item.cost_price > 0
+                else product_cost
+            )
+            stock, created = Stock.objects.select_for_update().get_or_create(
+                organization=org,
+                product=product,
+                variant=original_item.variant,
+                warehouse=warehouse,
+                defaults={'quantity': Decimal('0.000'), 'avg_cost': cost},
+            )
+            if not created and stock.avg_cost == 0 and cost > 0:
+                stock.avg_cost = cost
+
+            quantity_before = stock.quantity
+
+            # Recalcul du coût moyen pondéré au retour
+            if cost > 0 and item.quantity > 0:
+                if stock.quantity > 0:
+                    total_existing = stock.quantity * stock.avg_cost
+                    total_incoming = item.quantity * original_item.cost_price
+                    stock.avg_cost = (
+                        (total_existing + total_incoming) /
+                        (stock.quantity + item.quantity)
+                    ).quantize(TWO_PLACES)
+                else:
+                    stock.avg_cost = original_item.cost_price
+
+            PackagingService.apply_delta(
+                stock, product,
+                delta_base=item.quantity,
+                delta_loose=item.quantity,
+            )
+            stock.last_movement_at = timezone.now()
+            stock.save()
+
+            StockMovement.objects.create(
+                organization=org,
+                product=product,
+                variant=original_item.variant,
+                warehouse=warehouse,
+                movement_type='return_in',
+                quantity=item.quantity,
+                unit_cost=original_item.cost_price,
+                quantity_before=quantity_before,
+                quantity_after=stock.quantity,
+                input_loose_quantity=item.quantity,
+                packaging_factor=original_item.packaging_factor,
+                reference_type='sale_return',
+                reference_id=sale_return.id,
+                notes=f"Retour {sale_return.reference}",
                 created_by=user,
             )
 
@@ -366,7 +499,7 @@ def create_payment(sale, user, *, payment_method=None, payment_method_id=None,
     devise de la vente. ``tendered_amount`` est prioritaire ; à défaut ``amount``
     est traité comme le montant remis (rétro-compatibilité mono-devise).
 
-    Ne met PAS à jour ``sale.amount_paid`` — l'appelant agrège les ``payment.amount``.
+    Ne met PAS à jour ``sale.amount_paid`` - l'appelant agrège les ``payment.amount``.
     Retourne le ``Payment`` créé.
     """
     from apps.sales.models import Payment

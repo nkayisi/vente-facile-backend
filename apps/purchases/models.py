@@ -184,7 +184,33 @@ class PurchaseOrderItem(TenantModel):
     )
     
     unit_price = models.DecimalField(max_digits=15, decimal_places=2)
-    
+
+    # Commande passée en contenants : « 10 cartons à 12 500 ». `quantity_ordered`
+    # (en unité de détail) et `unit_price` restent les valeurs qui font foi pour
+    # la réception et le stock ; les champs ci-dessous conservent la saisie du
+    # marchand, qui est aussi ce que le fournisseur facture.
+    package_quantity = models.DecimalField(
+        max_digits=15,
+        decimal_places=3,
+        default=Decimal('0.000')
+    )
+    loose_quantity = models.DecimalField(
+        max_digits=15,
+        decimal_places=3,
+        default=Decimal('0.000')
+    )
+    package_unit_price = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        null=True,
+        blank=True
+    )
+    packaging_factor = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Nombre d'unités par contenant au moment de la commande."
+    )
+
     tax_rate = models.DecimalField(
         max_digits=5,
         decimal_places=2,
@@ -318,7 +344,36 @@ class GoodsReceiptItem(TenantModel):
     )
     
     unit_cost = models.DecimalField(max_digits=15, decimal_places=2)
-    
+
+    # Réception constatée en contenants : « 10 cartons + 3 bouteilles ». Les
+    # quantités en unité de détail restent seules à piloter le stock, les lots
+    # et le coût moyen pondéré ; ce partage sert à savoir ce qui entre scellé.
+    package_quantity = models.DecimalField(
+        max_digits=15,
+        decimal_places=3,
+        default=Decimal('0.000')
+    )
+    loose_quantity = models.DecimalField(
+        max_digits=15,
+        decimal_places=3,
+        default=Decimal('0.000')
+    )
+    package_unit_cost = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text=(
+            "Prix d'achat d'un contenant entier. `unit_cost` en est déduit et "
+            "reste la valeur utilisée pour le coût moyen pondéré."
+        )
+    )
+    packaging_factor = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Nombre d'unités par contenant au moment de la réception."
+    )
+
     batch_number = models.CharField(max_length=100, blank=True)
     expiry_date = models.DateField(null=True, blank=True)
     

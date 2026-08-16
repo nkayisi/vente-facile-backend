@@ -40,7 +40,7 @@ SYNCABLE_MODELS_MAP = {
 # Tables that are read-only on mobile (can only be pulled, not pushed).
 # Reflète l'intention documentée ligne 10 ("Phase 1: Reference data (read-only
 # on mobile)") : ces référentiels sont gérés depuis le dashboard par
-# l'owner/manager — le cashier sur mobile sélectionne dans le catalogue
+# l'owner/manager - le cashier sur mobile sélectionne dans le catalogue
 # existant mais ne peut pas créer/modifier ces lignes.
 READ_ONLY_TABLES = {
     'categories',
@@ -60,5 +60,6 @@ SPECIAL_PUSH_TABLES = {
 # Maximum records per table in a single pull response
 MAX_RECORDS_PER_TABLE = 1000
 
-# Default schema version for sync responses
-SCHEMA_VERSION = 1
+# Default schema version for sync responses.
+# 2 : ajout de `selling_mode` / `units_per_package` sur les produits.
+SCHEMA_VERSION = 2

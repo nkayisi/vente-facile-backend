@@ -441,7 +441,7 @@ class ResetPasswordRequestView(APIView):
             frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:3005')
             reset_link = f"{frontend_url}/auth/reset-password?uid={uid}&token={token}"
             
-            subject = "Vente Facile — Réinitialisation de votre mot de passe"
+            subject = "Vente Facile - Réinitialisation de votre mot de passe"
             message = (
                 f"Bonjour {user.first_name or user.email},\n\n"
                 f"Vous avez demandé la réinitialisation de votre mot de passe.\n\n"
@@ -449,7 +449,7 @@ class ResetPasswordRequestView(APIView):
                 f"{reset_link}\n\n"
                 f"Ce lien est valide pendant 24 heures.\n\n"
                 f"Si vous n'avez pas fait cette demande, ignorez simplement cet email.\n\n"
-                f"— L'équipe Vente Facile"
+                f"- L'équipe Vente Facile"
             )
             
             try:

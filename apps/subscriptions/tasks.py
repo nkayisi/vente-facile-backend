@@ -1,5 +1,5 @@
 """
-Tâches Celery — suivi des paiements MOKO en attente (API v2).
+Tâches Celery - suivi des paiements MOKO en attente (API v2).
 """
 import logging
 

@@ -3,6 +3,7 @@ Services pour l'importation et l'exportation de produits via Excel.
 """
 import hashlib
 import io
+import unicodedata
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Tuple, Optional, Any
@@ -11,6 +12,7 @@ from django.db import transaction
 from django.utils.text import slugify
 from rest_framework.exceptions import ValidationError
 
+from apps.products.pricing import ProductPricingService
 from apps.subscriptions.services import SubscriptionService
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, Protection
@@ -23,13 +25,30 @@ from .models import Product, Category, Brand, Unit
 # Signature secrète pour valider l'authenticité du template
 TEMPLATE_SIGNATURE = "VF-IMPORT-2026-SECURE"
 # 1.2: signature globale (sans organization.id) pour que le même fichier reste valide entre orgs / environnements.
-TEMPLATE_VERSION = "1.2"
+# 1.3: prix d'achat au conditionnement, mode de vente explicite, en-têtes de prix
+#      qui disent gros ou détail.
+TEMPLATE_VERSION = "1.3"
+
+
+class ProductRowError(Exception):
+    """
+    Erreurs de contenu d'une ligne, regroupées.
+
+    Le marchand corrige son fichier une fois : lui livrer les reproches un par
+    un le ferait revenir autant de fois qu'il y a de colonnes fautives.
+    """
+
+    def __init__(self, messages):
+        self.messages = messages if isinstance(messages, list) else [messages]
+        super().__init__(" ".join(self.messages))
 
 
 class ProductExcelService:
     """Service pour la gestion des imports/exports Excel de produits."""
-    
-    # Colonnes du template avec leurs configurations
+
+    # Colonnes du template avec leurs configurations.
+    # Les quatre prix forment deux paires adjacentes, détail puis gros : le
+    # marchand retrouve dans son tableur le regroupement qu'il voit à l'écran.
     COLUMNS = [
         {"key": "name", "header": "Nom du produit *", "width": 35, "required": True},
         {"key": "sku", "header": "Code SKU *", "width": 15, "required": True},
@@ -37,10 +56,14 @@ class ProductExcelService:
         {"key": "category", "header": "Catégorie", "width": 25, "required": False},
         {"key": "subcategory", "header": "Sous-catégorie", "width": 25, "required": False},
         {"key": "brand", "header": "Marque", "width": 15, "required": False},
-        {"key": "unit", "header": "Unité", "width": 12, "required": False},
-        {"key": "cost_price", "header": "Prix d'achat", "width": 15, "required": False},
-        {"key": "selling_price", "header": "Prix de vente *", "width": 15, "required": True},
-        {"key": "wholesale_price", "header": "Prix de gros", "width": 15, "required": False},
+        {"key": "unit", "header": "Unité de détail", "width": 15, "required": False},
+        {"key": "selling_mode", "header": "Mode de vente", "width": 18, "required": False},
+        {"key": "packaging_unit", "header": "Unité de gros", "width": 15, "required": False},
+        {"key": "units_per_package", "header": "Unités par conditionnement", "width": 24, "required": False},
+        {"key": "cost_price", "header": "Prix d'achat (détail)", "width": 18, "required": False},
+        {"key": "selling_price", "header": "Prix de vente (détail) *", "width": 20, "required": True},
+        {"key": "package_cost_price", "header": "Prix d'achat (conditionnement)", "width": 26, "required": False},
+        {"key": "wholesale_price", "header": "Prix de vente (conditionnement)", "width": 27, "required": False},
         {"key": "tax_rate", "header": "Taux TVA (%)", "width": 12, "required": False},
         {"key": "is_taxable", "header": "Taxable (Oui/Non)", "width": 15, "required": False},
         {"key": "track_inventory", "header": "Suivi stock (Oui/Non)", "width": 18, "required": False},
@@ -48,7 +71,68 @@ class ProductExcelService:
         {"key": "min_stock_level", "header": "Stock minimum", "width": 14, "required": False},
         {"key": "short_description", "header": "Description", "width": 40, "required": False},
     ]
-    
+
+    # Dispositions des versions précédentes, **figées à jamais** : un marchand
+    # peut avoir téléchargé son modèle il y a des mois et le remplir aujourd'hui.
+    # Recopiées littéralement, elles ne doivent jamais être régénérées depuis
+    # COLUMNS, sinon la compatibilité disparaîtrait au premier renommage.
+    LEGACY_LAYOUTS = {
+        "1.2": [
+            ("name", "Nom du produit *"),
+            ("sku", "Code SKU *"),
+            ("barcode", "Code-barres"),
+            ("category", "Catégorie"),
+            ("subcategory", "Sous-catégorie"),
+            ("brand", "Marque"),
+            ("unit", "Unité"),
+            ("packaging_unit", "Unité de gros"),
+            ("units_per_package", "Unités par conditionnement"),
+            ("cost_price", "Prix d'achat"),
+            ("selling_price", "Prix de vente *"),
+            ("wholesale_price", "Prix de gros / du conditionnement"),
+            ("tax_rate", "Taux TVA (%)"),
+            ("is_taxable", "Taxable (Oui/Non)"),
+            ("track_inventory", "Suivi stock (Oui/Non)"),
+            ("has_expiry_date", "Périssable (Oui/Non)"),
+            ("min_stock_level", "Stock minimum"),
+            ("short_description", "Description"),
+        ],
+    }
+
+    # Libellés acceptés dans la colonne « Mode de vente ». Tolérants : le
+    # marchand écrit dans ses mots, pas dans ceux de la base.
+    SELLING_MODE_ALIASES = {
+        "detail": Product.SellingMode.RETAIL_ONLY,
+        "au detail": Product.SellingMode.RETAIL_ONLY,
+        "detail seul": Product.SellingMode.RETAIL_ONLY,
+        "vente au detail": Product.SellingMode.RETAIL_ONLY,
+        "retail": Product.SellingMode.RETAIL_ONLY,
+        "retail_only": Product.SellingMode.RETAIL_ONLY,
+        "gros": Product.SellingMode.WHOLESALE_ONLY,
+        "en gros": Product.SellingMode.WHOLESALE_ONLY,
+        "gros seul": Product.SellingMode.WHOLESALE_ONLY,
+        "vente en gros": Product.SellingMode.WHOLESALE_ONLY,
+        "wholesale": Product.SellingMode.WHOLESALE_ONLY,
+        "wholesale_only": Product.SellingMode.WHOLESALE_ONLY,
+        "gros et detail": Product.SellingMode.WHOLESALE_AND_RETAIL,
+        "detail et gros": Product.SellingMode.WHOLESALE_AND_RETAIL,
+        "en gros et au detail": Product.SellingMode.WHOLESALE_AND_RETAIL,
+        "gros et au detail": Product.SellingMode.WHOLESALE_AND_RETAIL,
+        "les deux": Product.SellingMode.WHOLESALE_AND_RETAIL,
+        "mixte": Product.SellingMode.WHOLESALE_AND_RETAIL,
+        "wholesale_and_retail": Product.SellingMode.WHOLESALE_AND_RETAIL,
+    }
+
+    SELLING_MODE_CHOICES_LABEL = "Détail, Gros, Gros et détail"
+
+    # Libellés écrits à l'export. Volontairement pris parmi les alias acceptés à
+    # l'import : un fichier exporté doit pouvoir être réimporté tel quel.
+    SELLING_MODE_EXPORT_LABELS = {
+        Product.SellingMode.RETAIL_ONLY: "Détail",
+        Product.SellingMode.WHOLESALE_ONLY: "Gros",
+        Product.SellingMode.WHOLESALE_AND_RETAIL: "Gros et détail",
+    }
+
     @classmethod
     def generate_template(cls, organization) -> io.BytesIO:
         """
@@ -100,7 +184,9 @@ class ProductExcelService:
         row += 1
         guide_sheet.cell(row=row, column=1, value="• Code SKU * : Code unique d'identification (ex: COCA-33CL, FANTA-50CL)").font = text_font
         row += 1
-        guide_sheet.cell(row=row, column=1, value="• Prix de vente * : Prix de vente au client (nombre décimal)").font = text_font
+        guide_sheet.cell(row=row, column=1, value="• Prix de vente (détail) * : Prix d'une unité vendue à la pièce").font = text_font
+        row += 1
+        guide_sheet.cell(row=row, column=1, value="  → Sauf en mode « Gros », où c'est le prix du conditionnement qui est obligatoire").font = example_font
         row += 2
         
         # Section 3 : Colonnes optionnelles
@@ -116,11 +202,13 @@ class ProductExcelService:
         row += 1
         guide_sheet.cell(row=row, column=1, value="• Marque : Nom de la marque du produit").font = text_font
         row += 1
-        guide_sheet.cell(row=row, column=1, value="• Unité : Unité de mesure (Pièce, Kg, Litre, Carton, etc.)").font = text_font
+        guide_sheet.cell(row=row, column=1, value="• Unité de détail : Ce que vous vendez à la pièce (Bouteille, Pièce, Kg, Litre…)").font = text_font
         row += 1
-        guide_sheet.cell(row=row, column=1, value="• Prix d'achat : Prix d'achat/coût du produit").font = text_font
+        guide_sheet.cell(row=row, column=1, value="• Prix d'achat (détail) : Ce que vous coûte une unité").font = text_font
         row += 1
-        guide_sheet.cell(row=row, column=1, value="• Prix de gros : Prix pour les ventes en gros (optionnel)").font = text_font
+        guide_sheet.cell(row=row, column=1, value="• Prix d'achat (conditionnement) : Ce que vous coûte un carton entier").font = text_font
+        row += 1
+        guide_sheet.cell(row=row, column=1, value="• Prix de vente (conditionnement) : Le prix auquel vous vendez le carton entier").font = text_font
         row += 1
         guide_sheet.cell(row=row, column=1, value="• Taux TVA (%) : Pourcentage de TVA (ex: 16 pour 16%)").font = text_font
         row += 1
@@ -135,6 +223,36 @@ class ProductExcelService:
         guide_sheet.cell(row=row, column=1, value="• Description : Description courte du produit").font = text_font
         row += 2
         
+        # Section 3 bis : vente en gros et au détail
+        guide_sheet.cell(row=row, column=1, value="🏷️ VENDRE EN GROS ET AU DÉTAIL").font = section_font
+        row += 1
+        guide_sheet.cell(row=row, column=1, value="La colonne « Mode de vente » décide de la forme sous laquelle vous vendez :").font = text_font
+        row += 1
+        guide_sheet.cell(row=row, column=1, value="• Détail : à la pièce uniquement (c'est le mode par défaut si la colonne est vide)").font = text_font
+        row += 1
+        guide_sheet.cell(row=row, column=1, value="• Gros : par conditionnement entier uniquement").font = text_font
+        row += 1
+        guide_sheet.cell(row=row, column=1, value="• Gros et détail : les deux, avec un prix pour chacun").font = text_font
+        row += 2
+        guide_sheet.cell(row=row, column=1, value="Exemple : un carton de 12 bouteilles d'eau, acheté 5 400 le carton,").font = example_font
+        row += 1
+        guide_sheet.cell(row=row, column=1, value="revendu 6 000 le carton ou 550 la bouteille, se saisit ainsi :").font = example_font
+        row += 1
+        guide_sheet.cell(row=row, column=1, value="  Mode de vente: Gros et détail | Unité de détail: Bouteille | Unité de gros: Carton").font = example_font
+        row += 1
+        guide_sheet.cell(row=row, column=1, value="  Unités par conditionnement: 12 | Prix d'achat (conditionnement): 5400").font = example_font
+        row += 1
+        guide_sheet.cell(row=row, column=1, value="  Prix de vente (conditionnement): 6000 | Prix de vente (détail): 550").font = example_font
+        row += 2
+        guide_sheet.cell(row=row, column=1, value="⚠️ En mode Gros ou Gros et détail, ces quatre colonnes sont obligatoires :").font = warning_font
+        row += 1
+        guide_sheet.cell(row=row, column=1, value="unité de détail, unité de gros, unités par conditionnement (au moins 2) et").font = text_font
+        row += 1
+        guide_sheet.cell(row=row, column=1, value="prix de vente du conditionnement. Sinon la ligne est REJETÉE et vous êtes prévenu.").font = text_font
+        row += 1
+        guide_sheet.cell(row=row, column=1, value="Le prix d'achat au détail peut rester vide : il se déduit du prix du carton.").font = example_font
+        row += 2
+
         # Section 4 : Création automatique
         guide_sheet.cell(row=row, column=1, value="✨ CRÉATION AUTOMATIQUE DES RÉFÉRENCES").font = success_font
         row += 1
@@ -146,7 +264,9 @@ class ProductExcelService:
         row += 1
         guide_sheet.cell(row=row, column=1, value="  elle sera créée automatiquement avant d'importer le produit.").font = example_font
         row += 1
-        guide_sheet.cell(row=row, column=1, value="  Le même principe s'applique pour les sous-catégories, marques et unités.").font = example_font
+        guide_sheet.cell(row=row, column=1, value="  Le même principe s'applique pour les sous-catégories, marques, unités de").font = example_font
+        row += 1
+        guide_sheet.cell(row=row, column=1, value="  détail et unités de gros.").font = example_font
         row += 2
         
         # Section 5 : Règles importantes
@@ -225,7 +345,22 @@ class ProductExcelService:
                 yes_no_validation.add(f"{col_letter}3:{col_letter}1000")
         
         ws.add_data_validation(yes_no_validation)
-        
+
+        # Mode de vente : liste déroulante plutôt que saisie libre, pour que le
+        # marchand n'ait pas à deviner les libellés acceptés.
+        mode_validation = DataValidation(
+            type="list",
+            formula1='"Détail,Gros,Gros et détail"',
+            allow_blank=True
+        )
+        mode_validation.error = "Choisissez Détail, Gros, ou Gros et détail"
+        mode_validation.errorTitle = "Mode de vente invalide"
+        for col_idx, col_config in enumerate(cls.COLUMNS, start=1):
+            if col_config["key"] == "selling_mode":
+                col_letter = get_column_letter(col_idx)
+                mode_validation.add(f"{col_letter}3:{col_letter}1000")
+        ws.add_data_validation(mode_validation)
+
         # Ajouter quelques lignes vides formatées pour guider l'utilisateur
         for row in range(3, 13):
             for col_idx in range(1, len(cls.COLUMNS) + 1):
@@ -301,18 +436,56 @@ class ProductExcelService:
         
         ws = wb[products_sheet_name]
 
-        # En-têtes (ligne 2) : critère principal du format — doit correspondre au template officiel
-        expected_headers = [col["header"] for col in cls.COLUMNS]
-        actual_headers = [ws.cell(row=2, column=i).value for i in range(1, len(cls.COLUMNS) + 1)]
-
-        if actual_headers != expected_headers:
-            return False, "Les en-têtes du fichier ont été modifiés. Utilisez le template officiel sans modifier les en-têtes.", None
+        # En-têtes (ligne 2) : critère principal du format. La disposition
+        # courante et celles des versions précédentes sont acceptées.
+        if cls._resolve_layout(ws) is None:
+            return (
+                False,
+                "Les en-têtes du fichier ne correspondent à aucun modèle connu. "
+                "Téléchargez le nouveau modèle et recopiez-y vos produits.",
+                None,
+            )
 
         # Signature (ligne 1) : renforce l'authenticité mais ne bloque pas si les en-têtes sont conformes
         # (ex. template 1.1 lié à une autre organisation, copie entre environnements, Excel qui modifie A1).
         # Ligne 1 (signature) ignorée pour le blocage : les en-têtes exacts garantissent le format attendu.
 
         return True, "Fichier valide", wb
+
+    @classmethod
+    def _resolve_layout(cls, ws) -> Optional[List[str]]:
+        """
+        Clés de colonnes, dans l'ordre, correspondant aux en-têtes du fichier.
+
+        Retourne ``None`` si la ligne d'en-tête ne correspond à aucune version
+        connue du modèle. Un fichier d'une version antérieure produit une liste
+        plus courte : les clés apparues depuis sont simplement absentes, et le
+        parsing retombe alors sur le comportement de cette version-là.
+        """
+        def headers_at(count):
+            return [ws.cell(row=2, column=i).value for i in range(1, count + 1)]
+
+        current = [col["header"] for col in cls.COLUMNS]
+        if headers_at(len(current)) == current:
+            return [col["key"] for col in cls.COLUMNS]
+
+        for layout in cls.LEGACY_LAYOUTS.values():
+            if headers_at(len(layout)) == [header for _key, header in layout]:
+                return [key for key, _header in layout]
+
+        return None
+
+    @classmethod
+    def _read_row(cls, ws, row_num: int, layout: List[str]) -> Tuple[Dict[str, Any], bool]:
+        """Lit une ligne selon la disposition résolue. Retourne (données, non vide)."""
+        row_data = {}
+        has_data = False
+        for col_idx, key in enumerate(layout, start=1):
+            value = ws.cell(row=row_num, column=col_idx).value
+            if value is not None and str(value).strip():
+                has_data = True
+            row_data[key] = value
+        return row_data, has_data
     
     @classmethod
     def import_products(cls, file_content: bytes, organization, user) -> Dict[str, Any]:
@@ -343,6 +516,13 @@ class ProductExcelService:
         # Charger les SKU et codes-barres existants pour détecter les doublons
         existing_skus = set(Product.objects.filter(organization=organization, is_deleted=False).values_list('sku', flat=True))
         existing_barcodes = set(Product.objects.filter(organization=organization, is_deleted=False, barcode__isnull=False).exclude(barcode='').values_list('barcode', flat=True))
+        # Slugs déjà attribués dans CE fichier : sans eux, deux produits de même
+        # nom recevraient le même slug, la contrainte d'unicité sauterait à la
+        # création et tout le lot serait perdu.
+        allocated_slugs = set(
+            Product.objects.filter(organization=organization, is_deleted=False)
+            .values_list('slug', flat=True)
+        )
         
         results = {
             "success": True,
@@ -354,39 +534,32 @@ class ProductExcelService:
         
         products_to_create = []
         row_num = 3  # Données commencent à la ligne 3
-        parent_categories, subcategories, brand_values, unit_values = cls._collect_reference_values(ws)
+        layout = cls._resolve_layout(ws)
+        parent_categories, subcategories, brand_values, unit_values = cls._collect_reference_values(ws, layout)
         cls._sync_categories(organization, category_lookup, parent_categories, subcategories)
         cls._sync_brands(organization, brands_map, brand_values)
         cls._sync_units(organization, units_map, unit_values)
-        
+
         while True:
-            # Lire la ligne
-            row_data = {}
-            has_data = False
-            
-            for col_idx, col_config in enumerate(cls.COLUMNS, start=1):
-                value = ws.cell(row=row_num, column=col_idx).value
-                if value is not None and str(value).strip():
-                    has_data = True
-                row_data[col_config["key"]] = value
-            
+            row_data, has_data = cls._read_row(ws, row_num, layout)
+
             if not has_data:
                 break  # Fin des données
-            
+
             # Valider les champs requis
             errors = []
-            
+
             name = str(row_data.get("name") or "").strip()
             sku = str(row_data.get("sku") or "").strip()
-            selling_price = row_data.get("selling_price")
-            
+
             if not name:
                 errors.append("Nom du produit requis")
             if not sku:
                 errors.append("Code SKU requis")
-            if selling_price is None:
-                errors.append("Prix de vente requis")
-            
+            # Le prix de vente au détail est contrôlé dans `_parse_row_data`, qui
+            # seul connaît le mode de vente : en gros seul, c'est le prix du
+            # conditionnement qui prend le relais.
+
             # Vérifier les doublons SKU
             if sku and sku in existing_skus:
                 errors.append(f"SKU '{sku}' existe déjà")
@@ -418,18 +591,26 @@ class ProductExcelService:
                 product_data["created_by"] = user
                 product_data["slug"] = slugify(name)
                 
-                # Assurer l'unicité du slug
+                # Assurer l'unicité du slug, en base comme dans ce fichier
                 base_slug = product_data["slug"]
                 counter = 1
-                while Product.objects.filter(organization=organization, slug=product_data["slug"], is_deleted=False).exists():
+                while product_data["slug"] in allocated_slugs:
                     product_data["slug"] = f"{base_slug}-{counter}"
                     counter += 1
-                
+                allocated_slugs.add(product_data["slug"])
+
                 products_to_create.append(product_data)
                 existing_skus.add(sku)  # Ajouter pour éviter les doublons dans le même fichier
                 if barcode:
                     existing_barcodes.add(barcode)
-                
+
+            except ProductRowError as e:
+                results["errors"].append({
+                    "row": row_num,
+                    "name": name,
+                    "errors": e.messages
+                })
+                results["skipped"] += 1
             except Exception as e:
                 results["errors"].append({
                     "row": row_num,
@@ -472,6 +653,66 @@ class ProductExcelService:
     def _normalize_key(cls, value: Any) -> str:
         """Normalise une valeur pour comparaison (minuscule, espaces unifiés)."""
         return " ".join(str(value or "").strip().lower().split())
+
+    @classmethod
+    def _normalize_label(cls, value: Any) -> str:
+        """
+        Comme `_normalize_key`, mais sans les accents.
+
+        Réservée aux libellés d'un vocabulaire fermé (le mode de vente). Replier
+        les accents dans `_normalize_key` fusionnerait « Café » et « Cafe »,
+        qui sont deux catégories légitimement distinctes.
+        """
+        text = cls._normalize_key(value)
+        decomposed = unicodedata.normalize("NFKD", text)
+        return "".join(c for c in decomposed if not unicodedata.combining(c))
+
+    @classmethod
+    def _parse_selling_mode(cls, value, *, has_packaging_inputs: bool) -> str:
+        """
+        Mode de vente saisi par le marchand, dans ses mots.
+
+        Colonne vide (ou absente, pour un fichier d'une version antérieure du
+        modèle) : on retombe sur la déduction historique, qui regarde si le
+        conditionnement est renseigné.
+        """
+        label = cls._normalize_label(value)
+        if not label:
+            return (
+                Product.SellingMode.WHOLESALE_AND_RETAIL if has_packaging_inputs
+                else Product.SellingMode.RETAIL_ONLY
+            )
+
+        mode = cls.SELLING_MODE_ALIASES.get(label)
+        if mode is None:
+            raise ProductRowError(
+                f"Mode de vente non reconnu : « {value} ». "
+                f"Valeurs attendues : {cls.SELLING_MODE_CHOICES_LABEL}."
+            )
+        return mode
+
+    @classmethod
+    def _flatten_validation_error(cls, exc: ValidationError) -> List[str]:
+        """
+        Aplatit une erreur DRF en messages lisibles ligne par ligne.
+
+        Attention : DRF ne normalise pas les valeurs d'un dictionnaire d'erreurs
+        en listes. Les itérer sans distinguer découperait un message en autant
+        de caractères.
+        """
+        def as_messages(value):
+            if isinstance(value, (list, tuple)):
+                return [str(item) for item in value]
+            return [str(value)]
+
+        detail = exc.detail
+        if isinstance(detail, dict):
+            return [
+                message
+                for value in detail.values()
+                for message in as_messages(value)
+            ]
+        return as_messages(detail)
 
     @classmethod
     def _allocate_unique_category_slug(cls, organization, parent: Optional[Category], display_name: str) -> str:
@@ -545,7 +786,7 @@ class ProductExcelService:
         return {cls._normalize_key(unit.name): unit for unit in units}
 
     @classmethod
-    def _collect_reference_values(cls, ws):
+    def _collect_reference_values(cls, ws, layout: List[str]):
         """Collecte les référentiels saisis dans les lignes du fichier."""
         parent_categories: Dict[str, str] = {}
         subcategories: Dict[Tuple[str, str], Tuple[str, str]] = {}
@@ -554,13 +795,7 @@ class ProductExcelService:
 
         row_num = 3
         while True:
-            row_data = {}
-            has_data = False
-            for col_idx, col_config in enumerate(cls.COLUMNS, start=1):
-                value = ws.cell(row=row_num, column=col_idx).value
-                if value is not None and str(value).strip():
-                    has_data = True
-                row_data[col_config["key"]] = value
+            row_data, has_data = cls._read_row(ws, row_num, layout)
 
             if not has_data:
                 break
@@ -569,6 +804,10 @@ class ProductExcelService:
             subcategory_name = cls._clean_text(row_data.get("subcategory"))
             brand_name = cls._clean_text(row_data.get("brand"))
             unit_name = cls._clean_text(row_data.get("unit"))
+            # L'unité de gros est un `Unit` comme un autre : sans cette collecte,
+            # un carton inconnu n'était jamais créé et le produit retombait en
+            # vente au détail seule, sans le moindre message.
+            packaging_unit_name = cls._clean_text(row_data.get("packaging_unit"))
 
             if category_name and not subcategory_name and ">" in category_name:
                 parts = [cls._clean_text(part) for part in category_name.split(">") if cls._clean_text(part)]
@@ -594,6 +833,10 @@ class ProductExcelService:
                 brand_values.setdefault(cls._normalize_key(brand_name), brand_name)
             if unit_name:
                 unit_values.setdefault(cls._normalize_key(unit_name), unit_name)
+            if packaging_unit_name:
+                unit_values.setdefault(
+                    cls._normalize_key(packaging_unit_name), packaging_unit_name
+                )
 
             row_num += 1
 
@@ -673,7 +916,26 @@ class ProductExcelService:
                 return Decimal(str(value).replace(",", ".").strip())
             except (InvalidOperation, ValueError):
                 return default
-        
+
+        def parse_price(value, label):
+            """
+            Prix optionnel : ``None`` si vide, erreur si illisible.
+
+            `parse_decimal` retombe silencieusement sur 0 : « 6 000 FC » saisi
+            dans une colonne de prix devenait un prix nul sans un mot, et le
+            produit partait en vente à perte.
+            """
+            if value is None or str(value).strip() == "":
+                return None
+            text = str(value).replace(",", ".").strip()
+            try:
+                return Decimal(text)
+            except (InvalidOperation, ValueError):
+                raise ProductRowError(
+                    f"{label} illisible : « {value} ». Saisissez un nombre, "
+                    f"sans devise ni espace."
+                )
+
         def parse_bool(value, default=True):
             if value is None:
                 return default
@@ -716,7 +978,82 @@ class ProductExcelService:
 
         brand = brands_map.get(cls._normalize_key(brand_input)) if brand_input else None
         unit = units_map.get(cls._normalize_key(unit_input)) if unit_input else None
-        
+
+        packaging_unit_input = cls._clean_text(row_data.get("packaging_unit"))
+        packaging_unit = (
+            units_map.get(cls._normalize_key(packaging_unit_input))
+            if packaging_unit_input else None
+        )
+        units_per_package = parse_int(row_data.get("units_per_package"), 0)
+
+        cost_price = parse_price(row_data.get("cost_price"), "Prix d'achat (détail)")
+        selling_price = parse_price(row_data.get("selling_price"), "Prix de vente (détail)")
+        package_cost_price = parse_price(
+            row_data.get("package_cost_price"), "Prix d'achat (conditionnement)"
+        )
+        wholesale_price = parse_price(
+            row_data.get("wholesale_price"), "Prix de vente (conditionnement)"
+        ) or None
+
+        # Le mode de vente est saisi. Une colonne vide, ou un fichier d'une
+        # version antérieure du modèle où la colonne n'existe pas, retombe sur
+        # la déduction d'avant.
+        selling_mode = cls._parse_selling_mode(
+            row_data.get("selling_mode"),
+            has_packaging_inputs=bool(
+                packaging_unit_input and units_per_package >= 2 and wholesale_price
+            ),
+        )
+        is_packaged = selling_mode != Product.SellingMode.RETAIL_ONLY
+
+        errors = []
+        if is_packaged:
+            # Plus de dégradation silencieuse en vente au détail : une ligne
+            # incomplète est rejetée, avec la liste de ce qui manque. Sans ce
+            # contrôle, la contrainte de base ferait échouer tout le lot.
+            if not unit:
+                errors.append(
+                    "Unité de détail manquante : indiquez la bouteille, la pièce "
+                    "ou le sachet."
+                )
+            if not packaging_unit:
+                errors.append(
+                    "Unité de gros manquante : indiquez le carton, le paquet ou "
+                    "le casier."
+                )
+            if units_per_package < 2:
+                errors.append(
+                    "Unités par conditionnement invalide : indiquez au moins 2."
+                )
+            if not wholesale_price:
+                errors.append(
+                    "Prix de vente (conditionnement) manquant pour un produit "
+                    "vendu en gros."
+                )
+        if (
+            selling_mode != Product.SellingMode.WHOLESALE_ONLY
+            and selling_price is None
+        ):
+            errors.append("Prix de vente (détail) requis")
+        if errors:
+            raise ProductRowError(errors)
+
+        # Mêmes règles de prix que la fiche produit et que l'approvisionnement :
+        # le prix unitaire se déduit du prix au conditionnement, et un prix de
+        # vente inférieur au prix d'achat est refusé.
+        try:
+            prices = ProductPricingService.resolve_and_validate(
+                selling_mode=selling_mode,
+                units_per_package=units_per_package,
+                cost_price=cost_price,
+                package_cost_price=package_cost_price,
+                selling_price=selling_price,
+                wholesale_price=wholesale_price,
+                require_wholesale=False,
+            )
+        except ValidationError as exc:
+            raise ProductRowError(cls._flatten_validation_error(exc))
+
         return {
             "name": str(row_data.get("name") or "").strip(),
             "sku": str(row_data.get("sku") or "").strip(),
@@ -724,9 +1061,13 @@ class ProductExcelService:
             "category": category,
             "brand": brand,
             "unit": unit,
-            "cost_price": parse_decimal(row_data.get("cost_price")),
-            "selling_price": parse_decimal(row_data.get("selling_price")),
-            "wholesale_price": parse_decimal(row_data.get("wholesale_price")) or None,
+            "selling_mode": selling_mode,
+            "packaging_unit": packaging_unit if is_packaged else None,
+            "units_per_package": units_per_package if is_packaged else None,
+            "cost_price": prices.get("cost_price") or Decimal("0.00"),
+            "selling_price": prices.get("selling_price") or Decimal("0.00"),
+            "package_cost_price": prices.get("package_cost_price") if is_packaged else None,
+            "wholesale_price": wholesale_price,
             "tax_rate": parse_decimal(row_data.get("tax_rate")),
             "is_taxable": parse_bool(row_data.get("is_taxable"), True),
             "track_inventory": parse_bool(row_data.get("track_inventory"), True),
@@ -746,12 +1087,17 @@ class ProductExcelService:
         {"key": "barcode", "header": "Code-barres", "width": 18},
         {"key": "category", "header": "Catégorie", "width": 22},
         {"key": "brand", "header": "Marque", "width": 18},
-        {"key": "unit", "header": "Unité", "width": 12},
-        {"key": "cost_price", "header": "Prix d'achat", "width": 14},
-        {"key": "selling_price", "header": "Prix de vente", "width": 14},
-        {"key": "wholesale_price", "header": "Prix de gros", "width": 14},
+        {"key": "unit", "header": "Unité de détail", "width": 15},
+        {"key": "selling_mode", "header": "Mode de vente", "width": 18},
+        {"key": "packaging_unit", "header": "Unité de gros", "width": 14},
+        {"key": "units_per_package", "header": "Unités par conditionnement", "width": 24},
+        {"key": "cost_price", "header": "Prix d'achat (détail)", "width": 18},
+        {"key": "selling_price", "header": "Prix de vente (détail)", "width": 20},
+        {"key": "package_cost_price", "header": "Prix d'achat (conditionnement)", "width": 26},
+        {"key": "wholesale_price", "header": "Prix de vente (conditionnement)", "width": 27},
         {"key": "tax_rate", "header": "TVA (%)", "width": 10},
-        {"key": "stock_quantity", "header": "Stock", "width": 10},
+        {"key": "stock_quantity", "header": "Stock (unités)", "width": 14},
+        {"key": "stock_display", "header": "Stock (détaillé)", "width": 26},
         {"key": "min_stock_level", "header": "Stock min", "width": 10},
         {"key": "is_active", "header": "Actif", "width": 8},
     ]
@@ -760,14 +1106,18 @@ class ProductExcelService:
     def _export_queryset(cls, organization):
         return (
             Product.objects.filter(organization=organization, is_deleted=False)
-            .select_related("category", "brand", "unit")
+            .select_related("category", "brand", "unit", "packaging_unit")
             .prefetch_related("stocks")
             .order_by("name")
         )
 
     @classmethod
     def _product_export_row(cls, product: Product) -> Dict[str, Any]:
-        total_stock = sum((s.quantity or Decimal("0") for s in product.stocks.all()), Decimal("0"))
+        from apps.inventory.packaging import PackagingService
+
+        stocks = list(product.stocks.all())
+        total_stock = sum((s.quantity or Decimal("0") for s in stocks), Decimal("0"))
+        total_loose = sum((s.loose_quantity or Decimal("0") for s in stocks), Decimal("0"))
         return {
             "name": product.name or "",
             "sku": product.sku or "",
@@ -775,11 +1125,26 @@ class ProductExcelService:
             "category": product.category.name if product.category_id else "",
             "brand": product.brand.name if product.brand_id else "",
             "unit": product.unit.name if product.unit_id else "",
+            "selling_mode": cls.SELLING_MODE_EXPORT_LABELS.get(
+                product.selling_mode, ""
+            ),
+            "packaging_unit": (
+                product.packaging_unit.name if product.packaging_unit_id else ""
+            ),
+            "units_per_package": product.units_per_package or "",
             "cost_price": product.cost_price or Decimal("0.00"),
             "selling_price": product.selling_price or Decimal("0.00"),
+            "package_cost_price": product.package_cost_price or "",
             "wholesale_price": product.wholesale_price or "",
             "tax_rate": product.tax_rate or Decimal("0.00"),
             "stock_quantity": total_stock if product.track_inventory else "",
+            # Stock dans les mots du marchand : « 12 cartons + 3 bouteilles »
+            # plutôt que « 147 », qui ne lui dit pas s'il peut servir une
+            # commande en gros.
+            "stock_display": (
+                PackagingService.format_quantity(product, total_stock, total_loose)
+                if product.track_inventory else ""
+            ),
             "min_stock_level": product.min_stock_level or 0,
             "is_active": "Oui" if product.is_active else "Non",
         }
@@ -875,23 +1240,27 @@ class ProductExcelService:
             leading=10,
         )
 
+        # Les prix sont groupés par canal, détail puis gros, comme à l'écran.
+        # La colonne « Unité » disparaît : le stock détaillé porte désormais les
+        # libellés (« 12 cartons + 3 bouteilles »), elle ferait doublon.
         pdf_columns = [
-            {"key": "name", "header": "Produit", "width": 55},
-            {"key": "sku", "header": "SKU", "width": 30},
-            {"key": "category", "header": "Catégorie", "width": 35},
-            {"key": "brand", "header": "Marque", "width": 28},
-            {"key": "unit", "header": "Unité", "width": 18},
-            {"key": "cost_price", "header": "P. achat", "width": 25},
-            {"key": "selling_price", "header": "P. vente", "width": 25},
-            {"key": "stock_quantity", "header": "Stock", "width": 18},
-            {"key": "is_active", "header": "Actif", "width": 16},
+            {"key": "name", "header": "Produit", "width": 44},
+            {"key": "sku", "header": "SKU", "width": 24},
+            {"key": "category", "header": "Catégorie", "width": 26},
+            {"key": "brand", "header": "Marque", "width": 22},
+            {"key": "cost_price", "header": "Achat détail", "width": 22},
+            {"key": "selling_price", "header": "Vente détail", "width": 22},
+            {"key": "package_cost_price", "header": "Achat gros", "width": 22},
+            {"key": "wholesale_price", "header": "Vente gros", "width": 22},
+            {"key": "stock_display", "header": "Stock", "width": 36},
+            {"key": "is_active", "header": "Actif", "width": 14},
         ]
 
         queryset = cls._export_queryset(organization)
         total = queryset.count()
 
         story = [
-            Paragraph(f"Catalogue produits — {organization.name}", title_style),
+            Paragraph(f"Catalogue produits - {organization.name}", title_style),
             Paragraph(
                 f"Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')} • {total} produit(s)",
                 meta_style,
@@ -911,18 +1280,18 @@ class ProductExcelService:
 
         for product in queryset.iterator(chunk_size=500):
             row_dict = cls._product_export_row(product)
+            # Un produit vendu au détail seul n'a pas de prix de gros : un tiret
+            # se lit mieux qu'un zéro, qui ferait croire à la gratuité.
             data.append([
                 Paragraph(str(row_dict["name"] or ""), cell_style),
                 Paragraph(str(row_dict["sku"] or ""), cell_style),
-                Paragraph(str(row_dict["category"] or "—"), cell_style),
-                Paragraph(str(row_dict["brand"] or "—"), cell_style),
-                Paragraph(str(row_dict["unit"] or "—"), cell_style),
-                Paragraph(fmt_money(row_dict["cost_price"]), cell_style),
-                Paragraph(fmt_money(row_dict["selling_price"]), cell_style),
-                Paragraph(
-                    str(row_dict["stock_quantity"]) if row_dict["stock_quantity"] != "" else "—",
-                    cell_style,
-                ),
+                Paragraph(str(row_dict["category"] or "-"), cell_style),
+                Paragraph(str(row_dict["brand"] or "-"), cell_style),
+                Paragraph(fmt_money(row_dict["cost_price"]) or "-", cell_style),
+                Paragraph(fmt_money(row_dict["selling_price"]) or "-", cell_style),
+                Paragraph(fmt_money(row_dict["package_cost_price"]) or "-", cell_style),
+                Paragraph(fmt_money(row_dict["wholesale_price"]) or "-", cell_style),
+                Paragraph(str(row_dict["stock_display"] or "-"), cell_style),
                 Paragraph(str(row_dict["is_active"]), cell_style),
             ])
 
@@ -939,7 +1308,8 @@ class ProductExcelService:
                 [
                     ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F97316")),
                     ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                    ("ALIGN", (5, 1), (7, -1), "RIGHT"),
+                    # Les quatre colonnes de prix alignées à droite
+                    ("ALIGN", (4, 1), (7, -1), "RIGHT"),
                     ("ALIGN", (-1, 1), (-1, -1), "CENTER"),
                     ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                     ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#E5E7EB")),

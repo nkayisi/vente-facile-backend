@@ -400,7 +400,7 @@ class RegisterSessionViewSet(
         session.notes = notes_input
         session.save()
 
-        # Audit log de la fermeture — détail par devise inclus.
+        # Audit log de la fermeture - détail par devise inclus.
         from apps.users.models import UserActivity
 
         closed_by_other = session.opened_by_id != request.user.id
@@ -530,7 +530,7 @@ class SaleViewSet(
     
     # Champs relationnels communs à toutes les actions. La liste et le détail
     # ayant des besoins différents, ils sont affinés par action dans
-    # get_queryset() — pour éviter à la fois le N+1 (détail) et le
+    # get_queryset() - pour éviter à la fois le N+1 (détail) et le
     # sur-préchargement des items/paiements (liste).
     select_related_fields = ['customer', 'sold_by']
     prefetch_related_fields = []
@@ -675,7 +675,7 @@ class SaleViewSet(
         from .services import SaleStockService
 
         # Pré-validation hors transaction (permissions, statut grossier).
-        # Le sale qu'on lit ici sert uniquement à valider l'accès — le vrai
+        # Le sale qu'on lit ici sert uniquement à valider l'accès - le vrai
         # objet utilisé pour la mise à jour est relu avec `select_for_update`
         # à l'intérieur de la transaction pour bloquer les race conditions
         # sur `amount_paid` quand deux add_payment concurrents arrivent.
@@ -698,7 +698,7 @@ class SaleViewSet(
             # Lock exclusif sur la Sale pour la durée du recalcul amount_paid /
             # amount_due / status. Deux requêtes concurrentes sont sérialisées.
             # `of=('self',)` lock UNIQUEMENT la table Sale (Postgres refuse
-            # FOR UPDATE sur le côté nullable d'un LEFT JOIN — customer/warehouse).
+            # FOR UPDATE sur le côté nullable d'un LEFT JOIN - customer/warehouse).
             sale = (
                 Sale.objects.select_related('customer', 'organization', 'warehouse')
                 .select_for_update(of=('self',))
@@ -941,7 +941,7 @@ class SaleViewSet(
                 points=-original.points,
                 balance_after=loyalty.current_points,
                 sale=sale,
-                description=f"{reversal_label} — annulation vente {sale.reference}",
+                description=f"{reversal_label} - annulation vente {sale.reference}",
                 created_by=user,
             )
 
@@ -1105,60 +1105,11 @@ class SaleReturnViewSet(
             )
         
         with transaction.atomic():
-            # Remettre le stock pour les articles à restocker
-            original_sale = sale_return.original_sale
-            if original_sale.warehouse:
-                for item in sale_return.items.filter(restock=True):
-                    original_item = item.original_item
-                    
-                    if original_item.product.track_inventory:
-                        product_cost = original_item.product.cost_price if original_item.product.cost_price else Decimal('0.00')
-                        cost = original_item.cost_price if original_item.cost_price and original_item.cost_price > 0 else product_cost
-                        stock, created = Stock.objects.select_for_update().get_or_create(
-                            organization=sale_return.organization,
-                            product=original_item.product,
-                            variant=original_item.variant,
-                            warehouse=original_sale.warehouse,
-                            defaults={'quantity': Decimal('0.000'), 'avg_cost': cost}
-                        )
-                        
-                        if not created and stock.avg_cost == 0 and cost > 0:
-                            stock.avg_cost = cost
-                        
-                        quantity_before = stock.quantity
-                        
-                        # Mettre à jour le coût moyen pondéré pour le retour
-                        if cost > 0 and item.quantity > 0:
-                            if stock.quantity > 0:
-                                total_existing = stock.quantity * stock.avg_cost
-                                total_incoming = item.quantity * original_item.cost_price
-                                stock.avg_cost = (
-                                    (total_existing + total_incoming) /
-                                    (stock.quantity + item.quantity)
-                                ).quantize(Decimal('0.01'))
-                            else:
-                                stock.avg_cost = original_item.cost_price
-                        
-                        stock.quantity += item.quantity
-                        stock.last_movement_at = timezone.now()
-                        stock.save()
-                        
-                        StockMovement.objects.create(
-                            organization=sale_return.organization,
-                            product=original_item.product,
-                            variant=original_item.variant,
-                            warehouse=original_sale.warehouse,
-                            movement_type='return_in',
-                            quantity=item.quantity,
-                            unit_cost=original_item.cost_price,
-                            quantity_before=quantity_before,
-                            quantity_after=stock.quantity,
-                            reference_type='sale_return',
-                            reference_id=sale_return.id,
-                            notes=f"Retour {sale_return.reference}",
-                            created_by=request.user
-                        )
-            
+            # Remise en stock déléguée au service, qui centralise le recalcul du
+            # coût moyen et la mise à jour du partage scellé/vrac.
+            from .services import SaleStockService
+            SaleStockService.apply_return(sale_return, request.user)
+
             sale_return.status = 'completed'
             sale_return.approved_by = request.user
             sale_return.approved_at = timezone.now()

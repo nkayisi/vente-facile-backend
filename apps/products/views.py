@@ -356,7 +356,7 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
     ordering_fields = ['name', 'sku', 'selling_price', 'created_at']
     ordering = ['name']
     
-    select_related_fields = ['category', 'brand', 'unit']
+    select_related_fields = ['category', 'brand', 'unit', 'packaging_unit']
     prefetch_related_fields = ['stocks__warehouse', 'stocks__location', 'images', 'variants']
     bulk_update_fields = ['is_active', 'is_featured', 'category', 'brand']
     

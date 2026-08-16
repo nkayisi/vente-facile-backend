@@ -2,7 +2,7 @@
 Helpers pour scoper les FK des serializers DRF par organisation.
 
 Sans ce scoping, les ``PrimaryKeyRelatedField`` auto-créés par
-``ModelSerializer`` utilisent ``queryset = Model.objects.all()`` — donc un
+``ModelSerializer`` utilisent ``queryset = Model.objects.all()`` : donc un
 client peut référencer un objet d'une autre organisation (faille
 cross-tenant). Le viewset filtre la queryset principale, mais les FK dans
 le serializer restent ouvertes.
@@ -20,7 +20,7 @@ Conditions :
 - Les modèles cibles doivent avoir un champ ``organization`` (cas standard
   pour tous les ``TenantModel`` / ``TenantSoftDeleteModel``).
 - Si l'org n'est pas résolvable (call hors HTTP, contexte de test sans
-  request), le queryset reste celui par défaut — c'est le viewset qui
+  request), le queryset reste celui par défaut : c'est le viewset qui
   protège l'API.
 """
 from __future__ import annotations
@@ -37,7 +37,7 @@ def scope_fk_to_org(serializer, *fk_names: str) -> None:
     - le header ``X-Organization-ID`` est absent,
     - le modèle cible n'a pas de champ ``organization``.
 
-    Ces conditions sont normales hors HTTP — le code applicatif passe par
+    Ces conditions sont normales hors HTTP - le code applicatif passe par
     des querysets explicites via ``.for_organization(org)`` dans ce cas.
     """
     request = serializer.context.get('request')

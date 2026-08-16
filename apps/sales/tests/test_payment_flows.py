@@ -156,7 +156,7 @@ class LoyaltyRedemptionTests(_BaseSaleFlowTest):
             is_active=True,
             point_value=Decimal('10.00'),       # 1 point = 10 CDF
             min_points_to_redeem=10,
-            # 0% sur le total — on teste la redemption isolément, sans gain croisé.
+            # 0% sur le total - on teste la redemption isolément, sans gain croisé.
             points_calculation_type=LoyaltyProgram.PointsCalculationType.PERCENTAGE,
             points_percentage=Decimal('0.00'),
             only_registered_customers=False,

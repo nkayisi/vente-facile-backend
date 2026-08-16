@@ -473,6 +473,28 @@ class SaleItem(TenantModel, SyncableModel):
         validators=[MinValueValidator(Decimal('0.001'))]
     )
     unit_price = models.DecimalField(max_digits=15, decimal_places=2)
+
+    # Vente en gros : part de `quantity` vendue en conditionnements entiers.
+    # `quantity` reste la quantité totale en unité de base (détail) : c'est elle
+    # qui pilote le stock, le FIFO, le coût et les rapports. La part vendue au
+    # détail est dérivée (`loose_quantity`), jamais stockée, ce qui rend
+    # impossible une incohérence entre les deux.
+    package_quantity = models.DecimalField(
+        max_digits=15,
+        decimal_places=3,
+        default=Decimal('0.000')
+    )
+    package_unit_price = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        null=True,
+        blank=True
+    )
+    packaging_factor = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Nombre d'unités par conditionnement au moment de la vente."
+    )
     cost_price = models.DecimalField(
         max_digits=15,
         decimal_places=2,
@@ -528,10 +550,45 @@ class SaleItem(TenantModel, SyncableModel):
     def __str__(self):
         return f"{self.product.name} x {self.quantity}"
 
+    @property
+    def loose_quantity(self):
+        """
+        Part de la ligne vendue à l'unité, déduite et jamais stockée.
+
+        Garder un champ séparé exigerait de maintenir l'égalité
+        ``paquets × facteur + unités == quantity`` à chaque écriture ; la
+        dériver la rend vraie par construction.
+        """
+        if not self.package_quantity or not self.packaging_factor:
+            return self.quantity
+        return self.quantity - (self.package_quantity * self.packaging_factor)
+
     def save(self, *args, **kwargs):
         TWO_PLACES = Decimal('0.01')
-        self.subtotal = (self.quantity * self.unit_price).quantize(TWO_PLACES)
-        
+
+        # Vente en gros : le prix du conditionnement n'est pas le prix unitaire
+        # multiplié par le nombre d'unités : c'est tout l'intérêt commercial du
+        # gros. Une ligne mixte additionne donc les deux tarifs.
+        # `packaging_factor` est exigé : sans lui, la part vendue à l'unité
+        # serait indéterminée.
+        if (
+            self.package_quantity
+            and self.package_unit_price is not None
+            and self.packaging_factor
+        ):
+            loose = self.loose_quantity
+            if loose < 0:
+                raise ValueError(
+                    "La quantité totale est inférieure au contenu des "
+                    "conditionnements vendus."
+                )
+            self.subtotal = (
+                self.package_quantity * self.package_unit_price
+                + loose * self.unit_price
+            ).quantize(TWO_PLACES)
+        else:
+            self.subtotal = (self.quantity * self.unit_price).quantize(TWO_PLACES)
+
         if self.discount_percentage > 0:
             self.discount_amount = (self.subtotal * self.discount_percentage / 100).quantize(TWO_PLACES)
         
@@ -605,7 +662,7 @@ class Payment(TenantModel, SyncableModel):
     # (= tendered_amount × exchange_rate).
     amount = models.DecimalField(max_digits=15, decimal_places=2)
 
-    # Montant réellement remis par le client, exprimé dans `currency` — c'est ce
+    # Montant réellement remis par le client, exprimé dans `currency` : c'est ce
     # qui entre physiquement dans le tiroir-caisse. Nullable pour compat : les
     # anciennes lignes sont backfillées à `amount` (mono-devise).
     tendered_amount = models.DecimalField(
