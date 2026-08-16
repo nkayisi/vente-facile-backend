@@ -141,15 +141,21 @@ class LoyaltyProgramCreateUpdateSerializer(serializers.ModelSerializer):
         return attrs
     
     def create(self, validated_data):
-        organization = self.context['request'].user.active_organization
-        
+        # L'organisation est injectée par la vue (perform_create) depuis
+        # l'en-tête X-Organization-ID. On ne retombe pas sur
+        # user.active_organization : elle ignore le tenant de la requête.
+        organization = validated_data.get('organization')
+        if organization is None:
+            raise serializers.ValidationError(
+                "Organisation introuvable pour cette requête."
+            )
+
         # Vérifier si un programme existe déjà
         if LoyaltyProgram.objects.filter(organization=organization).exists():
             raise serializers.ValidationError(
                 "Un programme de fidélité existe déjà pour cet établissement."
             )
-        
-        validated_data['organization'] = organization
+
         return super().create(validated_data)
 
 
@@ -200,16 +206,54 @@ class CustomerLoyaltySerializer(serializers.ModelSerializer):
     """Serializer for CustomerLoyalty model."""
     customer_name = serializers.CharField(source='customer.name', read_only=True)
     customer_phone = serializers.CharField(source='customer.phone', read_only=True)
-    
+    # Prochaine échéance de points, pour que le marchand puisse prévenir son
+    # client AVANT que les points ne tombent. Nuls si aucune expiration n'est
+    # configurée sur le programme.
+    next_expiry_at = serializers.SerializerMethodField()
+    next_expiry_points = serializers.SerializerMethodField()
+    points_expiry_days = serializers.SerializerMethodField()
+
     class Meta:
         model = CustomerLoyalty
         fields = [
             'id', 'customer', 'customer_name', 'customer_phone',
             'total_points_earned', 'total_points_redeemed', 'current_points',
             'tier', 'last_points_earned_at', 'last_points_redeemed_at',
+            'next_expiry_at', 'next_expiry_points', 'points_expiry_days',
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def _program(self, obj):
+        """Programme actif, résolu une seule fois pour toute la sérialisation."""
+        if not hasattr(self, '_cached_program'):
+            from .services import LoyaltyService
+            self._cached_program = LoyaltyService.active_program(obj.organization)
+        return self._cached_program
+
+    def _snapshot(self, obj):
+        """
+        Photographie d'expiration, calculée une seule fois par instance.
+
+        Sans expiration configurée, `expiry_snapshot` sort avant toute requête :
+        le coût est nul pour les organisations qui n'utilisent pas la fonction.
+        """
+        cached = getattr(obj, '_expiry_snapshot', None)
+        if cached is None:
+            from .services import LoyaltyExpiryService
+            cached = LoyaltyExpiryService.expiry_snapshot(obj, self._program(obj))
+            obj._expiry_snapshot = cached
+        return cached
+
+    def get_next_expiry_at(self, obj):
+        return self._snapshot(obj)['next_expiry_at']
+
+    def get_next_expiry_points(self, obj):
+        return self._snapshot(obj)['next_expiry_points']
+
+    def get_points_expiry_days(self, obj):
+        program = self._program(obj)
+        return program.points_expiry_days if program else 0
 
 
 class LoyaltyTransactionSerializer(serializers.ModelSerializer):

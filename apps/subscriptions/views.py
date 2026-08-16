@@ -25,9 +25,10 @@ from .serializers import (
     SubscriptionPaymentSerializer,
     InvoiceSerializer,
 )
-from .services import SubscriptionService
+from .services import MokoActivationDeferred, SubscriptionService
 from .moko_client import (
     initiate_payment_v2,
+    get_payment_status_v2,
     extract_transaction_id_v2,
     extract_payment_status_v2,
     is_payment_successful_v2,
@@ -436,10 +437,21 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
             pending.delete()
             return Response({'detail': str(e)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         except Exception as e:
-            logger.exception('MOKO v2 initiate failure')
-            pending.status = SubscriptionPayment.Status.FAILED
-            pending.notes = (pending.notes or '') + f' | Erreur: {e!s}'
-            pending.save(update_fields=['status', 'notes', 'updated_at'])
+            # Timeout / coupure réseau : on ne sait PAS si MOKO a reçu la demande.
+            # Marquer FAILED ici perdrait un paiement que le client va peut-être
+            # confirmer sur son téléphone. On garde PENDING et on enfile la
+            # référence : le poller et la réconciliation trancheront.
+            logger.exception('MOKO v2 initiate: réponse indéterminée, paiement laissé en attente')
+            pending.notes = (pending.notes or '') + (
+                f' | Réponse indéterminée à l\'initiation: {e!s}'
+            )
+            pending.save(update_fields=['notes', 'updated_at'])
+            enqueue_pending_payment(
+                reference=reference,
+                payment_id=str(pending.id),
+                paydrc_reference='',
+                thirdparty_reference=reference,
+            )
             return Response(
                 {'detail': 'Impossible de joindre le service de paiement.'},
                 status=status.HTTP_502_BAD_GATEWAY,
@@ -540,6 +552,35 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
                 {'detail': 'Paiement non trouvé.'},
                 status=status.HTTP_404_NOT_FOUND,
             )
+
+        # Troisième voie de confirmation, indépendante de Celery et de Redis :
+        # le navigateur du marchand déclenche lui-même la vérification. Si le
+        # worker est arrêté, l'abonnement s'active quand même.
+        if payment.status == SubscriptionPayment.Status.PENDING:
+            try:
+                code, data = get_payment_status_v2(reference)
+                if code < 400:
+                    moko_status = extract_payment_status_v2(data)
+                    if moko_status and not is_payment_pending_v2(moko_status):
+                        SubscriptionService.apply_moko_terminal_or_intermediate_status(
+                            payment,
+                            moko_status.lower(),
+                            paid_by=request.user,
+                            detail_note=f' | Vérification directe: {moko_status}',
+                        )
+                        payment.refresh_from_db()
+                        if payment.status != SubscriptionPayment.Status.PENDING:
+                            remove_pending_payment(reference)
+            except MokoActivationDeferred as exc:
+                logger.error(
+                    'MOKO status: activation différée pour ref=%s (%s) - '
+                    'paiement encaissé, intervention requise.',
+                    reference, exc,
+                )
+            except Exception:
+                # La vérification directe est un bonus : son échec ne doit pas
+                # casser la page de suivi du paiement.
+                logger.exception('MOKO status: vérification directe échouée pour %s', reference)
 
         # Mapper le statut interne vers un statut simplifié pour le frontend
         if payment.status == SubscriptionPayment.Status.PENDING:
@@ -698,6 +739,13 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
                 and payment.subscription_id is not None
                 and not getattr(payment.subscription, 'is_active', True)
             )
+            # Réparation : un paiement marqué FAILED que MOKO annonce maintenant
+            # encaissé doit être rejoué (dégâts de l'ancienne logique de poll).
+            if (
+                payment.status == SubscriptionPayment.Status.FAILED
+                and is_payment_successful_v2(str(moko_status or '').strip())
+            ):
+                needs_reapply = True
             if not needs_reapply:
                 remove_pending_payment(str(ref))
                 return Response(
@@ -725,6 +773,16 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
                 detail_note=f' | Callback MOKO v2: {description}' if description else ' | Callback MOKO v2',
             )
             logger.info('MOKO callback: ref=%s status=%s outcome=%s', ref, status_normalized, outcome)
+        except MokoActivationDeferred as exc:
+            # Argent encaissé, activation impossible pour l'instant. On accuse
+            # réception (inutile que MOKO rejoue) et on laisse la réconciliation
+            # ou l'admin reprendre le paiement, qui reste PENDING.
+            logger.error(
+                'MOKO callback: activation différée pour ref=%s (%s) - '
+                'paiement encaissé, abonnement non activé, intervention requise.',
+                ref, exc,
+            )
+            return Response({'status': 'Callback received successfully'}, status=status.HTTP_200_OK)
         except Exception:
             logger.exception('MOKO callback apply status failed for %s', ref)
             return Response({'detail': 'internal error'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

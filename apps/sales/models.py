@@ -609,6 +609,10 @@ class PaymentMethod(TenantModel):
         BANK_TRANSFER = 'bank_transfer', 'Virement bancaire'
         CHECK = 'check', 'Chèque'
         CREDIT = 'credit', 'Crédit'
+        # Règlement d'une facture par les points de fidélité. Ce n'est pas de
+        # l'argent physique : exclu des mouvements de caisse et du comptage de
+        # clôture de session.
+        LOYALTY = 'loyalty', 'Points de fidélité'
         OTHER = 'other', 'Autre'
 
     name = models.CharField(max_length=100)

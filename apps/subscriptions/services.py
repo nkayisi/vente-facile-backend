@@ -2,6 +2,7 @@
 Service de gestion des abonnements.
 Centralise toute la logique métier liée aux subscriptions.
 """
+import logging
 from datetime import timedelta
 from decimal import Decimal
 from django.core.cache import cache
@@ -9,6 +10,8 @@ from django.db import transaction
 from django.utils import timezone
 
 from rest_framework.exceptions import ValidationError
+
+logger = logging.getLogger(__name__)
 
 # Clés de cache par organisation (Redis en prod). TTL court : les données restent
 # fraîches à ~60s, et l'invalidation explicite (signals sur Subscription /
@@ -26,6 +29,17 @@ from .models import Plan, Subscription, SubscriptionPayment, Invoice, InvoiceIte
 
 def _default_plan_currency():
     return Currency.objects.filter(code="USD", is_active=True).first()
+
+
+class MokoActivationDeferred(Exception):
+    """
+    L'activation d'un paiement MOKO encaissé ne peut pas aboutir maintenant, mais
+    l'argent a bien été prélevé : le paiement doit rester ``PENDING`` pour être
+    repris par la réconciliation ou traité à la main.
+
+    Ne JAMAIS transformer cette situation en ``FAILED`` : un paiement que MOKO a
+    confirmé réussi ne doit pas être marqué comme échoué côté plateforme.
+    """
 
 
 class SubscriptionService:
@@ -721,6 +735,26 @@ class SubscriptionService:
         }
 
     @staticmethod
+    def _resolve_activation_mode(organization, plan):
+        """
+        Détermine, à partir de l'état COURANT de l'organisation, s'il faut
+        prolonger l'abonnement existant ou en activer un nouveau.
+
+        Appelé au moment de la confirmation d'un paiement : la métadonnée
+        enregistrée à l'initiation peut être périmée (période expirée depuis,
+        ou abonnement déjà activé par un autre paiement).
+        """
+        current = SubscriptionService._subscription_for_quotas(organization)
+        if (
+            current
+            and current.plan_id == plan.id
+            and current.current_period_end
+            and timezone.now() < current.current_period_end
+        ):
+            return SubscriptionService.CHECKOUT_MODE_EXTEND
+        return SubscriptionService.CHECKOUT_MODE_NEW
+
+    @staticmethod
     @transaction.atomic
     def complete_pending_moko_payment(
         pending_payment,
@@ -730,61 +764,109 @@ class SubscriptionService:
         extra_notes='',
     ):
         """
-        Finalise un SubscriptionPayment en pending après confirmation MOKO.
-        Idempotent si le paiement n'est plus pending.
+        Finalise un SubscriptionPayment après confirmation MOKO.
+
+        Accepte un paiement ``PENDING`` (cas nominal) mais aussi ``FAILED`` : la
+        réconciliation répare ainsi les paiements que l'ancienne logique avait
+        marqués à tort comme échoués alors que MOKO les avait encaissés.
+        Idempotent sur un paiement déjà ``COMPLETED`` rattaché à un abonnement.
         """
-        if pending_payment.status != SubscriptionPayment.Status.PENDING:
+        repairable = (
+            SubscriptionPayment.Status.PENDING,
+            SubscriptionPayment.Status.FAILED,
+        )
+        if pending_payment.status not in repairable:
             return {
                 'already_done': True,
                 'payment': pending_payment,
                 'subscription': pending_payment.subscription,
                 'invoice': getattr(pending_payment, 'invoice', None),
             }
+        if pending_payment.status == SubscriptionPayment.Status.FAILED:
+            logger.warning(
+                'MOKO activation: réparation d\'un paiement marqué FAILED alors '
+                'que MOKO le donne encaissé (ref=%s org=%s)',
+                pending_payment.reference, pending_payment.organization_id,
+            )
 
         metadata = pending_payment.metadata or {}
         plan_id = metadata.get('plan_id')
         billing_cycle = metadata.get('billing_cycle')
         if not plan_id or not billing_cycle:
-            raise ValueError('Métadonnées de paiement MOKO incomplètes.')
-
-        plan = Plan.objects.get(id=plan_id, is_active=True)
-        checkout_mode = metadata.get('checkout_mode')
-        if checkout_mode not in (
-            SubscriptionService.CHECKOUT_MODE_NEW,
-            SubscriptionService.CHECKOUT_MODE_EXTEND,
-        ):
-            # Compatibilité paiements pending legacy (sans checkout_mode).
-            current_subscription = SubscriptionService._subscription_for_quotas(
-                pending_payment.organization
+            raise MokoActivationDeferred(
+                f'Métadonnées de paiement MOKO incomplètes (ref={pending_payment.reference}).'
             )
-            if (
-                current_subscription
-                and current_subscription.plan_id == plan.id
-                and current_subscription.current_period_end
-                and timezone.now() < current_subscription.current_period_end
-            ):
-                checkout_mode = SubscriptionService.CHECKOUT_MODE_EXTEND
-            else:
-                checkout_mode = SubscriptionService.CHECKOUT_MODE_NEW
+
+        # Le plan était actif au moment de l'achat : on ne re-filtre PAS sur
+        # `is_active`. Un plan désactivé entre l'initiation et la confirmation ne
+        # doit pas faire perdre son abonnement à un marchand qui a déjà payé.
+        try:
+            plan = Plan.objects.get(id=plan_id)
+        except Plan.DoesNotExist:
+            raise MokoActivationDeferred(
+                f'Plan {plan_id} introuvable pour le paiement {pending_payment.reference}.'
+            )
+
+        # Le mode est déduit de l'ÉTAT COURANT, pas de la métadonnée figée à
+        # l'initiation : entre-temps la période a pu expirer (une prolongation
+        # devient une souscription) ou un autre paiement a pu activer
+        # l'abonnement (une souscription devient une prolongation).
+        checkout_mode = SubscriptionService._resolve_activation_mode(
+            pending_payment.organization, plan,
+        )
+        if metadata.get('checkout_mode') != checkout_mode:
             metadata['checkout_mode'] = checkout_mode
             pending_payment.metadata = metadata
             pending_payment.save(update_fields=['metadata', 'updated_at'])
 
         notes = (metadata.get('notes') or '') + (extra_notes or '')
 
-        SubscriptionService.require_checkout_allowed(
-            pending_payment.organization,
-            plan,
-            mode=checkout_mode,
+        # Règle de checkout CONSULTATIVE : elle est bloquante à l'initiation
+        # (`moko_initiate`), jamais après encaissement. L'argent a été prélevé,
+        # la contrepartie est due. On journalise l'écart pour l'admin.
+        verdict = SubscriptionService.evaluate_checkout(
+            pending_payment.organization, plan, mode=checkout_mode,
         )
-        if checkout_mode == SubscriptionService.CHECKOUT_MODE_EXTEND:
-            subscription = SubscriptionService.extend_subscription(
-                organization=pending_payment.organization,
-                plan=plan,
-                billing_cycle=billing_cycle,
-                notes=notes or 'Prolongation MOKO',
+        if not verdict['allowed']:
+            logger.warning(
+                'MOKO activation: règle de checkout outrepassée ref=%s org=%s '
+                'plan=%s mode=%s code=%s (%s)',
+                pending_payment.reference,
+                pending_payment.organization_id,
+                plan.code,
+                checkout_mode,
+                verdict['reason_code'],
+                verdict['message'],
             )
-        else:
+            metadata['checkout_override'] = {
+                'reason_code': verdict['reason_code'],
+                'message': verdict['message'],
+                'mode': checkout_mode,
+                'at': timezone.now().isoformat(),
+            }
+            pending_payment.metadata = metadata
+            extra_notes = (extra_notes or '') + (
+                f" | Règle outrepassée ({verdict['reason_code']}) : paiement encaissé"
+            )
+
+        subscription = None
+        if checkout_mode == SubscriptionService.CHECKOUT_MODE_EXTEND:
+            try:
+                subscription = SubscriptionService.extend_subscription(
+                    organization=pending_payment.organization,
+                    plan=plan,
+                    billing_cycle=billing_cycle,
+                    notes=notes or 'Prolongation MOKO',
+                )
+            except ValidationError as exc:
+                # Repli : l'abonnement visé a changé entre la résolution du mode
+                # et l'écriture. On active plutôt que de perdre le paiement.
+                logger.warning(
+                    'MOKO activation: prolongation impossible ref=%s (%s), '
+                    'bascule sur activation.',
+                    pending_payment.reference, exc.detail,
+                )
+        if subscription is None:
             subscription = SubscriptionService.activate_subscription(
                 organization=pending_payment.organization,
                 plan=plan,
@@ -844,10 +926,19 @@ class SubscriptionService:
         Interprète le statut transaction MOKO (API /payments/transactions/status).
         Retourne: 'pending' | 'completed' | 'failed' | 'unknown'
         """
+        # Source de vérité unique sur le vocabulaire de statuts : les helpers du
+        # client MOKO. Les dupliquer ici faisait retomber 'processing' et
+        # 'rejected' dans 'unknown', et la référence restait en file sans fin.
+        from .moko_client import (
+            is_payment_failed_v2,
+            is_payment_pending_v2,
+            is_payment_successful_v2,
+        )
+
         s = (moko_status or '').strip().lower()
-        if s in ('pending', 'submitted'):
+        if is_payment_pending_v2(s):
             return 'pending'
-        if s in ('successful', 'success', 'completed'):
+        if is_payment_successful_v2(s):
             ext = (payment.external_transaction_id or payment.external_id or '').strip()
             SubscriptionService.complete_pending_moko_payment(
                 payment,
@@ -856,13 +947,120 @@ class SubscriptionService:
                 extra_notes=detail_note or ' | Confirmé (MOKO status)',
             )
             return 'completed'
-        if s in ('failed', 'error', 'cancelled', 'canceled'):
+        if is_payment_failed_v2(s):
             SubscriptionService.fail_pending_moko_payment(
                 payment,
                 reason=detail_note or 'MOKO: transaction failed',
             )
             return 'failed'
+        logger.warning(
+            'MOKO: statut inconnu "%s" pour ref=%s - paiement laissé en attente.',
+            moko_status, payment.reference,
+        )
         return 'unknown'
+
+    @staticmethod
+    def reconcile_moko_payments(max_age_days: int = 30, dry_run: bool = False,
+                                reference: str = ''):
+        """
+        Filet de sécurité : rattrape les paiements MOKO encaissés dont
+        l'abonnement n'a jamais été activé.
+
+        Interroge la BASE (et non la file Redis), donc survit à un flush Redis, à
+        un worker arrêté, ou à l'expiration du TTL des métadonnées. Reprend aussi
+        les paiements marqués ``FAILED`` à tort par l'ancienne logique de poll.
+
+        Renvoie un rapport : reconciled / still_pending / really_failed /
+        unresolved.
+        """
+        from .moko_client import (
+            extract_payment_status_v2,
+            get_payment_status_v2,
+            is_payment_failed_v2,
+            is_payment_pending_v2,
+            is_payment_successful_v2,
+        )
+        from .moko_pending import remove_pending_payment
+
+        qs = SubscriptionPayment.objects.filter(
+            payment_method=SubscriptionPayment.PaymentMethod.MOBILE_MONEY,
+            status__in=[
+                SubscriptionPayment.Status.PENDING,
+                SubscriptionPayment.Status.FAILED,
+            ],
+        )
+        if reference:
+            qs = qs.filter(reference=reference)
+        else:
+            cutoff = timezone.now() - timedelta(days=max_age_days)
+            qs = qs.filter(created_at__gte=cutoff)
+
+        report = {
+            'checked': 0,
+            'reconciled': [],
+            'still_pending': [],
+            'really_failed': [],
+            'unresolved': [],
+        }
+
+        for payment in qs.select_related('organization').order_by('created_at'):
+            report['checked'] += 1
+            ref = payment.reference
+
+            try:
+                code, data = get_payment_status_v2(ref)
+            except Exception as exc:
+                report['unresolved'].append((ref, f'appel MOKO impossible: {exc}'))
+                continue
+
+            if code >= 400:
+                report['unresolved'].append((ref, f'MOKO HTTP {code}'))
+                continue
+
+            moko_status = extract_payment_status_v2(data)
+            if not moko_status:
+                report['unresolved'].append((ref, 'statut absent de la réponse'))
+                continue
+
+            if is_payment_pending_v2(moko_status):
+                report['still_pending'].append((ref, moko_status))
+                continue
+
+            if is_payment_successful_v2(moko_status):
+                if dry_run:
+                    report['reconciled'].append((ref, f'{moko_status} (simulation)'))
+                    continue
+                try:
+                    result = SubscriptionService.complete_pending_moko_payment(
+                        payment,
+                        external_id=(payment.external_transaction_id or payment.external_id or ''),
+                        extra_notes=' | Réconciliation MOKO',
+                    )
+                except MokoActivationDeferred as exc:
+                    report['unresolved'].append((ref, f'activation différée: {exc}'))
+                    continue
+                except Exception as exc:
+                    logger.exception('Réconciliation MOKO: échec sur %s', ref)
+                    report['unresolved'].append((ref, f'erreur: {exc}'))
+                    continue
+                remove_pending_payment(ref)
+                report['reconciled'].append(
+                    (ref, f"abonnement {result['subscription'].id}")
+                )
+                continue
+
+            if is_payment_failed_v2(moko_status):
+                if not dry_run and payment.status == SubscriptionPayment.Status.PENDING:
+                    SubscriptionService.fail_pending_moko_payment(
+                        payment, reason=f'Réconciliation MOKO: {moko_status}',
+                    )
+                    remove_pending_payment(ref)
+                report['really_failed'].append((ref, moko_status))
+                continue
+
+            report['unresolved'].append((ref, f'statut inconnu: {moko_status}'))
+
+        return report
 
     # ------------------------------------------------------------------ #
     # Helpers internes

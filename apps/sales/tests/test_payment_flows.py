@@ -270,12 +270,16 @@ class AddPaymentAndCancelTests(_BaseSaleFlowTest):
         self.assertEqual(stock_final, stock_after)
 
     def test_cancel_credit_sale_overpaid_restores_balance_correctly(self):
+        """
+        Surpaiement : le client remet 2500 pour une dette de 2000 et repart avec
+        500 de monnaie. Sa dette tombe à 0, pas à -500 : lui créditer la monnaie
+        qu'on vient de lui rendre la compterait deux fois.
+        """
         sale_id = self._create_credit_sale(total='2000.00')
         # Customer balance = 2000 après création (à crédit)
         self.customer.refresh_from_db()
         self.assertEqual(self.customer.current_balance, Decimal('2000.00'))
 
-        # Paiement excédentaire de 2500 → balance -> 2000 - 2500 = -500 (crédit client)
         self.client.force_authenticate(user=self.cashier_a)
         resp = self.client.post(
             f'/api/v1/sales/{sale_id}/add-payment/',
@@ -284,7 +288,10 @@ class AddPaymentAndCancelTests(_BaseSaleFlowTest):
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
         self.customer.refresh_from_db()
-        self.assertEqual(self.customer.current_balance, Decimal('-500.00'))
+        self.assertEqual(self.customer.current_balance, Decimal('0.00'))
+
+        # La monnaie rendue est bien tracée sur la vente.
+        self.assertEqual(Sale.objects.get(pk=sale_id).change_amount, Decimal('500.00'))
 
         # Cancel par le manager (le cashier n'a pas `sales.cancel` par défaut).
         self.client.force_authenticate(user=self.manager)

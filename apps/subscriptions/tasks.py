@@ -4,7 +4,6 @@ Tâches Celery - suivi des paiements MOKO en attente (API v2).
 import logging
 
 from celery import shared_task
-from rest_framework.exceptions import ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +34,7 @@ def poll_moko_pending_payments():
         remove_pending_payment,
     )
     from apps.subscriptions.models import SubscriptionPayment
-    from apps.subscriptions.services import SubscriptionService
+    from apps.subscriptions.services import MokoActivationDeferred, SubscriptionService
 
     if pending_queue_empty():
         return
@@ -102,27 +101,21 @@ def poll_moko_pending_payments():
             )
             logger.info('MOKO poll v2: ref=%s status=%s outcome=%s', ref, moko_status, outcome)
             processed += 1
-        except ValidationError as exc:
-            # Erreur métier (ex: règle checkout) : on marque failed pour stopper la boucle pending.
-            detail = exc.detail
-            reason_code = None
-            if isinstance(detail, dict):
-                reason_code = detail.get('code')
-            checkout_mode = (payment.metadata or {}).get('checkout_mode', 'missing')
-            logger.warning(
-                'MOKO poll v2: validation failed for ref=%s mode=%s code=%s detail=%s',
-                ref,
-                checkout_mode,
-                reason_code,
-                detail,
+        except MokoActivationDeferred as exc:
+            # L'argent a été encaissé mais l'activation ne peut pas aboutir tout
+            # de suite (plan supprimé, métadonnées perdues). On NE marque PAS
+            # failed : le paiement reste pending pour la réconciliation ou un
+            # traitement manuel, et l'anomalie est remontée.
+            logger.error(
+                'MOKO poll v2: activation différée pour ref=%s (%s) - '
+                'paiement encaissé, abonnement non activé, intervention requise.',
+                ref, exc,
             )
-            SubscriptionService.fail_pending_moko_payment(
-                payment,
-                reason=f'Validation checkout: {exc.detail}',
-            )
-            remove_pending_payment(ref)
             continue
         except Exception:
+            # Jamais de `fail_pending_moko_payment` ici : MOKO vient de confirmer
+            # l'encaissement. Un paiement confirmé ne doit pas devenir FAILED à
+            # cause d'une erreur de notre côté.
             logger.exception('MOKO poll v2: apply status failed for %s', ref)
             continue
 
@@ -131,3 +124,38 @@ def poll_moko_pending_payments():
 
     if processed > 0:
         logger.info('MOKO poll v2: processed %d payments', processed)
+
+
+@shared_task(name='apps.subscriptions.tasks.reconcile_moko_payments')
+def reconcile_moko_payments(max_age_days: int = 30):
+    """
+    Filet de sécurité périodique, indépendant de la file Redis.
+
+    Le poller ne voit que ce que Redis lui présente : un flush, un redémarrage
+    sans persistance ou l'expiration du TTL des métadonnées suffisent à orpheliner
+    un paiement encaissé. Cette tâche repart de la BASE et rattrape :
+    - les paiements ``PENDING`` que MOKO donne réussis,
+    - les paiements ``FAILED`` à tort par l'ancienne logique de poll.
+    """
+    from apps.subscriptions.services import SubscriptionService
+
+    report = SubscriptionService.reconcile_moko_payments(max_age_days=max_age_days)
+
+    if report['reconciled']:
+        logger.warning(
+            'Réconciliation MOKO: %d paiement(s) encaissé(s) réactivé(s): %s',
+            len(report['reconciled']), report['reconciled'],
+        )
+    if report['unresolved']:
+        logger.error(
+            'Réconciliation MOKO: %d paiement(s) non résolu(s), intervention '
+            'requise: %s',
+            len(report['unresolved']), report['unresolved'],
+        )
+    logger.info(
+        'Réconciliation MOKO: %d vérifié(s), %d réactivé(s), %d en attente, '
+        '%d échoué(s), %d non résolu(s)',
+        report['checked'], len(report['reconciled']), len(report['still_pending']),
+        len(report['really_failed']), len(report['unresolved']),
+    )
+    return {k: (v if isinstance(v, int) else len(v)) for k, v in report.items()}

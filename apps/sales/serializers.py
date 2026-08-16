@@ -1068,9 +1068,11 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         loyalty_resolution = None
         sale.loyalty_redemption_amount = Decimal('0.00')
         if points_used > 0 and sale.customer:
+            from apps.settings.services import LoyaltyService
             tentative_total = (items_subtotal - sale.discount_amount + tax_total).quantize(TWO_PLACES)
-            loyalty_resolution = self._resolve_loyalty_redemption(
+            loyalty_resolution = LoyaltyService.resolve_redemption(
                 sale.customer, org, points_used, tentative_total,
+                target_currency=sale.currency,
             )
             if loyalty_resolution:
                 sale.discount_amount = (sale.discount_amount + loyalty_resolution['amount']).quantize(TWO_PLACES)
@@ -1140,186 +1142,43 @@ class SaleCreateSerializer(serializers.ModelSerializer):
             from .services import SaleStockService
             SaleStockService.apply_decrement(sale, self.context['request'].user)
         
-        # Mettre à jour le solde client pour les ventes à crédit
-        if sale.customer and sale.sale_type == 'credit' and sale.amount_due > 0:
-            from apps.contacts.models import Customer, CustomerTransaction
-            customer = Customer.objects.select_for_update().get(id=sale.customer.id)
-            
-            # Vérifier la limite de crédit
-            if customer.credit_limit > 0:
-                new_balance = customer.current_balance + sale.amount_due
-                if new_balance > customer.credit_limit:
-                    raise serializers.ValidationError({
-                        'customer': (
-                            f"Cette vente dépasse la limite de crédit du client. "
-                            f"Dette actuelle : {customer.current_balance}, "
-                            f"Limite autorisée : {customer.credit_limit}, "
-                            f"Montant de la vente : {sale.amount_due}."
-                        )
-                    })
-            
-            balance_before = customer.current_balance
-            customer.current_balance += sale.amount_due
-            customer.save()
-            
-            # Enregistrer la transaction
-            CustomerTransaction.objects.create(
-                organization=customer.organization,
-                customer=customer,
-                transaction_type='credit_sale',
-                amount=sale.amount_due,
-                balance_before=balance_before,
-                balance_after=customer.current_balance,
+        # Inscrire la dette dès qu'il reste quelque chose à payer, quel que soit
+        # le `sale_type` : une vente au détail laissée partiellement payée est
+        # une dette réelle. Avant, seul `sale_type='credit'` alimentait le solde,
+        # et le reste à payer d'une vente au détail n'apparaissait nulle part
+        # dans la gestion de la dette.
+        #
+        # `amount_due` est déjà net de l'acompte encaissé plus haut.
+        if sale.customer and sale.amount_due > 0:
+            from apps.contacts import services as contacts_services
+            contacts_services.apply_debt(
+                sale.customer, sale.amount_due,
+                currency=sale.currency,
                 sale=sale,
                 reference=sale.reference,
-                notes=f"Vente à crédit {sale.reference}",
-                created_by=self.context['request'].user
+                notes=(
+                    f"Vente à crédit {sale.reference}"
+                    if sale.sale_type == 'credit'
+                    else f"Reste à payer sur vente {sale.reference}"
+                ),
+                user=self.context['request'].user,
             )
-        
+
         # Persister la consommation de points et la transaction loyalty maintenant
         # que la vente est sauvegardée (FK loyalty_transaction.sale → sale.id).
+        from apps.settings.services import LoyaltyService
         if loyalty_resolution:
-            self._persist_loyalty_redemption(sale, loyalty_resolution)
+            LoyaltyService.persist_redemption(
+                sale, loyalty_resolution, user=self.context['request'].user,
+            )
 
         # Attribuer les points de fidélité si applicable
         if sale.status == 'completed' and sale.customer:
-            self._award_loyalty_points(sale, org)
+            LoyaltyService.award_points_for_sale(
+                sale, user=self.context['request'].user,
+            )
 
         return sale
-
-    def _resolve_loyalty_redemption(self, customer, organization, points_used, tentative_total):
-        """
-        Calcule combien de points peuvent réellement être consommés et la valeur
-        monétaire correspondante, en respectant : solde points du client, minimum
-        configuré sur le programme, et total tentatif de la vente (pas de négatif).
-
-        Renvoie un dict {amount, points, loyalty, program} ou None si rien à faire.
-        Ne persiste rien : la persistance se fait après save() via
-        `_persist_loyalty_redemption`.
-        """
-        from apps.settings.models import LoyaltyProgram, CustomerLoyalty
-        import logging
-        logger = logging.getLogger(__name__)
-
-        if points_used <= 0 or not customer or tentative_total <= 0:
-            return None
-
-        try:
-            program = LoyaltyProgram.objects.get(organization=organization, is_active=True)
-        except LoyaltyProgram.DoesNotExist:
-            logger.info("[Loyalty] No active program - redemption skipped.")
-            return None
-
-        if points_used < program.min_points_to_redeem:
-            logger.info(
-                "[Loyalty] points_used (%s) < min_points_to_redeem (%s) - skipped.",
-                points_used, program.min_points_to_redeem,
-            )
-            return None
-
-        try:
-            loyalty = CustomerLoyalty.objects.get(
-                organization=organization, customer=customer,
-            )
-        except CustomerLoyalty.DoesNotExist:
-            logger.info("[Loyalty] No loyalty account for customer - skipped.")
-            return None
-
-        point_value = program.point_value or Decimal('0')
-        if point_value <= 0:
-            logger.warning("[Loyalty] point_value <= 0 - skipped.")
-            return None
-
-        # Cap par solde dispo, et par la valeur monétaire qui ne dépasse pas le total.
-        max_by_balance = int(loyalty.current_points)
-        max_by_total = int(tentative_total / point_value)
-        points_to_use = min(int(points_used), max_by_balance, max_by_total)
-        if points_to_use < program.min_points_to_redeem:
-            return None
-
-        redemption_amount = (Decimal(points_to_use) * point_value).quantize(Decimal('0.01'))
-        if redemption_amount > tentative_total:
-            redemption_amount = tentative_total
-
-        return {
-            'amount': redemption_amount,
-            'points': points_to_use,
-            'loyalty': loyalty,
-            'program': program,
-        }
-
-    def _persist_loyalty_redemption(self, sale, resolution):
-        """Consomme les points et crée la LoyaltyTransaction associée."""
-        from apps.settings.models import LoyaltyTransaction
-
-        loyalty = resolution['loyalty']
-        points_to_consume = resolution['points']
-        # `redeem_points` met à jour current_points et save
-        loyalty.redeem_points(points_to_consume)
-        LoyaltyTransaction.objects.create(
-            organization=sale.organization,
-            customer_loyalty=loyalty,
-            transaction_type=LoyaltyTransaction.TransactionType.REDEEM,
-            points=-points_to_consume,
-            balance_after=loyalty.current_points,
-            sale=sale,
-            description=(
-                f"Points utilisés sur vente {sale.reference} "
-                f"(réduction {resolution['amount']} {sale.currency})"
-            ),
-            created_by=self.context['request'].user,
-        )
-    
-    def _award_loyalty_points(self, sale, organization):
-        """Attribue les points de fidélité au client pour une vente complétée."""
-        from apps.settings.models import LoyaltyProgram, CustomerLoyalty, LoyaltyTransaction
-        import logging
-        logger = logging.getLogger(__name__)
-        
-        logger.info(f"[Loyalty] Attempting to award points for sale {sale.reference}, customer: {sale.customer}")
-        
-        try:
-            program = LoyaltyProgram.objects.get(organization=organization, is_active=True)
-            logger.info(f"[Loyalty] Found active program: {program.name}")
-        except LoyaltyProgram.DoesNotExist:
-            logger.info("[Loyalty] No active loyalty program found")
-            return  # Pas de programme de fidélité actif
-        
-        # Vérifier si seuls les clients enregistrés peuvent gagner des points
-        if program.only_registered_customers and not sale.customer:
-            logger.info("[Loyalty] Program requires registered customers but no customer on sale")
-            return
-        
-        # Calculer les points gagnés
-        points = program.calculate_points(sale.total)
-        logger.info(f"[Loyalty] Calculated points: {points} for amount {sale.total}")
-        if points <= 0:
-            logger.info("[Loyalty] No points to award (points <= 0)")
-            return
-        
-        # Obtenir ou créer le compte de fidélité du client
-        loyalty, created = CustomerLoyalty.objects.get_or_create(
-            organization=organization,
-            customer=sale.customer
-        )
-        logger.info(f"[Loyalty] Customer loyalty account {'created' if created else 'found'}: {loyalty.id}")
-        
-        # Ajouter les points
-        loyalty.add_points(points)
-        logger.info(f"[Loyalty] Points added. New balance: {loyalty.current_points}")
-        
-        # Créer la transaction de fidélité
-        transaction = LoyaltyTransaction.objects.create(
-            organization=organization,
-            customer_loyalty=loyalty,
-            transaction_type=LoyaltyTransaction.TransactionType.EARN,
-            points=points,
-            balance_after=loyalty.current_points,
-            sale=sale,
-            description=f"Points gagnés sur vente {sale.reference}",
-            created_by=self.context['request'].user
-        )
-        logger.info(f"[Loyalty] Transaction created: {transaction.id}")
 
 
 class SalePaymentSerializer(serializers.Serializer):
@@ -1328,10 +1187,17 @@ class SalePaymentSerializer(serializers.Serializer):
     ``amount`` = montant remis dans ``currency`` (compat historique). Un split
     multi-devise se fait via plusieurs appels ``add-payment`` successifs.
     ``change_currency`` : devise de la monnaie rendue si le règlement solde la vente.
+    ``points_used`` : points de fidélité à convertir en règlement sur cette
+    facture. Contrairement au POS (où la remise précède l'émission de la
+    facture), un règlement en points sur une facture DÉJÀ émise ne modifie pas
+    son total : il s'impute comme n'importe quel autre moyen de paiement.
     """
 
-    payment_method = serializers.UUIDField()
-    amount = serializers.DecimalField(max_digits=15, decimal_places=2)
+    payment_method = serializers.UUIDField(required=False, allow_null=True)
+    amount = serializers.DecimalField(
+        max_digits=15, decimal_places=2, required=False, default=Decimal('0.00'),
+    )
+    points_used = serializers.IntegerField(required=False, min_value=0, default=0)
     currency = serializers.CharField(max_length=3, required=False, allow_blank=True)
     exchange_rate = serializers.DecimalField(
         max_digits=15, decimal_places=6, required=False
@@ -1339,6 +1205,19 @@ class SalePaymentSerializer(serializers.Serializer):
     change_currency = serializers.CharField(max_length=3, required=False, allow_blank=True)
     reference = serializers.CharField(required=False, allow_blank=True)
     notes = serializers.CharField(required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        amount = attrs.get('amount') or Decimal('0.00')
+        points = attrs.get('points_used') or 0
+        if amount <= 0 and points <= 0:
+            raise serializers.ValidationError(
+                "Indiquez un montant ou un nombre de points à utiliser."
+            )
+        if amount > 0 and not attrs.get('payment_method'):
+            raise serializers.ValidationError(
+                {'payment_method': "Moyen de paiement requis pour un règlement en argent."}
+            )
+        return attrs
 
 
 # =============================================================================

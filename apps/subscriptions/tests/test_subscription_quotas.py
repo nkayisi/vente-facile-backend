@@ -158,7 +158,13 @@ class SubscriptionQuotaServiceTests(TestCase):
         self.assertEqual(payment.metadata.get("checkout_mode"), SubscriptionService.CHECKOUT_MODE_EXTEND)
         self.assertGreater(sub.current_period_end, prev_end)
 
-    def test_complete_pending_moko_payment_legacy_other_plan_keeps_upgrade_rule(self):
+    def test_complete_pending_moko_payment_legacy_other_plan_activates_anyway(self):
+        """
+        Paiement legacy sur un plan de palier inférieur alors qu'un plan supérieur
+        est actif. La règle d'upgrade reste bloquante à l'INITIATION, mais plus
+        après encaissement : l'argent a été prélevé, la contrepartie est due.
+        L'écart est tracé dans `metadata['checkout_override']` pour l'admin.
+        """
         now = timezone.now()
         Subscription.objects.create(
             organization=self.org,
@@ -182,8 +188,14 @@ class SubscriptionQuotaServiceTests(TestCase):
                 "billing_cycle": Plan.BillingCycle.MONTHLY,
             },
         )
-        with self.assertRaises(ValidationError):
-            SubscriptionService.complete_pending_moko_payment(payment)
+        SubscriptionService.complete_pending_moko_payment(payment)
+
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, SubscriptionPayment.Status.COMPLETED)
+        self.assertIsNotNone(payment.subscription)
+        override = (payment.metadata or {}).get("checkout_override")
+        self.assertIsNotNone(override, "L'écart de règle doit rester traçable.")
+        self.assertEqual(override["reason_code"], "SUBSCRIPTION_UPGRADE_REQUIRED")
 
     def test_activate_subscription_raises_floor_tier(self):
         SubscriptionService.activate_subscription(

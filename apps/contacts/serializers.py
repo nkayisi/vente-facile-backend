@@ -10,7 +10,24 @@ from .models import Customer, CustomerTransaction, Supplier, SupplierProduct
 # CUSTOMER SERIALIZERS
 # =============================================================================
 
-class CustomerListSerializer(serializers.ModelSerializer):
+class CustomerBalancesMixin(serializers.Serializer):
+    """
+    Expose la dette RÉELLE, ventilée par devise.
+
+    `current_balance` reste la vue agrégée convertie en devise principale ;
+    `balances` porte le détail, qu'on n'additionne jamais entre devises.
+    """
+
+    balances = serializers.SerializerMethodField()
+
+    def get_balances(self, obj):
+        return [
+            {'currency': row.currency, 'amount': str(row.amount)}
+            for row in obj.balances.all() if row.amount != 0
+        ]
+
+
+class CustomerListSerializer(CustomerBalancesMixin, serializers.ModelSerializer):
     """Serializer léger pour les listes de clients."""
     
     customer_type_display = serializers.CharField(
@@ -23,13 +40,13 @@ class CustomerListSerializer(serializers.ModelSerializer):
             'id', 'code', 'name', 'company_name',
             'customer_type', 'customer_type_display',
             'email', 'phone', 'address', 'tax_id',
-            'credit_limit', 'current_balance',
+            'credit_limit', 'current_balance', 'balances',
             'is_active'
         ]
         read_only_fields = ['id', 'code']
 
 
-class CustomerDetailSerializer(serializers.ModelSerializer):
+class CustomerDetailSerializer(CustomerBalancesMixin, serializers.ModelSerializer):
     """Serializer complet pour le détail d'un client."""
     
     customer_type_display = serializers.CharField(
@@ -48,7 +65,7 @@ class CustomerDetailSerializer(serializers.ModelSerializer):
             'id', 'code', 'customer_type', 'customer_type_display',
             'name', 'company_name',
             'email', 'phone', 'address', 'tax_id',
-            'credit_limit', 'current_balance', 'available_credit',
+            'credit_limit', 'current_balance', 'available_credit', 'balances',
             'notes', 'is_active',
             'created_by', 'created_by_name',
             'total_purchases', 'recent_sales',
@@ -156,7 +173,8 @@ class CustomerTransactionSerializer(serializers.ModelSerializer):
         model = CustomerTransaction
         fields = [
             'id', 'transaction_type', 'transaction_type_display',
-            'amount', 'balance_before', 'balance_after',
+            'amount', 'currency', 'exchange_rate',
+            'balance_before', 'balance_after',
             'reference', 'sale', 'sale_reference',
             'payment_method', 'notes',
             'created_by', 'created_by_name',
@@ -166,11 +184,20 @@ class CustomerTransactionSerializer(serializers.ModelSerializer):
 
 
 class RecordPaymentSerializer(serializers.Serializer):
-    """Serializer pour enregistrer un paiement ou avance client."""
-    
+    """
+    Serializer pour enregistrer un paiement ou une avance client.
+
+    ``currency`` est la devise réellement remise : un règlement en USD ne solde
+    que des factures libellées en USD, et n'entre au tiroir qu'en USD.
+    """
+
     amount = serializers.DecimalField(
         max_digits=15, decimal_places=2,
         min_value=Decimal('0.01')
+    )
+    currency = serializers.CharField(max_length=3, required=False, allow_blank=True)
+    exchange_rate = serializers.DecimalField(
+        max_digits=20, decimal_places=12, required=False
     )
     payment_method = serializers.CharField(required=False, default='cash')
     reference = serializers.CharField(required=False, allow_blank=True, default='')
@@ -179,8 +206,19 @@ class RecordPaymentSerializer(serializers.Serializer):
 
 class AdjustBalanceSerializer(serializers.Serializer):
     """Serializer pour ajuster manuellement le solde client."""
-    
+
     amount = serializers.DecimalField(max_digits=15, decimal_places=2)
+    currency = serializers.CharField(max_length=3, required=False, allow_blank=True)
+    exchange_rate = serializers.DecimalField(
+        max_digits=20, decimal_places=12, required=False
+    )
+    notes = serializers.CharField(required=False, allow_blank=True, default='')
+
+
+class RedeemPointsToDebtSerializer(serializers.Serializer):
+    """Utilisation des points de fidélité pour éponger la dette d'un client."""
+
+    points = serializers.IntegerField(min_value=1)
     notes = serializers.CharField(required=False, allow_blank=True, default='')
 
 

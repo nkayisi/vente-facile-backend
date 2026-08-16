@@ -8,18 +8,21 @@ from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Sum, Count
 from decimal import Decimal
+from rest_framework.exceptions import ValidationError as DRFValidationError
 
 from apps.core.api_mixins import TenantViewSetMixin, AuditMixin
 from apps.core.api_permissions import (
     IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission
 )
 from apps.core.warehouse_scope import get_membership_for_request
-from .models import Customer, CustomerTransaction, Supplier, SupplierProduct
+from apps.settings.services import CurrencyService
+from .models import Customer, CustomerBalance, CustomerTransaction, Supplier, SupplierProduct
 from .serializers import (
     CustomerListSerializer, CustomerDetailSerializer,
     CustomerCreateSerializer, CustomerUpdateSerializer,
     CustomerTransactionSerializer,
     RecordPaymentSerializer, AdjustBalanceSerializer,
+    RedeemPointsToDebtSerializer,
     SupplierListSerializer, SupplierDetailSerializer,
     SupplierCreateSerializer, SupplierUpdateSerializer,
     SupplierProductSerializer
@@ -68,6 +71,7 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         'record_payment': 'customers.edit',
         'record_advance': 'customers.edit',
         'adjust_balance': 'customers.edit',
+        'redeem_points_to_debt': 'customers.edit',
         'with_balance': 'customers.view',
         'debt_summary': 'customers.view',
         'search': 'customers.view',
@@ -138,82 +142,156 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         serializer = CustomerTransactionSerializer(txns, many=True)
         return Response(serializer.data)
 
+    def _settle_open_invoices(self, customer, amount, currency, user,
+                              payment_method='cash', reference='', notes=''):
+        """
+        Impute un règlement sur les factures ouvertes du client, de la plus
+        ancienne à la plus récente, et renvoie ``(reliquat, factures_soldées)``.
+
+        C'est le correctif central de la dette : auparavant ce chemin ne faisait
+        que déplacer ``current_balance``, laissant les ventes en
+        ``pending``/``partially_paid`` avec un ``amount_due`` non nul. Le solde
+        du client et la somme des factures dues divergeaient dès le premier
+        acompte, et comme la vente n'atteignait jamais ``completed``, les points
+        de fidélité n'étaient jamais attribués.
+        """
+        from apps.sales.services import apply_payment_to_sale
+        from apps.sales.models import PaymentMethod
+        from apps.contacts import services as contacts_services
+
+        method = PaymentMethod.objects.filter(
+            organization=customer.organization,
+            method_type=payment_method,
+            is_active=True,
+        ).first() or PaymentMethod.objects.filter(
+            organization=customer.organization, is_active=True,
+        ).first()
+
+        remaining = amount
+        touched = []
+        for sale in contacts_services.open_credit_sales(customer, currency):
+            if remaining <= 0:
+                break
+            applied = min(remaining, sale.amount_due)
+            if applied <= 0:
+                continue
+            apply_payment_to_sale(
+                sale.id, user,
+                payment_method_id=method.id if method else None,
+                tendered_amount=applied,
+                currency=currency,
+                reference=reference,
+                notes=notes or f"Règlement client {customer.name}",
+            )
+            remaining -= applied
+            touched.append(sale.reference)
+
+        return remaining, touched
+
     @action(detail=True, methods=['post'], url_path='record-payment')
     def record_payment(self, request, pk=None):
-        """Enregistre un paiement du client (réduit la dette)."""
+        """
+        Enregistre un règlement du client et l'impute sur ses factures ouvertes.
+
+        Le règlement solde d'abord les factures les plus anciennes dans la même
+        devise ; un éventuel reliquat devient une avance (solde créditeur).
+        """
         from django.db import transaction as db_transaction
-        
+        from apps.contacts import services as contacts_services
+
         customer = self.get_object()
         serializer = RecordPaymentSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        
+
         amount = serializer.validated_data['amount']
-        
+        currency, exchange_rate = CurrencyService.resolve(
+            customer.organization,
+            serializer.validated_data.get('currency'),
+            serializer.validated_data.get('exchange_rate'),
+            strict=True,
+        )
+        payment_method = serializer.validated_data.get('payment_method', 'cash')
+        notes = serializer.validated_data.get('notes', '')
+        reference = serializer.validated_data.get('reference', '')
+
         with db_transaction.atomic():
-            customer = Customer.objects.select_for_update().get(id=customer.id)
-            balance_before = customer.current_balance
-            customer.current_balance -= amount
-            customer.save(update_fields=['current_balance'])
-            
-            txn = CustomerTransaction.objects.create(
-                organization=customer.organization,
-                customer=customer,
-                transaction_type='payment',
-                amount=amount,
-                balance_before=balance_before,
-                balance_after=customer.current_balance,
-                payment_method=serializer.validated_data.get('payment_method', 'cash'),
-                reference=serializer.validated_data.get('reference', ''),
-                notes=serializer.validated_data.get('notes', ''),
-                created_by=request.user
+            # `apply_payment_to_sale` met déjà à jour la dette de chaque facture
+            # soldée : on n'enregistre ici que le reliquat, en avance.
+            remaining, touched = self._settle_open_invoices(
+                customer, amount, currency, request.user,
+                payment_method=payment_method, reference=reference, notes=notes,
             )
-            
-            # Enregistrer le mouvement de caisse (entrée)
-            from apps.cashbook.services import record_customer_debt_payment
-            record_customer_debt_payment(
-                organization=customer.organization,
-                customer=customer,
-                amount=amount,
-                user=request.user,
-                notes=serializer.validated_data.get('notes', ''),
-            )
-        
+
+            txn = None
+            if remaining > 0:
+                txn = contacts_services.settle_debt(
+                    customer, remaining,
+                    currency=currency,
+                    exchange_rate=exchange_rate,
+                    transaction_type=CustomerTransaction.TransactionType.ADVANCE,
+                    reference=reference,
+                    notes=notes or "Avance client (aucune facture à solder)",
+                    user=request.user,
+                    payment_method=payment_method,
+                )
+                # Le reliquat n'a soldé aucune facture : il entre au tiroir ici.
+                from apps.cashbook.services import record_customer_advance
+                record_customer_advance(
+                    organization=customer.organization,
+                    customer=customer,
+                    amount=remaining,
+                    user=request.user,
+                    notes=notes,
+                    currency=currency,
+                    exchange_rate=exchange_rate,
+                )
+
+            customer.refresh_from_db()
+
         return Response({
-            'transaction': CustomerTransactionSerializer(txn).data,
-            'new_balance': str(customer.current_balance)
+            'transaction': CustomerTransactionSerializer(txn).data if txn else None,
+            'settled_invoices': touched,
+            'advance_amount': str(remaining),
+            'currency': currency,
+            'new_balance': str(customer.current_balance),
+            'balances': contacts_services.balances_by_currency(customer),
         })
 
     @action(detail=True, methods=['post'], url_path='record-advance')
     def record_advance(self, request, pk=None):
-        """Enregistre une avance/acompte du client."""
+        """
+        Enregistre une avance du client sans l'imputer sur une facture.
+
+        Le solde de la devise devient créditeur (négatif) : l'avance sera
+        consommée par une vente à crédit future ou par un règlement ultérieur.
+        """
         from django.db import transaction as db_transaction
-        
+        from apps.contacts import services as contacts_services
+
         customer = self.get_object()
         serializer = RecordPaymentSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        
+
         amount = serializer.validated_data['amount']
-        
+        currency, exchange_rate = CurrencyService.resolve(
+            customer.organization,
+            serializer.validated_data.get('currency'),
+            serializer.validated_data.get('exchange_rate'),
+            strict=True,
+        )
+
         with db_transaction.atomic():
-            customer = Customer.objects.select_for_update().get(id=customer.id)
-            balance_before = customer.current_balance
-            customer.current_balance -= amount
-            customer.save(update_fields=['current_balance'])
-            
-            txn = CustomerTransaction.objects.create(
-                organization=customer.organization,
-                customer=customer,
-                transaction_type='advance',
-                amount=amount,
-                balance_before=balance_before,
-                balance_after=customer.current_balance,
-                payment_method=serializer.validated_data.get('payment_method', 'cash'),
+            txn = contacts_services.settle_debt(
+                customer, amount,
+                currency=currency,
+                exchange_rate=exchange_rate,
+                transaction_type=CustomerTransaction.TransactionType.ADVANCE,
                 reference=serializer.validated_data.get('reference', ''),
                 notes=serializer.validated_data.get('notes', ''),
-                created_by=request.user
+                user=request.user,
+                payment_method=serializer.validated_data.get('payment_method', 'cash'),
             )
-            
-            # Enregistrer le mouvement de caisse (entrée)
+
             from apps.cashbook.services import record_customer_advance
             record_customer_advance(
                 organization=customer.organization,
@@ -221,65 +299,144 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
                 amount=amount,
                 user=request.user,
                 notes=serializer.validated_data.get('notes', ''),
+                currency=currency,
+                exchange_rate=exchange_rate,
             )
-        
+            customer.refresh_from_db()
+
         return Response({
             'transaction': CustomerTransactionSerializer(txn).data,
-            'new_balance': str(customer.current_balance)
+            'new_balance': str(customer.current_balance),
+            'balances': contacts_services.balances_by_currency(customer),
         })
 
     @action(detail=True, methods=['post'], url_path='adjust-balance')
     def adjust_balance(self, request, pk=None):
-        """Ajustement manuel du solde client."""
+        """Ajustement manuel du solde client, dans une devise donnée."""
         from django.db import transaction as db_transaction
-        
+        from apps.contacts import services as contacts_services
+
         customer = self.get_object()
         serializer = AdjustBalanceSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        
+
         amount = serializer.validated_data['amount']
-        
-        with db_transaction.atomic():
-            customer = Customer.objects.select_for_update().get(id=customer.id)
-            
-            # Vérifier la limite de crédit si l'ajustement augmente la dette
-            if amount > 0 and customer.credit_limit > 0:
-                new_balance = customer.current_balance + amount
-                if new_balance > customer.credit_limit:
-                    return Response(
-                        {'error': f"Cet ajustement dépasse la limite de crédit autorisée ({customer.credit_limit})."},
-                        status=status.HTTP_400_BAD_REQUEST
+        currency, exchange_rate = CurrencyService.resolve(
+            customer.organization,
+            serializer.validated_data.get('currency'),
+            serializer.validated_data.get('exchange_rate'),
+            strict=True,
+        )
+        notes = serializer.validated_data.get('notes', '')
+
+        try:
+            with db_transaction.atomic():
+                if amount > 0:
+                    txn = contacts_services.apply_debt(
+                        customer, amount,
+                        currency=currency,
+                        exchange_rate=exchange_rate,
+                        transaction_type=CustomerTransaction.TransactionType.ADJUSTMENT,
+                        notes=notes,
+                        user=request.user,
                     )
-            
-            balance_before = customer.current_balance
-            customer.current_balance += amount
-            customer.save(update_fields=['current_balance'])
-            
-            txn = CustomerTransaction.objects.create(
-                organization=customer.organization,
-                customer=customer,
-                transaction_type='adjustment',
-                amount=abs(amount),
-                balance_before=balance_before,
-                balance_after=customer.current_balance,
-                notes=serializer.validated_data.get('notes', ''),
-                created_by=request.user
-            )
-            
-            # Enregistrer le mouvement de caisse si l'ajustement réduit la dette (= argent reçu)
-            if amount < 0:
-                from apps.cashbook.services import record_customer_debt_payment
-                record_customer_debt_payment(
-                    organization=customer.organization,
-                    customer=customer,
-                    amount=abs(amount),
-                    user=request.user,
-                    notes=f"Ajustement solde client - {serializer.validated_data.get('notes', '')}",
-                )
-        
+                else:
+                    txn = contacts_services.adjust_balance(
+                        customer, amount,
+                        currency=currency,
+                        exchange_rate=exchange_rate,
+                        notes=notes,
+                        user=request.user,
+                    )
+                    # Réduire la dette = argent reçu : ça entre au tiroir.
+                    from apps.cashbook.services import record_customer_debt_payment
+                    record_customer_debt_payment(
+                        organization=customer.organization,
+                        customer=customer,
+                        amount=abs(amount),
+                        user=request.user,
+                        notes=f"Ajustement solde client - {notes}",
+                        currency=currency,
+                        exchange_rate=exchange_rate,
+                    )
+                customer.refresh_from_db()
+        except DRFValidationError as exc:
+            return Response({'error': exc.detail}, status=status.HTTP_400_BAD_REQUEST)
+
         return Response({
-            'transaction': CustomerTransactionSerializer(txn).data,
-            'new_balance': str(customer.current_balance)
+            'transaction': CustomerTransactionSerializer(txn).data if txn else None,
+            'new_balance': str(customer.current_balance),
+            'balances': contacts_services.balances_by_currency(customer),
+        })
+
+    @action(detail=True, methods=['post'], url_path='redeem-points')
+    def redeem_points_to_debt(self, request, pk=None):
+        """
+        Utilise les points de fidélité du client pour éponger sa dette.
+
+        Les points sont convertis en montant puis imputés sur les factures
+        ouvertes comme un règlement ordinaire. Aucun mouvement de caisse : ce
+        n'est pas de l'argent physique.
+        """
+        from django.db import transaction as db_transaction
+        from apps.contacts import services as contacts_services
+        from apps.settings.services import LoyaltyService
+
+        customer = self.get_object()
+        serializer = RedeemPointsToDebtSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        points = serializer.validated_data['points']
+
+        primary = CurrencyService.primary_code(customer.organization)
+        outstanding = contacts_services.get_balance(customer, primary)
+        if outstanding <= 0:
+            return Response(
+                {'error': "Ce client n'a aucune dette dans la devise principale."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        resolution = LoyaltyService.resolve_redemption(
+            customer, customer.organization, points, outstanding,
+            target_currency=primary,
+        )
+        if resolution is None:
+            return Response(
+                {'error': (
+                    "Points inutilisables : solde insuffisant, minimum non "
+                    "atteint, ou aucun programme de fidélité actif."
+                )},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with db_transaction.atomic():
+            # Les points sont consommés UNE fois, ici ; le montant obtenu est
+            # ensuite imputé sur les factures comme un règlement ordinaire.
+            LoyaltyService.consume_points(
+                customer.organization, resolution, user=request.user,
+                description=f"Points utilisés sur la dette de {customer.name}",
+            )
+            remaining, touched = self._settle_open_invoices(
+                customer, resolution['amount'], primary, request.user,
+                payment_method='loyalty',
+                notes=f"{resolution['points']} points de fidélité",
+            )
+            if remaining > 0:
+                contacts_services.settle_debt(
+                    customer, remaining,
+                    currency=primary,
+                    notes=f"{resolution['points']} points de fidélité",
+                    user=request.user,
+                    payment_method='loyalty',
+                )
+            customer.refresh_from_db()
+
+        return Response({
+            'points_used': resolution['points'],
+            'amount': str(resolution['amount']),
+            'currency': primary,
+            'settled_invoices': touched,
+            'new_balance': str(customer.current_balance),
+            'balances': contacts_services.balances_by_currency(customer),
         })
 
     @action(detail=False, methods=['get'], url_path='with-balance')

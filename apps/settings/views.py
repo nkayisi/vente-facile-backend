@@ -6,6 +6,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django.db import transaction
+from django.http import JsonResponse
 from django.utils import timezone
 from decimal import Decimal
 
@@ -236,8 +237,18 @@ class LoyaltyProgramViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
             serializer = self.get_serializer(program)
             return Response(serializer.data)
         except LoyaltyProgram.DoesNotExist:
-            return Response(None)
-    
+            # `Response(None)` produit un corps VIDE : le JSONRenderer de DRF
+            # renvoie b'' quand data vaut None. Tout client qui parse du JSON
+            # casse dessus. On émet un `null` JSON explicite.
+            return JsonResponse(None, safe=False)
+
+    def perform_create(self, serializer):
+        # L'organisation vient de l'en-tête X-Organization-ID (tenant de la
+        # requête), jamais de user.active_organization : un utilisateur membre
+        # de plusieurs organisations créerait sinon le programme dans la
+        # mauvaise.
+        serializer.save(organization=self.get_organization())
+
     @action(detail=True, methods=['post'])
     def toggle(self, request, pk=None):
         """Activer/désactiver le programme de fidélité."""
@@ -353,13 +364,17 @@ class CustomerLoyaltyViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
                 loyalty.add_points(points)
                 trans_type = LoyaltyTransaction.TransactionType.BONUS
             else:
-                if abs(points) > loyalty.current_points:
+                # `redeem_points` verrouille la ligne et lève si le solde est
+                # insuffisant. L'ancien code faisait une lecture-modification-
+                # écriture non atomique et n'incrémentait jamais
+                # `total_points_redeemed`.
+                try:
+                    loyalty.redeem_points(abs(points))
+                except ValueError:
                     return Response(
                         {'error': "Points insuffisants pour cet ajustement."},
                         status=status.HTTP_400_BAD_REQUEST
                     )
-                loyalty.current_points += points  # points est négatif
-                loyalty.save()
                 trans_type = LoyaltyTransaction.TransactionType.ADJUST
             
             # Créer la transaction
@@ -408,17 +423,23 @@ class CustomerLoyaltyViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Vérifier le minimum
-        try:
-            program = LoyaltyProgram.objects.get(organization=org)
-            if points < program.min_points_to_redeem:
-                return Response(
-                    {'error': f"Minimum requis: {program.min_points_to_redeem} points."},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-        except LoyaltyProgram.DoesNotExist:
-            pass
-        
+        # Le programme doit être ACTIF : sans ce filtre, on pouvait consommer
+        # des points sur un programme désactivé, alors que le chemin de vente
+        # l'interdit déjà.
+        program = LoyaltyProgram.objects.filter(
+            organization=org, is_active=True,
+        ).first()
+        if program is None:
+            return Response(
+                {'error': "Aucun programme de fidélité actif."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if points < program.min_points_to_redeem:
+            return Response(
+                {'error': f"Minimum requis: {program.min_points_to_redeem} points."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         with transaction.atomic():
             loyalty.redeem_points(points)
             

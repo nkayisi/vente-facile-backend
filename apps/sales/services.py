@@ -530,6 +530,190 @@ def create_payment(sale, user, *, payment_method=None, payment_method_id=None,
     )
 
 
+@transaction.atomic
+def get_loyalty_payment_method(organization):
+    """
+    Moyen de paiement « points de fidélité » de l'organisation, créé au besoin.
+
+    Ce n'est pas de l'argent physique : il est exclu des mouvements de caisse et
+    du comptage de clôture de session.
+    """
+    from apps.sales.models import PaymentMethod
+
+    method, _ = PaymentMethod.objects.get_or_create(
+        organization=organization,
+        method_type=PaymentMethod.MethodType.LOYALTY,
+        defaults={
+            'name': 'Points de fidélité',
+            'code': 'LOYALTY',
+            'is_active': True,
+        },
+    )
+    return method
+
+
+def apply_payment_to_sale(sale_id, user, *, payment_method_id=None,
+                          tendered_amount=None, currency=None, exchange_rate=None,
+                          change_currency=None, reference='', notes='',
+                          award_loyalty=True, points_used=0):
+    """
+    Applique un règlement à une facture existante, de bout en bout.
+
+    Point d'entrée UNIQUE : utilisé par ``SaleViewSet.add_payment`` (règlement
+    depuis la facture) ET par ``CustomerViewSet.record_payment`` (règlement
+    depuis la fiche client). Avant ce lot, le second ne touchait aucune facture :
+    le solde du client bougeait pendant que la vente restait ``partially_paid``,
+    et comme la vente n'atteignait jamais ``completed``, les points de fidélité
+    n'étaient jamais attribués.
+
+    Enchaîne, sous verrou sur la vente : création du règlement, recalcul des
+    montants, monnaie rendue, décrément de stock, attribution des points,
+    mouvement de caisse et mise à jour de la dette client.
+
+    Retourne ``(sale, payment)``.
+    """
+    from apps.sales.models import Sale
+
+    sale = (
+        Sale.objects.select_related('customer', 'organization', 'warehouse')
+        .select_for_update(of=('self',))
+        .get(pk=sale_id)
+    )
+    if sale.status in ['completed', 'cancelled', 'refunded']:
+        raise ValidationError("Impossible d'ajouter un paiement à cette vente")
+
+    previous_status = sale.status
+    due_before = sale.amount_due
+
+    payments = []
+
+    # 1) Règlement en points d'abord : il réduit le reste à payer en argent.
+    loyalty_resolution = None
+    if points_used and points_used > 0 and sale.customer:
+        from apps.settings.services import LoyaltyService
+
+        loyalty_resolution = LoyaltyService.resolve_redemption(
+            sale.customer, sale.organization, points_used, sale.amount_due,
+            target_currency=sale.currency,
+        )
+        if loyalty_resolution is None:
+            raise ValidationError(
+                "Points inutilisables : solde insuffisant, minimum non atteint, "
+                "ou aucun programme de fidélité actif."
+            )
+        payments.append(create_payment(
+            sale, user,
+            payment_method_id=get_loyalty_payment_method(sale.organization).id,
+            tendered_amount=loyalty_resolution['amount'],
+            currency=sale.currency,
+            notes=f"{loyalty_resolution['points']} points utilisés",
+        ))
+
+    # 2) Puis le règlement en argent, s'il y en a un.
+    if tendered_amount is not None and Decimal(tendered_amount) > 0:
+        payments.append(create_payment(
+            sale, user,
+            payment_method_id=payment_method_id,
+            tendered_amount=tendered_amount,
+            currency=currency,
+            exchange_rate=exchange_rate,
+            reference=reference,
+            notes=notes,
+        ))
+
+    if not payments:
+        raise ValidationError("Aucun règlement à appliquer.")
+
+    payment = payments[-1]
+    for p in payments:
+        sale.amount_paid += p.amount
+    sale.amount_due = (sale.total - sale.amount_paid).quantize(TWO_PLACES)
+
+    change_amount = Decimal('0.00')
+    resolved_change_currency = change_currency or sale.change_currency or sale.currency
+    if sale.amount_paid >= sale.total:
+        change_amount, resolved_change_currency, _ = resolve_change(
+            sale, resolved_change_currency,
+        )
+        sale.change_amount = change_amount
+        sale.change_currency = resolved_change_currency
+        sale.amount_due = Decimal('0.00')
+        sale.status = 'completed'
+    else:
+        sale.status = 'partially_paid'
+
+    sale.save()
+
+    # Consommation effective des points, une fois la vente enregistrée.
+    if loyalty_resolution:
+        from apps.settings.services import LoyaltyService
+        LoyaltyService.persist_redemption(
+            sale, loyalty_resolution, user=user, payment=payments[0],
+        )
+
+    if sale.status == 'completed' and previous_status != 'completed':
+        if not sale.warehouse:
+            from apps.inventory.models import Warehouse as WarehouseModel
+            default_wh = WarehouseModel.objects.filter(
+                organization=sale.organization,
+                is_default=True, is_active=True, is_deleted=False,
+            ).first() or WarehouseModel.objects.filter(
+                organization=sale.organization,
+                is_active=True, is_deleted=False,
+            ).first()
+            if default_wh:
+                sale.warehouse = default_wh
+                sale.save(update_fields=['warehouse'])
+
+        SaleStockService.apply_decrement(sale, user)
+
+        if award_loyalty and sale.customer:
+            from apps.settings.services import LoyaltyService
+            LoyaltyService.award_points_for_sale(sale, user=user)
+
+    # Caisse : dans la devise réellement remise. Un règlement en points n'est
+    # pas de l'argent physique et ne doit pas entrer au tiroir.
+    from apps.cashbook.services import (
+        record_change, record_debt_collection_payment, record_sale_payment_income,
+    )
+    for p in payments:
+        if p.payment_method and p.payment_method.method_type == 'loyalty':
+            continue
+        if sale.sale_type == 'credit' and sale.customer:
+            record_debt_collection_payment(
+                sale.organization, sale, p, sale.customer, user,
+            )
+        else:
+            record_sale_payment_income(sale.organization, sale, p, user)
+    if change_amount > 0:
+        record_change(
+            sale.organization, sale, change_amount, resolved_change_currency, user,
+        )
+
+    # Dette client : on ne solde QUE ce qui était réellement dû. Le surplus est
+    # rendu physiquement au client (monnaie), le lui créditer en plus reviendrait
+    # à le compter deux fois.
+    if sale.customer and due_before > 0:
+        from apps.contacts import services as contacts_services
+        applied = sum((p.amount for p in payments), Decimal('0.00'))
+        settled = min(applied, due_before)
+        if settled > 0:
+            contacts_services.settle_debt(
+                sale.customer, settled,
+                currency=sale.currency,
+                sale=sale,
+                reference=sale.reference,
+                notes=f"Paiement sur facture {sale.reference}",
+                user=user,
+                payment_method=(
+                    payment.payment_method.method_type
+                    if payment.payment_method else 'cash'
+                ),
+            )
+
+    return sale, payment
+
+
 def resolve_change(sale, change_currency=None):
     """
     Calcule la monnaie à rendre à partir du surplus payé

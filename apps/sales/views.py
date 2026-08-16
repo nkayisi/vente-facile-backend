@@ -9,6 +9,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Sum, Count, F
 from django.utils import timezone
 from decimal import Decimal
+from rest_framework.exceptions import ValidationError as DRFValidationError
 
 from apps.core.api_mixins import (
     TenantViewSetMixin,
@@ -613,61 +614,6 @@ class SaleViewSet(
 
         return queryset
     
-    def _award_loyalty_points(self, sale, user):
-        """Attribue les points de fidélité au client pour une vente complétée.
-
-        Idempotent : la contrainte unique ``(sale, transaction_type='earn')``
-        sur ``LoyaltyTransaction`` empêche un double-award en cas de retry
-        ou de race condition.
-        """
-        from django.db import IntegrityError
-        from apps.settings.models import LoyaltyProgram, CustomerLoyalty, LoyaltyTransaction
-
-        try:
-            program = LoyaltyProgram.objects.get(organization=sale.organization, is_active=True)
-        except LoyaltyProgram.DoesNotExist:
-            return  # Pas de programme de fidélité actif
-
-        # Vérifier si seuls les clients enregistrés peuvent gagner des points
-        if program.only_registered_customers and not sale.customer:
-            return
-
-        # Calculer les points gagnés
-        points = program.calculate_points(sale.total)
-        if points <= 0:
-            return
-
-        # Lock + idempotence : si une ligne EARN existe déjà pour cette
-        # vente, on sort sans rien faire (cas du retry).
-        if LoyaltyTransaction.objects.filter(
-            sale=sale, transaction_type=LoyaltyTransaction.TransactionType.EARN
-        ).exists():
-            return
-
-        loyalty, _ = CustomerLoyalty.objects.select_for_update().get_or_create(
-            organization=sale.organization,
-            customer=sale.customer,
-        )
-
-        loyalty.add_points(points)
-
-        try:
-            LoyaltyTransaction.objects.create(
-                organization=sale.organization,
-                customer_loyalty=loyalty,
-                transaction_type=LoyaltyTransaction.TransactionType.EARN,
-                points=points,
-                balance_after=loyalty.current_points,
-                sale=sale,
-                description=f"Points gagnés sur vente {sale.reference}",
-                created_by=user,
-            )
-        except IntegrityError:
-            # Race extrême : une autre transaction a créé la ligne EARN
-            # juste avant. On retire les points qu'on venait d'ajouter
-            # (la première transaction a déjà ajouté les siens).
-            loyalty.add_points(-points)
-
     @action(detail=True, methods=['post'], url_path='add-payment')
     def add_payment(self, request, pk=None):
         """Ajoute un paiement à une vente existante."""
@@ -694,119 +640,25 @@ class SaleViewSet(
         serializer = SalePaymentSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        with transaction.atomic():
-            # Lock exclusif sur la Sale pour la durée du recalcul amount_paid /
-            # amount_due / status. Deux requêtes concurrentes sont sérialisées.
-            # `of=('self',)` lock UNIQUEMENT la table Sale (Postgres refuse
-            # FOR UPDATE sur le côté nullable d'un LEFT JOIN - customer/warehouse).
-            sale = (
-                Sale.objects.select_related('customer', 'organization', 'warehouse')
-                .select_for_update(of=('self',))
-                .get(pk=pk)
-            )
-            # Re-check sous lock (le statut a pu changer entre la pré-check et le lock).
-            if sale.status in ['completed', 'cancelled', 'refunded']:
-                return Response(
-                    {'error': 'Impossible d\'ajouter un paiement à cette vente'},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            previous_status = sale.status
-
-            # Gestion multi-devise centralisée : `create_payment` convertit le
-            # montant remis (dans `currency`) vers la devise de la vente et
-            # renseigne `amount` + `tendered_amount`.
-            from .services import create_payment, resolve_change
-            payment = create_payment(
-                sale, request.user,
-                payment_method_id=serializer.validated_data['payment_method'],
+        # Toute la mécanique (verrou, recalcul, stock, points, caisse, dette)
+        # vit dans `apply_payment_to_sale` : la fiche client l'appelle aussi,
+        # pour que les deux chemins de règlement produisent le même état.
+        from .services import apply_payment_to_sale
+        try:
+            sale, _payment = apply_payment_to_sale(
+                pk, request.user,
+                payment_method_id=serializer.validated_data.get('payment_method'),
                 tendered_amount=serializer.validated_data['amount'],
                 currency=serializer.validated_data.get('currency'),
                 exchange_rate=serializer.validated_data.get('exchange_rate'),
+                change_currency=serializer.validated_data.get('change_currency'),
                 reference=serializer.validated_data.get('reference', ''),
                 notes=serializer.validated_data.get('notes', ''),
+                points_used=serializer.validated_data.get('points_used', 0),
             )
+        except DRFValidationError as exc:
+            return Response({'error': exc.detail}, status=status.HTTP_400_BAD_REQUEST)
 
-            # Mettre à jour la vente (toujours en devise de la vente)
-            sale.amount_paid += payment.amount
-            sale.amount_due = (sale.total - sale.amount_paid).quantize(Decimal('0.01'))
-
-            change_amount = Decimal('0.00')
-            change_currency = sale.change_currency or sale.currency
-            if sale.amount_paid >= sale.total:
-                change_currency = serializer.validated_data.get('change_currency') or change_currency
-                change_amount, change_currency, _ = resolve_change(sale, change_currency)
-                sale.change_amount = change_amount
-                sale.change_currency = change_currency
-                sale.amount_due = Decimal('0.00')
-                sale.status = 'completed'
-            else:
-                sale.status = 'partially_paid'
-
-            sale.save()
-            
-            # Si la vente vient de passer en completed, mettre à jour le stock
-            if sale.status == 'completed' and previous_status != 'completed':
-                # Fallback: assigner l'entrepôt par défaut si aucun n'est défini
-                if not sale.warehouse:
-                    from apps.inventory.models import Warehouse as WarehouseModel
-                    default_wh = WarehouseModel.objects.filter(
-                        organization=sale.organization,
-                        is_default=True, is_active=True, is_deleted=False
-                    ).first() or WarehouseModel.objects.filter(
-                        organization=sale.organization,
-                        is_active=True, is_deleted=False
-                    ).first()
-                    if default_wh:
-                        sale.warehouse = default_wh
-                        sale.save(update_fields=['warehouse'])
-
-                # Décrémentation centralisée (FIFO + re-check allow_negative + idempotent)
-                SaleStockService.apply_decrement(sale, request.user)
-
-                # Attribuer les points de fidélité si applicable
-                if sale.customer:
-                    self._award_loyalty_points(sale, request.user)
-            
-            # Enregistrer le mouvement de caisse dans la devise réellement remise
-            # (+ la monnaie rendue en sortie si la vente est soldée).
-            from apps.cashbook.services import (
-                record_sale_payment_income, record_debt_collection_payment, record_change,
-            )
-            if sale.sale_type == 'credit' and sale.customer:
-                record_debt_collection_payment(
-                    sale.organization, sale, payment, sale.customer, request.user,
-                )
-            else:
-                record_sale_payment_income(sale.organization, sale, payment, request.user)
-            if change_amount > 0:
-                record_change(
-                    sale.organization, sale, change_amount, change_currency, request.user,
-                )
-            
-            # Mettre à jour le solde client pour les ventes à crédit
-            if sale.customer and sale.sale_type == 'credit':
-                from apps.contacts.models import Customer, CustomerTransaction
-                customer = Customer.objects.select_for_update().get(id=sale.customer.id)
-                balance_before = customer.current_balance
-                customer.current_balance -= payment.amount
-                customer.save()
-                
-                # Créer une transaction client pour l'historique
-                CustomerTransaction.objects.create(
-                    organization=sale.organization,
-                    customer=customer,
-                    transaction_type='payment',
-                    amount=payment.amount,
-                    balance_before=balance_before,
-                    balance_after=customer.current_balance,
-                    sale=sale,
-                    reference=sale.reference,
-                    payment_method=payment.payment_method.method_type if payment.payment_method else 'cash',
-                    notes=f"Paiement sur facture {sale.reference}",
-                    created_by=request.user
-                )
-        
         return Response(SaleDetailSerializer(sale).data)
 
     @action(detail=True, methods=['post'])
@@ -853,97 +705,35 @@ class SaleViewSet(
                     user=request.user,
                 )
 
-            # Restaurer le solde client pour les ventes à crédit.
+            # Restaurer le solde client.
             #
-            # Logique : à la création, on a fait `balance += amount_due_initial`.
-            # Chaque add_payment a fait `balance -= payment.amount`.
-            # L'impact NET courant sur le solde client est donc `sale.total - sale.amount_paid`
-            # (peut être négatif si le client a sur-payé → il a un crédit).
-            # Pour annuler proprement, on soustrait exactement cet impact net,
-            # ce qui ramène le solde à sa valeur d'avant la vente.
-            if sale.customer and sale.sale_type == 'credit':
-                from apps.contacts.models import Customer, CustomerTransaction
-                customer = Customer.objects.select_for_update().get(id=sale.customer.id)
-                net_balance_impact = (sale.total - sale.amount_paid).quantize(Decimal('0.01'))
-                if net_balance_impact != 0:
-                    balance_before = customer.current_balance
-                    customer.current_balance -= net_balance_impact
-                    customer.save()
-                    # `amount` du modèle CustomerTransaction est une magnitude
-                    # positive (>= 0.01). La direction est portée par
-                    # balance_before/after et le type 'adjustment'.
-                    CustomerTransaction.objects.create(
-                        organization=sale.organization,
-                        customer=customer,
-                        transaction_type=CustomerTransaction.TransactionType.ADJUSTMENT,
-                        amount=abs(net_balance_impact),
-                        balance_before=balance_before,
-                        balance_after=customer.current_balance,
-                        sale=sale,
-                        reference=sale.reference,
-                        notes=(
-                            f"Annulation vente {sale.reference} "
-                            f"(impact net solde : {-net_balance_impact:+})"
-                        ),
-                        created_by=request.user,
-                    )
+            # À la création on a inscrit `amount_due` en dette ; chaque règlement
+            # en a soldé exactement la part réellement due (jamais le surplus,
+            # qui est rendu en monnaie). L'impact net encore porté par le solde
+            # est donc simplement le `amount_due` courant : c'est ce qu'on retire.
+            if sale.customer and sale.amount_due > 0:
+                from apps.contacts import services as contacts_services
+                contacts_services.settle_debt(
+                    sale.customer, sale.amount_due,
+                    currency=sale.currency,
+                    transaction_type=(
+                        contacts_services.CustomerTransaction.TransactionType.ADJUSTMENT
+                    ),
+                    sale=sale,
+                    reference=sale.reference,
+                    notes=f"Annulation vente {sale.reference}",
+                    user=request.user,
+                )
 
             # Reverser les transactions de fidélité liées à cette vente.
             # Idempotent : on ne crée un REVERSAL que s'il n'existe pas déjà.
-            self._reverse_loyalty_transactions(sale, request.user)
+            from apps.settings.services import LoyaltyService
+            LoyaltyService.reverse_sale_transactions(sale, request.user)
 
             sale.status = 'cancelled'
             sale.save()
 
         return Response({'status': 'cancelled'})
-
-    def _reverse_loyalty_transactions(self, sale, user):
-        """
-        Inverse les transactions de fidélité d'une vente annulée :
-        - une ligne ``EARN`` → on retire les points et on crée ``EARN_REVERSAL``
-        - une ligne ``REDEEM`` → on restitue les points et on crée ``REDEEM_REVERSAL``
-
-        Idempotent : si un REVERSAL existe déjà pour cette vente, ne fait rien.
-        """
-        from apps.settings.models import CustomerLoyalty, LoyaltyTransaction
-
-        TxType = LoyaltyTransaction.TransactionType
-
-        for original_type, reversal_type, reversal_label in (
-            (TxType.EARN, TxType.EARN_REVERSAL, "Annulation des points gagnés"),
-            (TxType.REDEEM, TxType.REDEEM_REVERSAL, "Restitution des points utilisés"),
-        ):
-            if LoyaltyTransaction.objects.filter(
-                sale=sale, transaction_type=reversal_type
-            ).exists():
-                continue  # déjà reversé
-
-            original = LoyaltyTransaction.objects.filter(
-                sale=sale, transaction_type=original_type
-            ).first()
-            if not original:
-                continue
-
-            loyalty = CustomerLoyalty.objects.select_for_update().filter(
-                pk=original.customer_loyalty_id
-            ).first()
-            if not loyalty:
-                continue
-
-            # Inversion : on annule l'effet sur le solde de points.
-            # original.points est positif pour EARN, négatif pour REDEEM.
-            loyalty.add_points(-original.points)
-
-            LoyaltyTransaction.objects.create(
-                organization=sale.organization,
-                customer_loyalty=loyalty,
-                transaction_type=reversal_type,
-                points=-original.points,
-                balance_after=loyalty.current_points,
-                sale=sale,
-                description=f"{reversal_label} - annulation vente {sale.reference}",
-                created_by=user,
-            )
 
     @action(detail=False, methods=['get'])
     def today(self, request):
@@ -1124,7 +914,18 @@ class SaleReturnViewSet(
                     amount=sale_return.refund_amount,
                     user=request.user,
                 )
-        
+
+            # Reverser les points : seule l'annulation le faisait, un retour
+            # laissait le client garder les points d'une vente rendue.
+            # Un retour TOTAL seulement : sur un retour partiel, les points
+            # gagnés sur la part conservée restent acquis.
+            sale = sale_return.original_sale
+            if sale and sale_return.total_amount >= sale.total:
+                from apps.settings.services import LoyaltyService
+                LoyaltyService.reverse_sale_transactions(
+                    sale, request.user, label='retour',
+                )
+
         return Response({'status': 'approved'})
 
     @action(detail=True, methods=['post'])

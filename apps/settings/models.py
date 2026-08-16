@@ -327,6 +327,76 @@ class CustomerLoyalty(TenantModel):
             self.total_points_redeemed = fresh.total_points_redeemed
             self.last_points_redeemed_at = fresh.last_points_redeemed_at
 
+    def expire_points(self, points: int) -> int:
+        """
+        Retire des points périmés et renvoie le nombre réellement retiré.
+
+        Ne touche NI ``total_points_earned`` (ces points ont bien été gagnés),
+        NI ``total_points_redeemed`` (ils n'ont pas été utilisés) : seul le solde
+        courant diminue. Borné au solde disponible, relu sous verrou pour ne pas
+        passer sous zéro si le client vient de dépenser en parallèle.
+        """
+        from django.db import transaction
+
+        points = abs(int(points))
+        if points == 0:
+            return 0
+
+        with transaction.atomic():
+            fresh = type(self).objects.select_for_update().get(pk=self.pk)
+            amount = min(points, max(0, fresh.current_points))
+            if amount == 0:
+                return 0
+            fresh.current_points -= amount
+            fresh.save(update_fields=['current_points'])
+            self.current_points = fresh.current_points
+            return amount
+
+    def reverse_points(self, points: int, kind: str):
+        """
+        Inverse un mouvement de points en corrigeant le BON compteur à vie.
+
+        Détourner ``add_points(-points)`` pour annuler une utilisation gonflait
+        ``total_points_earned`` au lieu de réduire ``total_points_redeemed`` ;
+        inversement, annuler un gain pouvait faire passer
+        ``total_points_earned`` sous zéro et violer la contrainte CHECK du
+        ``PositiveIntegerField`` sur Postgres.
+
+        ``kind`` vaut ``'earn'`` (on annule un gain : les points partent) ou
+        ``'redeem'`` (on annule une utilisation : les points reviennent).
+        ``points`` est toujours une magnitude positive.
+        """
+        from django.db import transaction
+        from django.utils import timezone
+
+        points = abs(int(points))
+        if points == 0:
+            return
+
+        with transaction.atomic():
+            fresh = type(self).objects.select_for_update().get(pk=self.pk)
+            now = timezone.now()
+
+            if kind == 'earn':
+                fresh.current_points -= points
+                # Bornage à 0 : le cumul à vie ne peut pas être négatif.
+                fresh.total_points_earned = max(0, fresh.total_points_earned - points)
+                fresh.last_points_earned_at = now
+                fields = [
+                    'current_points', 'total_points_earned', 'last_points_earned_at',
+                ]
+            else:
+                fresh.current_points += points
+                fresh.total_points_redeemed = max(0, fresh.total_points_redeemed - points)
+                fresh.last_points_redeemed_at = now
+                fields = [
+                    'current_points', 'total_points_redeemed', 'last_points_redeemed_at',
+                ]
+
+            fresh.save(update_fields=fields)
+            for field in fields:
+                setattr(self, field, getattr(fresh, field))
+
 
 class LoyaltyTransaction(TenantModel):
     """
@@ -373,6 +443,17 @@ class LoyaltyTransaction(TenantModel):
         related_name='loyalty_transactions'
     )
     
+    # Règlement associé quand les points servent à payer une facture DÉJÀ émise
+    # (via add-payment). Porte l'idempotence des REDEEM, puisqu'une même vente
+    # peut être réglée en plusieurs fois, donc consommer des points plusieurs fois.
+    payment = models.ForeignKey(
+        'sales.Payment',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='loyalty_transactions'
+    )
+
     # Référence optionnelle à une récompense
     reward = models.ForeignKey(
         LoyaltyReward,
@@ -381,7 +462,7 @@ class LoyaltyTransaction(TenantModel):
         blank=True,
         related_name='transactions'
     )
-    
+
     description = models.CharField(max_length=255, blank=True)
     
     created_by = models.ForeignKey(
@@ -395,14 +476,28 @@ class LoyaltyTransaction(TenantModel):
         db_table = 'loyalty_transactions'
         ordering = ['-created_at']
         constraints = [
-            # Idempotence : une vente ne peut donner les points qu'une seule
-            # fois. Une seconde tentative de _award_loyalty_points lèvera
-            # IntegrityError attrapée côté caller. Idem pour REDEEM (les
-            # points dépensés à la création de la vente).
+            # Idempotence du GAIN : une vente ne donne ses points qu'une fois.
+            # Une seconde tentative lève IntegrityError, attrapée côté service.
+            # Les reversals sont uniques par vente pour la même raison.
             models.UniqueConstraint(
                 fields=['sale', 'transaction_type'],
-                condition=models.Q(transaction_type__in=['earn', 'redeem', 'earn_reversal', 'redeem_reversal']),
+                condition=models.Q(transaction_type__in=['earn', 'earn_reversal', 'redeem_reversal']),
                 name='loyalty_tx_unique_per_sale_type',
+            ),
+            # Idempotence de la CONSOMMATION à la création de vente : un seul
+            # REDEEM sans règlement associé par vente (remise avant émission).
+            models.UniqueConstraint(
+                fields=['sale'],
+                condition=models.Q(transaction_type='redeem', payment__isnull=True),
+                name='loyalty_tx_unique_sale_redeem_at_creation',
+            ),
+            # Idempotence des règlements en points sur facture émise : une
+            # facture peut être réglée en plusieurs fois, donc consommer des
+            # points plusieurs fois, mais jamais deux fois pour le même règlement.
+            models.UniqueConstraint(
+                fields=['payment'],
+                condition=models.Q(transaction_type='redeem', payment__isnull=False),
+                name='loyalty_tx_unique_payment_redeem',
             ),
         ]
 

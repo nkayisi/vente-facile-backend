@@ -40,12 +40,20 @@ class Customer(TenantSyncableModel):
         decimal_places=2,
         default=Decimal('0.00')
     )
+    # Dette totale CONVERTIE en devise principale de l'organisation. La dette
+    # réelle, devise par devise, vit dans `CustomerBalance` : un client peut
+    # devoir 50 USD ET 40 000 CDF, deux montants qu'on n'additionne jamais tels
+    # quels. Ce champ scalaire reste la vue comptable agrégée (limite de crédit,
+    # tri, rapports, sync mobile), sur le même principe que les champs scalaires
+    # de `RegisterSession` face à `RegisterSessionCurrencyBalance`.
+    #
+    # Ne jamais l'écrire directement : passer par `apps.contacts.services`.
     current_balance = models.DecimalField(
         max_digits=15,
         decimal_places=2,
         default=Decimal('0.00')
     )
-    
+
     notes = models.TextField(blank=True)
     
     is_active = models.BooleanField(default=True)
@@ -95,6 +103,51 @@ class Customer(TenantSyncableModel):
         )['total'] or Decimal('0.00')
 
 
+class CustomerBalance(TenantModel):
+    """
+    Dette d'un client pour UNE devise.
+
+    En RDC un même client peut devoir en CDF et en USD ; ces montants ne
+    s'additionnent pas. Chaque ligne suit une devise indépendamment. Le champ
+    scalaire `Customer.current_balance` reste la somme convertie en devise
+    principale, pour la limite de crédit et les rapports comptables.
+
+    Convention de signe : positif = le client doit de l'argent (dette),
+    négatif = le client est créditeur (avance non consommée).
+
+    Écriture exclusivement via `apps.contacts.services`.
+    """
+
+    customer = models.ForeignKey(
+        Customer,
+        on_delete=models.CASCADE,
+        related_name='balances'
+    )
+    currency = models.CharField(max_length=3)
+
+    amount = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        default=Decimal('0.00')
+    )
+
+    class Meta:
+        db_table = 'customer_balances'
+        ordering = ['currency']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['customer', 'currency'],
+                name='unique_customer_balance_per_currency'
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['organization', 'currency']),
+        ]
+
+    def __str__(self):
+        return f"{self.customer.name} - {self.amount} {self.currency}"
+
+
 class CustomerTransaction(TenantModel):
     """
     Tracks all financial movements for a customer:
@@ -103,8 +156,11 @@ class CustomerTransaction(TenantModel):
     - advance: avance/acompte versé par le client
     - adjustment: ajustement manuel du solde
     - refund: remboursement au client
+
+    ``amount``, ``balance_before`` et ``balance_after`` sont exprimés dans
+    ``currency`` (la devise du mouvement), et non en devise principale.
     """
-    
+
     class TransactionType(models.TextChoices):
         CREDIT_SALE = 'credit_sale', 'Vente à crédit'
         PAYMENT = 'payment', 'Paiement'
@@ -128,7 +184,17 @@ class CustomerTransaction(TenantModel):
         decimal_places=2,
         validators=[MinValueValidator(Decimal('0.01'))]
     )
-    
+
+    # Devise du mouvement. Défaut VIDE, résolu dans `save()` vers la devise
+    # principale de l'organisation, comme Sale, Payment, Expense, CashMovement.
+    currency = models.CharField(max_length=3, blank=True, default='')
+    # Unités de devise principale pour 1 unité de `currency` (principale = 1).
+    exchange_rate = models.DecimalField(
+        max_digits=20,
+        decimal_places=12,
+        default=Decimal('1')
+    )
+
     balance_before = models.DecimalField(
         max_digits=15,
         decimal_places=2
@@ -137,7 +203,7 @@ class CustomerTransaction(TenantModel):
         max_digits=15,
         decimal_places=2
     )
-    
+
     reference = models.CharField(max_length=100, blank=True)
     
     sale = models.ForeignKey(
@@ -167,8 +233,18 @@ class CustomerTransaction(TenantModel):
             models.Index(fields=['customer', 'created_at']),
         ]
 
+    def save(self, *args, **kwargs):
+        # Résolution centralisée : deux chemins créent des transactions client
+        # (les ventes et la fiche client), le modèle est le seul endroit sûr.
+        if self.organization_id:
+            from apps.settings.services import CurrencyService
+            self.currency, self.exchange_rate = CurrencyService.resolve(
+                self.organization, self.currency, self.exchange_rate,
+            )
+        super().save(*args, **kwargs)
+
     def __str__(self):
-        return f"{self.get_transaction_type_display()} - {self.amount} ({self.customer.name})"
+        return f"{self.get_transaction_type_display()} - {self.amount} {self.currency} ({self.customer.name})"
 
 
 class Supplier(TenantSyncableModel):
