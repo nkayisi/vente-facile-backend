@@ -8,8 +8,13 @@ services:
       POSTGRES_USER: ${DB_USER}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
       POSTGRES_DB: ${DB_NAME}
+    # Jamais sur 0.0.0.0 : Postgres etait joignable depuis Internet sur le port
+    # 5436, seul le mot de passe protegeait les donnees. Les services applicatifs
+    # passent par le reseau Docker et n'ont pas besoin de cette publication.
+    # Acces distant pour administration : tunnel SSH
+    # `ssh -L 5436:127.0.0.1:5436 user@vps` puis connexion sur 127.0.0.1:5436.
     ports:
-      - "5436:5432"
+      - "127.0.0.1:5436:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -48,8 +53,12 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: vente_facile_backend
+    # Ecoute liee a la loopback de l'hote : Traefik joint le conteneur par le
+    # reseau Docker, la publication sur 0.0.0.0 exposait l'API en HTTP clair
+    # depuis Internet (contournement de TLS). Le port reste joignable en local
+    # pour le debogage : `curl http://127.0.0.1:8001/healthz/` sur le VPS.
     ports:
-      - "8001:8001"
+      - "127.0.0.1:8001:8001"
     env_file:
       - .env
     environment:

@@ -462,6 +462,12 @@ SECURE_REFERRER_POLICY = 'same-origin'
 if not DEBUG:
     # HTTPS / cookies
     SECURE_SSL_REDIRECT = config('SECURE_SSL_REDIRECT', default=True, cast=bool)
+    # La sonde Docker interroge Gunicorn en direct sur 127.0.0.1 sans passer par
+    # le reverse proxy : elle ne porte donc pas `X-Forwarded-Proto: https` et se
+    # faisait rediriger (301) vers une URL TLS que Gunicorn ne sait pas servir.
+    # urllib suivait la redirection et envoyait un ClientHello TLS, que Gunicorn
+    # rejetait en « Invalid HTTP method » : le conteneur restait `unhealthy`.
+    SECURE_REDIRECT_EXEMPT = [r'^healthz/$']
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
