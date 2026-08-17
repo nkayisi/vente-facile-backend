@@ -315,7 +315,11 @@ class CustomerLoyaltyViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
     queryset = CustomerLoyalty.objects.all()
     serializer_class = CustomerLoyaltySerializer
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
-    
+    # Le seul usage réel est « le compte de CE client », interrogé avec
+    # `?customer=<uuid>` : une enveloppe de pagination n'apporte rien et faisait
+    # échouer la lecture côté POS, qui attendait un tableau.
+    pagination_class = None
+
     action_permissions = {
         'list': 'customers.view',
         'retrieve': 'customers.view',

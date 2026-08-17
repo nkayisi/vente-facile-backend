@@ -243,9 +243,11 @@ class ProductPackagingChangeTests(_ProductPackagingSetup):
         Le cas courant : le marchand corrige la taille du conditionnement peu
         après l'avoir saisie, y compris s'il a déjà du stock.
         """
+        # 3 paquets scellés, aucun emballage entamé.
         Stock.objects.create(
             organization=self.org, product=self.product,
-            warehouse=self.warehouse, quantity=Decimal('37.000'),
+            warehouse=self.warehouse, quantity=Decimal('36.000'),
+            package_quantity=Decimal('3.000'),
         )
 
         response = self._patch(units_per_package=24)
@@ -304,10 +306,13 @@ class ProductPackagingReadTests(_ProductPackagingSetup):
         super().setUp()
         self._post()
         self.product = Product.objects.get(sku='EAU-50')
+        # 1 paquet scellé + 10 bouteilles.
         Stock.objects.create(
             organization=self.org, product=self.product,
             warehouse=self.warehouse,
-            quantity=Decimal('22.000'), loose_quantity=Decimal('10.000'),
+            quantity=Decimal('22.000'),
+            package_quantity=Decimal('1.000'),
+            loose_quantity=Decimal('10.000'),
         )
 
     def test_detail_expose_la_phrase_de_confirmation(self):

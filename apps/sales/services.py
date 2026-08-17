@@ -125,9 +125,12 @@ class SaleStockService:
                     )
                 })
 
+            # Les deux canaux se décrémentent séparément, chacun dans son
+            # compteur : la vente en gros retire des conditionnements scellés,
+            # la vente au détail retire des unités déjà ouvertes.
             PackagingService.apply_delta(
                 stock, item.product,
-                delta_base=-item.quantity,
+                delta_packages=-package_quantity,
                 delta_loose=-loose_needed,
             )
             stock.last_movement_at = timezone.now()
@@ -325,7 +328,7 @@ class SaleStockService:
             # portait sur des conditionnements entiers.
             PackagingService.apply_delta(
                 stock, item.product,
-                delta_base=item.quantity,
+                delta_packages=0,
                 delta_loose=item.quantity,
             )
             stock.last_movement_at = timezone.now()
@@ -341,6 +344,12 @@ class SaleStockService:
                 unit_cost=item.cost_price,
                 quantity_before=quantity_before,
                 quantity_after=stock.quantity,
+                # Le retour se relit dans ses propres termes : tout revient en
+                # vrac. Sans ces champs, l'historique d'une annulation se lisait
+                # en unités brutes, contrairement à celui d'un retour client.
+                input_package_quantity=Decimal('0.000'),
+                input_loose_quantity=item.quantity,
+                packaging_factor=item.packaging_factor,
                 reference_type='sale_cancel',
                 reference_id=sale.id,
                 notes=f"Annulation vente {sale.reference}",
@@ -414,7 +423,7 @@ class SaleStockService:
 
             PackagingService.apply_delta(
                 stock, product,
-                delta_base=item.quantity,
+                delta_packages=0,
                 delta_loose=item.quantity,
             )
             stock.last_movement_at = timezone.now()

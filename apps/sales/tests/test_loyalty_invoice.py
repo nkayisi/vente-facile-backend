@@ -141,8 +141,8 @@ class AccumulationTests(_LoyaltyBaseTest):
         )
 
 
-class SecondaryCurrencyAccumulationTests(_LoyaltyBaseTest):
-    """Le barème est en devise principale : une facture en USD doit être convertie."""
+class _MultiCurrencyLoyaltyTest(_LoyaltyBaseTest):
+    """Organisation en CDF principal, avec l'USD activé à 2 800."""
 
     def setUp(self):
         super().setUp()
@@ -160,6 +160,10 @@ class SecondaryCurrencyAccumulationTests(_LoyaltyBaseTest):
             organization=self.org, currency=usd,
             defaults={'is_primary': False, 'exchange_rate': Decimal('2800'), 'is_active': True},
         )
+
+
+class SecondaryCurrencyAccumulationTests(_MultiCurrencyLoyaltyTest):
+    """Le barème est en devise principale : une facture en USD doit être convertie."""
 
     def test_usd_invoice_awards_converted_points(self):
         """
@@ -442,3 +446,504 @@ class ReturnReversalTests(_LoyaltyBaseTest):
 
         self.loyalty.refresh_from_db()
         self.assertEqual(self.loyalty.current_points, 0)
+
+
+class ReceiptExposureTests(_LoyaltyBaseTest):
+    """
+    Ce que le reçu doit lire. Le POS rejouait le barème avec la seule formule
+    « pourcentage » codée en dur : sur un programme `fixed_per_amount`, qui est
+    le défaut, il annonçait dix fois les points réellement crédités. Le serveur
+    est désormais la seule source.
+    """
+
+    def _detail(self, sale_id):
+        self.client.force_authenticate(user=self.cashier_a)
+        resp = self.client.get(f'/api/v1/sales/{sale_id}/', **self._headers())
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        return resp.data
+
+    def test_points_gagnes_correspondent_au_registre(self):
+        sale_id = self._create_sale(sale_type='retail', unit_price='5000.00', payments=[{
+            'payment_method': str(self.payment_method.id),
+            'amount': '5000.00',
+        }])
+
+        data = self._detail(sale_id)
+        self.loyalty.refresh_from_db()
+
+        # 1 point par 1 000 : 5 points, pas 50 (ce que donnait le 1 % du POS).
+        self.assertEqual(data['loyalty_points_earned'], 5)
+        self.assertEqual(data['loyalty_points_earned'], self.loyalty.total_points_earned)
+        self.assertEqual(data['loyalty_points_balance'], self.loyalty.current_points)
+        self.assertTrue(data['loyalty_program_active'])
+
+    def test_bareme_en_pourcentage(self):
+        self.program.points_calculation_type = (
+            LoyaltyProgram.PointsCalculationType.PERCENTAGE
+        )
+        self.program.points_percentage = Decimal('1.00')
+        self.program.save()
+
+        sale_id = self._create_sale(sale_type='retail', unit_price='5000.00', payments=[{
+            'payment_method': str(self.payment_method.id),
+            'amount': '5000.00',
+        }])
+
+        self.loyalty.refresh_from_db()
+        self.assertEqual(self._detail(sale_id)['loyalty_points_earned'], 50)
+        self.assertEqual(self.loyalty.current_points, 50)
+
+    def test_points_utilises_exposes(self):
+        self.loyalty.current_points = 100
+        self.loyalty.total_points_earned = 100
+        self.loyalty.save()
+
+        self.client.force_authenticate(user=self.cashier_a)
+        resp = self.client.post('/api/v1/sales/', {
+            'register': str(self.register.id),
+            'warehouse': str(self.warehouse.id),
+            'sale_type': 'retail',
+            'is_pos': True,
+            'customer': str(self.customer.id),
+            'items': [{
+                'product': str(self.product.id),
+                'quantity': '1',
+                'unit_price': '2000.00',
+            }],
+            'points_used': 50,
+            'payments': [{
+                'payment_method': str(self.payment_method.id),
+                'amount': '1500.00',
+            }],
+        }, format='json', **self._headers())
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+
+        # 50 points x 10 = 500 de remise sur 2 000.
+        self.assertEqual(Decimal(resp.data['loyalty_redemption_amount']), Decimal('500.00'))
+        self.assertEqual(resp.data['loyalty_points_used'], 50)
+
+        data = self._detail(resp.data['id'])
+        self.assertEqual(data['loyalty_points_used'], 50)
+
+    def test_annulation_remet_les_compteurs_du_recu_a_zero(self):
+        sale_id = self._create_sale(sale_type='retail', unit_price='5000.00', payments=[{
+            'payment_method': str(self.payment_method.id),
+            'amount': '5000.00',
+        }])
+        self.assertEqual(self._detail(sale_id)['loyalty_points_earned'], 5)
+
+        self.client.force_authenticate(user=self.manager)
+        resp = self.client.post(
+            f'/api/v1/sales/{sale_id}/cancel/',
+            {'reason': 'test'}, format='json', **self._headers(),
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+
+        # Un reçu réimprimé après annulation ne doit plus annoncer de points.
+        self.assertEqual(self._detail(sale_id)['loyalty_points_earned'], 0)
+
+    def test_sans_programme_actif_le_recu_le_sait(self):
+        self.program.is_active = False
+        self.program.save()
+
+        sale_id = self._create_sale(sale_type='retail', payments=[{
+            'payment_method': str(self.payment_method.id),
+            'amount': '2000.00',
+        }])
+
+        data = self._detail(sale_id)
+        self.assertFalse(data['loyalty_program_active'])
+        self.assertEqual(data['loyalty_points_earned'], 0)
+
+
+class CustomerLoyaltyEndpointTests(_LoyaltyBaseTest):
+    """
+    Le POS lit le solde via `?customer=`. L'endpoint était paginé alors que le
+    client attendait un tableau : il recevait donc toujours `null`, ce qui
+    masquait tout le panneau fidélité et affichait « 0 pts » sur la fiche.
+    """
+
+    def test_reponse_non_paginee(self):
+        self.loyalty.current_points = 42
+        self.loyalty.save()
+
+        self.client.force_authenticate(user=self.cashier_a)
+        resp = self.client.get(
+            f'/api/v1/settings/customer-loyalty/?customer={self.customer.id}',
+            **self._headers(),
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        self.assertIsInstance(resp.data, list)
+        self.assertEqual(len(resp.data), 1)
+        self.assertEqual(resp.data[0]['current_points'], 42)
+
+
+class TenderCurrencyIndependenceTests(_MultiCurrencyLoyaltyTest):
+    """
+    Les points se calculent sur la FACTURE, jamais sur ce qui est remis.
+
+    Le montant perçu peut être encaissé dans une autre devise (une facture en
+    CDF réglée en dollars, la monnaie rendue dans une troisième). Rien de tout
+    cela ne change ce que le client a acheté : le barème s'applique au total de
+    la facture, ramené en devise principale.
+    """
+
+    def _sell(self, *, unit_price, payments, currency=None, change_currency=None):
+        self.client.force_authenticate(user=self.cashier_a)
+        payload = {
+            'register': str(self.register.id),
+            'warehouse': str(self.warehouse.id),
+            'sale_type': 'retail',
+            'is_pos': True,
+            'customer': str(self.customer.id),
+            'items': [{
+                'product': str(self.product.id),
+                'quantity': '1',
+                'unit_price': unit_price,
+            }],
+            'payments': payments,
+        }
+        if currency:
+            payload['currency'] = currency
+        if change_currency:
+            payload['change_currency'] = change_currency
+        resp = self.client.post('/api/v1/sales/', payload, format='json', **self._headers())
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+        return resp
+
+    def test_facture_en_principale_reglee_en_devise_etrangere(self):
+        """2 800 CDF encaissés en 1 USD : 2 points, comme un règlement en CDF."""
+        resp = self._sell(unit_price='2800.00', payments=[{
+            'payment_method': str(self.payment_method.id),
+            'amount': '1.00',
+            'currency': 'USD',
+        }])
+
+        self.assertEqual(resp.data['currency'], 'CDF')
+        self.assertEqual(Decimal(resp.data['total']), Decimal('2800.00'))
+        self.assertEqual(resp.data['status'], 'completed')
+
+        self.loyalty.refresh_from_db()
+        self.assertEqual(self.loyalty.current_points, 2)
+        self.assertEqual(resp.data['loyalty_points_earned'], 2)
+
+    def test_reglement_fractionne_deux_devises(self):
+        """1 400 CDF + 0,5 USD sur une facture de 2 800 CDF : toujours 2 points."""
+        resp = self._sell(unit_price='2800.00', payments=[
+            {'payment_method': str(self.payment_method.id), 'amount': '1400.00'},
+            {
+                'payment_method': str(self.payment_method.id),
+                'amount': '0.50',
+                'currency': 'USD',
+            },
+        ])
+
+        self.assertEqual(resp.data['status'], 'completed')
+        self.loyalty.refresh_from_db()
+        self.assertEqual(self.loyalty.current_points, 2)
+
+    def test_monnaie_rendue_en_devise_etrangere_ne_change_rien(self):
+        """
+        Surpaiement rendu en USD : la monnaie sort du tiroir, elle ne retire
+        aucun point. Le client a bien acheté pour 2 800 CDF.
+        """
+        resp = self._sell(
+            unit_price='2800.00',
+            payments=[{
+                'payment_method': str(self.payment_method.id),
+                'amount': '5000.00',
+            }],
+            change_currency='USD',
+        )
+
+        self.assertEqual(resp.data['change_currency'], 'USD')
+        self.assertGreater(Decimal(resp.data['change_amount']), Decimal('0'))
+
+        self.loyalty.refresh_from_db()
+        self.assertEqual(self.loyalty.current_points, 2)
+
+    def test_facture_a_credit_soldee_plus_tard_en_devise_etrangere(self):
+        """
+        Le règlement différé emprunte le même chemin : la facture reste
+        l'assiette, quelle que soit la devise du versement.
+        """
+        self.client.force_authenticate(user=self.cashier_a)
+        resp = self.client.post('/api/v1/sales/', {
+            'register': str(self.register.id),
+            'warehouse': str(self.warehouse.id),
+            'sale_type': 'credit',
+            'is_pos': True,
+            'customer': str(self.customer.id),
+            'items': [{
+                'product': str(self.product.id),
+                'quantity': '1',
+                'unit_price': '2800.00',
+            }],
+            'payments': [],
+        }, format='json', **self._headers())
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+        sale_id = resp.data['id']
+
+        self.loyalty.refresh_from_db()
+        self.assertEqual(self.loyalty.current_points, 0, "Rien avant le règlement.")
+
+        resp = self.client.post(
+            f'/api/v1/sales/{sale_id}/add-payment/',
+            {
+                'payment_method': str(self.payment_method.id),
+                'amount': '1.00',
+                'currency': 'USD',
+            },
+            format='json', **self._headers(),
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        self.assertEqual(resp.data['status'], 'completed')
+
+        self.loyalty.refresh_from_db()
+        self.assertEqual(self.loyalty.current_points, 2)
+        self.assertEqual(resp.data['loyalty_points_earned'], 2)
+
+    def test_facture_en_usd_reglee_en_cdf(self):
+        """
+        Symétrique du cas précédent : facture de 50 USD réglée en 140 000 CDF.
+        L'assiette reste la facture ramenée en principale, soit 140 points.
+        """
+        resp = self._sell(
+            unit_price='50.00',
+            currency='USD',
+            payments=[{
+                'payment_method': str(self.payment_method.id),
+                'amount': '140000.00',
+                'currency': 'CDF',
+            }],
+        )
+
+        self.assertEqual(resp.data['currency'], 'USD')
+        self.assertEqual(resp.data['status'], 'completed')
+        self.loyalty.refresh_from_db()
+        self.assertEqual(self.loyalty.current_points, 140)
+
+
+class RedemptionCurrencyTests(_MultiCurrencyLoyaltyTest):
+    """
+    L'utilisation des points traverse les devises sans se perdre.
+
+    `point_value` est libellé en devise principale ; sur une facture en devise
+    secondaire, la remise doit être reconvertie. Le POS restreignait
+    l'utilisation aux factures en principale : les points disparaissaient en
+    silence, sans message au caissier.
+    """
+
+    def test_remise_convertie_dans_la_devise_de_facture(self):
+        self.loyalty.current_points = 280
+        self.loyalty.total_points_earned = 280
+        self.loyalty.save()
+
+        self.client.force_authenticate(user=self.cashier_a)
+        resp = self.client.post('/api/v1/sales/', {
+            'register': str(self.register.id),
+            'warehouse': str(self.warehouse.id),
+            'sale_type': 'retail',
+            'is_pos': True,
+            'customer': str(self.customer.id),
+            'currency': 'USD',
+            'items': [{
+                'product': str(self.product.id),
+                'quantity': '1',
+                'unit_price': '50.00',
+            }],
+            # 280 points x 10 CDF = 2 800 CDF = 1 USD de remise.
+            'points_used': 280,
+            'payments': [{
+                'payment_method': str(self.payment_method.id),
+                'amount': '49.00',
+                'currency': 'USD',
+            }],
+        }, format='json', **self._headers())
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+
+        self.assertEqual(
+            Decimal(resp.data['loyalty_redemption_amount']), Decimal('1.00')
+        )
+        self.assertEqual(Decimal(resp.data['total']), Decimal('49.00'))
+        self.assertEqual(resp.data['status'], 'completed')
+        self.assertEqual(resp.data['loyalty_points_used'], 280)
+
+        self.loyalty.refresh_from_db()
+        # 280 consommés, puis 49 USD = 137 200 CDF ⇒ 137 points gagnés.
+        self.assertEqual(self.loyalty.current_points, 137)
+
+
+class DegenerateExchangeRateTests(_MultiCurrencyLoyaltyTest):
+    """
+    Un taux nul sur la vente ne doit pas faire disparaître les points en silence.
+
+    `Sale.save()` passe par `CurrencyService.resolve` et ne peut pas en produire,
+    mais une reprise de données ou une écriture SQL directe le peut. Multiplier
+    par zéro donnerait 0 point sans aucun signal.
+    """
+
+    def test_taux_nul_retombe_sur_le_taux_de_l_organisation(self):
+        self.client.force_authenticate(user=self.cashier_a)
+        resp = self.client.post('/api/v1/sales/', {
+            'register': str(self.register.id),
+            'warehouse': str(self.warehouse.id),
+            'sale_type': 'credit',
+            'is_pos': True,
+            'customer': str(self.customer.id),
+            'currency': 'USD',
+            'items': [{
+                'product': str(self.product.id),
+                'quantity': '1',
+                'unit_price': '50.00',
+            }],
+            'payments': [],
+        }, format='json', **self._headers())
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+
+        sale = Sale.objects.get(pk=resp.data['id'])
+        # Écriture directe : on contourne `save()`, comme le ferait une reprise.
+        Sale.objects.filter(pk=sale.pk).update(exchange_rate=Decimal('0'))
+        sale.refresh_from_db()
+
+        points = LoyaltyService.points_for_sale(sale, self.program)
+
+        self.assertEqual(points, 140, "50 USD valent 140 000 CDF, soit 140 points.")
+
+
+class FractionalPointsTests(_MultiCurrencyLoyaltyTest):
+    """
+    Les fractions de point ne se perdent plus.
+
+    Cas réel rencontré en production : organisation en USD principal, barème à
+    1 %. Une vente de 58 USD valait 0,58 point, tronqué à zéro ; une vente de
+    396 USD en valait 3,96, tronqué à 3. Le compteur d'un marchand en devise
+    forte ne bougeait donc presque jamais, et il fallait dépenser 100 USD pour
+    voir un seul point apparaître.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # Devise principale USD, barème à 1 % - la configuration du terrain.
+        self.org.currency = 'USD'
+        self.org.save(update_fields=['currency'])
+        OrganizationCurrency.objects.filter(organization=self.org).update(is_primary=False)
+        OrganizationCurrency.objects.filter(
+            organization=self.org, currency__code='USD',
+        ).update(is_primary=True, exchange_rate=Decimal('1'))
+        OrganizationCurrency.objects.filter(
+            organization=self.org, currency__code='CDF',
+        ).update(exchange_rate=Decimal('0.000434782609'))
+
+        from django.core.cache import cache
+        cache.clear()
+
+        self.program.points_calculation_type = (
+            LoyaltyProgram.PointsCalculationType.PERCENTAGE
+        )
+        self.program.points_percentage = Decimal('1.00')
+        self.program.point_value = Decimal('1.00')
+        self.program.min_points_to_redeem = 1
+        self.program.save()
+
+    def _sell(self, unit_price):
+        self.client.force_authenticate(user=self.cashier_a)
+        resp = self.client.post('/api/v1/sales/', {
+            'register': str(self.register.id),
+            'warehouse': str(self.warehouse.id),
+            'sale_type': 'retail',
+            'is_pos': True,
+            'customer': str(self.customer.id),
+            'items': [{
+                'product': str(self.product.id),
+                'quantity': '1',
+                'unit_price': unit_price,
+            }],
+            'payments': [{
+                'payment_method': str(self.payment_method.id),
+                'amount': unit_price,
+            }],
+        }, format='json', **self._headers())
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+        return resp
+
+    def test_58_usd_credite_zero_virgule_cinquante_huit(self):
+        resp = self._sell('58.00')
+
+        self.loyalty.refresh_from_db()
+        self.assertEqual(self.loyalty.current_points, Decimal('0.58'))
+        self.assertEqual(resp.data['loyalty_points_earned'], 0.58)
+
+    def test_396_usd_ne_perd_plus_la_fraction(self):
+        resp = self._sell('396.00')
+
+        self.loyalty.refresh_from_db()
+        self.assertEqual(self.loyalty.current_points, Decimal('3.96'))
+        self.assertEqual(resp.data['loyalty_points_earned'], 3.96)
+
+    def test_les_fractions_s_additionnent(self):
+        for _ in range(4):
+            self._sell('58.00')
+
+        self.loyalty.refresh_from_db()
+        # 4 x 0,58 = 2,32 - là où l'ancien calcul laissait le compteur à zéro.
+        self.assertEqual(self.loyalty.current_points, Decimal('2.32'))
+        self.assertEqual(self.loyalty.total_points_earned, Decimal('2.32'))
+
+    def test_un_solde_entier_reste_entier_a_l_affichage(self):
+        resp = self._sell('100.00')
+
+        self.assertEqual(resp.data['loyalty_points_earned'], 1)
+        self.assertIsInstance(resp.data['loyalty_points_earned'], int)
+
+    def test_le_solde_fractionnaire_est_utilisable(self):
+        """Ce qui est gagné doit pouvoir être dépensé, fraction comprise."""
+        self._sell('396.00')
+        self.loyalty.refresh_from_db()
+        self.assertEqual(self.loyalty.current_points, Decimal('3.96'))
+
+        self.client.force_authenticate(user=self.cashier_a)
+        resp = self.client.post('/api/v1/sales/', {
+            'register': str(self.register.id),
+            'warehouse': str(self.warehouse.id),
+            'sale_type': 'retail',
+            'is_pos': True,
+            'customer': str(self.customer.id),
+            'items': [{
+                'product': str(self.product.id),
+                'quantity': '1',
+                'unit_price': '50.00',
+            }],
+            'points_used': '3.96',
+            'payments': [{
+                'payment_method': str(self.payment_method.id),
+                'amount': '46.04',
+            }],
+        }, format='json', **self._headers())
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+
+        # 3,96 points x 1 USD = 3,96 USD de remise sur 50.
+        self.assertEqual(
+            Decimal(resp.data['loyalty_redemption_amount']), Decimal('3.96')
+        )
+        self.assertEqual(Decimal(resp.data['total']), Decimal('46.04'))
+        self.assertEqual(resp.data['loyalty_points_used'], 3.96)
+
+    def test_le_bareme_par_tranches_garde_ses_paliers(self):
+        """
+        `FIXED_PER_AMOUNT` dit « X points pour CHAQUE Y dépensé » : une tranche
+        entamée ne compte pas. Le rendre continu relèverait tous les barèmes
+        existants sans que le marchand l'ait demandé.
+        """
+        self.program.points_calculation_type = (
+            LoyaltyProgram.PointsCalculationType.FIXED_PER_AMOUNT
+        )
+        self.program.points_per_unit = 1
+        self.program.amount_per_unit = Decimal('10.00')
+        self.program.save()
+
+        self._sell('25.00')
+
+        self.loyalty.refresh_from_db()
+        self.assertEqual(self.loyalty.current_points, Decimal('2.00'))

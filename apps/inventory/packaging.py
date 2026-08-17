@@ -8,33 +8,52 @@ refaire cette arithmétique de son côté.
 
 Modèle de données
 -----------------
-``Stock.quantity`` est la **seule** source de vérité de la quantité totale, en
-unité de détail. ``Stock.loose_quantity`` n'est pas un second compteur : c'est
-la part de ce total qui se trouve hors emballage scellé.
+Le stock d'un produit vendu en gros et au détail tient dans **deux compteurs
+distincts**, tous deux stockés :
 
-    paquets scellés = (quantity - loose_quantity) // facteur
-    unités en vrac  = loose_quantity + reste de la division
+    Stock.package_quantity  conditionnements encore scellés (casiers)
+    Stock.loose_quantity    unités déjà sorties d'un emballage (bouteilles)
 
-Le « reste » (dit *orphelin*) est réintégré au vrac plutôt que traité comme une
-anomalie. Cela rend la définition **auto-cicatrisante** dans deux situations qui
-arrivent en pratique :
+``Stock.quantity`` reste le total en unité de détail. Il n'est pas redondant :
+c'est l'ancre du coût moyen pondéré, des lots FIFO, des alertes de réassort, des
+rapports, de ``available_quantity`` et de la synchronisation mobile. Pour un
+produit conditionné il se **dérive** des deux compteurs :
 
-1. l'activation du mode gros sur un produit ayant déjà du stock (37 bouteilles
-   avec un facteur de 12 : 3 paquets + 1 bouteille, sans migration de données) ;
-2. les chemins d'écriture qui ne connaissent pas encore le conditionnement
-   (transferts, réceptions fournisseur, synchronisation mobile) et qui font
-   varier ``quantity`` sans toucher à ``loose_quantity``.
+    quantity = package_quantity × facteur + loose_quantity
 
-Un invariant strict aurait fait échouer ces cas ; ici la représentation reste
-cohérente et se corrige d'elle-même au mouvement suivant.
+Pour un produit vendu au détail uniquement, les deux compteurs restent à zéro et
+``quantity`` fait foi seul.
+
+Approvisionner 3 casiers **plus** 12 bouteilles donne donc bien 3 casiers et 12
+bouteilles, jamais 4 casiers : les deux canaux ne se mélangent pas.
+
+Asymétrie fondatrice
+--------------------
+On **ouvre** un conditionnement pour servir du détail ; on ne le **rescelle**
+jamais. Toute entrée d'unités isolées (retour, annulation, réception à la pièce)
+va au vrac, et toute sortie au détail puise d'abord dans le vrac avant de casser
+un scellé. C'est ce qui rend les deux stocks réellement séparés au lieu d'être
+deux vues d'un même nombre.
+
+Réparation
+----------
+``reconcile()`` rétablit l'égalité ci-dessus quand un chemin d'écriture a fait
+varier ``quantity`` sans passer par ce service. L'écart est absorbé par le vrac,
+puis, s'il le faut, en cassant des scellés - jamais en en fabriquant. Cette
+tolérance couvre deux situations réelles : l'activation du mode gros sur un
+produit ayant déjà du stock, et les écrivains qui ignorent le conditionnement
+(synchronisation mobile, scripts de reprise).
 """
 from __future__ import annotations
 
+import logging
 from decimal import ROUND_CEILING, Decimal
 
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
+
+logger = logging.getLogger(__name__)
 
 ZERO = Decimal('0.000')
 TWO_PLACES = Decimal('0.01')
@@ -173,11 +192,34 @@ class PackagingService:
         return (total_value / base_quantity).quantize(TWO_PLACES)
 
     @staticmethod
+    def stored_split(stock, factor=None):
+        """
+        Partage **lu** sur les compteurs du stock : ``(scellés, vrac)``.
+
+        C'est la lecture à privilégier partout où un ``Stock`` est disponible.
+        ``split()`` ne sert plus qu'à reconstituer un partage à partir d'un
+        total nu (historique des mouvements, migration, réparation).
+
+        ``factor`` est accepté pour épargner à l'appelant un second calcul, mais
+        n'est pas nécessaire : les compteurs sont autoportants.
+        """
+        if factor is None:
+            factor = PackagingService.factor(stock.product)
+        if factor is None:
+            return 0, Decimal(stock.quantity).quantize(ZERO)
+        return (
+            int(Decimal(stock.package_quantity or 0)),
+            Decimal(stock.loose_quantity or 0).quantize(ZERO),
+        )
+
+    @staticmethod
     def split(base_quantity, loose_quantity, factor):
         """
         Partage une quantité de base en (conditionnements scellés, unités en vrac).
 
-        Fonction **pure**, sans accès base de données.
+        Fonction **pure**, sans accès base de données. Ne décrit plus l'état du
+        stock - elle le **reconstitue** à partir d'un total, pour l'historique
+        des mouvements, la migration initiale et ``reconcile()``.
 
         Garantit toujours ``scellés × facteur + vrac == base_quantity``, y
         compris sur un stock négatif (entrepôt autorisant le découvert), où le
@@ -233,9 +275,22 @@ class PackagingService:
         : elle peut refuser une vente en gros de justesse, jamais en autoriser
         une qui viderait un paquet déjà promis à un devis.
         """
-        available_base = Decimal(stock.quantity) - Decimal(stock.reserved_quantity)
+        if not factor or factor < 2:
+            return 0, (
+                Decimal(stock.quantity) - Decimal(stock.reserved_quantity)
+            ).quantize(ZERO)
+
+        # Sans réservation, les compteurs se lisent tels quels : c'est le cas de
+        # loin le plus fréquent, et le seul où la réponse est exacte.
+        reserved = max(ZERO, Decimal(stock.reserved_quantity or 0))
+        if reserved <= 0:
+            return PackagingService.stored_split(stock, factor)
+
+        # Avec réservation, on reconstitue un partage sur le disponible en
+        # préservant le vrac : le déficit est donc porté par le scellé.
+        available_base = Decimal(stock.quantity) - reserved
         available_loose = min(
-            Decimal(stock.loose_quantity), max(available_base, ZERO)
+            Decimal(stock.loose_quantity or 0), max(available_base, ZERO)
         )
         return PackagingService.split(available_base, available_loose, factor)
 
@@ -392,9 +447,7 @@ class PackagingService:
 
         assert stock.pk is not None, "ensure_loose_available exige un Stock persisté"
 
-        sealed, loose = PackagingService.split(
-            stock.quantity, stock.loose_quantity, factor
-        )
+        sealed, loose = PackagingService.stored_split(stock, factor)
         if loose >= needed_loose:
             return 0, None
 
@@ -430,11 +483,17 @@ class PackagingService:
                 )
             })
 
+        # Transfert pur d'un compteur vers l'autre : le scellé descend, le vrac
+        # monte d'autant d'unités. `quantity` ne bouge pas, un déconditionnement
+        # ne crée ni ne détruit de marchandise.
         quantity_snapshot = Decimal(stock.quantity)
+        stock.package_quantity = (
+            Decimal(stock.package_quantity or 0) - packages_to_open
+        ).quantize(ZERO)
         stock.loose_quantity = (
             Decimal(stock.loose_quantity) + packages_to_open * factor
         ).quantize(ZERO)
-        stock.save(update_fields=['loose_quantity'])
+        stock.save(update_fields=['package_quantity', 'loose_quantity'])
 
         movement = StockMovement.objects.create(
             organization=stock.organization,
@@ -459,34 +518,155 @@ class PackagingService:
         return packages_to_open, movement
 
     @staticmethod
-    def apply_delta(stock, product, *, delta_base, delta_loose=ZERO):
+    def apply_delta(stock, product, *, delta_packages=0, delta_loose=ZERO):
         """
-        Applique une variation de stock en maintenant le partage scellé/vrac.
+        Applique une variation de stock sur les **deux compteurs**.
 
         Méthode mutante unique : entrées, sorties, retours et annulations
-        passent tous par ici, ce qui évite que la mise à jour du vrac ne
-        diverge d'un chemin d'écriture à l'autre.
+        passent tous par ici, ce qui évite qu'un chemin d'écriture ne fasse
+        diverger le partage. L'appelant passe sa saisie telle qu'il l'a reçue,
+        en conditionnements et en unités, sans jamais multiplier de tête.
 
-        - vente de 2 paquets + 3 pièces (facteur 12) :
-          ``delta_base=-27, delta_loose=-3``
-        - approvisionnement de 10 paquets : ``delta_base=+120, delta_loose=0``
-        - approvisionnement de 5 pièces :   ``delta_base=+5,   delta_loose=+5``
-        - retour ou annulation de 2 pièces : ``delta_base=+2,  delta_loose=+2``
+        - vente de 2 casiers + 3 bouteilles : ``delta_packages=-2, delta_loose=-3``
+        - approvisionnement de 10 casiers   : ``delta_packages=+10, delta_loose=0``
+        - approvisionnement de 5 bouteilles : ``delta_packages=0,   delta_loose=+5``
+        - retour ou annulation de 2 pièces  : ``delta_packages=0,   delta_loose=+2``
 
         Un retour ne reconstitue jamais un conditionnement scellé : les unités
-        rendues reviennent toujours en vrac.
+        rendues reviennent toujours en vrac. Pour un produit vendu au détail
+        seul, ``delta_loose`` est la variation totale et les conditionnements
+        sont ignorés.
 
         Ne sauvegarde pas - l'appelant maîtrise le moment de l'écriture.
         """
-        stock.quantity = (Decimal(stock.quantity) + Decimal(delta_base)).quantize(ZERO)
-
-        if not PackagingService.is_dual(product):
+        factor = PackagingService.factor(product)
+        if factor is None:
+            stock.quantity = (
+                Decimal(stock.quantity) + Decimal(delta_loose or 0)
+            ).quantize(ZERO)
             return stock
 
-        new_loose = Decimal(stock.loose_quantity) + Decimal(delta_loose or 0)
-        stock.loose_quantity = max(
-            ZERO, min(new_loose, max(Decimal(stock.quantity), ZERO))
+        stock.package_quantity = (
+            Decimal(stock.package_quantity or 0) + Decimal(delta_packages or 0)
         ).quantize(ZERO)
+        stock.loose_quantity = (
+            Decimal(stock.loose_quantity or 0) + Decimal(delta_loose or 0)
+        ).quantize(ZERO)
+        return PackagingService._settle(stock, factor)
+
+    @staticmethod
+    def apply_base_delta(stock, product, delta_base, loose_hint=None):
+        """
+        Variation exprimée en unités de détail seulement, pour les chemins qui
+        ne connaissent pas la saisie d'origine : synchronisation mobile, scripts
+        de reprise, retour fournisseur saisi à la pièce.
+
+        C'est ici que vit l'asymétrie du domaine :
+
+        - une **entrée** va toujours au vrac, on ne rescelle jamais ;
+        - une **sortie** puise d'abord dans le vrac, puis ouvre des scellés.
+
+        ``loose_hint`` permet à un appelant qui sait quelle part est scellée
+        (réception partielle, transfert incomplet) de le dire ; sans indication,
+        tout passe par le vrac.
+        """
+        delta_base = Decimal(delta_base or 0)
+        factor = PackagingService.factor(product)
+        if factor is None:
+            stock.quantity = (Decimal(stock.quantity) + delta_base).quantize(ZERO)
+            return stock
+
+        if loose_hint is None:
+            delta_loose = delta_base
+            delta_packages = 0
+        else:
+            # Part scellée déduite de ce qui bouge réellement ; l'orphelin
+            # retombe au vrac, un contenant entamé ne se rescelle pas.
+            sign = -1 if delta_base < 0 else 1
+            packages, loose = PackagingService.split(
+                abs(delta_base), min(abs(Decimal(loose_hint)), abs(delta_base)), factor
+            )
+            delta_packages = sign * packages
+            delta_loose = sign * loose
+
+        return PackagingService.apply_delta(
+            stock, product, delta_packages=delta_packages, delta_loose=delta_loose,
+        )
+
+    @staticmethod
+    def reconcile(stock, product=None):
+        """
+        Rétablit ``quantity == scellés × facteur + vrac``.
+
+        Appelée depuis ``Stock.save()`` : elle rattrape les écritures qui ont
+        fait varier ``quantity`` sans passer par ce service, et l'activation du
+        mode gros sur un produit ayant déjà du stock. **Ne lève jamais** - ce
+        ``save()`` est sur le chemin de tous les écrivains de stock, une
+        exception y serait un 500 au POS.
+
+        L'écart est absorbé par le vrac, puis en ouvrant des scellés si le vrac
+        ne suffit pas. On n'en fabrique jamais.
+        """
+        if not (stock.package_quantity or stock.loose_quantity or stock.quantity):
+            return stock
+
+        if product is None:
+            product = stock.product
+        factor = PackagingService.factor(product)
+        if factor is None:
+            # Produit non conditionné : les compteurs n'ont pas de sens, on les
+            # remet à zéro plutôt que de laisser traîner un partage fantôme.
+            stock.package_quantity = ZERO
+            stock.loose_quantity = ZERO
+            return stock
+
+        expected = (
+            Decimal(stock.package_quantity or 0) * factor
+            + Decimal(stock.loose_quantity or 0)
+        )
+        drift = Decimal(stock.quantity) - expected
+        if drift:
+            logger.warning(
+                "Stock %s : quantity=%s ne correspond pas à %s x %s + %s ; "
+                "écart de %s reporté sur le vrac.",
+                stock.pk, stock.quantity, stock.package_quantity, factor,
+                stock.loose_quantity, drift,
+            )
+            stock.loose_quantity = (
+                Decimal(stock.loose_quantity or 0) + drift
+            ).quantize(ZERO)
+
+        return PackagingService._settle(stock, factor)
+
+    @staticmethod
+    def _settle(stock, factor):
+        """
+        Normalise les deux compteurs et réaligne ``quantity``.
+
+        Un vrac négatif signifie qu'on a servi au détail plus que ce qui était
+        ouvert : on casse des scellés pour le combler, dans ce sens uniquement.
+        Ce qui reste en déficit est porté par le vrac plutôt que par un nombre
+        de conditionnements négatif, qui n'aurait aucun sens à l'écran - et ne
+        subsiste que sur un entrepôt tolérant le découvert.
+        """
+        packages = Decimal(stock.package_quantity or 0)
+        loose = Decimal(stock.loose_quantity or 0)
+
+        if loose < 0 and packages > 0:
+            to_open = min(
+                packages,
+                (-loose / factor).to_integral_value(rounding=ROUND_CEILING),
+            )
+            packages -= to_open
+            loose += to_open * factor
+
+        if packages < 0:
+            loose += packages * factor
+            packages = ZERO
+
+        stock.package_quantity = packages.quantize(ZERO)
+        stock.loose_quantity = loose.quantize(ZERO)
+        stock.quantity = (packages * factor + loose).quantize(ZERO)
         return stock
 
     @staticmethod

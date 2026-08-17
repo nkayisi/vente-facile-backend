@@ -39,10 +39,14 @@ class _InventoryPackagingSetup(APITestCase):
             wholesale_price=Decimal('6000.00'),
             track_inventory=True, is_active=True,
         )
+        # 1 paquet scellé + 10 bouteilles : les deux compteurs sont posés
+        # explicitement, `quantity` en est la somme.
         self.stock = Stock.objects.create(
             organization=self.org, product=self.product,
             warehouse=self.warehouse,
-            quantity=Decimal('22.000'), loose_quantity=Decimal('10.000'),
+            quantity=Decimal('22.000'),
+            package_quantity=Decimal('1.000'),
+            loose_quantity=Decimal('10.000'),
             avg_cost=Decimal('400.00'),
         )
         self.client.force_authenticate(user=self.owner)

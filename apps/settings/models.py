@@ -5,8 +5,24 @@ Includes multi-currency support and loyalty program.
 from django.db import models
 from django.conf import settings
 from django.core.validators import MinValueValidator, MaxValueValidator
-from decimal import Decimal
+from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 from apps.core.models import TenantModel, TimeStampedModel, UUIDModel
+
+# Les points s'accumulent au centième : c'est la finesse qu'exige un barème en
+# pourcentage sur une devise forte (1 % de 58 USD = 0,58 point). Au delà, on
+# afficherait un bruit que le marchand ne saurait pas lire.
+POINT_PRECISION = Decimal('0.01')
+
+
+def _as_points(value) -> Decimal:
+    """
+    Normalise une quantité de points au centième.
+
+    Les appelants passent indifféremment un ``int``, un ``float`` ou un
+    ``Decimal`` ; sans normalisation, additionner un ``float`` à un ``Decimal``
+    lève, et un ``Decimal`` non quantifié ferait dériver le compteur.
+    """
+    return Decimal(str(value or 0)).quantize(POINT_PRECISION)
 
 
 class Currency(TimeStampedModel, UUIDModel):
@@ -149,23 +165,42 @@ class LoyaltyProgram(TenantModel):
     def __str__(self):
         return f"{self.organization.name} - {self.name}"
     
-    def calculate_points(self, amount: Decimal) -> int:
-        """Calcule le nombre de points pour un montant donné."""
+    def calculate_points(self, amount: Decimal) -> Decimal:
+        """
+        Points gagnés pour un montant donné, en **devise principale**.
+
+        Retourne un ``Decimal`` à deux décimales. Le calcul tronquait autrefois
+        à l'entier : sur une organisation dont la devise principale a une valeur
+        unitaire élevée, 1 % d'un panier de 58 USD valait 0,58 point, ramené à
+        **zéro** sans le moindre signal. Un panier de 396 USD perdait de même
+        0,96 point. La fidélité y devenait inerte.
+
+        Les deux modes gardent leur sémantique propre :
+
+        - ``PERCENTAGE`` est continu par nature (« X % du montant ») : le
+          résultat est exact ;
+        - ``FIXED_PER_AMOUNT`` reste un barème par tranches (« X points pour
+          **chaque** Y dépensé ») : une tranche entamée ne compte pas. C'est ce
+          que le libellé promet au marchand, et le changer relèverait tous les
+          barèmes existants sans qu'il l'ait demandé.
+        """
         if not self.is_active:
-            return 0
-        
+            return Decimal('0.00')
+
         if self.points_calculation_type == self.PointsCalculationType.FIXED_PER_AMOUNT:
             if self.amount_per_unit > 0:
-                units = int(amount / self.amount_per_unit)
-                return units * self.points_per_unit
-            return 0
-        else:  # PERCENTAGE
-            points = (amount * self.points_percentage / 100)
-            return int(points)
-    
-    def calculate_redemption_value(self, points: int) -> Decimal:
+                units = (amount / self.amount_per_unit).to_integral_value(
+                    rounding=ROUND_FLOOR
+                )
+                return (units * self.points_per_unit).quantize(POINT_PRECISION)
+            return Decimal('0.00')
+
+        points = amount * self.points_percentage / 100
+        return points.quantize(POINT_PRECISION, rounding=ROUND_HALF_UP)
+
+    def calculate_redemption_value(self, points) -> Decimal:
         """Calcule la valeur monétaire des points."""
-        return Decimal(points) * self.point_value
+        return (Decimal(points) * self.point_value).quantize(Decimal('0.01'))
 
 
 class LoyaltyReward(TenantModel):
@@ -242,10 +277,22 @@ class CustomerLoyalty(TenantModel):
         related_name='loyalty'
     )
     
-    total_points_earned = models.PositiveIntegerField(default=0)
-    total_points_redeemed = models.PositiveIntegerField(default=0)
-    current_points = models.IntegerField(default=0)
-    
+    # Points fractionnaires : un barème en pourcentage sur une devise forte
+    # produit des fractions de point (1 % de 58 USD = 0,58). Les tronquer les
+    # faisait disparaître, et le compteur d'un marchand en USD ne bougeait
+    # jamais. Les contraintes « positif » sont retirées : `reverse_points`
+    # borne déjà les cumuls à vie, et un solde courant peut légitimement passer
+    # sous zéro le temps d'une correction.
+    total_points_earned = models.DecimalField(
+        max_digits=15, decimal_places=2, default=Decimal('0.00')
+    )
+    total_points_redeemed = models.DecimalField(
+        max_digits=15, decimal_places=2, default=Decimal('0.00')
+    )
+    current_points = models.DecimalField(
+        max_digits=15, decimal_places=2, default=Decimal('0.00')
+    )
+
     tier = models.CharField(max_length=50, blank=True, default='')
     
     last_points_earned_at = models.DateTimeField(null=True, blank=True)
@@ -263,8 +310,8 @@ class CustomerLoyalty(TenantModel):
     
     def __str__(self):
         return f"{self.customer.name} - {self.current_points} pts"
-    
-    def add_points(self, points: int, save: bool = True):
+
+    def add_points(self, points, save: bool = True):
         """
         Ajoute des points au compte du client.
 
@@ -273,6 +320,8 @@ class CustomerLoyalty(TenantModel):
         """
         from django.db.models import F
         from django.utils import timezone
+
+        points = _as_points(points)
 
         if not save:
             # Modif in-memory uniquement (rare ; caller orchestre le save)
@@ -293,7 +342,7 @@ class CustomerLoyalty(TenantModel):
             fields=['current_points', 'total_points_earned', 'last_points_earned_at']
         )
 
-    def redeem_points(self, points: int, save: bool = True):
+    def redeem_points(self, points, save: bool = True):
         """
         Utilise des points du compte du client.
 
@@ -303,6 +352,8 @@ class CustomerLoyalty(TenantModel):
         """
         from django.db import transaction
         from django.utils import timezone
+
+        points = _as_points(points)
 
         if not save:
             if points > self.current_points:
@@ -327,7 +378,7 @@ class CustomerLoyalty(TenantModel):
             self.total_points_redeemed = fresh.total_points_redeemed
             self.last_points_redeemed_at = fresh.last_points_redeemed_at
 
-    def expire_points(self, points: int) -> int:
+    def expire_points(self, points) -> Decimal:
         """
         Retire des points périmés et renvoie le nombre réellement retiré.
 
@@ -338,29 +389,29 @@ class CustomerLoyalty(TenantModel):
         """
         from django.db import transaction
 
-        points = abs(int(points))
+        points = abs(_as_points(points))
         if points == 0:
-            return 0
+            return Decimal('0.00')
 
         with transaction.atomic():
             fresh = type(self).objects.select_for_update().get(pk=self.pk)
-            amount = min(points, max(0, fresh.current_points))
+            amount = min(points, max(Decimal('0.00'), fresh.current_points))
             if amount == 0:
-                return 0
+                return Decimal('0.00')
             fresh.current_points -= amount
             fresh.save(update_fields=['current_points'])
             self.current_points = fresh.current_points
             return amount
 
-    def reverse_points(self, points: int, kind: str):
+    def reverse_points(self, points, kind: str):
         """
         Inverse un mouvement de points en corrigeant le BON compteur à vie.
 
         Détourner ``add_points(-points)`` pour annuler une utilisation gonflait
         ``total_points_earned`` au lieu de réduire ``total_points_redeemed`` ;
         inversement, annuler un gain pouvait faire passer
-        ``total_points_earned`` sous zéro et violer la contrainte CHECK du
-        ``PositiveIntegerField`` sur Postgres.
+        ``total_points_earned`` sous zéro ; le bornage à zéro reste, même si le
+        champ n'est plus contraint au positif en base.
 
         ``kind`` vaut ``'earn'`` (on annule un gain : les points partent) ou
         ``'redeem'`` (on annule une utilisation : les points reviennent).
@@ -369,7 +420,7 @@ class CustomerLoyalty(TenantModel):
         from django.db import transaction
         from django.utils import timezone
 
-        points = abs(int(points))
+        points = abs(_as_points(points))
         if points == 0:
             return
 
@@ -380,14 +431,18 @@ class CustomerLoyalty(TenantModel):
             if kind == 'earn':
                 fresh.current_points -= points
                 # Bornage à 0 : le cumul à vie ne peut pas être négatif.
-                fresh.total_points_earned = max(0, fresh.total_points_earned - points)
+                fresh.total_points_earned = max(
+                    Decimal('0.00'), fresh.total_points_earned - points
+                )
                 fresh.last_points_earned_at = now
                 fields = [
                     'current_points', 'total_points_earned', 'last_points_earned_at',
                 ]
             else:
                 fresh.current_points += points
-                fresh.total_points_redeemed = max(0, fresh.total_points_redeemed - points)
+                fresh.total_points_redeemed = max(
+                    Decimal('0.00'), fresh.total_points_redeemed - points
+                )
                 fresh.last_points_redeemed_at = now
                 fields = [
                     'current_points', 'total_points_redeemed', 'last_points_redeemed_at',
@@ -426,11 +481,13 @@ class LoyaltyTransaction(TenantModel):
         choices=TransactionType.choices
     )
     
-    points = models.IntegerField(
+    points = models.DecimalField(
+        max_digits=15, decimal_places=2,
         help_text="Positif pour gain, négatif pour utilisation"
     )
-    
-    balance_after = models.IntegerField(
+
+    balance_after = models.DecimalField(
+        max_digits=15, decimal_places=2,
         help_text="Solde de points après la transaction"
     )
     

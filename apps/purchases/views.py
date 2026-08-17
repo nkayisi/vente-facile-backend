@@ -463,17 +463,23 @@ class PurchaseReturnViewSet(
         
         from apps.inventory.models import Stock, StockMovement
         
-        for item in purchase_return.items.all():
-            stock = Stock.objects.filter(
+        from apps.inventory.packaging import PackagingService
+
+        for item in purchase_return.items.select_related('product').all():
+            stock = Stock.objects.select_for_update().filter(
                 organization=purchase_return.organization,
                 product=item.product,
                 variant=item.variant,
                 warehouse=purchase_return.warehouse
             ).first()
-            
+
             if stock:
                 quantity_before = stock.quantity
-                stock.quantity -= item.quantity
+                # Ce chemin écrivait `stock.quantity` directement, ce qui
+                # rongeait silencieusement le nombre de contenants scellés.
+                # Retirer des unités puise d'abord dans le vrac, puis ouvre un
+                # contenant : on ne rescelle jamais.
+                PackagingService.apply_base_delta(stock, item.product, -item.quantity)
                 stock.last_movement_at = timezone.now()
                 stock.save()
                 
@@ -544,16 +550,19 @@ class PurchaseReturnViewSet(
         # Si approuvé, remettre le stock
         if purchase_return.status == 'approved':
             from apps.inventory.models import Stock
-            
-            for item in purchase_return.items.all():
-                stock, _ = Stock.objects.get_or_create(
+            from apps.inventory.packaging import PackagingService
+
+            for item in purchase_return.items.select_related('product').all():
+                stock, _ = Stock.objects.select_for_update().get_or_create(
                     organization=purchase_return.organization,
                     product=item.product,
                     variant=item.variant,
                     warehouse=purchase_return.warehouse,
                     defaults={'quantity': 0}
                 )
-                stock.quantity += item.quantity
+                # Les unités rendues reviennent en vrac : annuler un retour
+                # fournisseur ne reconstitue pas des contenants scellés.
+                PackagingService.apply_base_delta(stock, item.product, item.quantity)
                 stock.save()
         
         purchase_return.status = 'cancelled'

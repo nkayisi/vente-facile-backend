@@ -57,9 +57,9 @@ class Command(BaseCommand):
 
         for stock in stocks.iterator(chunk_size=500):
             # Conditionnement : signalements informatifs, jamais bloquants.
-            # La part en vrac est une aide à l'affichage, elle se recalcule
-            # d'elle-même au mouvement suivant - un écart ici ne remet pas en
-            # cause la quantité totale, qui reste la seule source de vérité.
+            # `Stock.save()` réaligne les compteurs à chaque écriture ; un écart
+            # constaté ici vient donc d'une écriture SQL directe et se corrigera
+            # au mouvement suivant, sans remettre en cause la quantité totale.
             if stock.location_id is not None:
                 avertissements.append(
                     f"  Stock {stock.id} ({stock.product.name}) porte un "
@@ -67,15 +67,22 @@ class Command(BaseCommand):
                     f"emplacement et ignoreront cette ligne."
                 )
 
+            # L'invariant des deux compteurs : scellés x facteur + vrac = total.
             factor = getattr(stock.product, 'units_per_package', None)
-            if factor and factor > 1 and stock.loose_quantity is not None:
-                reste = (stock.quantity - stock.loose_quantity) % factor
-                if reste:
+            if factor and factor > 1:
+                attendu = (
+                    (stock.package_quantity or Decimal('0.000')) * factor
+                    + (stock.loose_quantity or Decimal('0.000'))
+                )
+                ecart = stock.quantity - attendu
+                if abs(ecart) > TOLERANCE:
                     avertissements.append(
                         f"  Stock {stock.id} ({stock.product.name} @ "
-                        f"{stock.warehouse.name}) : {reste} unité(s) hors "
-                        f"conditionnement complet - rattachées au vrac à "
-                        f"l'affichage."
+                        f"{stock.warehouse.name}) : "
+                        f"{stock.package_quantity} x {factor} + "
+                        f"{stock.loose_quantity} = {attendu}, mais "
+                        f"quantity={stock.quantity} (écart={ecart}) - "
+                        f"sera réaligné à la prochaine écriture."
                     )
 
             batches_total = StockBatch.objects.filter(

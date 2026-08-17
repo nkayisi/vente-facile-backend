@@ -134,12 +134,24 @@ class Stock(TenantModel):
         decimal_places=3,
         default=Decimal('0.000')
     )
+    package_quantity = models.DecimalField(
+        max_digits=15,
+        decimal_places=3,
+        default=Decimal('0.000'),
+        help_text=(
+            "Conditionnements encore scellés réellement présents (casiers, "
+            "cartons). Compteur à part entière, pas une division de "
+            "`quantity` : c'est ce qui permet de refuser une vente en gros "
+            "quand il ne reste que des unités déjà sorties d'un emballage. "
+            "Sans objet pour les produits vendus au détail uniquement."
+        )
+    )
     loose_quantity = models.DecimalField(
         max_digits=15,
         decimal_places=3,
         default=Decimal('0.000'),
         help_text=(
-            "Part de `quantity` qui se trouve hors emballage scellé, pour les "
+            "Unités hors emballage scellé (bouteilles à la pièce), pour les "
             "produits vendus en gros et au détail. Alimentée par les "
             "déconditionnements et les entrées saisies à l'unité. Sans objet "
             "pour les produits vendus au détail uniquement."
@@ -178,12 +190,36 @@ class Stock(TenantModel):
         return self.quantity - self.reserved_quantity
 
     def save(self, *args, **kwargs):
+        from django.core.exceptions import ValidationError
+
+        # Partage scellé / vrac réaligné en premier : c'est lui qui fixe
+        # `quantity` pour un produit conditionné, la validation qui suit doit
+        # donc porter sur la valeur définitive. On corrige silencieusement au
+        # lieu de lever - ce `save()` est sur le chemin de tous les écrivains de
+        # stock, dont certains ignorent le conditionnement (sync mobile,
+        # scripts de reprise) ; une exception ici ferait tomber des flux qui
+        # fonctionnent. Un partage incohérent est une imprécision d'affichage,
+        # jamais une raison de refuser une vente.
+        from apps.inventory.packaging import PackagingService
+
+        before = (self.quantity, self.package_quantity, self.loose_quantity)
+        PackagingService.reconcile(self)
+
+        # Une écriture ciblée ne doit pas laisser en base un partage que la
+        # réconciliation vient de corriger en mémoire : on élargit
+        # `update_fields` plutôt que d'écrire une incohérence.
+        update_fields = kwargs.get('update_fields')
+        if update_fields is not None and before != (
+            self.quantity, self.package_quantity, self.loose_quantity
+        ):
+            kwargs['update_fields'] = set(update_fields) | {
+                'quantity', 'package_quantity', 'loose_quantity',
+            }
+
         # Filet de sécurité : tout point d'entrée qui descend Stock.quantity
         # sous zéro doit avoir vérifié warehouse.allow_negative_stock au
         # préalable. Cette validation rejette les chemins qui auraient sauté
         # la vérification (signal mort, import direct, script externe).
-        from django.core.exceptions import ValidationError
-
         if self.quantity < 0:
             allow_neg = (
                 bool(getattr(self.warehouse, 'allow_negative_stock', False))
@@ -202,24 +238,6 @@ class Stock(TenantModel):
             raise ValidationError({
                 'reserved_quantity': "La quantité réservée ne peut pas être négative."
             })
-
-        # Part en vrac : on corrige silencieusement au lieu de lever. Ce `save()`
-        # est sur le chemin de tous les écrivains de stock, dont plusieurs
-        # ignorent encore le conditionnement (transferts, réceptions, sync
-        # mobile) : y ajouter une exception ferait tomber des flux qui
-        # fonctionnent aujourd'hui. Une valeur hors bornes est une imprécision
-        # d'affichage, jamais une raison de refuser une vente.
-        clamped = max(
-            Decimal('0.000'),
-            min(self.loose_quantity, max(self.quantity, Decimal('0.000'))),
-        )
-        if clamped != self.loose_quantity:
-            logger.warning(
-                "Stock %s : loose_quantity %s hors bornes (quantity=%s), "
-                "ramenée à %s.",
-                self.pk, self.loose_quantity, self.quantity, clamped,
-            )
-            self.loose_quantity = clamped
 
         super().save(*args, **kwargs)
 

@@ -567,6 +567,19 @@ class SaleListSerializer(serializers.ModelSerializer):
         return obj.items.count()
 
 
+def _points_out(value):
+    """
+    Points rendus au client HTTP en **nombre**, jamais en chaîne.
+
+    Un ``Decimal`` traverse le rendu JSON de DRF sous forme de chaîne selon le
+    contexte ; ces quatre champs sont lus directement par le reçu et le POS, qui
+    les comparent et les affichent. On fixe la forme ici une fois pour toutes.
+    """
+    quantized = Decimal(value or 0).quantize(Decimal('0.01'))
+    # Un solde entier reste un entier à l'écran : « 3 pts », pas « 3.0 pts ».
+    return int(quantized) if quantized == quantized.to_integral_value() else float(quantized)
+
+
 class SaleDetailSerializer(serializers.ModelSerializer):
     """Serializer complet pour le détail d'une vente."""
     
@@ -579,6 +592,11 @@ class SaleDetailSerializer(serializers.ModelSerializer):
     items = SaleItemSerializer(many=True, read_only=True)
     payments = PaymentSerializer(many=True, read_only=True)
     unpacking_notices = serializers.SerializerMethodField()
+
+    loyalty_points_earned = serializers.SerializerMethodField()
+    loyalty_points_used = serializers.SerializerMethodField()
+    loyalty_points_balance = serializers.SerializerMethodField()
+    loyalty_program_active = serializers.SerializerMethodField()
 
     class Meta:
         model = Sale
@@ -596,6 +614,8 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             'sold_by', 'sold_by_name',
             'sale_date', 'due_date', 'is_pos', 'receipt_printed',
             'items', 'payments', 'unpacking_notices',
+            'loyalty_points_earned', 'loyalty_points_used',
+            'loyalty_points_balance', 'loyalty_program_active',
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'reference', 'sale_date', 'created_at', 'updated_at']
@@ -657,6 +677,81 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             })
         return notices
 
+    # -- Fidélité -----------------------------------------------------------
+    #
+    # Ces quatre champs existent pour que le reçu n'ait plus à rejouer le barème
+    # du programme. Le POS le faisait, avec la seule formule « pourcentage » en
+    # dur : sur un programme `fixed_per_amount` (le défaut), une vente de 5 000
+    # CDF imprimait 50 points quand la base en enregistrait 5. On ne recalcule
+    # donc rien ici, on lit le registre `LoyaltyTransaction`, qui est la seule
+    # trace de ce qui a réellement été crédité ou consommé.
+
+    def _loyalty_rows(self, obj):
+        """Lignes de fidélité de cette vente, chargées une seule fois."""
+        cached = getattr(obj, '_loyalty_rows_cache', None)
+        if cached is None:
+            from apps.settings.models import LoyaltyTransaction
+
+            cached = list(
+                LoyaltyTransaction.objects
+                .filter(sale=obj)
+                .values_list('transaction_type', 'points')
+            )
+            obj._loyalty_rows_cache = cached
+        return cached
+
+    def get_loyalty_points_earned(self, obj):
+        """
+        Points nets gagnés sur cette vente : les gains, moins leur annulation
+        éventuelle. Un reçu réimprimé après annulation ne doit pas annoncer des
+        points que le client n'a plus.
+        """
+        TxType = self._tx_types()
+        return _points_out(sum(
+            (points for kind, points in self._loyalty_rows(obj)
+             if kind in (TxType.EARN, TxType.EARN_REVERSAL)),
+            Decimal('0.00'),
+        ))
+
+    def get_loyalty_points_used(self, obj):
+        """
+        Points nets consommés, remise à la création et règlements ultérieurs
+        confondus. Retourné positif : c'est une quantité utilisée, le signe est
+        porté par le libellé du reçu.
+        """
+        TxType = self._tx_types()
+        total = sum(
+            (points for kind, points in self._loyalty_rows(obj)
+             if kind in (TxType.REDEEM, TxType.REDEEM_REVERSAL)),
+            Decimal('0.00'),
+        )
+        return _points_out(-total)
+
+    def get_loyalty_points_balance(self, obj):
+        """Solde du client après cette vente, 0 s'il n'a pas encore de compte."""
+        from apps.settings.models import CustomerLoyalty
+
+        if not obj.customer_id:
+            return _points_out(Decimal('0.00'))
+        balance = CustomerLoyalty.objects.filter(
+            organization_id=obj.organization_id, customer_id=obj.customer_id,
+        ).values_list('current_points', flat=True).first()
+        return _points_out(balance or Decimal('0.00'))
+
+    def get_loyalty_program_active(self, obj):
+        """
+        Permet au reçu de décider d'imprimer le bloc fidélité sans second appel
+        réseau au moment de l'impression.
+        """
+        from apps.settings.services import LoyaltyService
+
+        return LoyaltyService.active_program(obj.organization) is not None
+
+    @staticmethod
+    def _tx_types():
+        from apps.settings.models import LoyaltyTransaction
+        return LoyaltyTransaction.TransactionType
+
 
 class SaleCreateSerializer(serializers.ModelSerializer):
     """
@@ -666,7 +761,12 @@ class SaleCreateSerializer(serializers.ModelSerializer):
     
     items = SaleItemCreateSerializer(many=True)
     payments = PaymentCreateSerializer(many=True, required=False)
-    points_used = serializers.IntegerField(required=False, min_value=0, default=0)
+    # Décimal : le solde d'un client peut être fractionnaire (1 % d'un panier
+    # de 58 USD vaut 0,58 point), il doit pouvoir être dépensé tel quel.
+    points_used = serializers.DecimalField(
+        max_digits=15, decimal_places=2, required=False,
+        min_value=Decimal('0'), default=Decimal('0'), coerce_to_string=False,
+    )
     global_discount_amount = serializers.DecimalField(
         max_digits=15,
         decimal_places=2,
@@ -789,9 +889,17 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         if warehouse:
             from apps.inventory.models import Stock
             from apps.inventory.packaging import PackagingService
+
+            # Le découvert se décide au niveau de l'ENTREPÔT, comme partout en
+            # aval (`assert_sealed_available`, `ensure_loose_available`,
+            # `Stock.save`). Lire ici `product.allow_negative_stock` faisait
+            # sauter ce pré-contrôle courtois sur une configuration divergente,
+            # et la vente tombait alors sur la `ValidationError` Django de
+            # `Stock.save()`, qui n'est pas une erreur DRF : 500 au lieu de 400.
+            allow_negative = getattr(warehouse, 'allow_negative_stock', False)
             for item in items:
                 product = item['product']
-                if product.track_inventory and not product.allow_negative_stock:
+                if product.track_inventory and not allow_negative:
                     stock = Stock.objects.filter(
                         product=product,
                         variant=item.get('variant'),
@@ -1197,7 +1305,12 @@ class SalePaymentSerializer(serializers.Serializer):
     amount = serializers.DecimalField(
         max_digits=15, decimal_places=2, required=False, default=Decimal('0.00'),
     )
-    points_used = serializers.IntegerField(required=False, min_value=0, default=0)
+    # Décimal : le solde d'un client peut être fractionnaire (1 % d'un panier
+    # de 58 USD vaut 0,58 point), il doit pouvoir être dépensé tel quel.
+    points_used = serializers.DecimalField(
+        max_digits=15, decimal_places=2, required=False,
+        min_value=Decimal('0'), default=Decimal('0'), coerce_to_string=False,
+    )
     currency = serializers.CharField(max_length=3, required=False, allow_blank=True)
     exchange_rate = serializers.DecimalField(
         max_digits=15, decimal_places=6, required=False

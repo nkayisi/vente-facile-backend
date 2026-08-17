@@ -4,7 +4,7 @@ Centralized utility for all currency-related operations.
 """
 import logging
 from datetime import timedelta
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 
 from django.core.cache import cache
 from django.db import transaction
@@ -357,16 +357,34 @@ class LoyaltyService:
         """
         Points gagnés pour une vente, **convertis en devise principale**.
 
+        L'assiette est le total de la FACTURE, jamais ce qui a été remis. Le
+        montant perçu peut être encaissé dans une autre devise, fractionné entre
+        plusieurs devises, et la monnaie rendue dans une troisième : rien de tout
+        cela ne change ce que le client a acheté. Les deux points d'attribution
+        (création de la vente et règlement différé) passent d'ailleurs par
+        ``award_points_for_sale(sale)``, qui ne connaît que la vente.
+
         ``LoyaltyProgram.amount_per_unit`` est documenté « en devise principale ».
         Comparer directement ``sale.total``, qui est exprimé dans la devise de la
         FACTURE, faisait qu'une facture de 50 USD (soit ~140 000 CDF) donnait 0
         point avec un barème de 1 point par 1 000 CDF.
 
         ``Sale.exchange_rate`` = unités de devise principale pour 1 unité de la
-        devise de facture ⇒ on multiplie pour revenir à la principale.
+        devise de facture ⇒ on multiplie pour revenir à la principale. On retient
+        le taux **figé sur la vente**, pas celui du jour : une facture de la
+        semaine dernière ne se revalorise pas parce que le dollar a bougé.
         """
-        total_primary = (sale.total * (sale.exchange_rate or Decimal('1')))
-        return program.calculate_points(total_primary)
+        rate = sale.exchange_rate
+        if not rate or rate <= 0:
+            # Un taux nul ou négatif ne peut pas sortir de `Sale.save()`, qui
+            # passe par `CurrencyService.resolve`. S'il en arrive un malgré tout
+            # (écriture SQL directe, reprise de données), le multiplier donnerait
+            # 0 point sans le moindre signal. On relit alors le taux de l'org.
+            _currency, rate = CurrencyService.resolve(
+                sale.organization, sale.currency,
+            )
+
+        return program.calculate_points(sale.total * rate)
 
     @staticmethod
     def active_program(organization):
@@ -539,7 +557,9 @@ class LoyaltyService:
         Ne persiste rien. Renvoie ``{'points', 'amount', 'loyalty', 'program'}``
         ou ``None``.
         """
-        from apps.settings.models import CustomerLoyalty
+        from apps.settings.models import (
+            POINT_PRECISION, CustomerLoyalty, _as_points,
+        )
 
         if points_used <= 0 or not customer or max_amount <= 0:
             return None
@@ -571,10 +591,16 @@ class LoyaltyService:
                 max_amount, target_currency, organization,
             )
 
-        max_by_balance = int(loyalty.current_points)
-        max_by_total = int(max_amount_primary / point_value)
-        points_to_use = min(int(points_used), max_by_balance, max_by_total)
-        if points_to_use < program.min_points_to_redeem:
+        # Plafonds au centième de point : tronquer à l'entier interdisait au
+        # client d'utiliser le solde fractionnaire qu'il vient de gagner, et
+        # sur une devise forte (1 point = 1 USD) rabotait jusqu'à un dollar de
+        # remise à chaque utilisation.
+        max_by_balance = _as_points(loyalty.current_points)
+        max_by_total = (max_amount_primary / point_value).quantize(
+            POINT_PRECISION, rounding=ROUND_FLOOR,
+        )
+        points_to_use = min(_as_points(points_used), max_by_balance, max_by_total)
+        if points_to_use <= 0 or points_to_use < program.min_points_to_redeem:
             return None
 
         amount_primary = LoyaltyService.redemption_value(program, points_to_use)
@@ -659,7 +685,11 @@ class LoyaltyExpiryService:
         """
         from django.utils import timezone as tz
 
-        empty = {'expired_now': 0, 'next_expiry_at': None, 'next_expiry_points': 0}
+        empty = {
+            'expired_now': Decimal('0.00'),
+            'next_expiry_at': None,
+            'next_expiry_points': Decimal('0.00'),
+        }
         if not program or not program.is_active or program.points_expiry_days <= 0:
             return empty
 
@@ -667,9 +697,9 @@ class LoyaltyExpiryService:
         lifetime = timedelta(days=program.points_expiry_days)
         cutoff = now - lifetime
 
-        expired_now = 0
+        expired_now = Decimal('0.00')
         next_expiry_at = None
-        next_expiry_points = 0
+        next_expiry_points = Decimal('0.00')
 
         for earned_at, remaining in LoyaltyExpiryService._remaining_lots(loyalty):
             if earned_at <= cutoff:
@@ -684,7 +714,7 @@ class LoyaltyExpiryService:
 
         # Filet : le registre peut être incomplet (comptes antérieurs au
         # registre). On n'expire jamais plus que le solde réel.
-        expired_now = min(expired_now, max(0, loyalty.current_points))
+        expired_now = min(expired_now, max(Decimal('0.00'), loyalty.current_points))
 
         return {
             'expired_now': expired_now,
@@ -704,9 +734,15 @@ class LoyaltyExpiryService:
 
         program = LoyaltyService.active_program(organization)
         if not program or program.points_expiry_days <= 0:
-            return {'organization': organization, 'accounts': 0, 'points': 0, 'details': []}
+            return {
+                'organization': organization, 'accounts': 0,
+                'points': Decimal('0.00'), 'details': [],
+            }
 
-        report = {'organization': organization, 'accounts': 0, 'points': 0, 'details': []}
+        report = {
+            'organization': organization, 'accounts': 0,
+            'points': Decimal('0.00'), 'details': [],
+        }
 
         accounts = CustomerLoyalty.objects.filter(
             organization=organization, current_points__gt=0,
@@ -746,7 +782,7 @@ class LoyaltyExpiryService:
 
         if report['points']:
             logger.info(
-                'Expiration fidélité: %s - %d point(s) retiré(s) sur %d compte(s)',
+                'Expiration fidélité: %s - %s point(s) retiré(s) sur %d compte(s)',
                 organization.name, report['points'], report['accounts'],
             )
 

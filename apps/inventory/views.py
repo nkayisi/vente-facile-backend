@@ -271,9 +271,7 @@ class StockViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, viewsets.Mo
 
         with transaction.atomic():
             locked = Stock.objects.select_for_update().get(pk=stock.pk)
-            _, loose = PackagingService.split(
-                locked.quantity, locked.loose_quantity, factor
-            )
+            _, loose = PackagingService.stored_split(locked, factor)
             opened, _movement = PackagingService.ensure_loose_available(
                 locked, product,
                 needed_loose=loose + packages * factor,
@@ -583,15 +581,17 @@ class StockMovementViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, vie
         if delta_loose is None:
             # Saisie en quantité simple : sans indication de conditionnement, on
             # considère qu'elle porte sur des unités hors emballage.
-            delta_loose = data['quantity']
-        elif data['quantity'] < 0:
-            delta_loose = -abs(delta_loose)
-
-        PackagingService.apply_delta(
-            stock, product,
-            delta_base=data['quantity'],
-            delta_loose=delta_loose,
-        )
+            PackagingService.apply_base_delta(stock, product, data['quantity'])
+        else:
+            # Saisie « X contenants + Y unités » : chaque part va dans son
+            # compteur, sans jamais se convertir dans l'autre.
+            sign = -1 if data['quantity'] < 0 else 1
+            delta_packages = data.get('input_package_quantity') or Decimal('0.000')
+            PackagingService.apply_delta(
+                stock, product,
+                delta_packages=sign * abs(delta_packages),
+                delta_loose=sign * abs(delta_loose),
+            )
         stock.last_movement_at = timezone.now()
         stock.save()
 
@@ -746,10 +746,10 @@ class StockTransferViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
                         reference_id=transfer.id,
                     )
 
-                PackagingService.apply_delta(
+                PackagingService.apply_base_delta(
                     stock, item.product,
-                    delta_base=-item.quantity_requested,
-                    delta_loose=-loose_shipped,
+                    -item.quantity_requested,
+                    loose_hint=loose_shipped,
                 )
                 PackagingService.touch(stock)
                 stock.save()
@@ -870,10 +870,10 @@ class StockTransferViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
                     else:
                         stock.avg_cost = source_avg_cost
                 
-                PackagingService.apply_delta(
+                PackagingService.apply_base_delta(
                     stock, item.product,
-                    delta_base=received_qty,
-                    delta_loose=loose_received,
+                    received_qty,
+                    loose_hint=loose_received,
                 )
                 PackagingService.touch(stock)
                 stock.save()
@@ -946,10 +946,10 @@ class StockTransferViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
                     loose_to_restore = PackagingService.loose_share(
                         item.product, quantity_to_restore, item.loose_quantity
                     )
-                    PackagingService.apply_delta(
+                    PackagingService.apply_base_delta(
                         stock, item.product,
-                        delta_base=quantity_to_restore,
-                        delta_loose=loose_to_restore,
+                        quantity_to_restore,
+                        loose_hint=loose_to_restore,
                     )
                     PackagingService.touch(stock)
                     stock.save()
@@ -1079,11 +1079,14 @@ class StockAdjustmentViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, A
                     else:
                         stock.avg_cost = item.unit_cost
                 
+                # Le comptage physique fait foi sur les DEUX canaux : « j'ai
+                # compté 3 casiers et 2 bouteilles » se pose tel quel, sans
+                # repasser par une division. `reconcile` réaligne `quantity`.
                 stock.quantity = item.quantity_counted
-                # Même règle que l'inventaire : le comptage physique fait foi
-                # sur la part hors emballage quand elle a été relevée.
                 if item.counted_loose_quantity is not None:
                     stock.loose_quantity = item.counted_loose_quantity
+                if item.counted_package_quantity is not None:
+                    stock.package_quantity = item.counted_package_quantity
                 stock.last_counted_at = timezone.now()
                 stock.last_movement_at = timezone.now()
                 stock.save()
@@ -1445,12 +1448,13 @@ class InventorySessionViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, 
                     stock.avg_cost = product_cost
                 
                 quantity_before = stock.quantity
+                # Le comptage physique constate les deux canaux : ses valeurs
+                # écrasent les anciennes, sinon l'affichage continuerait
+                # d'annoncer des paquets qui n'existent plus.
                 stock.quantity = count.quantity_counted
-                # Le comptage physique constate ce qui est réellement hors
-                # emballage : sa valeur écrase l'ancienne, sinon l'affichage
-                # continuerait d'annoncer des paquets qui n'existent plus.
                 if count.packaging_factor:
                     stock.loose_quantity = count.counted_loose_quantity
+                    stock.package_quantity = count.counted_package_quantity or Decimal('0.000')
                 stock.last_counted_at = timezone.now()
                 stock.last_movement_at = timezone.now()
                 stock.save()

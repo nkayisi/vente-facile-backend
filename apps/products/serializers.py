@@ -453,9 +453,15 @@ class ProductListSerializer(serializers.ModelSerializer):
         if stock is None:
             quantity = self.get_stock_quantity(obj)
             return PackagingService.format_quantity(obj, quantity or 0)
-        available = stock.available_quantity
-        loose = min(stock.loose_quantity, max(available, 0))
-        return PackagingService.format_quantity(obj, available, loose)
+        # Même partage que `stock_packages` / `stock_loose`, pour que le libellé
+        # et les deux compteurs affichés ne puissent jamais se contredire.
+        split = self._packaging_split(obj)
+        if split is None:
+            return PackagingService.format_quantity(obj, stock.available_quantity)
+        sealed, loose = split
+        return PackagingService.format_quantity(
+            obj, stock.available_quantity, loose,
+        )
 
 
 class ProductDetailSerializer(serializers.ModelSerializer):

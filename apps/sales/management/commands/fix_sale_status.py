@@ -8,6 +8,7 @@ from django.utils import timezone
 from decimal import Decimal
 from apps.sales.models import Sale
 from apps.inventory.models import Stock, StockMovement
+from apps.inventory.packaging import PackagingService
 
 
 class Command(BaseCommand):
@@ -142,7 +143,12 @@ class Command(BaseCommand):
                                     )
 
                                     quantity_before = stock.quantity
-                                    stock.quantity -= item.quantity
+                                    # Passe par le service : écrire `quantity`
+                                    # directement ferait fondre des contenants
+                                    # scellés au profit du vrac.
+                                    PackagingService.apply_base_delta(
+                                        stock, item.product, -item.quantity,
+                                    )
                                     stock.last_movement_at = timezone.now()
                                     stock.save()
 

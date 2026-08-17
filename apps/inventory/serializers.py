@@ -174,12 +174,13 @@ class StockListSerializer(serializers.ModelSerializer):
         )
 
     def _split(self, obj):
+        """Partage lu sur les compteurs, jamais redivisé depuis le total."""
         from apps.inventory.packaging import PackagingService
 
         factor = PackagingService.factor(obj.product)
         if factor is None:
             return None
-        return PackagingService.split(obj.quantity, obj.loose_quantity, factor)
+        return PackagingService.stored_split(obj, factor)
 
     def get_stock_packages(self, obj):
         split = self._split(obj)

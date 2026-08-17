@@ -434,3 +434,101 @@ class AcceptanceScenarioTests(_PackagingSaleSetup):
         self.assertEqual(movement.created_by, self.owner)
         self.assertIsNotNone(movement.created_at)
         self.assertEqual(movement.input_package_quantity, Decimal('1.000'))
+
+
+class SeparateChannelStockTests(_PackagingSaleSetup):
+    """
+    Les deux canaux sont deux stocks distincts, pas deux vues d'un même nombre.
+
+    Scénario dicté par le métier : approvisionner 3 casiers **plus** 12
+    bouteilles ne donne pas 4 casiers. On peut ouvrir un casier pour servir du
+    détail, jamais rassembler des bouteilles pour reconstituer un casier.
+    """
+
+    def test_approvisionnement_mixte_ne_fusionne_pas_les_canaux(self):
+        self._supply(packages=3, loose=12)
+
+        stock = self._stock()
+        self.assertEqual(stock.package_quantity, Decimal('3.000'))
+        self.assertEqual(stock.loose_quantity, Decimal('12.000'))
+        self.assertEqual(stock.quantity, Decimal('48.000'))
+
+        response = self.client.get(
+            f'/api/v1/stocks/{stock.id}/', **self._headers
+        )
+        self.assertEqual(
+            response.data['stock_display'], '3 paquets + 12 bouteilles'
+        )
+        self.assertEqual(response.data['stock_packages'], 3)
+        self.assertEqual(response.data['stock_loose'], '12.000')
+
+    def test_detail_a_sec_ouvre_un_seul_paquet(self):
+        """
+        Stock détail vide, un client achète 5 bouteilles : on ouvre un paquet,
+        on en tire 12 bouteilles, on en retire 5.
+        """
+        self._supply(packages=3)
+        self.assertEqual(self._stock().loose_quantity, Decimal('0.000'))
+
+        response = self._sell(loose=5)
+
+        stock = self._stock()
+        self.assertEqual(stock.package_quantity, Decimal('2.000'))
+        self.assertEqual(stock.loose_quantity, Decimal('7.000'))
+        self.assertEqual(stock.quantity, Decimal('31.000'))
+
+        self.assertEqual(len(response.data['unpacking_notices']), 1)
+        self.assertEqual(
+            response.data['unpacking_notices'][0]['packages_opened'], 1
+        )
+        self.assertEqual(
+            StockMovement.objects.filter(movement_type='unpack').count(), 1
+        )
+
+    def test_le_vrac_ne_reconstitue_jamais_un_paquet(self):
+        """
+        24 bouteilles en vrac ne font pas 2 paquets : la vente en gros est
+        refusée alors que le total suffirait largement.
+        """
+        self._supply(loose=24)
+
+        stock = self._stock()
+        self.assertEqual(stock.package_quantity, Decimal('0.000'))
+        self.assertEqual(stock.loose_quantity, Decimal('24.000'))
+
+        response = self._sell(packages=1, expect=status.HTTP_400_BAD_REQUEST)
+        self.assertIn('au détail', str(response.data))
+
+    def test_trois_paquets_demandes_pour_deux_scelles_refuse_en_400(self):
+        """
+        Le cas d'usage du comptoir : 2 paquets + 12 bouteilles en stock, le
+        client en veut 3. Le total (36) couvre la demande (36), seul le partage
+        ne le permet pas. Doit rester un 400 lisible, jamais un 500.
+        """
+        self._supply(packages=2, loose=12)
+
+        response = self._sell(packages=3, expect=status.HTTP_400_BAD_REQUEST)
+
+        message = str(response.data)
+        self.assertIn('2 paquets', message)
+        self.assertIn('au détail', message)
+        # Le stock n'a pas bougé : le refus est total.
+        stock = self._stock()
+        self.assertEqual(stock.package_quantity, Decimal('2.000'))
+        self.assertEqual(stock.loose_quantity, Decimal('12.000'))
+
+    def test_le_retour_revient_en_vrac_et_ne_rescelle_pas(self):
+        self._supply(packages=3)
+        response = self._sell(packages=1)
+        sale_id = response.data['id']
+
+        self.client.post(
+            f'/api/v1/sales/{sale_id}/cancel/',
+            {'reason': 'test'}, format='json', **self._headers,
+        )
+
+        stock = self._stock()
+        self.assertEqual(stock.quantity, Decimal('36.000'))
+        # Les 12 bouteilles rendues ne reforment pas le paquet vendu.
+        self.assertEqual(stock.package_quantity, Decimal('2.000'))
+        self.assertEqual(stock.loose_quantity, Decimal('12.000'))

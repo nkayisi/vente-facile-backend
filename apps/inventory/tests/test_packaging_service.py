@@ -121,12 +121,26 @@ class _PackagingSetup(TestCase):
         )
 
     def _stock(self, quantity='24.000', loose='0.000', product=None):
+        """
+        Stock décrit par son total et sa part vrac, comme le faisaient les
+        écrans avant que les conditionnements scellés ne soient stockés.
+
+        Le nombre de contenants scellés se déduit ici une fois pour toutes, à
+        l'identique de la migration `inventory/0016` : « 24 unités dont 0 en
+        vrac » signifie bien 2 paquets scellés.
+        """
+        product = product or self.product
+        factor = PackagingService.factor(product)
+        packages, effective_loose = PackagingService.split(
+            Decimal(quantity), Decimal(loose), factor
+        )
         return Stock.objects.create(
             organization=self.org,
-            product=product or self.product,
+            product=product,
             warehouse=self.warehouse,
             quantity=Decimal(quantity),
-            loose_quantity=Decimal(loose),
+            package_quantity=Decimal(packages),
+            loose_quantity=effective_loose if factor else Decimal('0.000'),
             avg_cost=Decimal('400.00'),
         )
 
@@ -465,74 +479,150 @@ class AssertSealedAvailableTests(_PackagingSetup):
 
 
 class ApplyDeltaTests(_PackagingSetup):
+    """Les deux compteurs bougent séparément, chacun dans son canal."""
 
     def test_vente_mixte(self):
-        stock = self._stock(quantity='36.000', loose='12.000')
+        stock = self._stock(quantity='36.000', loose='12.000')  # 2 paquets + 12
 
-        # 2 paquets + 3 bouteilles = 27 unités, dont 3 prises au vrac
+        # 2 paquets + 3 bouteilles : chaque part sort de son propre compteur.
         PackagingService.apply_delta(
-            stock, self.product, delta_base=Decimal('-27'), delta_loose=Decimal('-3')
+            stock, self.product, delta_packages=-2, delta_loose=Decimal('-3')
         )
-        self.assertEqual(stock.quantity, Decimal('9.000'))
+        self.assertEqual(stock.package_quantity, Decimal('0.000'))
         self.assertEqual(stock.loose_quantity, Decimal('9.000'))
+        self.assertEqual(stock.quantity, Decimal('9.000'))
 
     def test_entree_en_paquets_ne_touche_pas_au_vrac(self):
         stock = self._stock(quantity='10.000', loose='10.000')
 
         PackagingService.apply_delta(
-            stock, self.product, delta_base=Decimal('120'), delta_loose=Decimal('0')
+            stock, self.product, delta_packages=10, delta_loose=Decimal('0')
         )
-        self.assertEqual(stock.quantity, Decimal('130.000'))
+        self.assertEqual(stock.package_quantity, Decimal('10.000'))
         self.assertEqual(stock.loose_quantity, Decimal('10.000'))
+        self.assertEqual(stock.quantity, Decimal('130.000'))
 
     def test_entree_en_pieces_alimente_le_vrac(self):
-        stock = self._stock(quantity='120.000', loose='0.000')
+        stock = self._stock(quantity='120.000', loose='0.000')  # 10 paquets
 
         PackagingService.apply_delta(
-            stock, self.product, delta_base=Decimal('5'), delta_loose=Decimal('5')
+            stock, self.product, delta_packages=0, delta_loose=Decimal('5')
         )
-        self.assertEqual(stock.quantity, Decimal('125.000'))
+        self.assertEqual(stock.package_quantity, Decimal('10.000'))
         self.assertEqual(stock.loose_quantity, Decimal('5.000'))
+        self.assertEqual(stock.quantity, Decimal('125.000'))
 
     def test_retour_revient_toujours_en_vrac(self):
-        stock = self._stock(quantity='22.000', loose='10.000')
+        stock = self._stock(quantity='22.000', loose='10.000')  # 1 paquet + 10
 
         PackagingService.apply_delta(
-            stock, self.product, delta_base=Decimal('2'), delta_loose=Decimal('2')
+            stock, self.product, delta_packages=0, delta_loose=Decimal('2')
         )
-        self.assertEqual(stock.quantity, Decimal('24.000'))
+        self.assertEqual(stock.package_quantity, Decimal('1.000'))
         self.assertEqual(stock.loose_quantity, Decimal('12.000'))
-        sealed, loose = PackagingService.split(
-            stock.quantity, stock.loose_quantity, 12
-        )
-        self.assertEqual((sealed, loose), (1, Decimal('12.000')))
+        self.assertEqual(stock.quantity, Decimal('24.000'))
 
-    def test_produit_simple_ignore_le_vrac(self):
+    def test_produit_simple_ignore_les_paquets(self):
         stock = self._stock(quantity='10.000', product=self.simple_product)
 
         PackagingService.apply_delta(
             stock, self.simple_product,
-            delta_base=Decimal('-3'), delta_loose=Decimal('-3'),
+            delta_packages=0, delta_loose=Decimal('-3'),
         )
         self.assertEqual(stock.quantity, Decimal('7.000'))
+        self.assertEqual(stock.package_quantity, Decimal('0.000'))
         self.assertEqual(stock.loose_quantity, Decimal('0.000'))
 
 
-class StockClampTests(_PackagingSetup):
-    """``Stock.save()`` corrige le vrac hors bornes sans jamais lever."""
+class ApplyBaseDeltaTests(_PackagingSetup):
+    """
+    Chemin de repli des écritures qui ne connaissent qu'un total.
 
-    def test_vrac_superieur_au_total_est_ramene(self):
-        stock = self._stock(quantity='10.000', loose='0.000')
-        stock.loose_quantity = Decimal('50.000')
+    C'est ici que se joue l'asymétrie du domaine : on ouvre un conditionnement
+    pour servir du détail, on n'en rescelle jamais.
+    """
+
+    def test_sortie_puise_dabord_dans_le_vrac(self):
+        stock = self._stock(quantity='34.000', loose='10.000')  # 2 paquets + 10
+
+        PackagingService.apply_base_delta(stock, self.product, Decimal('-4'))
+
+        self.assertEqual(stock.package_quantity, Decimal('2.000'))
+        self.assertEqual(stock.loose_quantity, Decimal('6.000'))
+
+    def test_sortie_casse_un_scelle_quand_le_vrac_ne_suffit_pas(self):
+        stock = self._stock(quantity='36.000', loose='0.000')  # 3 paquets
+
+        PackagingService.apply_base_delta(stock, self.product, Decimal('-5'))
+
+        self.assertEqual(stock.package_quantity, Decimal('2.000'))
+        self.assertEqual(stock.loose_quantity, Decimal('7.000'))
+        self.assertEqual(stock.quantity, Decimal('31.000'))
+
+    def test_entree_va_toujours_au_vrac(self):
+        stock = self._stock(quantity='36.000', loose='0.000')  # 3 paquets
+
+        PackagingService.apply_base_delta(stock, self.product, Decimal('5'))
+
+        self.assertEqual(stock.package_quantity, Decimal('3.000'))
+        self.assertEqual(stock.loose_quantity, Decimal('5.000'))
+
+    def test_indication_de_partage_respectee(self):
+        """Réception de 3 paquets + 12 pièces : 3 paquets ET 12 pièces."""
+        stock = self._stock(quantity='0.000', loose='0.000')
+
+        PackagingService.apply_base_delta(
+            stock, self.product, Decimal('48'), loose_hint=Decimal('12'),
+        )
+
+        self.assertEqual(stock.package_quantity, Decimal('3.000'))
+        self.assertEqual(stock.loose_quantity, Decimal('12.000'))
+        self.assertEqual(stock.quantity, Decimal('48.000'))
+
+
+class ReconcileTests(_PackagingSetup):
+    """``Stock.save()`` réaligne les compteurs sans jamais lever."""
+
+    def test_ecriture_aveugle_en_sortie_casse_un_scelle(self):
+        """
+        Un chemin qui descend `quantity` sans toucher aux compteurs ne doit pas
+        faire fondre des contenants scellés en vrac : il en ouvre un.
+        """
+        stock = self._stock(quantity='36.000', loose='0.000')  # 3 paquets
+        stock.quantity = Decimal('31.000')
         stock.save()
 
         stock.refresh_from_db()
-        self.assertEqual(stock.loose_quantity, Decimal('10.000'))
+        self.assertEqual(stock.package_quantity, Decimal('2.000'))
+        self.assertEqual(stock.loose_quantity, Decimal('7.000'))
 
-    def test_vrac_negatif_est_ramene_a_zero(self):
-        stock = self._stock(quantity='10.000', loose='0.000')
+    def test_ecriture_aveugle_en_entree_va_au_vrac(self):
+        stock = self._stock(quantity='36.000', loose='0.000')
+        stock.quantity = Decimal('41.000')
+        stock.save()
+
+        stock.refresh_from_db()
+        self.assertEqual(stock.package_quantity, Decimal('3.000'))
+        self.assertEqual(stock.loose_quantity, Decimal('5.000'))
+
+    def test_vrac_negatif_ouvre_un_scelle(self):
+        stock = self._stock(quantity='24.000', loose='0.000')  # 2 paquets
         stock.loose_quantity = Decimal('-5.000')
         stock.save()
 
         stock.refresh_from_db()
-        self.assertEqual(stock.loose_quantity, Decimal('0.000'))
+        # Le total est resté 24 : l'écart repart au vrac, puis se normalise.
+        self.assertEqual(stock.quantity, Decimal('24.000'))
+        self.assertEqual(
+            stock.package_quantity * 12 + stock.loose_quantity, Decimal('24.000')
+        )
+        self.assertGreaterEqual(stock.loose_quantity, Decimal('0.000'))
+
+    def test_produit_simple_garde_ses_compteurs_a_zero(self):
+        stock = self._stock(quantity='10.000', product=self.simple_product)
+        stock.package_quantity = Decimal('4.000')
+        stock.save()
+
+        stock.refresh_from_db()
+        self.assertEqual(stock.package_quantity, Decimal('0.000'))
+        self.assertEqual(stock.quantity, Decimal('10.000'))

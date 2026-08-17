@@ -88,10 +88,12 @@ class GoodsReceiptStockService:
             loose_accepted = PackagingService.loose_share(
                 item.product, item.quantity_accepted, item.loose_quantity
             )
-            PackagingService.apply_delta(
+            # Recevoir 3 casiers + 12 bouteilles donne 3 casiers ET 12
+            # bouteilles, pas 4 casiers : chaque canal alimente son compteur.
+            PackagingService.apply_base_delta(
                 stock, item.product,
-                delta_base=item.quantity_accepted,
-                delta_loose=loose_accepted,
+                item.quantity_accepted,
+                loose_hint=loose_accepted,
             )
             PackagingService.touch(stock)
             stock.save()
@@ -188,10 +190,10 @@ class GoodsReceiptStockService:
             loose_accepted = PackagingService.loose_share(
                 item.product, item.quantity_accepted, item.loose_quantity
             )
-            PackagingService.apply_delta(
+            PackagingService.apply_base_delta(
                 stock, item.product,
-                delta_base=-item.quantity_accepted,
-                delta_loose=-loose_accepted,
+                -item.quantity_accepted,
+                loose_hint=loose_accepted,
             )
             PackagingService.touch(stock)
             stock.save()

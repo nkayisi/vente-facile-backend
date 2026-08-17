@@ -202,10 +202,28 @@ class LoyaltyRewardCreateSerializer(serializers.ModelSerializer):
         return attrs
 
 
+def points_field(**kwargs):
+    """
+    Champ de points exposé en **nombre JSON**, pas en chaîne.
+
+    DRF sérialise les ``DecimalField`` en chaîne par défaut, comme le reste des
+    montants du projet. Les points n'en sont pas : ils se comparent et
+    s'additionnent directement à l'écran (« solde >= minimum »), et les basculer
+    en chaîne obligerait à parser à chaque usage. Deux décimales tiennent très
+    largement dans un nombre JavaScript.
+    """
+    return serializers.DecimalField(
+        max_digits=15, decimal_places=2, coerce_to_string=False, **kwargs
+    )
+
+
 class CustomerLoyaltySerializer(serializers.ModelSerializer):
     """Serializer for CustomerLoyalty model."""
     customer_name = serializers.CharField(source='customer.name', read_only=True)
     customer_phone = serializers.CharField(source='customer.phone', read_only=True)
+    total_points_earned = points_field(read_only=True)
+    total_points_redeemed = points_field(read_only=True)
+    current_points = points_field(read_only=True)
     # Prochaine échéance de points, pour que le marchand puisse prévenir son
     # client AVANT que les points ne tombent. Nuls si aucune expiration n'est
     # configurée sur le programme.
@@ -269,7 +287,10 @@ class LoyaltyTransactionSerializer(serializers.ModelSerializer):
     sale_reference = serializers.CharField(source='sale.reference', read_only=True)
     reward_name = serializers.CharField(source='reward.name', read_only=True)
     created_by_name = serializers.CharField(source='created_by.full_name', read_only=True)
-    
+    points = points_field(read_only=True)
+    balance_after = points_field(read_only=True)
+
+
     class Meta:
         model = LoyaltyTransaction
         fields = [
@@ -304,7 +325,8 @@ class OrganizationSettingsSerializer(serializers.ModelSerializer):
 class AdjustLoyaltyPointsSerializer(serializers.Serializer):
     """Serializer for manually adjusting customer loyalty points."""
     customer_id = serializers.UUIDField()
-    points = serializers.IntegerField()
+    # Décimal : un ajustement doit pouvoir corriger un solde fractionnaire.
+    points = points_field()
     description = serializers.CharField(max_length=255, required=False, allow_blank=True)
     
     def validate_points(self, value):
@@ -317,7 +339,7 @@ class RedeemPointsSerializer(serializers.Serializer):
     """Serializer for redeeming loyalty points."""
     customer_id = serializers.UUIDField()
     reward_id = serializers.UUIDField(required=False)
-    points = serializers.IntegerField(required=False)
+    points = points_field(required=False)
     
     def validate(self, attrs):
         if not attrs.get('reward_id') and not attrs.get('points'):
