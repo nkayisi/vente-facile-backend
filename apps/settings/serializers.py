@@ -3,7 +3,9 @@ Serializers for settings module.
 """
 from rest_framework import serializers
 from decimal import Decimal
+from drf_spectacular.utils import extend_schema_field
 from .models import (
+    MAX_REDEMPTION_PERCENT_CEILING,
     Currency, OrganizationCurrency, LoyaltyProgram, LoyaltyReward,
     CustomerLoyalty, LoyaltyTransaction, OrganizationSettings
 )
@@ -99,7 +101,10 @@ class LoyaltyProgramSerializer(serializers.ModelSerializer):
         source='get_points_calculation_type_display',
         read_only=True
     )
-    
+    # Borne dure du plafond, exposée pour que le POS n'ait pas à la coder en
+    # dur de son côté : la valeur vit dans le modèle, pas dans deux endroits.
+    max_redemption_percent_ceiling = serializers.SerializerMethodField()
+
     class Meta:
         model = LoyaltyProgram
         fields = [
@@ -107,11 +112,17 @@ class LoyaltyProgramSerializer(serializers.ModelSerializer):
             'points_calculation_type', 'points_calculation_type_display',
             'points_per_unit', 'amount_per_unit',
             'points_percentage', 'point_value',
-            'min_points_to_redeem', 'points_expiry_days',
+            'min_points_to_redeem', 'max_redemption_percent',
+            'max_redemption_percent_ceiling',
+            'points_expiry_days',
             'only_registered_customers',
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+    @extend_schema_field(serializers.DecimalField(max_digits=5, decimal_places=2))
+    def get_max_redemption_percent_ceiling(self, obj):
+        return MAX_REDEMPTION_PERCENT_CEILING
 
 
 class LoyaltyProgramCreateUpdateSerializer(serializers.ModelSerializer):
@@ -124,10 +135,11 @@ class LoyaltyProgramCreateUpdateSerializer(serializers.ModelSerializer):
             'points_calculation_type',
             'points_per_unit', 'amount_per_unit',
             'points_percentage', 'point_value',
-            'min_points_to_redeem', 'points_expiry_days',
+            'min_points_to_redeem', 'max_redemption_percent',
+            'points_expiry_days',
             'only_registered_customers'
         ]
-    
+
     def validate(self, attrs):
         calc_type = attrs.get('points_calculation_type', 
                               getattr(self.instance, 'points_calculation_type', None))

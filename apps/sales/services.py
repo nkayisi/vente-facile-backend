@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from django.db import transaction
+from django.db.models import Sum
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
@@ -561,6 +562,33 @@ def get_loyalty_payment_method(organization):
     return method
 
 
+def remaining_loyalty_allowance(sale, program):
+    """
+    Ce qu'il reste de la facture réglable en points, dans sa devise.
+
+    Le plafond porte sur le **total de la facture**, pas sur le reste à payer :
+    sinon deux règlements successifs en points (50 % de 100, puis 50 % des 50
+    restants) dépasseraient la part autorisée sans jamais la franchir en
+    apparence. On retranche donc tout ce qui a déjà été réglé en points, que ce
+    soit la remise posée à la création (``loyalty_redemption_amount``) ou les
+    règlements ultérieurs portés par le moyen de paiement « fidélité ».
+    """
+    from apps.sales.models import Payment, PaymentMethod
+
+    if program is None:
+        return Decimal('0.00')
+
+    allowance = program.max_redeemable_amount(sale.total)
+    already = sale.loyalty_redemption_amount or Decimal('0.00')
+    already += (
+        sale.payments
+        .filter(payment_method__method_type=PaymentMethod.MethodType.LOYALTY)
+        .exclude(status=Payment.Status.FAILED)
+        .aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+    )
+    return max(Decimal('0.00'), (allowance - already).quantize(Decimal('0.01')))
+
+
 def apply_payment_to_sale(sale_id, user, *, payment_method_id=None,
                           tendered_amount=None, currency=None, exchange_rate=None,
                           change_currency=None, reference='', notes='',
@@ -601,13 +629,20 @@ def apply_payment_to_sale(sale_id, user, *, payment_method_id=None,
     if points_used and points_used > 0 and sale.customer:
         from apps.settings.services import LoyaltyService
 
+        program = LoyaltyService.active_program(sale.organization)
+        # Plafond : les points ne soldent jamais toute la facture. Borné aussi
+        # par le reste à payer, sinon un règlement en points dépasserait le dû.
+        allowance = min(
+            remaining_loyalty_allowance(sale, program), sale.amount_due,
+        )
         loyalty_resolution = LoyaltyService.resolve_redemption(
-            sale.customer, sale.organization, points_used, sale.amount_due,
+            sale.customer, sale.organization, points_used, allowance,
             target_currency=sale.currency,
         )
         if loyalty_resolution is None:
             raise ValidationError(
                 "Points inutilisables : solde insuffisant, minimum non atteint, "
+                "part de la facture réglable en points déjà atteinte, "
                 "ou aucun programme de fidélité actif."
             )
         payments.append(create_payment(

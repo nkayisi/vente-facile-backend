@@ -188,10 +188,14 @@ class LoyaltyRedemptionTests(_BaseSaleFlowTest):
         self.loyalty.refresh_from_db()
         self.assertEqual(self.loyalty.current_points, 50)
 
-    def test_loyalty_points_capped_by_total(self):
-        """1000 points dispo mais total=2000 → max 200 points utilisables → cappé."""
+    def test_loyalty_points_capped_by_redemption_ceiling(self):
+        """1000 points dispo, total 2000, plafond 70 % → 140 points utilisables."""
         self.loyalty.current_points = 1000
         self.loyalty.save()
+        # Au maximum autorisé : la borne dure de 70 % est ce qui mord désormais,
+        # le total ne peut plus être le cap puisqu'il n'est jamais atteignable.
+        self.program.max_redemption_percent = Decimal('70.00')
+        self.program.save(update_fields=['max_redemption_percent'])
 
         self.client.force_authenticate(user=self.cashier_a)
         resp = self.client.post(
@@ -207,12 +211,12 @@ class LoyaltyRedemptionTests(_BaseSaleFlowTest):
             format='json', **self._headers(),
         )
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
-        # Cap : on ne peut pas déduire plus que le total (2000 CDF = 200 points).
-        self.assertEqual(Decimal(resp.data['loyalty_redemption_amount']), Decimal('2000.00'))
-        self.assertEqual(Decimal(resp.data['total']), Decimal('0.00'))
+        # 70 % de 2 000 = 1 400 CDF, soit 140 points à 10 CDF pièce.
+        self.assertEqual(Decimal(resp.data['loyalty_redemption_amount']), Decimal('1400.00'))
+        self.assertEqual(Decimal(resp.data['total']), Decimal('600.00'))
         self.loyalty.refresh_from_db()
-        # 1000 - 200 = 800 points restants
-        self.assertEqual(self.loyalty.current_points, 800)
+        # 1000 - 140 = 860 points restants
+        self.assertEqual(self.loyalty.current_points, 860)
 
 
 class AddPaymentAndCancelTests(_BaseSaleFlowTest):

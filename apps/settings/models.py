@@ -13,6 +13,11 @@ from apps.core.models import TenantModel, TimeStampedModel, UUIDModel
 # afficherait un bruit que le marchand ne saurait pas lire.
 POINT_PRECISION = Decimal('0.01')
 
+# Borne dure du plafond de rédemption : quelle que soit la configuration, une
+# facture garde toujours au moins 30 % à encaisser en monnaie. Le réglage de
+# l'organisation ne peut que durcir ce plafond, jamais le desserrer.
+MAX_REDEMPTION_PERCENT_CEILING = Decimal('70.00')
+
 
 def _as_points(value) -> Decimal:
     """
@@ -140,7 +145,22 @@ class LoyaltyProgram(TenantModel):
         default=100,
         help_text="Nombre minimum de points pour pouvoir les utiliser"
     )
-    
+
+    # Plafond de rédemption : part d'une facture réglable en points
+    max_redemption_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=Decimal('50.00'),
+        validators=[
+            MinValueValidator(Decimal('0.01')),
+            MaxValueValidator(MAX_REDEMPTION_PERCENT_CEILING),
+        ],
+        help_text=(
+            "Part maximale d'une facture réglable en points "
+            f"(maximum {MAX_REDEMPTION_PERCENT_CEILING:.0f} %)"
+        )
+    )
+
     # Expiration des points (0 = jamais)
     points_expiry_days = models.PositiveIntegerField(
         default=0,
@@ -201,6 +221,22 @@ class LoyaltyProgram(TenantModel):
     def calculate_redemption_value(self, points) -> Decimal:
         """Calcule la valeur monétaire des points."""
         return (Decimal(points) * self.point_value).quantize(Decimal('0.01'))
+
+    def max_redeemable_amount(self, amount) -> Decimal:
+        """
+        Part de ``amount`` réglable en points, dans la devise de ``amount``.
+
+        Seule source du plafond : les points ne soldent jamais toute une
+        facture, il reste toujours un montant à encaisser en monnaie. Le
+        réglage de l'organisation est re-borné ici par
+        ``MAX_REDEMPTION_PERCENT_CEILING`` : la garantie tient même sur une
+        ligne écrite hors validation (SQL direct, fixture ancienne).
+        """
+        amount = Decimal(amount or 0)
+        if amount <= 0:
+            return Decimal('0.00')
+        percent = min(self.max_redemption_percent, MAX_REDEMPTION_PERCENT_CEILING)
+        return (amount * percent / 100).quantize(Decimal('0.01'))
 
 
 class LoyaltyReward(TenantModel):

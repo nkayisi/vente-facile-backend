@@ -1171,15 +1171,22 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         sale.discount_amount = (items_discount_total + global_discount).quantize(TWO_PLACES)
 
         # Points de fidélité : appliquer comme réduction effective AVANT le total.
-        # Cappés à la fois par le solde points du client et par le total tentatif
-        # (pas de total négatif).
+        # Cappés par le solde points du client, par la part de la facture que le
+        # programme autorise à régler en points, et par le total tentatif (pas de
+        # total négatif). Le plafond garantit qu'il reste toujours un montant à
+        # encaisser en monnaie.
         loyalty_resolution = None
         sale.loyalty_redemption_amount = Decimal('0.00')
         if points_used > 0 and sale.customer:
             from apps.settings.services import LoyaltyService
             tentative_total = (items_subtotal - sale.discount_amount + tax_total).quantize(TWO_PLACES)
+            program = LoyaltyService.active_program(org)
+            max_redeemable = (
+                program.max_redeemable_amount(tentative_total)
+                if program else Decimal('0.00')
+            )
             loyalty_resolution = LoyaltyService.resolve_redemption(
-                sale.customer, org, points_used, tentative_total,
+                sale.customer, org, points_used, max_redeemable,
                 target_currency=sale.currency,
             )
             if loyalty_resolution:
