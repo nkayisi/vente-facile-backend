@@ -2,6 +2,7 @@
 Celery tasks for notifications and alerts.
 """
 from celery import shared_task
+from django.db.models import F
 from django.utils import timezone
 from datetime import timedelta
 
@@ -115,6 +116,170 @@ def check_expiring_products():
                     'quantity': float(batch.quantity)
                 }
             )
+
+
+@shared_task
+def check_customer_payment_due():
+    """
+    Alerte sur les créances clients : échéance proche, échéance dépassée, et
+    limite de crédit bientôt atteinte.
+
+    Les trois types d'alerte (`payment_due`, `payment_overdue`, `credit_limit`)
+    étaient déclarés dans `Alert.AlertType` depuis l'origine mais **aucune tâche
+    ne les produisait** : `Sale.due_date` était stocké et exposé sans que rien ne
+    le lise.
+
+    Idempotence : une alerte ACTIVE existante pour la même ressource n'est pas
+    recréée. Une facture passe de `payment_due` à `payment_overdue` quand
+    l'échéance tombe ; l'alerte d'échéance proche est alors résolue pour ne pas
+    laisser deux alertes concurrentes sur la même facture.
+    """
+    from django.conf import settings
+    from apps.contacts.models import Customer
+    from apps.notifications.models import Alert
+    from apps.sales.models import Sale
+
+    today = timezone.now().date()
+    warning_days = settings.VENTE_FACILE.get('PAYMENT_DUE_WARNING_DAYS', 3)
+    warning_date = today + timedelta(days=warning_days)
+
+    open_invoices = Sale.objects.filter(
+        status__in=[Sale.Status.PENDING, Sale.Status.PARTIALLY_PAID],
+        amount_due__gt=0,
+        customer__isnull=False,
+        due_date__isnull=False,
+    ).select_related('customer', 'organization')
+
+    def _alert_exists(organization, alert_type, resource_id):
+        return Alert.objects.filter(
+            organization=organization,
+            alert_type=alert_type,
+            resource_type='sale',
+            resource_id=resource_id,
+            status=Alert.Status.ACTIVE,
+        ).exists()
+
+    for sale in open_invoices.filter(due_date__lt=today):
+        days_late = (today - sale.due_date).days
+
+        # L'échéance est passée : l'alerte « bientôt dû » n'a plus d'objet.
+        Alert.objects.filter(
+            organization=sale.organization,
+            alert_type=Alert.AlertType.PAYMENT_DUE,
+            resource_type='sale',
+            resource_id=sale.id,
+            status=Alert.Status.ACTIVE,
+        ).update(status=Alert.Status.RESOLVED)
+
+        if _alert_exists(sale.organization, Alert.AlertType.PAYMENT_OVERDUE, sale.id):
+            continue
+
+        Alert.objects.create(
+            organization=sale.organization,
+            alert_type=Alert.AlertType.PAYMENT_OVERDUE,
+            severity=(
+                Alert.Severity.HIGH if days_late > 7 else Alert.Severity.MEDIUM
+            ),
+            title=f"Paiement en retard : {sale.customer.name}",
+            message=(
+                f"La facture {sale.reference} est échue depuis {days_late} jour(s). "
+                f"Reste à payer : {sale.amount_due} {sale.currency}."
+            ),
+            resource_type='sale',
+            resource_id=sale.id,
+            data={
+                'sale_id': str(sale.id),
+                'sale_reference': sale.reference,
+                'customer_id': str(sale.customer_id),
+                'customer_name': sale.customer.name,
+                'due_date': str(sale.due_date),
+                'days_late': days_late,
+                # Montant ET devise : une créance de 50 USD n'est pas une
+                # créance de 50 CDF.
+                'amount_due': str(sale.amount_due),
+                'currency': sale.currency,
+            },
+        )
+
+    for sale in open_invoices.filter(due_date__gte=today, due_date__lte=warning_date):
+        if _alert_exists(sale.organization, Alert.AlertType.PAYMENT_DUE, sale.id):
+            continue
+
+        days_left = (sale.due_date - today).days
+        Alert.objects.create(
+            organization=sale.organization,
+            alert_type=Alert.AlertType.PAYMENT_DUE,
+            severity=Alert.Severity.LOW,
+            title=f"Échéance proche : {sale.customer.name}",
+            message=(
+                f"La facture {sale.reference} arrive à échéance "
+                f"{'aujourd’hui' if days_left == 0 else f'dans {days_left} jour(s)'}. "
+                f"Reste à payer : {sale.amount_due} {sale.currency}."
+            ),
+            resource_type='sale',
+            resource_id=sale.id,
+            data={
+                'sale_id': str(sale.id),
+                'sale_reference': sale.reference,
+                'customer_id': str(sale.customer_id),
+                'customer_name': sale.customer.name,
+                'due_date': str(sale.due_date),
+                'days_left': days_left,
+                'amount_due': str(sale.amount_due),
+                'currency': sale.currency,
+            },
+        )
+
+    # Limite de crédit bientôt atteinte. `current_balance` et `credit_limit` sont
+    # tous deux exprimés en devise principale : la comparaison est homogène.
+    # Une limite à 0 signifie « illimité », il n'y a rien à surveiller.
+    threshold_percent = settings.VENTE_FACILE.get('CREDIT_LIMIT_WARNING_PERCENT', 80)
+    near_limit = Customer.objects.filter(
+        credit_limit__gt=0,
+        current_balance__gt=0,
+    ).filter(
+        current_balance__gte=F('credit_limit') * threshold_percent / 100,
+    ).select_related('organization')
+
+    for customer in near_limit:
+        if _customer_alert_exists(customer):
+            continue
+
+        used_percent = int(customer.current_balance / customer.credit_limit * 100)
+        Alert.objects.create(
+            organization=customer.organization,
+            alert_type=Alert.AlertType.CREDIT_LIMIT,
+            severity=(
+                Alert.Severity.HIGH if used_percent >= 100 else Alert.Severity.MEDIUM
+            ),
+            title=f"Limite de crédit : {customer.name}",
+            message=(
+                f"{customer.name} utilise {used_percent} % de sa limite de crédit "
+                f"({customer.current_balance} sur {customer.credit_limit})."
+            ),
+            resource_type='customer',
+            resource_id=customer.id,
+            data={
+                'customer_id': str(customer.id),
+                'customer_name': customer.name,
+                'current_balance': str(customer.current_balance),
+                'credit_limit': str(customer.credit_limit),
+                'used_percent': used_percent,
+            },
+        )
+
+
+def _customer_alert_exists(customer):
+    """Alerte de limite de crédit déjà active pour ce client."""
+    from apps.notifications.models import Alert
+
+    return Alert.objects.filter(
+        organization=customer.organization,
+        alert_type=Alert.AlertType.CREDIT_LIMIT,
+        resource_type='customer',
+        resource_id=customer.id,
+        status=Alert.Status.ACTIVE,
+    ).exists()
 
 
 @shared_task

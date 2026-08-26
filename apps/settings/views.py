@@ -51,16 +51,23 @@ class OrganizationCurrencyViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     pagination_class = None
     
+    # Les devises activées sont des données de RÉFÉRENCE (code, symbole,
+    # décimales, taux), pas un paramètre sensible : sans elles, impossible de
+    # formater un prix, de convertir un règlement ou de rendre la monnaie. Le
+    # POS en dépend entièrement, or le rôle caissier n'a pas `settings.view` :
+    # un caissier voyait donc tous les taux à 1 et les codes bruts en guise de
+    # symboles. La LECTURE est ouverte à tout membre de l'organisation ; la
+    # modification reste réservée à `settings.manage`.
     action_permissions = {
-        'list': 'settings.view',
-        'retrieve': 'settings.view',
+        'list': '*',
+        'retrieve': '*',
+        'convert': '*',
         'create': 'settings.manage',
         'update': 'settings.manage',
         'partial_update': 'settings.manage',
         'destroy': 'settings.manage',
         'set_primary': 'settings.manage',
         'update_rate': 'settings.manage',
-        'convert': 'settings.view',
     }
     
     def get_serializer_class(self):

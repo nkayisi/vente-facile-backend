@@ -36,8 +36,16 @@ def _get_default_currency_info(organization):
 # =============================================================================
 
 class OrganizationListSerializer(serializers.ModelSerializer):
-    """Serializer léger pour les listes d'organisations."""
-    
+    """Serializer léger pour les listes d'organisations.
+
+    Porte l'identité imprimable (adresse, téléphone, mentions légales) parce que
+    c'est cette liste que consomme le front pour construire l'en-tête des reçus :
+    le POS et le détail de vente alimentent leur contexte `organization` depuis
+    `GET /organizations/`, puis lisent `organization.address` et
+    `organization.phone`. Tant que ces champs manquaient ici, ils valaient
+    `undefined` et tous les tickets sortaient avec le seul nom de la boutique.
+    """
+
     business_type_display = serializers.CharField(
         source='get_business_type_display', read_only=True
     )
@@ -48,7 +56,9 @@ class OrganizationListSerializer(serializers.ModelSerializer):
         model = Organization
         fields = [
             'id', 'name', 'slug', 'business_type', 'business_type_display',
-            'logo', 'is_active', 'members_count', 'default_currency_info', 'created_at'
+            'logo', 'email', 'phone', 'address', 'city', 'country',
+            'tax_id', 'rccm', 'id_nat',
+            'is_active', 'members_count', 'default_currency_info', 'created_at'
         ]
         read_only_fields = ['id', 'slug', 'created_at']
 

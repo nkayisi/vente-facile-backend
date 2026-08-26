@@ -35,6 +35,13 @@ class Customer(TenantSyncableModel):
     
     tax_id = models.CharField(max_length=50, blank=True)
     
+    # Autorisation d'acheter à crédit, indépendante du montant : `credit_limit`
+    # à 0 signifie « pas de plafond », pas « pas de crédit ». Les deux règles
+    # sont distinctes et se cumulent - un client autorisé peut avoir un plafond,
+    # un client non autorisé ne peut rien prendre à crédit quel que soit le sien.
+    # Défaut à True : les clients existants gardent leur comportement.
+    allow_credit = models.BooleanField(default=True)
+
     credit_limit = models.DecimalField(
         max_digits=15,
         decimal_places=2,
@@ -96,10 +103,17 @@ class Customer(TenantSyncableModel):
         return self.credit_limit - self.current_balance
 
     def get_total_purchases(self):
-        return self.sales.filter(
-            status='completed'
-        ).aggregate(
-            total=models.Sum('total')
+        """
+        Total acheté, converti en devise principale.
+
+        Un `Sum('total')` brut additionnait 50 USD et 40 000 CDF comme des
+        nombres nus. `Supplier.get_total_purchases` convertissait déjà ; les deux
+        côtés du carnet d'adresses suivent maintenant la même règle.
+        """
+        from apps.cashbook.services import primary_sum
+
+        return self.sales.filter(status='completed').aggregate(
+            total=primary_sum('total')
         )['total'] or Decimal('0.00')
 
 
@@ -204,8 +218,15 @@ class CustomerTransaction(TenantModel):
         decimal_places=2
     )
 
+    # Référence EXTERNE saisie par le caissier (numéro de transaction mobile
+    # money, de chèque). À ne pas confondre avec `receipt_number`.
     reference = models.CharField(max_length=100, blank=True)
-    
+
+    # Numéro de la pièce remise au client, alloué par `core.numbering` :
+    # RGL- pour un règlement, AVC- pour une avance, AJU- pour un ajustement.
+    # Stable d'une réimpression à l'autre. Vide pour les mouvements antérieurs.
+    receipt_number = models.CharField(max_length=32, blank=True, db_index=True)
+
     sale = models.ForeignKey(
         'sales.Sale',
         on_delete=models.SET_NULL,

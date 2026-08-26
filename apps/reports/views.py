@@ -14,8 +14,11 @@ from django.db.models import (
     Case,
     When,
     Value,
+    DateField,
 )
-from django.db.models.functions import Coalesce, TruncDate, TruncWeek, TruncMonth, TruncHour
+from django.db.models.functions import (
+    Cast, Coalesce, TruncDate, TruncWeek, TruncMonth, TruncHour,
+)
 from django.utils import timezone
 from collections import defaultdict
 from datetime import timedelta
@@ -35,6 +38,7 @@ from apps.products.models import Product
 from apps.inventory.models import Stock, StockBatch
 from apps.inventory.packaging import PackagingService
 from apps.contacts.models import Customer
+from apps.settings.services import CurrencyService
 from apps.cashbook.models import CashMovement, Expense
 # Agrégations comptables : les montants de caisse/dépenses sont convertis en
 # devise principale (montant × exchange_rate) avant d'être sommés. Le livre de
@@ -140,6 +144,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         'cash_flow': 'reports.view',
         'daily_cash_report': 'reports.view',
         'customers': 'reports.view',
+        'receivables': 'reports.view',
         'profit_margins': 'reports.view',
         'product_profits': 'reports.view',
         'sales_by_packaging': 'reports.view',
@@ -729,12 +734,17 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             request,
         ).select_related('customer')
         
+        # Converti en devise principale : un `Sum('total')` brut classait un
+        # client à 50 USD derrière un client à 40 000 CDF en comparant des
+        # nombres nus. `current_balance` est déjà exprimé en principale.
+        from apps.cashbook.services import primary_sum
+
         data = sales.values(
             'customer__id',
             'customer__name',
             'customer__current_balance'
         ).annotate(
-            total_purchases=Coalesce(Sum('total'), Decimal('0'), output_field=DecimalField()),
+            total_purchases=primary_sum('total'),
             order_count=Count('id')
         ).order_by('-total_purchases')
         
@@ -848,6 +858,116 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         stats = self._get_customer_stats(org, start_date, end_date)
         serializer = CustomerStatsSerializer(stats)
         return Response(serializer.data)
+
+    @action(detail=False, methods=['get'])
+    def receivables(self, request):
+        """
+        Balance âgée des créances clients, ventilée par devise.
+
+        Le seul chiffre existant jusqu'ici (`total_receivables`) était la somme
+        des `current_balance`, un agrégat converti en devise principale : utile
+        pour un total, muet sur l'ancienneté et sur la devise réellement due.
+        Un marchand qui doit relancer a besoin de savoir QUI est en retard, de
+        COMBIEN et DEPUIS QUAND.
+
+        Tranches calculées depuis `due_date`, avec repli sur `sale_date` quand
+        aucune échéance n'a été fixée : une facture sans échéance vieillit
+        quand même. Les montants ne sont jamais additionnés entre devises ;
+        `total_primary` fournit à part la conversion en devise principale.
+        """
+        from apps.cashbook.services import primary_sum
+
+        org = self.get_organization()
+        today = timezone.now().date()
+
+        open_invoices = self._scope_sales(
+            Sale.objects.filter(
+                organization=org,
+                status__in=[Sale.Status.PENDING, Sale.Status.PARTIALLY_PAID],
+                amount_due__gt=0,
+                customer__isnull=False,
+            ),
+            request,
+        ).select_related('customer')
+
+        # Ancienneté : échéance si elle existe, sinon date de vente.
+        reference_date = Coalesce('due_date', Cast('sale_date', DateField()))
+        open_invoices = open_invoices.annotate(aging_date=reference_date)
+
+        buckets = [
+            ('current', None, 0),
+            ('d1_30', 1, 30),
+            ('d31_60', 31, 60),
+            ('d61_90', 61, 90),
+            ('d90_plus', 91, None),
+        ]
+
+        def bucket_for(days_late):
+            if days_late <= 0:
+                return 'current'
+            if days_late <= 30:
+                return 'd1_30'
+            if days_late <= 60:
+                return 'd31_60'
+            if days_late <= 90:
+                return 'd61_90'
+            return 'd90_plus'
+
+        by_currency = {}
+        by_customer = {}
+
+        for sale in open_invoices:
+            days_late = (today - sale.aging_date).days
+            slot = bucket_for(days_late)
+
+            row = by_currency.setdefault(
+                sale.currency,
+                {'currency': sale.currency, 'total': Decimal('0.00'),
+                 **{name: Decimal('0.00') for name, _, _ in buckets}},
+            )
+            row[slot] += sale.amount_due
+            row['total'] += sale.amount_due
+
+            key = (sale.customer_id, sale.currency)
+            entry = by_customer.setdefault(key, {
+                'customer_id': str(sale.customer_id),
+                'customer_name': sale.customer.name,
+                'currency': sale.currency,
+                'amount_due': Decimal('0.00'),
+                'invoice_count': 0,
+                'oldest_days': 0,
+                'overdue_amount': Decimal('0.00'),
+            })
+            entry['amount_due'] += sale.amount_due
+            entry['invoice_count'] += 1
+            entry['oldest_days'] = max(entry['oldest_days'], days_late)
+            if days_late > 0:
+                entry['overdue_amount'] += sale.amount_due
+
+        total_primary = open_invoices.aggregate(
+            total=primary_sum('amount_due')
+        )['total'] or Decimal('0.00')
+
+        overdue_primary = open_invoices.filter(
+            aging_date__lt=today
+        ).aggregate(total=primary_sum('amount_due'))['total'] or Decimal('0.00')
+
+        debtors = sorted(
+            by_customer.values(), key=lambda e: e['amount_due'], reverse=True,
+        )
+
+        return Response({
+            'as_of': str(today),
+            'buckets': [name for name, _, _ in buckets],
+            'by_currency': sorted(by_currency.values(), key=lambda r: r['currency']),
+            'by_customer': debtors,
+            'invoice_count': open_invoices.count(),
+            'debtor_count': len({cid for cid, _ in by_customer}),
+            # Seuls chiffres convertis, et clairement nommés comme tels.
+            'total_primary': total_primary,
+            'overdue_primary': overdue_primary,
+            'primary_currency': CurrencyService.primary_code(org),
+        })
     
     # ========================================================================
     # HELPER METHODS

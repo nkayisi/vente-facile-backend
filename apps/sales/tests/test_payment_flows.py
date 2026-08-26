@@ -309,3 +309,183 @@ class AddPaymentAndCancelTests(_BaseSaleFlowTest):
 
         sale = Sale.objects.get(pk=sale_id)
         self.assertEqual(sale.status, 'cancelled')
+
+
+class SaleListContractTests(_BaseSaleFlowTest):
+    """
+    Le serializer de LISTE doit accompagner ses montants de leur devise.
+
+    `SaleListSerializer` n'exposait ni `currency`, ni `exchange_rate`, ni
+    `due_date`, alors que toutes les surfaces de liste (fiche client, paiements
+    en attente, liste des ventes) lisent ces champs pour formater et convertir.
+    À l'exécution ils valaient `undefined` : l'interface affichait
+    « 50 undefined » et les règlements en devise étrangère n'étaient jamais
+    convertis.
+
+    Le type TS `Sale` les déclarant obligatoires, la compilation ne pouvait pas
+    attraper l'écart : ce test est le seul garde-fou.
+    """
+
+    def _list(self):
+        self.client.force_authenticate(user=self.manager)
+        resp = self.client.get('/api/v1/sales/', **self._headers())
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        return resp.data['results']
+
+    def _create_paid_sale(self, **overrides):
+        self.client.force_authenticate(user=self.cashier_a)
+        resp = self.client.post(
+            '/api/v1/sales/',
+            self._base_sale_payload(
+                payments=[{
+                    'payment_method': str(self.payment_method.id),
+                    'amount': '2000.00',
+                }],
+                **overrides,
+            ),
+            format='json', **self._headers(),
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+        return resp.data
+
+    def test_list_exposes_the_fields_needed_to_interpret_amounts(self):
+        self._create_paid_sale()
+
+        row = self._list()[0]
+        for field in ('currency', 'exchange_rate', 'change_currency', 'due_date'):
+            self.assertIn(field, row, f"`{field}` manque au serializer de liste")
+        self.assertTrue(row['currency'], "la devise ne doit jamais être vide")
+
+    def test_list_currency_matches_the_detail(self):
+        detail = self._create_paid_sale()
+
+        self.assertEqual(self._list()[0]['currency'], detail['currency'])
+
+
+class LoyaltyAllowanceExposureTests(LoyaltyRedemptionTests):
+    """
+    `loyalty_max_redeemable` doit dire ce que le serveur autorisera vraiment.
+
+    L'écran de règlement d'une facture calculait son « Maximum » sur le seul
+    reste à payer : il proposait des points que `resolve_redemption` refusait
+    ensuite dès que `max_redemption_percent` était plus serré. Le plafond est
+    désormais calculé par la fonction que `apply_payment_to_sale` applique
+    lui-même, et exposé tel quel.
+    """
+
+    def _credit_sale(self, unit_price='2000.00'):
+        """Facture émise et laissée entièrement due."""
+        self.client.force_authenticate(user=self.cashier_a)
+        resp = self.client.post(
+            '/api/v1/sales/',
+            self._base_sale_payload(
+                sale_type='credit',
+                customer=str(self.customer.id),
+                items=[{
+                    'product': str(self.product.id),
+                    'quantity': '1',
+                    'unit_price': unit_price,
+                }],
+                payments=[],
+            ),
+            format='json', **self._headers(),
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
+        return resp.data
+
+    def _detail(self, sale_id):
+        self.client.force_authenticate(user=self.manager)
+        resp = self.client.get(f'/api/v1/sales/{sale_id}/', **self._headers())
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        return resp.data
+
+    def test_allowance_follows_the_program_ceiling(self):
+        self.program.max_redemption_percent = Decimal('25.00')
+        self.program.save(update_fields=['max_redemption_percent'])
+
+        sale = self._credit_sale()
+
+        # 25 % de 2 000 = 500, bien en deçà du reste à payer (2 000).
+        self.assertEqual(
+            Decimal(self._detail(sale['id'])['loyalty_max_redeemable']),
+            Decimal('500.00'),
+        )
+
+    def test_allowance_is_capped_by_what_is_still_due(self):
+        self.program.max_redemption_percent = Decimal('100.00')
+        self.program.save(update_fields=['max_redemption_percent'])
+
+        sale = self._credit_sale()
+        self.client.force_authenticate(user=self.cashier_a)
+        self.client.post(
+            f"/api/v1/sales/{sale['id']}/add-payment/",
+            {'payment_method': str(self.payment_method.id), 'amount': '1500.00'},
+            format='json', **self._headers(),
+        )
+
+        # Le plafond vaut 2 000, mais il ne reste que 500 à payer.
+        self.assertEqual(
+            Decimal(self._detail(sale['id'])['loyalty_max_redeemable']),
+            Decimal('500.00'),
+        )
+
+    def test_allowance_shrinks_after_a_payment_in_points(self):
+        self.program.max_redemption_percent = Decimal('50.00')
+        self.program.save(update_fields=['max_redemption_percent'])
+
+        sale = self._credit_sale()
+        self.client.force_authenticate(user=self.cashier_a)
+        resp = self.client.post(
+            f"/api/v1/sales/{sale['id']}/add-payment/",
+            {'points_used': '50'},   # 50 pts × 10 = 500
+            format='json', **self._headers(),
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+
+        # Le plafond porte sur le TOTAL (50 % de 2 000 = 1 000) et retranche ce
+        # qui a déjà été réglé en points : 1 000 - 500 = 500. Sans cette
+        # soustraction, deux règlements successifs dépasseraient la part
+        # autorisée sans jamais la franchir en apparence.
+        self.assertEqual(
+            Decimal(self._detail(sale['id'])['loyalty_max_redeemable']),
+            Decimal('500.00'),
+        )
+
+    def test_a_program_set_above_the_hard_ceiling_is_re_bounded(self):
+        """
+        `MAX_REDEMPTION_PERCENT_CEILING` (70 %) borne le réglage de
+        l'organisation. L'écran doit lire la valeur re-bornée, pas le réglage
+        brut : sinon il proposerait 100 % d'une facture que le serveur refuse.
+        """
+        self.program.max_redemption_percent = Decimal('100.00')
+        self.program.save(update_fields=['max_redemption_percent'])
+
+        sale = self._credit_sale()
+
+        # 70 % de 2 000, et non 100 %.
+        self.assertEqual(
+            Decimal(self._detail(sale['id'])['loyalty_max_redeemable']),
+            Decimal('1400.00'),
+        )
+
+    def test_the_maximum_offered_is_accepted_by_the_server(self):
+        """Le contrat qui manquait : ce qu'on propose doit passer."""
+        self.program.max_redemption_percent = Decimal('25.00')
+        self.program.save(update_fields=['max_redemption_percent'])
+
+        sale = self._credit_sale()
+        allowance = Decimal(self._detail(sale['id'])['loyalty_max_redeemable'])
+        points = allowance / self.program.point_value
+
+        self.client.force_authenticate(user=self.cashier_a)
+        resp = self.client.post(
+            f"/api/v1/sales/{sale['id']}/add-payment/",
+            {'points_used': str(points)},
+            format='json', **self._headers(),
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        self.assertEqual(
+            Decimal(self._detail(sale['id'])['loyalty_max_redeemable']),
+            Decimal('0.00'),
+        )

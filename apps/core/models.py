@@ -157,3 +157,40 @@ class TenantSyncableModel(TenantSoftDeleteModel, SyncableModel):
     
     class Meta:
         abstract = True
+
+
+class DocumentSequence(models.Model):
+    """
+    Compteur de numérotation des documents imprimés, par organisation et par an.
+
+    Les reçus de règlement portaient jusqu'ici un numéro fabriqué dans le
+    navigateur (`PAY-` suivi d'un horodatage en base 36). Il n'était ni stocké ni
+    retrouvable, et surtout il CHANGEAIT à chaque réimpression : un client qui
+    revenait avec son ticket ne pouvait prouver aucun paiement.
+
+    Le numéro est alloué ici, sous verrou de ligne, et apposé sur les lignes que
+    l'opération crée. Une même opération ne consomme qu'un seul numéro, même
+    lorsqu'elle écrit plusieurs lignes (un règlement qui solde trois factures
+    crée trois `Payment` et porte un seul numéro de reçu).
+    """
+
+    organization = models.ForeignKey(
+        'organizations.Organization',
+        on_delete=models.CASCADE,
+        related_name='document_sequences',
+    )
+    prefix = models.CharField(max_length=8)
+    year = models.PositiveIntegerField()
+    last_value = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        db_table = 'document_sequences'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['organization', 'prefix', 'year'],
+                name='unique_document_sequence_per_org_prefix_year',
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.prefix}-{self.year}: {self.last_value}"

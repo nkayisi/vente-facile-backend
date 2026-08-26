@@ -481,11 +481,11 @@ class PaymentSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'payment_method', 'payment_method_name',
             'amount', 'tendered_amount', 'currency', 'exchange_rate',
-            'reference', 'status',
+            'reference', 'receipt_number', 'status',
             'received_by', 'received_by_name',
             'paid_at', 'notes'
         ]
-        read_only_fields = ['id', 'paid_at']
+        read_only_fields = ['id', 'paid_at', 'receipt_number']
 
 
 class PaymentCreateSerializer(serializers.ModelSerializer):
@@ -536,24 +536,38 @@ class PaymentCreateSerializer(serializers.ModelSerializer):
 # =============================================================================
 
 class SaleListSerializer(serializers.ModelSerializer):
-    """Serializer léger pour les listes de ventes."""
-    
+    """
+    Serializer léger pour les listes de ventes.
+
+    « Léger » ne veut pas dire « sans devise ». Tous les montants exposés ici
+    (`total`, `amount_paid`, `amount_due`…) sont libellés dans `currency` : les
+    omettre laissait le client afficher une facture de 50 USD comme « 50 FC »,
+    puis, une fois le formatage corrigé pour lire la devise de la vente,
+    afficher littéralement « 50 undefined ». `due_date` est dans le même cas :
+    sans lui, aucune surface de liste ne peut signaler une échéance dépassée.
+
+    Règle : tout champ dont dépend l'interprétation d'un montant ou d'une date
+    doit accompagner ce montant, y compris dans un serializer de liste.
+    """
+
     customer_name = serializers.CharField(source='customer.name', read_only=True)
+    customer_phone = serializers.CharField(source='customer.phone', read_only=True)
     sold_by_name = serializers.CharField(source='sold_by.full_name', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     sale_type_display = serializers.CharField(source='get_sale_type_display', read_only=True)
     items_count = serializers.SerializerMethodField()
-    
+
     class Meta:
         model = Sale
         fields = [
-            'id', 'reference', 'customer', 'customer_name',
+            'id', 'reference', 'customer', 'customer_name', 'customer_phone',
             'sale_type', 'sale_type_display',
             'status', 'status_display',
             'subtotal', 'tax_amount', 'discount_percentage', 'discount_amount', 'total',
             'amount_paid', 'amount_due',
+            'currency', 'exchange_rate', 'change_currency',
             'sold_by', 'sold_by_name',
-            'sale_date', 'items_count', 'is_pos'
+            'sale_date', 'due_date', 'items_count', 'is_pos'
         ]
         read_only_fields = ['id', 'reference', 'sale_date']
 
@@ -597,6 +611,7 @@ class SaleDetailSerializer(serializers.ModelSerializer):
     loyalty_points_used = serializers.SerializerMethodField()
     loyalty_points_balance = serializers.SerializerMethodField()
     loyalty_program_active = serializers.SerializerMethodField()
+    loyalty_max_redeemable = serializers.SerializerMethodField()
 
     class Meta:
         model = Sale
@@ -616,6 +631,7 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             'items', 'payments', 'unpacking_notices',
             'loyalty_points_earned', 'loyalty_points_used',
             'loyalty_points_balance', 'loyalty_program_active',
+            'loyalty_max_redeemable',
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'reference', 'sale_date', 'created_at', 'updated_at']
@@ -747,10 +763,65 @@ class SaleDetailSerializer(serializers.ModelSerializer):
 
         return LoyaltyService.active_program(obj.organization) is not None
 
+    def get_loyalty_max_redeemable(self, obj):
+        """
+        Part de CETTE facture encore réglable en points, dans sa devise.
+
+        Exposé pour que l'interface n'ait pas à rejouer le plafond du programme.
+        Elle proposait un « Maximum » borné par le seul reste à payer, que
+        ``resolve_redemption`` refusait ensuite dès que
+        ``max_redemption_percent`` était plus serré : le caissier lisait un
+        nombre de points utilisable, le saisissait, et se voyait répondre
+        « Points inutilisables ».
+
+        On appelle ici la fonction que ``apply_payment_to_sale`` applique
+        lui-même, bornée par ``amount_due`` de la même façon : la règle n'existe
+        qu'à un seul endroit et l'écran ne peut plus en diverger.
+        """
+        from apps.sales.services import remaining_loyalty_allowance
+        from apps.settings.services import LoyaltyService
+
+        program = LoyaltyService.active_program(obj.organization)
+        if program is None:
+            return '0.00'
+
+        allowance = min(remaining_loyalty_allowance(obj, program), obj.amount_due)
+        return str(max(Decimal('0.00'), allowance))
+
     @staticmethod
     def _tx_types():
         from apps.settings.models import LoyaltyTransaction
         return LoyaltyTransaction.TransactionType
+
+
+class SaleUpdateSerializer(SaleDetailSerializer):
+    """
+    Mise à jour d'une vente : seules les annotations sont modifiables.
+
+    ``SaleDetailSerializer`` servait aussi de serializer d'entrée à ``update`` /
+    ``partial_update`` et laissait ``customer``, ``total``, ``amount_paid``,
+    ``amount_due``, ``status`` et la devise writables. Un simple PATCH pouvait
+    donc réécrire les montants sans toucher ``CustomerBalance``, solder une
+    facture sans encaissement, ou déplacer la vente vers un autre client en
+    laissant la dette chez l'ancien.
+
+    Les montants d'une vente ne bougent que par un règlement, une annulation ou
+    un retour : trois chemins qui passent tous par les services et tiennent la
+    dette à jour. Le reste est en lecture seule.
+    """
+
+    class Meta(SaleDetailSerializer.Meta):
+        read_only_fields = [
+            'id', 'reference',
+            'session', 'register', 'warehouse',
+            'customer', 'sale_type', 'status', 'price_list',
+            'subtotal', 'tax_amount', 'discount_amount', 'discount_percentage',
+            'loyalty_redemption_amount', 'total',
+            'amount_paid', 'amount_due', 'change_amount', 'change_currency',
+            'currency', 'exchange_rate',
+            'sold_by', 'sale_date', 'is_pos', 'receipt_printed',
+            'created_at', 'updated_at',
+        ]
 
 
 class SaleCreateSerializer(serializers.ModelSerializer):
@@ -976,6 +1047,16 @@ class SaleCreateSerializer(serializers.ModelSerializer):
                     'customer': (
                         f"Le client « {customer.name} » est suspendu ou désactivé "
                         "et ne peut pas effectuer d'achat à crédit."
+                    )
+                })
+            # `apply_debt` refuse déjà en fin de course, mais le caissier doit
+            # l'apprendre avant d'avoir composé tout le panier.
+            if not getattr(customer, 'allow_credit', True):
+                raise serializers.ValidationError({
+                    'customer': (
+                        f"Le client « {customer.name} » n'est pas autorisé à "
+                        "acheter à crédit. Activez l'autorisation de crédit sur "
+                        "sa fiche."
                     )
                 })
 
@@ -1264,19 +1345,20 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         # dans la gestion de la dette.
         #
         # `amount_due` est déjà net de l'acompte encaissé plus haut.
+        #
+        # `register_sale_debt` consomme aussi l'avance éventuelle du client dans
+        # la devise de la facture : sans cela la vente restait `pending` avec un
+        # `amount_due` positif alors que le client ne devait plus rien.
         if sale.customer and sale.amount_due > 0:
-            from apps.contacts import services as contacts_services
-            contacts_services.apply_debt(
-                sale.customer, sale.amount_due,
-                currency=sale.currency,
-                sale=sale,
-                reference=sale.reference,
+            from .services import register_sale_debt
+
+            register_sale_debt(
+                sale, self.context['request'].user,
                 notes=(
                     f"Vente à crédit {sale.reference}"
                     if sale.sale_type == 'credit'
                     else f"Reste à payer sur vente {sale.reference}"
                 ),
-                user=self.context['request'].user,
             )
 
         # Persister la consommation de points et la transaction loyalty maintenant

@@ -507,6 +507,10 @@ VENTE_FACILE = {
     'RECEIPT_LOGO_MAX_SIZE': (200, 100),
     'LOW_STOCK_THRESHOLD_DAYS': 7,
     'EXPIRY_WARNING_DAYS': 30,
+    # Créances clients : à combien de jours de l'échéance on prévient, et à
+    # quel pourcentage de la limite de crédit on alerte.
+    'PAYMENT_DUE_WARNING_DAYS': 3,
+    'CREDIT_LIMIT_WARNING_PERCENT': 80,
     'SESSION_TIMEOUT_MINUTES': 480,
     'MAX_LOGIN_ATTEMPTS': 5,
     'LOCKOUT_DURATION_MINUTES': 30,

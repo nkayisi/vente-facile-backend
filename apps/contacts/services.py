@@ -20,7 +20,6 @@ créditeur (avance non encore consommée).
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import F
 
 from apps.settings.services import CurrencyService
 
@@ -31,6 +30,28 @@ TWO_PLACES = Decimal('0.01')
 
 def _quantize(amount):
     return Decimal(amount or 0).quantize(TWO_PLACES)
+
+
+def _lock_customer(customer):
+    """
+    Sérialise toutes les écritures de dette d'un même client.
+
+    Le verrou de `_move_balance` ne porte que sur la ligne de devise, ce qui ne
+    suffit pas pour deux raisons :
+
+    - `current_balance` est **recalculé** depuis toutes les lignes de devise puis
+      réécrit. Deux règlements concurrents dans deux devises différentes ne se
+      bloquaient pas et écrasaient mutuellement leur recalcul (lost update) ;
+      l'agrégat dérivait alors des `CustomerBalance` qu'il est censé résumer.
+    - Le contrôle de limite de crédit de `apply_debt` lit le solde **avant** tout
+      verrou : deux ventes à crédit simultanées pouvaient chacune valider la
+      limite et la dépasser ensemble.
+
+    Le verrou est pris sur la ligne `Customer`, avant toute lecture qui décide.
+    `with_deleted()` : un client archivé conserve sa dette, on doit pouvoir la
+    solder.
+    """
+    Customer.objects.with_deleted().select_for_update().filter(pk=customer.pk).first()
 
 
 def get_balance(customer, currency):
@@ -104,16 +125,30 @@ def _move_balance(customer, delta, currency, exchange_rate=None):
 def apply_debt(customer, amount, *, currency=None, exchange_rate=None,
                transaction_type=CustomerTransaction.TransactionType.CREDIT_SALE,
                sale=None, reference='', notes='', user=None,
-               enforce_credit_limit=True):
+               enforce_credit_limit=True, receipt_number=''):
     """
     Inscrit une dette (le client doit davantage).
 
     ``enforce_credit_limit`` compare la dette totale convertie en devise
     principale à ``credit_limit``, qui est lui aussi exprimé en principale.
+    Un ``credit_limit`` à 0 signifie **illimité**, pas « crédit interdit » :
+    l'autorisation d'acheter à crédit est portée par ``Customer.allow_credit``.
     """
     amount = _quantize(amount)
     if amount <= 0:
         return None
+
+    _lock_customer(customer)
+
+    if enforce_credit_limit and not customer.allow_credit:
+        from rest_framework.exceptions import ValidationError
+        raise ValidationError({
+            'customer': (
+                f"{customer.name} n'est pas autorisé à acheter à crédit. "
+                "Activez l'autorisation de crédit sur sa fiche pour lui laisser "
+                "une facture ouverte."
+            )
+        })
 
     if enforce_credit_limit and customer.credit_limit > 0:
         added_primary = CurrencyService.convert_to_primary(
@@ -146,6 +181,7 @@ def apply_debt(customer, amount, *, currency=None, exchange_rate=None,
         balance_after=after,
         sale=sale,
         reference=reference,
+        receipt_number=receipt_number,
         notes=notes,
         created_by=user,
     )
@@ -157,14 +193,20 @@ def apply_debt(customer, amount, *, currency=None, exchange_rate=None,
 def settle_debt(customer, amount, *, currency=None, exchange_rate=None,
                 transaction_type=CustomerTransaction.TransactionType.PAYMENT,
                 sale=None, reference='', notes='', user=None,
-                payment_method=''):
+                payment_method='', receipt_number=''):
     """
     Réduit la dette (le client a payé). Un excédent rend le solde négatif :
     le client devient créditeur, l'avance sera consommée par une vente future.
+
+    ``receipt_number`` est imposé par l'opération appelante, jamais alloué ici :
+    un règlement qui solde trois factures crée trois mouvements et doit porter un
+    seul numéro de reçu, celui du papier remis au client.
     """
     amount = _quantize(amount)
     if amount <= 0:
         return None
+
+    _lock_customer(customer)
 
     before, after, currency, rate = _move_balance(
         customer, -amount, currency, exchange_rate,
@@ -182,6 +224,7 @@ def settle_debt(customer, amount, *, currency=None, exchange_rate=None,
         reference=reference,
         notes=notes,
         payment_method=payment_method,
+        receipt_number=receipt_number,
         created_by=user,
     )
     recompute_primary_balance(customer)
@@ -190,11 +233,13 @@ def settle_debt(customer, amount, *, currency=None, exchange_rate=None,
 
 @transaction.atomic
 def adjust_balance(customer, signed_amount, *, currency=None, exchange_rate=None,
-                   notes='', user=None):
+                   notes='', user=None, receipt_number=''):
     """Ajustement manuel : positif augmente la dette, négatif la réduit."""
     signed_amount = _quantize(signed_amount)
     if signed_amount == 0:
         return None
+
+    _lock_customer(customer)
 
     before, after, currency, rate = _move_balance(
         customer, signed_amount, currency, exchange_rate,
@@ -209,6 +254,7 @@ def adjust_balance(customer, signed_amount, *, currency=None, exchange_rate=None
         balance_before=before,
         balance_after=after,
         notes=notes,
+        receipt_number=receipt_number,
         created_by=user,
     )
     recompute_primary_balance(customer)

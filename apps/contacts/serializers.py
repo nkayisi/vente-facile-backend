@@ -33,6 +33,12 @@ class CustomerListSerializer(CustomerBalancesMixin, serializers.ModelSerializer)
     customer_type_display = serializers.CharField(
         source='get_customer_type_display', read_only=True
     )
+    # Le POS choisit son client depuis CETTE liste : sans `available_credit` ni
+    # `allow_credit` ici, il refaisait le calcul `credit_limit - current_balance`
+    # à la main, en trois endroits, avec le risque de diverger du backend.
+    available_credit = serializers.DecimalField(
+        max_digits=15, decimal_places=2, read_only=True
+    )
     
     class Meta:
         model = Customer
@@ -40,7 +46,8 @@ class CustomerListSerializer(CustomerBalancesMixin, serializers.ModelSerializer)
             'id', 'code', 'name', 'company_name',
             'customer_type', 'customer_type_display',
             'email', 'phone', 'address', 'tax_id',
-            'credit_limit', 'current_balance', 'balances',
+            'allow_credit', 'credit_limit', 'current_balance', 'balances',
+            'available_credit',
             'is_active'
         ]
         read_only_fields = ['id', 'code']
@@ -65,7 +72,8 @@ class CustomerDetailSerializer(CustomerBalancesMixin, serializers.ModelSerialize
             'id', 'code', 'customer_type', 'customer_type_display',
             'name', 'company_name',
             'email', 'phone', 'address', 'tax_id',
-            'credit_limit', 'current_balance', 'available_credit', 'balances',
+            'allow_credit', 'credit_limit', 'current_balance',
+            'available_credit', 'balances',
             'notes', 'is_active',
             'created_by', 'created_by_name',
             'total_purchases', 'recent_sales',
@@ -87,6 +95,9 @@ class CustomerDetailSerializer(CustomerBalancesMixin, serializers.ModelSerialize
                 'id': str(sale.id),
                 'reference': sale.reference,
                 'total': str(sale.total),
+                # Sans la devise, le client affichait ces totaux avec le symbole
+                # de la devise principale : une vente de 50 USD se lisait « 50 FC ».
+                'currency': sale.currency,
                 'date': sale.sale_date
             }
             for sale in sales
@@ -101,7 +112,7 @@ class CustomerCreateSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'code', 'customer_type', 'name', 'company_name',
             'email', 'phone', 'address', 'tax_id',
-            'credit_limit', 'notes', 'is_active',
+            'allow_credit', 'credit_limit', 'notes', 'is_active',
         ]
         read_only_fields = ['id', 'code']
         extra_kwargs = {
@@ -136,7 +147,7 @@ class CustomerUpdateSerializer(serializers.ModelSerializer):
         fields = [
             'customer_type', 'name', 'company_name',
             'email', 'phone', 'address', 'tax_id',
-            'credit_limit', 'notes', 'is_active'
+            'allow_credit', 'credit_limit', 'notes', 'is_active'
         ]
         extra_kwargs = {
             'name': {'required': True, 'allow_blank': False},
@@ -175,20 +186,30 @@ class CustomerTransactionSerializer(serializers.ModelSerializer):
             'id', 'transaction_type', 'transaction_type_display',
             'amount', 'currency', 'exchange_rate',
             'balance_before', 'balance_after',
-            'reference', 'sale', 'sale_reference',
+            'reference', 'receipt_number', 'sale', 'sale_reference',
             'payment_method', 'notes',
             'created_by', 'created_by_name',
             'created_at'
         ]
-        read_only_fields = ['id', 'created_at']
+        read_only_fields = ['id', 'created_at', 'receipt_number']
 
 
 class RecordPaymentSerializer(serializers.Serializer):
     """
-    Serializer pour enregistrer un paiement ou une avance client.
+    Serializer pour enregistrer un règlement client.
 
-    ``currency`` est la devise réellement remise : un règlement en USD ne solde
-    que des factures libellées en USD, et n'entre au tiroir qu'en USD.
+    Deux devises, à ne pas confondre :
+
+    - ``currency`` : la devise **réellement remise** par le client, celle qui
+      entre au tiroir. C'est la même sémantique que ``Payment.currency``.
+    - ``settle_currency`` : la devise des **factures à solder**. Par défaut la
+      même que ``currency``.
+
+    Les deux étaient confondues : un client devant 15 000 USD qui payait en
+    francs congolais ne pouvait pas voir sa dette bouger, puisque choisir CDF
+    cherchait des factures libellées en CDF et n'en trouvait aucune. Le montant
+    partait en avance CDF pendant que la dette USD restait entière. La modale de
+    paiement d'une facture, elle, acceptait déjà ce cas de figure.
     """
 
     amount = serializers.DecimalField(
@@ -196,6 +217,9 @@ class RecordPaymentSerializer(serializers.Serializer):
         min_value=Decimal('0.01')
     )
     currency = serializers.CharField(max_length=3, required=False, allow_blank=True)
+    settle_currency = serializers.CharField(
+        max_length=3, required=False, allow_blank=True
+    )
     exchange_rate = serializers.DecimalField(
         max_digits=20, decimal_places=12, required=False
     )

@@ -38,6 +38,7 @@ from .serializers import (
     RegisterSessionOpenSerializer, RegisterSessionCloseSerializer,
     PaymentMethodSerializer,
     SaleListSerializer, SaleDetailSerializer, SaleCreateSerializer, SalePaymentSerializer,
+    SaleUpdateSerializer,
     SaleReturnListSerializer, SaleReturnDetailSerializer, SaleReturnCreateSerializer,
     QuotationListSerializer, QuotationDetailSerializer, QuotationCreateSerializer
 )
@@ -526,7 +527,7 @@ class SaleViewSet(
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['status', 'sale_type', 'customer', 'register', 'is_pos']
     search_fields = ['reference', 'customer__name']
-    ordering_fields = ['sale_date', 'total', 'reference']
+    ordering_fields = ['sale_date', 'total', 'reference', 'due_date', 'amount_due']
     ordering = ['-sale_date']
     
     # Champs relationnels communs à toutes les actions. La liste et le détail
@@ -561,6 +562,11 @@ class SaleViewSet(
             return SaleCreateSerializer
         elif self.action == 'add_payment':
             return SalePaymentSerializer
+        elif self.action in ('update', 'partial_update'):
+            # Les montants et le statut d'une vente ne se modifient pas par PATCH :
+            # ils suivent les règlements, l'annulation et les retours, seuls
+            # chemins qui tiennent la dette client à jour.
+            return SaleUpdateSerializer
         return SaleDetailSerializer
 
     def create(self, request, *args, **kwargs):
@@ -612,19 +618,28 @@ class SaleViewSet(
         if date_to:
             queryset = queryset.filter(sale_date__date__lte=date_to)
 
+        # Créances en retard : facture encore due dont l'échéance est passée.
+        # `due_date` était jusqu'ici un champ mort - stocké, exposé, mais jamais
+        # ni saisi ni interrogé.
+        overdue = self.request.query_params.get('overdue')
+        if overdue and overdue.lower() in ('1', 'true', 'yes'):
+            queryset = queryset.filter(
+                status__in=[Sale.Status.PENDING, Sale.Status.PARTIALLY_PAID],
+                amount_due__gt=0,
+                due_date__lt=timezone.now().date(),
+            )
+
         return queryset
     
     @action(detail=True, methods=['post'], url_path='add-payment')
     def add_payment(self, request, pk=None):
         """Ajoute un paiement à une vente existante."""
-        from django.db import transaction
-        from .services import SaleStockService
-
         # Pré-validation hors transaction (permissions, statut grossier).
         # Le sale qu'on lit ici sert uniquement à valider l'accès - le vrai
         # objet utilisé pour la mise à jour est relu avec `select_for_update`
-        # à l'intérieur de la transaction pour bloquer les race conditions
-        # sur `amount_paid` quand deux add_payment concurrents arrivent.
+        # dans `apply_payment_to_sale`, qui ouvre sa propre transaction, pour
+        # bloquer les race conditions sur `amount_paid` quand deux add_payment
+        # concurrents arrivent.
         sale_for_check = self.get_object()
         if sale_for_check.sold_by_id != request.user.id and not is_manager_or_above(request):
             return Response(
@@ -660,6 +675,26 @@ class SaleViewSet(
             return Response({'error': exc.detail}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response(SaleDetailSerializer(sale).data)
+
+    def perform_destroy(self, instance):
+        """
+        Refuse la suppression d'une facture encore due.
+
+        La suppression est un soft delete : la vente sort du manager, donc de
+        `open_credit_sales`, alors que la dette reste inscrite au
+        `CustomerBalance`. Elle devenait impossible à solder par facture et le
+        solde du client ne correspondait plus à la somme de ses factures
+        ouvertes. Annuler est le geste correct : `cancel` retire la dette,
+        restitue le stock et enregistre le remboursement.
+        """
+        if instance.customer_id and instance.amount_due > 0:
+            raise DRFValidationError(
+                "Cette vente porte une dette client de "
+                f"{instance.amount_due} {instance.currency}. Annulez-la "
+                "(action « cancel ») plutôt que de la supprimer : la dette doit "
+                "être retirée du solde du client."
+            )
+        return super().perform_destroy(instance)
 
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
@@ -730,6 +765,12 @@ class SaleViewSet(
             from apps.settings.services import LoyaltyService
             LoyaltyService.reverse_sale_transactions(sale, request.user)
 
+            # Une vente annulée ne doit plus rien : laisser `amount_due` positif
+            # la faisait ressortir de tout filtre `amount_due__gt=0` (l'index
+            # `sales_org_status_due_idx` invite précisément à écrire ce filtre) et
+            # elle serait recomptée en créance alors que la dette vient d'être
+            # retirée du solde client juste au-dessus.
+            sale.amount_due = Decimal('0.00')
             sale.status = 'cancelled'
             sale.save()
 
@@ -904,14 +945,42 @@ class SaleReturnViewSet(
             sale_return.approved_by = request.user
             sale_return.approved_at = timezone.now()
             sale_return.save()
-            
-            # Enregistrer le mouvement de caisse si remboursement au client
-            if sale_return.refund_amount and sale_return.refund_amount > 0:
+
+            sale = sale_return.original_sale
+            refund_amount = sale_return.refund_amount or Decimal('0.00')
+
+            # Un retour sur une facture encore due éteint d'abord la dette : le
+            # client a rendu la marchandise, il n'a plus à la payer. Seul le
+            # reliquat sort physiquement de la caisse. Sans cela le client rendait
+            # le produit ET continuait de devoir la totalité, et le marchand lui
+            # remboursait en espèces de l'argent jamais encaissé.
+            debt_offset = Decimal('0.00')
+            if sale and sale.customer and sale.amount_due > 0 and refund_amount > 0:
+                from apps.contacts import services as contacts_services
+
+                debt_offset = min(refund_amount, sale.amount_due)
+                contacts_services.settle_debt(
+                    sale.customer, debt_offset,
+                    currency=sale.currency,
+                    transaction_type=(
+                        contacts_services.CustomerTransaction.TransactionType.REFUND
+                    ),
+                    sale=sale,
+                    reference=sale_return.reference,
+                    notes=f"Retour {sale_return.reference} sur vente {sale.reference}",
+                    user=request.user,
+                )
+                sale.amount_due = (sale.amount_due - debt_offset).quantize(Decimal('0.01'))
+                sale.save(update_fields=['amount_due'])
+
+            # Mouvement de caisse pour la seule part réellement remboursée.
+            cash_refund = refund_amount - debt_offset
+            if cash_refund > 0:
                 from apps.cashbook.services import record_sale_return_refund
                 record_sale_return_refund(
                     organization=sale_return.organization,
                     sale_return=sale_return,
-                    amount=sale_return.refund_amount,
+                    amount=cash_refund,
                     user=request.user,
                 )
 
@@ -919,7 +988,6 @@ class SaleReturnViewSet(
             # laissait le client garder les points d'une vente rendue.
             # Un retour TOTAL seulement : sur un retour partiel, les points
             # gagnés sur la part conservée restent acquis.
-            sale = sale_return.original_sale
             if sale and sale_return.total_amount >= sale.total:
                 from apps.settings.services import LoyaltyService
                 LoyaltyService.reverse_sale_transactions(
@@ -1114,6 +1182,26 @@ class QuotationViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
             # ``SaleStockService.apply_decrement`` lors du ``add_payment``.
             if sale.warehouse:
                 SaleStockService.reserve_stock(sale, request.user)
+
+            # Un devis converti est une facture émise et non payée : c'est une
+            # dette, au même titre qu'une vente à crédit. Sans cet appel la
+            # facture était retenue par `open_credit_sales` (statut `pending`,
+            # `amount_due > 0`) alors qu'aucune dette n'avait été inscrite - son
+            # règlement ultérieur décrémentait donc un solde jamais incrémenté et
+            # rendait le client artificiellement créditeur. C'est aussi ici que
+            # passent le contrôle de limite de crédit et la consommation d'une
+            # avance, jusque-là contournés sur ce chemin.
+            #
+            # Après la réservation : si une avance solde entièrement la facture,
+            # `register_sale_debt` enchaîne sur le décrément, dans le même ordre
+            # réservation → décrément que le chemin `add_payment`.
+            if sale.customer and sale.amount_due > 0:
+                from .services import register_sale_debt
+
+                register_sale_debt(
+                    sale, request.user,
+                    notes=f"Devis {quotation.reference} converti en vente {sale.reference}",
+                )
 
         return Response({
             'status': 'converted',

@@ -562,6 +562,104 @@ def get_loyalty_payment_method(organization):
     return method
 
 
+@transaction.atomic
+def get_advance_payment_method(organization):
+    """
+    Moyen de paiement « avance client » de l'organisation, créé au besoin.
+
+    Comme les points de fidélité, ce n'est pas un encaissement : l'argent est
+    entré au tiroir quand l'avance a été enregistrée. Il est donc exclu des
+    mouvements de caisse, et le comptage de clôture (qui ne compte que
+    ``method_type='cash'``) l'ignore déjà.
+    """
+    from apps.sales.models import PaymentMethod
+
+    method, _ = PaymentMethod.objects.get_or_create(
+        organization=organization,
+        method_type=PaymentMethod.MethodType.ADVANCE,
+        defaults={
+            'name': 'Avance client',
+            'code': 'ADVANCE',
+            'is_active': True,
+        },
+    )
+    return method
+
+
+@transaction.atomic
+def register_sale_debt(sale, user, notes=''):
+    """
+    Porte au compte du client ce qui reste à payer sur une facture émise, puis
+    consomme immédiatement l'avance dont il dispose dans la devise de la facture.
+
+    Point d'entrée unique pour les deux chemins qui émettent une facture non
+    soldée : la création d'une vente et la conversion d'un devis.
+
+    Sur l'avance, l'ordre compte. On inscrit d'abord la dette **entière** née de
+    la vente : c'est elle que le contrôle de limite de crédit doit voir, et le
+    solde créditeur l'absorbe arithmétiquement (``-A + due``). Reste à en porter
+    la trace côté FACTURE, ce qui manquait : ``available_advance`` n'était appelée
+    nulle part, si bien qu'après une avance la vente suivante restait ``pending``
+    avec un ``amount_due`` positif alors que le client ne devait plus rien. Le
+    solde et la somme des factures ouvertes divergeaient, en violation de
+    l'invariant que vérifie ``test_debt_and_open_invoices_never_diverge``.
+
+    Le montant disponible est donc mesuré **avant** l'inscription de la dette,
+    sans quoi on lirait le reliquat au lieu de la part consommée.
+
+    Retourne ``(transaction_dette, montant_avance_consommé)``.
+    """
+    from apps.contacts import services as contacts_services
+
+    if not sale.customer or sale.amount_due <= 0:
+        return None, Decimal('0.00')
+
+    available = contacts_services.available_advance(sale.customer, sale.currency)
+    due_before = sale.amount_due
+
+    txn = contacts_services.apply_debt(
+        sale.customer, due_before,
+        currency=sale.currency,
+        sale=sale,
+        reference=sale.reference,
+        notes=notes,
+        user=user,
+    )
+
+    consumed = min(available, due_before)
+    if consumed <= 0:
+        return txn, Decimal('0.00')
+
+    # Règlement sans encaissement : l'argent est déjà au tiroir depuis
+    # `record_customer_advance`. Aucun mouvement de caisse ici, et aucun
+    # mouvement de solde non plus - `apply_debt` ci-dessus a déjà tout compté.
+    create_payment(
+        sale, user,
+        payment_method_id=get_advance_payment_method(sale.organization).id,
+        tendered_amount=consumed,
+        currency=sale.currency,
+        notes=f"Avance client imputée sur {sale.reference}",
+    )
+
+    sale.amount_paid = (sale.amount_paid + consumed).quantize(TWO_PLACES)
+    sale.amount_due = (sale.total - sale.amount_paid).quantize(TWO_PLACES)
+    became_complete = sale.amount_due <= 0
+    if became_complete:
+        sale.amount_due = Decimal('0.00')
+        sale.status = 'completed'
+    else:
+        sale.status = 'partially_paid'
+    sale.save(update_fields=['amount_paid', 'amount_due', 'status'])
+
+    if became_complete:
+        if sale.warehouse:
+            SaleStockService.apply_decrement(sale, user)
+        from apps.settings.services import LoyaltyService
+        LoyaltyService.award_points_for_sale(sale, user=user)
+
+    return txn, consumed
+
+
 def remaining_loyalty_allowance(sale, program):
     """
     Ce qu'il reste de la facture réglable en points, dans sa devise.
@@ -589,10 +687,11 @@ def remaining_loyalty_allowance(sale, program):
     return max(Decimal('0.00'), (allowance - already).quantize(Decimal('0.01')))
 
 
+@transaction.atomic
 def apply_payment_to_sale(sale_id, user, *, payment_method_id=None,
                           tendered_amount=None, currency=None, exchange_rate=None,
                           change_currency=None, reference='', notes='',
-                          award_loyalty=True, points_used=0):
+                          award_loyalty=True, points_used=0, receipt_number=None):
     """
     Applique un règlement à une facture existante, de bout en bout.
 
@@ -606,6 +705,15 @@ def apply_payment_to_sale(sale_id, user, *, payment_method_id=None,
     Enchaîne, sous verrou sur la vente : création du règlement, recalcul des
     montants, monnaie rendue, décrément de stock, attribution des points,
     mouvement de caisse et mise à jour de la dette client.
+
+    ``@transaction.atomic`` n'est pas décoratif : le ``select_for_update``
+    ci-dessous lève ``TransactionManagementError`` sous PostgreSQL s'il est
+    exécuté hors transaction, et ``SaleViewSet.add_payment`` appelle cette
+    fonction sans ouvrir de bloc. Le défaut restait invisible en dev (SQLite
+    ignore ``select_for_update``) et en test (``APITestCase`` enveloppe chaque
+    test dans un ``atomic``). Il garantit aussi que la séquence règlement →
+    stock → points → caisse → dette est tout ou rien : un échec en cours de
+    route laissait jusqu'ici une facture payée avec une dette non soldée.
 
     Retourne ``(sale, payment)``.
     """
@@ -621,6 +729,22 @@ def apply_payment_to_sale(sale_id, user, *, payment_method_id=None,
 
     previous_status = sale.status
     due_before = sale.amount_due
+
+    # Un numéro de reçu pour TOUTE l'opération, pas un par ligne : un règlement
+    # peut créer plusieurs `Payment` (points puis espèces) et un mouvement de
+    # dette, alors que le client ne repart qu'avec un seul papier.
+    #
+    # `receipt_number` peut être imposé par l'appelant : `record_payment` solde
+    # plusieurs factures d'un seul versement, et ces factures doivent partager le
+    # numéro du reçu unique remis au client.
+    if receipt_number is None:
+        from apps.core.numbering import (
+            PREFIX_DEBT_PAYMENT, allocate_document_number,
+        )
+
+        receipt_number = allocate_document_number(
+            sale.organization, PREFIX_DEBT_PAYMENT,
+        )
 
     payments = []
 
@@ -668,8 +792,23 @@ def apply_payment_to_sale(sale_id, user, *, payment_method_id=None,
     if not payments:
         raise ValidationError("Aucun règlement à appliquer.")
 
-    payment = payments[-1]
     for p in payments:
+        p.receipt_number = receipt_number
+    from apps.sales.models import Payment as _PaymentModel
+
+    _PaymentModel.objects.filter(pk__in=[p.pk for p in payments]).update(
+        receipt_number=receipt_number,
+    )
+
+    payment = payments[-1]
+    # Un règlement en échec n'a rien encaissé : le compter gonflerait `amount_paid`
+    # et solderait une facture impayée. `sync/services._recompute_affected_sales`
+    # et `remaining_loyalty_allowance` filtrent déjà ainsi ; les trois chemins de
+    # calcul de `amount_paid` doivent donner le même résultat.
+    from apps.sales.models import Payment as PaymentModel
+
+    applied_payments = [p for p in payments if p.status != PaymentModel.Status.FAILED]
+    for p in applied_payments:
         sale.amount_paid += p.amount
     sale.amount_due = (sale.total - sale.amount_paid).quantize(TWO_PLACES)
 
@@ -720,8 +859,10 @@ def apply_payment_to_sale(sale_id, user, *, payment_method_id=None,
     from apps.cashbook.services import (
         record_change, record_debt_collection_payment, record_sale_payment_income,
     )
-    for p in payments:
-        if p.payment_method and p.payment_method.method_type == 'loyalty':
+    for p in applied_payments:
+        # Ni les points ni une avance déjà versée ne sont un encaissement :
+        # l'argent de l'avance est entré au tiroir quand elle a été enregistrée.
+        if p.payment_method and p.payment_method.method_type in ('loyalty', 'advance'):
             continue
         if sale.sale_type == 'credit' and sale.customer:
             record_debt_collection_payment(
@@ -739,7 +880,7 @@ def apply_payment_to_sale(sale_id, user, *, payment_method_id=None,
     # à le compter deux fois.
     if sale.customer and due_before > 0:
         from apps.contacts import services as contacts_services
-        applied = sum((p.amount for p in payments), Decimal('0.00'))
+        applied = sum((p.amount for p in applied_payments), Decimal('0.00'))
         settled = min(applied, due_before)
         if settled > 0:
             contacts_services.settle_debt(
@@ -749,6 +890,7 @@ def apply_payment_to_sale(sale_id, user, *, payment_method_id=None,
                 reference=sale.reference,
                 notes=f"Paiement sur facture {sale.reference}",
                 user=user,
+                receipt_number=receipt_number,
                 payment_method=(
                     payment.payment_method.method_type
                     if payment.payment_method else 'cash'

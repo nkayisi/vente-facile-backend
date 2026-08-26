@@ -58,6 +58,10 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     ordering = ['name']
     
     select_related_fields = ['created_by']
+    # `CustomerBalancesMixin` lit `obj.balances.all()` sur CHAQUE client, en
+    # liste comme en détail : sans ce prefetch, une page de clients déclenchait
+    # une requête par client.
+    prefetch_related_fields = ['balances']
     
     action_permissions = {
         'list': 'customers.view',
@@ -143,7 +147,8 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         return Response(serializer.data)
 
     def _settle_open_invoices(self, customer, amount, currency, user,
-                              payment_method='cash', reference='', notes=''):
+                              payment_method='cash', reference='', notes='',
+                              settle_currency=None, receipt_number=None):
         """
         Impute un règlement sur les factures ouvertes du client, de la plus
         ancienne à la plus récente, et renvoie ``(reliquat, factures_soldées)``.
@@ -154,37 +159,94 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         du client et la somme des factures dues divergeaient dès le premier
         acompte, et comme la vente n'atteignait jamais ``completed``, les points
         de fidélité n'étaient jamais attribués.
+
+        ``currency`` est la devise **remise** (celle qui entre au tiroir),
+        ``settle_currency`` celle des **factures visées**. Les deux étaient
+        confondues : un client devant en USD qui payait en CDF ne voyait pas sa
+        dette bouger, le montant partant en avance CDF. Le reliquat reste
+        exprimé dans la devise remise, puisque c'est l'argent réellement détenu.
         """
-        from apps.sales.services import apply_payment_to_sale
-        from apps.sales.models import PaymentMethod
+        from apps.sales.services import apply_payment_to_sale, get_loyalty_payment_method
+        from apps.sales.models import PaymentMethod, Sale
         from apps.contacts import services as contacts_services
 
-        method = PaymentMethod.objects.filter(
-            organization=customer.organization,
-            method_type=payment_method,
-            is_active=True,
-        ).first() or PaymentMethod.objects.filter(
-            organization=customer.organization, is_active=True,
-        ).first()
+        is_loyalty = payment_method == PaymentMethod.MethodType.LOYALTY
+
+        if is_loyalty:
+            # Surtout pas de repli ici : le repli « première méthode active »
+            # renvoyait `cash` quand aucune méthode « fidélité » n'existait, et
+            # `apply_payment_to_sale` n'exclut le mouvement de caisse que sur le
+            # type `loyalty`. Des points se transformaient donc en entrée
+            # d'argent réel au tiroir. Le helper crée la méthode au besoin.
+            method = get_loyalty_payment_method(customer.organization)
+        else:
+            # Repli sur une autre méthode d'encaissement si le type demandé
+            # n'existe pas dans l'organisation, mais jamais sur « fidélité » :
+            # ce serait de l'argent encaissé qui n'entrerait pas en caisse.
+            method = PaymentMethod.objects.filter(
+                organization=customer.organization,
+                method_type=payment_method,
+                is_active=True,
+            ).first() or PaymentMethod.objects.filter(
+                organization=customer.organization, is_active=True,
+            ).exclude(method_type=PaymentMethod.MethodType.LOYALTY).first()
+
+        settle_currency = settle_currency or currency
+
+        # On raisonne dans la devise des FACTURES pour décider combien chacune
+        # absorbe, puis on reconvertit vers la devise remise pour l'encaissement
+        # lui-même : `apply_payment_to_sale` attend un montant tendu et sait le
+        # ramener à la devise de la vente.
+        remaining_settle = CurrencyService.convert(
+            amount, currency, settle_currency, customer.organization,
+        )['converted_amount']
 
         remaining = amount
         touched = []
-        for sale in contacts_services.open_credit_sales(customer, currency):
-            if remaining <= 0:
+        for open_sale in contacts_services.open_credit_sales(customer, settle_currency):
+            if remaining <= 0 or remaining_settle <= 0:
                 break
-            applied = min(remaining, sale.amount_due)
-            if applied <= 0:
+            # `open_credit_sales` lit hors verrou. Sans cette relecture, deux
+            # règlements concurrents imputaient chacun le même montant sur la
+            # même facture : le second produisait un surplus rendu en monnaie
+            # sur une facture déjà soldée.
+            locked = Sale.objects.select_for_update().get(pk=open_sale.pk)
+            if locked.amount_due <= 0 or locked.status in ('completed', 'cancelled', 'refunded'):
                 continue
+
+            applied_settle = min(remaining_settle, locked.amount_due)
+            if applied_settle <= 0:
+                continue
+
+            # Part de l'argent remis que cette facture consomme. Même chemin de
+            # conversion que la modale de paiement d'une facture : à devise
+            # égale, `convert` renvoie le montant inchangé.
+            applied_tendered = min(
+                remaining,
+                CurrencyService.convert(
+                    applied_settle, settle_currency, currency, customer.organization,
+                )['converted_amount'],
+            )
+            if applied_tendered <= 0:
+                continue
+
             apply_payment_to_sale(
-                sale.id, user,
+                locked.id, user,
                 payment_method_id=method.id if method else None,
-                tendered_amount=applied,
+                tendered_amount=applied_tendered,
                 currency=currency,
                 reference=reference,
                 notes=notes or f"Règlement client {customer.name}",
+                # Une facture réglée avec des points n'en rapporte pas de
+                # nouveaux : elle en consomme.
+                award_loyalty=not is_loyalty,
+                # Toutes les factures soldées par ce versement portent le numéro
+                # du reçu unique remis au client.
+                receipt_number=receipt_number,
             )
-            remaining -= applied
-            touched.append(sale.reference)
+            remaining -= applied_tendered
+            remaining_settle -= applied_settle
+            touched.append(locked.reference)
 
         return remaining, touched
 
@@ -193,8 +255,11 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         """
         Enregistre un règlement du client et l'impute sur ses factures ouvertes.
 
-        Le règlement solde d'abord les factures les plus anciennes dans la même
-        devise ; un éventuel reliquat devient une avance (solde créditeur).
+        Le règlement solde d'abord les factures les plus anciennes ; un éventuel
+        reliquat devient une avance (solde créditeur), dans la devise remise.
+
+        ``currency`` est la devise remise, ``settle_currency`` celle des factures
+        visées : un client qui doit en USD peut payer en francs congolais.
         """
         from django.db import transaction as db_transaction
         from apps.contacts import services as contacts_services
@@ -210,16 +275,45 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
             serializer.validated_data.get('exchange_rate'),
             strict=True,
         )
+        # Devise des factures à solder. Par défaut celle de l'argent remis, ce
+        # qui préserve le comportement des appelants qui ne la connaissent pas.
+        settle_currency, _ = CurrencyService.resolve(
+            customer.organization,
+            serializer.validated_data.get('settle_currency') or currency,
+            None,
+            strict=True,
+        )
         payment_method = serializer.validated_data.get('payment_method', 'cash')
         notes = serializer.validated_data.get('notes', '')
         reference = serializer.validated_data.get('reference', '')
 
         with db_transaction.atomic():
+            # Numéro alloué AVANT le règlement, et une seule fois : le client
+            # repart avec un papier, quel que soit le nombre de factures soldées
+            # et de lignes écrites. Le préfixe dépend de ce que l'opération est
+            # vraiment : un règlement s'il y a des factures ouvertes à solder,
+            # une avance sinon.
+            from apps.core.numbering import (
+                PREFIX_ADVANCE, PREFIX_DEBT_PAYMENT, allocate_document_number,
+            )
+
+            has_open_invoices = bool(
+                contacts_services.open_credit_sales(customer, settle_currency)
+            )
+            receipt_number = allocate_document_number(
+                customer.organization,
+                PREFIX_DEBT_PAYMENT if has_open_invoices else PREFIX_ADVANCE,
+            )
+            # Solde d'avant l'opération, dans la devise remise : c'est le
+            # « Dette avant » du reçu. Le lire après coup donnerait le solde
+            # d'arrivée pour les deux lignes.
+            balance_before = contacts_services.get_balance(customer, currency)
             # `apply_payment_to_sale` met déjà à jour la dette de chaque facture
             # soldée : on n'enregistre ici que le reliquat, en avance.
             remaining, touched = self._settle_open_invoices(
                 customer, amount, currency, request.user,
                 payment_method=payment_method, reference=reference, notes=notes,
+                settle_currency=settle_currency, receipt_number=receipt_number,
             )
 
             txn = None
@@ -233,6 +327,7 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
                     notes=notes or "Avance client (aucune facture à solder)",
                     user=request.user,
                     payment_method=payment_method,
+                    receipt_number=receipt_number,
                 )
                 # Le reliquat n'a soldé aucune facture : il entre au tiroir ici.
                 from apps.cashbook.services import record_customer_advance
@@ -250,9 +345,17 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
 
         return Response({
             'transaction': CustomerTransactionSerializer(txn).data if txn else None,
+            # Numéro et soldes au niveau de l'ENVELOPPE, et pas seulement sur
+            # `transaction` : celle-ci est nulle quand le versement a soldé des
+            # factures sans laisser de reliquat, c'est-à-dire dans le cas
+            # nominal. Un reçu ne peut donc pas en dépendre.
+            'receipt_number': receipt_number,
+            'balance_before': str(balance_before),
+            'balance_after': str(contacts_services.get_balance(customer, currency)),
             'settled_invoices': touched,
             'advance_amount': str(remaining),
             'currency': currency,
+            'settle_currency': settle_currency,
             'new_balance': str(customer.current_balance),
             'balances': contacts_services.balances_by_currency(customer),
         })
@@ -260,55 +363,20 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='record-advance')
     def record_advance(self, request, pk=None):
         """
-        Enregistre une avance du client sans l'imputer sur une facture.
+        Enregistre de l'argent reçu d'un client, en avance sur ses achats.
 
-        Le solde de la devise devient créditeur (négatif) : l'avance sera
-        consommée par une vente à crédit future ou par un règlement ultérieur.
+        **Impute d'abord sur les factures ouvertes** de la devise, de la plus
+        ancienne à la plus récente ; seul le reliquat devient une avance. C'est
+        strictement le comportement de ``record_payment``, dont cette action
+        n'est plus qu'un alias.
+
+        Elle écrivait auparavant le solde directement, sans toucher aucune
+        facture : appelée sur un client déjà endetté, elle faisait diverger le
+        solde de la somme des ``amount_due`` ouverts - l'invariant que
+        ``test_debt_and_open_invoices_never_diverge`` protège. Quand un client
+        qui doit de l'argent en remet, c'est un règlement, pas une avance.
         """
-        from django.db import transaction as db_transaction
-        from apps.contacts import services as contacts_services
-
-        customer = self.get_object()
-        serializer = RecordPaymentSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-
-        amount = serializer.validated_data['amount']
-        currency, exchange_rate = CurrencyService.resolve(
-            customer.organization,
-            serializer.validated_data.get('currency'),
-            serializer.validated_data.get('exchange_rate'),
-            strict=True,
-        )
-
-        with db_transaction.atomic():
-            txn = contacts_services.settle_debt(
-                customer, amount,
-                currency=currency,
-                exchange_rate=exchange_rate,
-                transaction_type=CustomerTransaction.TransactionType.ADVANCE,
-                reference=serializer.validated_data.get('reference', ''),
-                notes=serializer.validated_data.get('notes', ''),
-                user=request.user,
-                payment_method=serializer.validated_data.get('payment_method', 'cash'),
-            )
-
-            from apps.cashbook.services import record_customer_advance
-            record_customer_advance(
-                organization=customer.organization,
-                customer=customer,
-                amount=amount,
-                user=request.user,
-                notes=serializer.validated_data.get('notes', ''),
-                currency=currency,
-                exchange_rate=exchange_rate,
-            )
-            customer.refresh_from_db()
-
-        return Response({
-            'transaction': CustomerTransactionSerializer(txn).data,
-            'new_balance': str(customer.current_balance),
-            'balances': contacts_services.balances_by_currency(customer),
-        })
+        return self.record_payment(request, pk)
 
     @action(detail=True, methods=['post'], url_path='adjust-balance')
     def adjust_balance(self, request, pk=None):
@@ -331,6 +399,15 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
 
         try:
             with db_transaction.atomic():
+                from apps.core.numbering import (
+                    PREFIX_ADJUSTMENT, allocate_document_number,
+                )
+
+                receipt_number = allocate_document_number(
+                    customer.organization, PREFIX_ADJUSTMENT,
+                )
+                balance_before = contacts_services.get_balance(customer, currency)
+
                 if amount > 0:
                     txn = contacts_services.apply_debt(
                         customer, amount,
@@ -339,6 +416,7 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
                         transaction_type=CustomerTransaction.TransactionType.ADJUSTMENT,
                         notes=notes,
                         user=request.user,
+                        receipt_number=receipt_number,
                     )
                 else:
                     txn = contacts_services.adjust_balance(
@@ -347,6 +425,7 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
                         exchange_rate=exchange_rate,
                         notes=notes,
                         user=request.user,
+                        receipt_number=receipt_number,
                     )
                     # Réduire la dette = argent reçu : ça entre au tiroir.
                     from apps.cashbook.services import record_customer_debt_payment
@@ -365,6 +444,9 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
 
         return Response({
             'transaction': CustomerTransactionSerializer(txn).data if txn else None,
+            'receipt_number': receipt_number,
+            'balance_before': str(balance_before),
+            'balance_after': str(contacts_services.get_balance(customer, currency)),
             'new_balance': str(customer.current_balance),
             'balances': contacts_services.balances_by_currency(customer),
         })
@@ -441,19 +523,24 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'], url_path='with-balance')
     def with_balance(self, request):
-        """Retourne les clients avec un solde non nul (débiteurs)."""
-        organization = self.get_organization()
-        
-        customers = Customer.objects.filter(
-            organization=organization,
-            is_deleted=False
-        ).exclude(current_balance=0).order_by('-current_balance')
-        
+        """
+        Clients dont le solde n'est pas nul : débiteurs d'abord, puis créditeurs
+        (avances). C'est le filtre « Avec dette » de la liste des clients.
+
+        Passe par `filter_queryset(get_queryset())` et non par un queryset
+        reconstruit à la main : on hérite ainsi du périmètre tenant, du prefetch
+        des soldes par devise (sinon N+1) et des filtres de recherche et de type
+        déjà déclarés sur le viewset, pour que le filtre se combine avec eux.
+        """
+        customers = self.filter_queryset(self.get_queryset()).exclude(
+            current_balance=0
+        ).order_by('-current_balance')
+
         page = self.paginate_queryset(customers)
         if page is not None:
             serializer = CustomerListSerializer(page, many=True)
             return self.get_paginated_response(serializer.data)
-        
+
         serializer = CustomerListSerializer(customers, many=True)
         return Response(serializer.data)
 

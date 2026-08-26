@@ -613,6 +613,10 @@ class PaymentMethod(TenantModel):
         # l'argent physique : exclu des mouvements de caisse et du comptage de
         # clôture de session.
         LOYALTY = 'loyalty', 'Points de fidélité'
+        # Consommation d'une avance déjà versée par le client. Comme les points,
+        # ce n'est pas un encaissement : l'argent est entré au tiroir au moment
+        # où l'avance a été enregistrée. Exclu des mouvements de caisse.
+        ADVANCE = 'advance', 'Avance client'
         OTHER = 'other', 'Autre'
 
     name = models.CharField(max_length=100)
@@ -687,8 +691,15 @@ class Payment(TenantModel, SyncableModel):
         default=Decimal('1.000000')
     )
 
+    # Référence EXTERNE saisie par le caissier : numéro de transaction mobile
+    # money, numéro de chèque. À ne pas confondre avec `receipt_number`.
     reference = models.CharField(max_length=100, blank=True)
-    
+
+    # Numéro du reçu remis au client, alloué par `core.numbering`. Stable : une
+    # réimpression rend le même numéro, ce qui n'était pas le cas quand il était
+    # fabriqué dans le navigateur. Vide pour les règlements antérieurs.
+    receipt_number = models.CharField(max_length=32, blank=True, db_index=True)
+
     status = models.CharField(
         max_length=20,
         choices=Status.choices,
