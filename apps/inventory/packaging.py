@@ -90,6 +90,55 @@ def _fmt_number(value) -> str:
     return f"{quantized:f}"
 
 
+class _UnitLabel:
+    """Porteur de nom d'unité, pour un produit reconstitué hors ORM."""
+
+    __slots__ = ('name', 'symbol')
+
+    def __init__(self, name='', symbol=''):
+        self.name = name or ''
+        self.symbol = symbol or name or ''
+
+
+class PackagingProfile:
+    """
+    Portrait minimal d'un produit, suffisant pour tout ``PackagingService``.
+
+    Les rapports agrègent avec ``values()`` et n'ont donc aucun ``Product`` sous
+    la main : sans ce porteur, chaque rapport rechargerait les produits un par un
+    pour lire trois attributs. Le service ne lit que ``selling_mode``,
+    ``units_per_package`` et le nom des deux unités, c'est exactement ce que
+    cette classe expose.
+    """
+
+    __slots__ = ('name', 'selling_mode', 'units_per_package', 'unit', 'packaging_unit')
+
+    def __init__(self, *, selling_mode='retail_only', units_per_package=None,
+                 unit_name='', package_unit_name='', name=''):
+        self.name = name or ''
+        self.selling_mode = selling_mode or 'retail_only'
+        self.units_per_package = units_per_package
+        self.unit = _UnitLabel(unit_name)
+        self.packaging_unit = _UnitLabel(package_unit_name)
+
+    @classmethod
+    def from_values(cls, row, prefix='product__'):
+        """
+        Construit un portrait depuis une ligne de ``values()``.
+
+        ``prefix`` suit le chemin de jointure employé par l'agrégation, de sorte
+        qu'un rapport partant de ``SaleItem`` et un autre partant de
+        ``StockMovement`` se servent du même constructeur.
+        """
+        return cls(
+            selling_mode=row.get(f'{prefix}selling_mode') or 'retail_only',
+            units_per_package=row.get(f'{prefix}units_per_package'),
+            unit_name=row.get(f'{prefix}unit__name') or '',
+            package_unit_name=row.get(f'{prefix}packaging_unit__name') or '',
+            name=row.get(f'{prefix}name') or '',
+        )
+
+
 class PackagingService:
     """Conversion, partage scellé/vrac et déconditionnement."""
 
@@ -297,32 +346,149 @@ class PackagingService:
     # -- Formatage ----------------------------------------------------------
 
     @staticmethod
+    def format_split(product, package_quantity, loose_quantity) -> str:
+        """
+        Rend un partage DÉJÀ calculé : « 3 casiers + 7 bouteilles ».
+
+        Ne recalcule rien. C'est le point de sortie commun de tous les autres
+        formateurs, et le seul à employer quand le partage est connu de source
+        sûre (compteurs du stock, saisie d'un mouvement, ligne de vente) : le
+        faire redécouper par ``split()`` transformerait « 3 casiers +
+        27 bouteilles » en « 4 casiers + 3 bouteilles », c'est-à-dire une
+        situation de rayon en une autre.
+
+        La partie nulle est omise : « 2 paquets », jamais « 2 paquets +
+        0 bouteille ». Un partage entièrement vide se lit « 0 <unité de détail> ».
+        """
+        packages = Decimal(package_quantity or 0)
+        loose = Decimal(loose_quantity or 0)
+        retail_label = PackagingService.retail_unit_label(product)
+        package_label = PackagingService.package_unit_label(product)
+
+        parts = []
+        if packages:
+            parts.append(f"{_fmt_number(packages)} {_plural(package_label, packages)}".strip())
+        if loose or not parts:
+            parts.append(f"{_fmt_number(loose)} {_plural(retail_label, loose)}".strip())
+        return ' + '.join(parts)
+
+    @staticmethod
     def format_quantity(product, base_quantity, loose_quantity=None) -> str:
         """
         Rend une quantité lisible : « 1 paquet + 10 bouteilles ».
 
         Pour un produit mono-unité, retourne la quantité suivie de son unité.
-        La partie nulle est omise : « 2 paquets », pas « 2 paquets + 0 bouteille ».
         """
         base_quantity = Decimal(base_quantity or 0)
         factor = PackagingService.factor(product)
-        retail_label = PackagingService.retail_unit_label(product)
 
         if factor is None:
             text = _fmt_number(base_quantity)
+            retail_label = PackagingService.retail_unit_label(product)
             return f"{text} {_plural(retail_label, base_quantity)}".strip()
 
         if loose_quantity is None:
             loose_quantity = ZERO
         sealed, loose = PackagingService.split(base_quantity, loose_quantity, factor)
+        return PackagingService.format_split(product, sealed, loose)
+
+    @staticmethod
+    def format_stock(stock) -> str:
+        """
+        Quantité en rayon d'une ligne de stock, LUE sur ses deux compteurs.
+
+        Formulation unique du « 3 casiers + 7 bouteilles » de la rubrique
+        « Niveau de stock », des exports et des rapports : les trois lisaient le
+        même partage mais chacun le reconstruisait de son côté, et un écart
+        d'arrondi aurait suffi à faire diverger le fichier téléchargé de l'écran
+        qui l'a déclenché.
+        """
+        factor = PackagingService.factor(stock.product)
+        if factor is None:
+            return PackagingService.format_quantity(stock.product, stock.quantity)
+        packages, loose = PackagingService.stored_split(stock, factor)
+        return PackagingService.format_split(stock.product, packages, loose)
+
+    @staticmethod
+    def format_available(stock) -> str:
+        """
+        Quantité disponible (hors réservations), dans les mêmes termes.
+
+        S'appuie sur ``available_split``, donc sur la même imputation
+        conservatrice des réservations que le contrôle de vente : ce qui
+        s'affiche comme disponible est exactement ce que le POS acceptera.
+        """
+        factor = PackagingService.factor(stock.product)
+        if factor is None:
+            return PackagingService.format_quantity(
+                stock.product, stock.available_quantity
+            )
+        packages, loose = PackagingService.available_split(stock, factor)
+        return PackagingService.format_split(stock.product, packages, loose)
+
+    @staticmethod
+    def format_signed_split(product, package_delta, loose_delta) -> str:
+        """
+        Rend un ÉCART par canal : « -2 casiers, +5 bouteilles ».
+
+        Un écart d'inventaire n'a aucune raison d'aller dans le même sens sur
+        les deux canaux : il manque deux casiers scellés et il traîne cinq
+        bouteilles isolées. Les additionner en unités de détail donnerait
+        « -43 » et effacerait précisément ce que le gérant cherche à voir. Le
+        signe est donc porté par chaque terme, et la virgule remplace le « + »
+        de ``format_split`` pour qu'on ne lise pas un plus comme une addition.
+        """
+        packages = Decimal(package_delta or 0)
+        loose = Decimal(loose_delta or 0)
+        retail_label = PackagingService.retail_unit_label(product)
         package_label = PackagingService.package_unit_label(product)
 
+        def signed(value, label):
+            prefix = '+' if value > 0 else ''
+            return f"{prefix}{_fmt_number(value)} {_plural(label, value)}".strip()
+
         parts = []
-        if sealed:
-            parts.append(f"{sealed} {_plural(package_label, sealed)}".strip())
+        if packages:
+            parts.append(signed(packages, package_label))
         if loose or not parts:
-            parts.append(f"{_fmt_number(loose)} {_plural(retail_label, loose)}".strip())
-        return ' + '.join(parts)
+            parts.append(signed(loose, retail_label))
+        return ', '.join(parts)
+
+    @staticmethod
+    def format_difference(product, base_delta, package_delta=None, loose_delta=None) -> str:
+        """
+        Écart lisible, ventilé par canal quand les deux parts sont connues.
+
+        Sans ventilation disponible, retombe sur le total signé en unité de
+        détail nommée plutôt que de répartir un écart au facteur : un manquant
+        de 43 bouteilles n'est pas « -1 casier - 19 bouteilles » tant que
+        personne n'a constaté qu'un casier scellé manquait.
+        """
+        factor = PackagingService.factor(product)
+        if factor is None or (package_delta is None and loose_delta is None):
+            base_delta = Decimal(base_delta or 0)
+            prefix = '+' if base_delta > 0 else ''
+            return f"{prefix}{PackagingService.format_base_total(product, base_delta)}"
+        return PackagingService.format_signed_split(
+            product, package_delta or 0, loose_delta or 0
+        )
+
+    @staticmethod
+    def format_base_total(product, base_quantity) -> str:
+        """
+        Total en unité de détail, suivi de cette unité : « 99 bouteilles ».
+
+        Réservé aux quantités dont le partage réel n'est PAS connu : le stock
+        avant et après un mouvement, par exemple, n'est enregistré qu'en total.
+        Le redécouper au facteur afficherait « 4 casiers + 3 bouteilles » pour
+        un rayon qui portait « 3 casiers + 27 bouteilles » : une lecture fausse,
+        et d'autant plus trompeuse qu'elle a l'air précise. On nomme donc
+        l'unité au lieu d'inventer un partage.
+        """
+        base_quantity = Decimal(base_quantity or 0)
+        retail_label = PackagingService.retail_unit_label(product)
+        text = _fmt_number(base_quantity)
+        return f"{text} {_plural(retail_label, base_quantity)}".strip()
 
     @staticmethod
     def format_movement_quantity(movement) -> str:
@@ -354,16 +520,7 @@ class PackagingService:
             # répartit le total au facteur enregistré.
             packages, loose = PackagingService.split(magnitude, ZERO, factor)
 
-        package_label = PackagingService.package_unit_label(product)
-
-        parts = []
-        if packages:
-            parts.append(
-                f"{_fmt_number(packages)} {_plural(package_label, packages)}".strip()
-            )
-        if loose or not parts:
-            parts.append(f"{_fmt_number(loose)} {_plural(retail_label, loose)}".strip())
-        return ' + '.join(parts)
+        return PackagingService.format_split(product, packages, loose)
 
     # -- Mutations (le lock est pris par l'appelant) ------------------------
 

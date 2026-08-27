@@ -1,7 +1,10 @@
 """
 Mixins DRF pour les ViewSets multi-tenant.
 """
+from django.http import HttpResponse
+from django.utils import timezone
 from rest_framework import status
+from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from django.shortcuts import get_object_or_404
 from guardian.shortcuts import assign_perm
@@ -358,3 +361,71 @@ class ActionPaginationMixin:
             'page_size': page_size,
             'total_pages': total_pages,
         })
+
+
+class ExportResponseMixin:
+    """
+    Sert un rapport en téléchargement, dans le format demandé.
+
+    Centralise ce que `apps/products/views.py` recopiait à chaque action
+    d'export : validation du format, en-tête `Content-Type` et
+    `Content-Disposition` horodaté. Le nom de fichier porte la date afin qu'un
+    gestionnaire qui exporte deux fois dans la journée ne récupère pas deux
+    fichiers homonymes dans son dossier de téléchargements.
+    """
+
+    #: Formats acceptés par les actions d'export du ViewSet.
+    export_formats = ('pdf', 'xlsx')
+
+    #: Nom du paramètre de requête portant le format demandé.
+    #:
+    #: Surtout PAS `format` : DRF réserve ce nom à la négociation de contenu
+    #: (`URL_FORMAT_OVERRIDE`), et comme le projet n'expose que le renderer JSON,
+    #: un `?format=pdf` déclencherait un 404 dans la négociation avant même
+    #: d'atteindre la vue. Le piège est silencieux et coûte cher à diagnostiquer.
+    export_format_param = 'export_format'
+
+    def get_export_format(self, request, default='pdf'):
+        """
+        Lit et valide le format demandé.
+
+        Accepte `excel` comme alias de `xlsx` : c'est le mot que porte le bouton
+        côté interface, et l'écart entre les deux vocabulaires est une source
+        d'erreurs 400 incompréhensibles pour l'utilisateur.
+        """
+        raw = (
+            request.query_params.get(self.export_format_param) or default
+        ).lower().strip()
+        if raw == 'excel':
+            raw = 'xlsx'
+        if raw not in self.export_formats:
+            raise ValidationError({
+                self.export_format_param: (
+                    f"Format invalide. Attendu : {', '.join(self.export_formats)}."
+                )
+            })
+        return raw
+
+    def export_file_response(self, buffer, basename, fmt):
+        """Enveloppe un buffer rendu dans une réponse de téléchargement."""
+        from apps.core.exports import CONTENT_TYPES
+
+        stamp = timezone.localtime().strftime('%Y%m%d_%H%M')
+        filename = f"{basename}_{stamp}.{fmt}"
+
+        response = HttpResponse(
+            buffer.getvalue(),
+            content_type=CONTENT_TYPES.get(fmt, 'application/octet-stream'),
+        )
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        # Sans cet en-tête, le navigateur ne voit pas le nom du fichier lorsqu'il
+        # est servi à travers une requête XHR depuis une autre origine.
+        response['Access-Control-Expose-Headers'] = 'Content-Disposition'
+        return response
+
+    def render_export(self, spec, basename, fmt):
+        """Rend la description de rapport puis la sert en pièce jointe."""
+        from apps.core.exports import render_report
+
+        buffer = render_report(spec, fmt)
+        return self.export_file_response(buffer, basename, fmt)

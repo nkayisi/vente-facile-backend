@@ -139,17 +139,7 @@ class CategoryViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
                     organization=self.get_organization(), id=exclude_root,
                 ).first()
                 if root:
-                    forbidden_ids = {root.id}
-                    # BFS sur les enfants pour collecter toute la descendance.
-                    pending = [root.id]
-                    while pending:
-                        children_ids = list(
-                            Category.objects.filter(parent_id__in=pending).values_list('id', flat=True)
-                        )
-                        new_ids = [cid for cid in children_ids if cid not in forbidden_ids]
-                        forbidden_ids.update(new_ids)
-                        pending = new_ids
-                    queryset = queryset.exclude(id__in=forbidden_ids)
+                    queryset = queryset.exclude(id__in=root.descendant_ids())
             except (ValueError, Category.DoesNotExist):
                 pass  # UUID invalide → on ignore le filtre, pas de fuite
 

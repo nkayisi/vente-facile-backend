@@ -34,6 +34,41 @@ from .serializers import (
 # ORGANIZATION VIEWSET
 # =============================================================================
 
+def _dashboard_top_product(row):
+    """
+    Ligne « produit le plus vendu » du tableau de bord, quantité ventilée.
+
+    Le partage vient des contenants réellement facturés, non d'une division du
+    total : 5 casiers plus 120 bouteilles ne se relisent pas « 10 casiers », et
+    le facteur d'un produit peut avoir changé depuis la vente.
+    """
+    from decimal import Decimal
+
+    from apps.inventory.packaging import PackagingProfile, PackagingService
+
+    profile = PackagingProfile.from_values(row)
+    factor = PackagingService.factor(profile)
+    quantity = Decimal(row['quantity_sold'] or 0)
+    packages = Decimal(row.get('packages_sold') or 0)
+    packaged_units = Decimal(row.get('packaged_units') or 0)
+
+    if factor is not None and packages > 0:
+        loose = max(Decimal('0'), quantity - packaged_units)
+        display = PackagingService.format_split(profile, packages, loose)
+    else:
+        display = PackagingService.format_quantity(profile, quantity)
+
+    return {
+        'id': str(row['product__id']),
+        'name': row['product__name'],
+        'sku': row['product__sku'],
+        'quantity': quantity,
+        'quantity_display': display,
+        'packaging_factor': factor,
+        'revenue': str(row['total_revenue']),
+    }
+
+
 class OrganizationViewSet(viewsets.ModelViewSet):
     """
     ViewSet pour la gestion des organisations.
@@ -308,13 +343,24 @@ class OrganizationViewSet(viewsets.ModelViewSet):
                 'count': item['count'] or 0
             })
         
-        # Top produits vendus
+        # Top produits vendus. `packages_sold` cumule les contenants réellement
+        # facturés : « 10 casiers + 5 bouteilles » se lit tout autrement que
+        # « 245 unités » quand il s'agit de décider d'un réassort.
         top_products = SaleItem.objects.filter(
             sale__in=current_sales
         ).values(
-            'product__id', 'product__name', 'product__sku'
+            'product__id', 'product__name', 'product__sku',
+            'product__selling_mode', 'product__units_per_package',
+            'product__unit__name', 'product__packaging_unit__name',
         ).annotate(
             quantity_sold=Sum('quantity'),
+            packages_sold=Coalesce(
+                Sum('package_quantity'), Decimal('0'), output_field=DecimalField()
+            ),
+            packaged_units=Coalesce(
+                Sum(F('package_quantity') * F('packaging_factor')),
+                Decimal('0'), output_field=DecimalField(),
+            ),
             total_revenue=Sum('total')
         ).order_by('-quantity_sold')[:10]
         
@@ -384,14 +430,7 @@ class OrganizationViewSet(viewsets.ModelViewSet):
                     for p in by_payment_method
                 ],
                 'top_products': [
-                    {
-                        'id': str(p['product__id']),
-                        'name': p['product__name'],
-                        'sku': p['product__sku'],
-                        'quantity': p['quantity_sold'],
-                        'revenue': str(p['total_revenue'])
-                    }
-                    for p in top_products
+                    _dashboard_top_product(p) for p in top_products
                 ]
             },
             'inventory': {

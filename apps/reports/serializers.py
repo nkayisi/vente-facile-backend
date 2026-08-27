@@ -90,6 +90,19 @@ class TopProductSerializer(serializers.Serializer):
     product_name = serializers.CharField()
     product_sku = serializers.CharField()
     quantity_sold = serializers.IntegerField()
+    # Ce qui est SORTI du rayon, dans les termes de la vente : « 10 casiers +
+    # 5 bouteilles ». La somme brute masquait la forme de vente, alors que
+    # 10 casiers et 245 bouteilles ne se réapprovisionnent pas pareil.
+    quantity_display = serializers.CharField(required=False, allow_blank=True)
+    packages_sold = serializers.DecimalField(
+        max_digits=15, decimal_places=3, required=False, allow_null=True
+    )
+    loose_sold = serializers.DecimalField(
+        max_digits=15, decimal_places=3, required=False, allow_null=True
+    )
+    # `null` pour un produit vendu à la pièce : c'est ce qui dit à l'interface
+    # s'il y a une ventilation gros/détail à montrer sous la quantité.
+    packaging_factor = serializers.IntegerField(allow_null=True, required=False)
     total_revenue = serializers.DecimalField(max_digits=15, decimal_places=2)
 
 
@@ -223,6 +236,10 @@ class ProductProfitSerializer(serializers.Serializer):
     product_name = serializers.CharField()
     product_sku = serializers.CharField()
     quantity_sold = serializers.DecimalField(max_digits=15, decimal_places=3)
+    quantity_display = serializers.CharField(required=False, allow_blank=True)
+    # `null` pour un produit vendu à la pièce : c'est ce qui dit à l'interface
+    # s'il y a une ventilation gros/détail à montrer sous la quantité.
+    packaging_factor = serializers.IntegerField(allow_null=True, required=False)
     total_revenue = serializers.DecimalField(max_digits=15, decimal_places=2)
     total_cost = serializers.DecimalField(max_digits=15, decimal_places=2)
     profit = serializers.DecimalField(max_digits=15, decimal_places=2)
@@ -238,9 +255,19 @@ class StockDetailSerializer(serializers.Serializer):
     current_stock = serializers.DecimalField(max_digits=15, decimal_places=3)
     # Le même stock dans les mots du marchand : « 12 cartons + 3 bouteilles »
     stock_display = serializers.CharField()
+    stock_packages = serializers.DecimalField(
+        max_digits=15, decimal_places=3, allow_null=True, required=False
+    )
+    stock_loose = serializers.DecimalField(
+        max_digits=15, decimal_places=3, allow_null=True, required=False
+    )
     reserved_stock = serializers.DecimalField(max_digits=15, decimal_places=3)
+    reserved_display = serializers.CharField(required=False, allow_blank=True)
     available_stock = serializers.DecimalField(max_digits=15, decimal_places=3)
     available_display = serializers.CharField()
+    # Nombre d'unités de détail par contenant, ou null pour un produit vendu à
+    # la pièce : c'est ce qui dit à l'interface s'il faut lire deux compteurs.
+    packaging_factor = serializers.IntegerField(allow_null=True, required=False)
     min_stock_level = serializers.DecimalField(max_digits=15, decimal_places=3, allow_null=True)
     cost_price = serializers.DecimalField(max_digits=15, decimal_places=2, allow_null=True)
     stock_value = serializers.DecimalField(max_digits=15, decimal_places=2)

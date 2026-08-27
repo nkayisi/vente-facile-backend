@@ -51,6 +51,38 @@ class Category(TenantSoftDeleteModel):
     def __str__(self):
         return self.name
 
+    @classmethod
+    def subtree_ids(cls, root_ids):
+        """
+        Renvoie les identifiants d'un ou plusieurs sous-arbres, racines incluses.
+
+        Filtrer un rapport sur « Boissons » doit ramener les lignes classées dans
+        « Boissons > Sodas » : sans la descendance, un tirage par catégorie sous
+        estime silencieusement, ce qui est pire qu'une erreur visible.
+
+        Parcours en largeur, borné par le jeu déjà visité : une hiérarchie
+        accidentellement cyclique ralentit la requête mais ne la fait pas boucler.
+        """
+        collected = {rid for rid in (root_ids or []) if rid}
+        if not collected:
+            return set()
+
+        pending = list(collected)
+        while pending:
+            children = list(
+                cls.objects.filter(parent_id__in=pending)
+                .values_list('id', flat=True)
+            )
+            fresh = [cid for cid in children if cid not in collected]
+            collected.update(fresh)
+            pending = fresh
+
+        return collected
+
+    def descendant_ids(self):
+        """Identifiants de cette catégorie et de toute sa descendance."""
+        return type(self).subtree_ids([self.id])
+
     def get_ancestors(self):
         """Get all parent categories. Safe even si un cycle existait
         accidentellement (limite via set d'IDs visités)."""

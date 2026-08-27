@@ -3,6 +3,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.pagination import PageNumberPagination
+from rest_framework.exceptions import ValidationError as DRFValidationError
 from django.db.models import (
     Sum,
     Count,
@@ -36,7 +37,7 @@ from apps.sales.models import Sale, SaleItem, Payment
 from apps.sales.profit_allocation import allocated_line_ht_revenues_for_sale, effective_unit_cost
 from apps.products.models import Product
 from apps.inventory.models import Stock, StockBatch
-from apps.inventory.packaging import PackagingService
+from apps.inventory.packaging import PackagingProfile, PackagingService
 from apps.contacts.models import Customer
 from apps.settings.services import CurrencyService
 from apps.cashbook.models import CashMovement, Expense
@@ -140,6 +141,9 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         'stock': 'reports.view',
         'stock_details': 'reports.view',
         'stock_movements_summary': 'reports.view',
+        # Sans cette entrée, `HasPermission` refuse l'action à TOUS les rôles
+        # (« action non listée = accès refusé »), alors que le frontend l'appelle.
+        'product_supplies': 'reports.view',
         'cashbook': 'reports.view',
         'cash_flow': 'reports.view',
         'daily_cash_report': 'reports.view',
@@ -287,8 +291,20 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         
         if date_from and date_to:
             from datetime import datetime
-            start_date = datetime.strptime(date_from, '%Y-%m-%d').date()
-            end_date = datetime.strptime(date_to, '%Y-%m-%d').date()
+
+            # Une date malformée est une erreur de l'appelant, pas du serveur :
+            # sans ce garde-fou, `strptime` remonte en 500 et masque la cause.
+            try:
+                start_date = datetime.strptime(date_from, '%Y-%m-%d').date()
+                end_date = datetime.strptime(date_to, '%Y-%m-%d').date()
+            except ValueError:
+                raise DRFValidationError({
+                    'date_from': "Dates attendues au format AAAA-MM-JJ.",
+                })
+            if start_date > end_date:
+                raise DRFValidationError({
+                    'date_from': "La date de début doit précéder la date de fin.",
+                })
         elif period == 'today':
             start_date = today
             end_date = today
@@ -662,6 +678,47 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             'total_pages': (total_count + page_size - 1) // page_size if page_size > 0 else 0,
         })
     
+    @staticmethod
+    def _top_product_row(item):
+        """
+        Traduit une ligne agrégée de ventes en quantité lisible.
+
+        L'agrégation travaille sur ``values()`` : il n'y a donc pas de ``Product``
+        sous la main. On en reconstitue le strict nécessaire, un objet léger dont
+        ``PackagingService`` ne lit que ``selling_mode``, ``units_per_package``
+        et le nom des deux unités.
+        """
+        packages = Decimal(item.get('packages_sold') or 0)
+        packaged_units = Decimal(item.get('packaged_units') or 0)
+        quantity = Decimal(item['quantity_sold'] or 0)
+
+        stand_in = PackagingProfile.from_values(item)
+        factor = PackagingService.factor(stand_in)
+
+        if factor is None or packages <= 0:
+            display = PackagingService.format_quantity(stand_in, quantity)
+            packages_out = None if factor is None else Decimal('0')
+            loose_out = None if factor is None else quantity
+        else:
+            # Le vrac ne peut pas être négatif : une ligne dont la part
+            # conditionnée dépasse le total signale un facteur modifié après
+            # coup, on retombe alors sur la lecture au total.
+            loose_out = max(Decimal('0'), quantity - packaged_units)
+            display = PackagingService.format_split(stand_in, packages, loose_out)
+            packages_out = packages
+
+        return {
+            'product_id': item['product__id'],
+            'product_name': item['product__name'],
+            'product_sku': item['product__sku'],
+            'quantity_sold': quantity,
+            'quantity_display': display,
+            'packages_sold': packages_out,
+            'loose_sold': loose_out,
+            'packaging_factor': factor,
+            'total_revenue': item['total_revenue'],
+        }
+
     @action(detail=False, methods=['get'])
     def top_products(self, request):
         """Top produits les plus vendus avec pagination"""
@@ -680,12 +737,28 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             request,
         ).select_related('product')
         
+        # `packages_sold` additionne les contenants réellement facturés et
+        # `packaged_units` ce qu'ils pèsent en unités de détail : la part vraiment
+        # vendue à la pièce est le reste. Redécouper `quantity_sold` au facteur
+        # d'aujourd'hui donnerait « 10 casiers » là où le marchand a vendu
+        # 5 casiers et 120 bouteilles, et le facteur a pu changer depuis.
         data = items.values(
             'product__id',
             'product__name',
-            'product__sku'
+            'product__sku',
+            'product__selling_mode',
+            'product__units_per_package',
+            'product__unit__name',
+            'product__packaging_unit__name',
         ).annotate(
             quantity_sold=Coalesce(Sum('quantity'), Decimal('0'), output_field=DecimalField()),
+            packages_sold=Coalesce(
+                Sum('package_quantity'), Decimal('0'), output_field=DecimalField()
+            ),
+            packaged_units=Coalesce(
+                Sum(F('package_quantity') * F('packaging_factor')),
+                Decimal('0'), output_field=DecimalField(),
+            ),
             total_revenue=Coalesce(Sum('total'), Decimal('0'), output_field=DecimalField())
         ).order_by('-quantity_sold')
         
@@ -695,16 +768,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         end_idx = start_idx + page_size
         paginated_data = data[start_idx:end_idx]
         
-        result = [
-            {
-                'product_id': item['product__id'],
-                'product_name': item['product__name'],
-                'product_sku': item['product__sku'],
-                'quantity_sold': item['quantity_sold'],
-                'total_revenue': item['total_revenue']
-            }
-            for item in paginated_data
-        ]
+        result = [self._top_product_row(item) for item in paginated_data]
         
         serializer = TopProductSerializer(result, many=True)
         return Response({
@@ -1560,6 +1624,12 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
                         'quantity_sold': Decimal('0'),
                         'total_revenue': Decimal('0'),
                         'total_cost': Decimal('0'),
+                        # Ventilation gros/détail, cumulée depuis les lignes :
+                        # elles portent le nombre de contenants facturés et le
+                        # facteur en vigueur au moment de la vente.
+                        '_product': item.product,
+                        '_packages': Decimal('0'),
+                        '_packaged_units': Decimal('0'),
                     }
 
                 cu = effective_unit_cost(item)
@@ -1567,14 +1637,27 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
                 product_data[pid]['quantity_sold'] += item.quantity
                 product_data[pid]['total_revenue'] += rev
                 product_data[pid]['total_cost'] += (cu * item.quantity).quantize(Decimal('0.01'))
+                packages = Decimal(item.package_quantity or 0)
+                product_data[pid]['_packages'] += packages
+                product_data[pid]['_packaged_units'] += packages * (item.packaging_factor or 0)
         
         # Calculer profit et marge
         result = []
         for data in product_data.values():
             profit = data['total_revenue'] - data['total_cost']
             margin = (profit / data['total_revenue'] * 100) if data['total_revenue'] > 0 else Decimal('0')
+            product = data.pop('_product')
+            packages = data.pop('_packages')
+            packaged_units = data.pop('_packaged_units')
+            if packages > 0:
+                loose = max(Decimal('0'), data['quantity_sold'] - packaged_units)
+                display = PackagingService.format_split(product, packages, loose)
+            else:
+                display = PackagingService.format_quantity(product, data['quantity_sold'])
             result.append({
                 **data,
+                'quantity_display': display,
+                'packaging_factor': PackagingService.factor(product),
                 'profit': profit,
                 'margin_percentage': round(margin, 2),
             })
@@ -1649,10 +1732,13 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             
             # Le stock d'un produit vendu en gros se lit en contenants : « 147 »
             # ne dit pas au gérant s'il peut honorer une commande de 10 cartons.
-            loose = Decimal(str(stock.loose_quantity or 0))
-            stock_display = PackagingService.format_quantity(stock.product, qty, loose)
-            available_display = PackagingService.format_quantity(
-                stock.product, available, min(loose, max(available, Decimal('0')))
+            # Les deux compteurs sont LUS sur la ligne de stock, jamais
+            # reconstitués depuis le total : « 3 casiers + 27 bouteilles » ne
+            # doit pas se réécrire « 4 casiers + 3 bouteilles ».
+            factor = PackagingService.factor(stock.product)
+            packages, loose_split = (
+                PackagingService.stored_split(stock, factor)
+                if factor is not None else (None, None)
             )
 
             result.append({
@@ -1661,10 +1747,16 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
                 'product_sku': stock.product.sku,
                 'category_name': stock.product.category.name if stock.product.category else None,
                 'current_stock': qty,
-                'stock_display': stock_display,
+                'stock_display': PackagingService.format_stock(stock),
+                'stock_packages': packages,
+                'stock_loose': loose_split,
                 'reserved_stock': reserved,
+                'reserved_display': PackagingService.format_base_total(
+                    stock.product, reserved
+                ),
                 'available_stock': available,
-                'available_display': available_display,
+                'available_display': PackagingService.format_available(stock),
+                'packaging_factor': factor,
                 'min_stock_level': min_level,
                 'cost_price': cost,
                 'stock_value': qty * cost,
@@ -1747,7 +1839,15 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
     
     @action(detail=False, methods=['get'])
     def product_supplies(self, request):
-        """Approvisionnements par produit pour une période donnée"""
+        """
+        Approvisionnements par produit pour une période donnée.
+
+        Chaque entrée porte le total en unité de détail ET sa lecture en
+        contenants (« 10 cartons + 5 bouteilles »). Les contenants viennent des
+        champs de saisie figés sur le mouvement, jamais d'une division du total :
+        une réception de 5 cartons plus 120 bouteilles ne doit pas se relire
+        « 10 cartons ».
+        """
         org = self.get_organization()
         start_date, end_date, _, _ = self._parse_date_range(request)
         
@@ -1762,10 +1862,44 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
                 movement_type__in=['purchase', 'initial', 'transfer_in', 'adjustment_in', 'return_in']
             ),
             request,
-        ).values('product_id').annotate(
-            total_supply=Sum('quantity')
+        ).values(
+            'product_id',
+            'product__name',
+            'product__selling_mode',
+            'product__units_per_package',
+            'product__unit__name',
+            'product__packaging_unit__name',
+        ).annotate(
+            total_supply=Coalesce(Sum('quantity'), Decimal('0'), output_field=DecimalField()),
+            total_packages=Coalesce(
+                Sum('input_package_quantity'), Decimal('0'), output_field=DecimalField()
+            ),
+            packaged_units=Coalesce(
+                Sum(F('input_package_quantity') * F('packaging_factor')),
+                Decimal('0'), output_field=DecimalField(),
+            ),
         )
         
-        # Convertir en dictionnaire product_id -> quantity
-        result = {str(s['product_id']): float(s['total_supply']) for s in supplies}
+        result = {}
+        for row in supplies:
+            profile = PackagingProfile.from_values(row)
+            factor = PackagingService.factor(profile)
+            quantity = Decimal(row['total_supply'] or 0)
+            packages = Decimal(row['total_packages'] or 0)
+            packaged_units = Decimal(row['packaged_units'] or 0)
+
+            if factor is not None and packages > 0:
+                loose = max(Decimal('0'), quantity - packaged_units)
+                display = PackagingService.format_split(profile, packages, loose)
+            else:
+                loose = quantity if factor is not None else None
+                packages = Decimal('0') if factor is not None else None
+                display = PackagingService.format_quantity(profile, quantity)
+
+            result[str(row['product_id'])] = {
+                'quantity': float(quantity),
+                'display': display,
+                'packages': float(packages) if packages is not None else None,
+                'loose': float(loose) if loose is not None else None,
+            }
         return Response(result)

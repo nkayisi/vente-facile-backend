@@ -120,6 +120,46 @@ class StockLocationSerializer(serializers.ModelSerializer):
 
 
 # =============================================================================
+# LECTURE DES ÉCARTS DE COMPTAGE
+# =============================================================================
+
+def _difference_display(product, *, expected_base, expected_loose,
+                        counted_packages, counted_loose, base_delta):
+    """
+    Écart d'un comptage, ventilé par canal quand les deux parts sont connues.
+
+    Comptages d'inventaire et lignes d'ajustement enregistrent exactement les
+    mêmes quatre nombres ; leur écart doit donc se lire de la même façon dans
+    les deux rubriques, sans quoi le même produit compté deux fois donnerait
+    deux formulations.
+
+    Une saisie faite en total simple (les deux compteurs à zéro alors qu'une
+    quantité a bien été comptée) ne permet aucune ventilation honnête : on rend
+    alors le total signé en unité de détail.
+    """
+    from apps.inventory.packaging import PackagingService
+
+    factor = PackagingService.factor(product)
+    if factor is None:
+        return PackagingService.format_difference(product, base_delta)
+
+    counted_packages = counted_packages or 0
+    counted_loose = counted_loose or 0
+    if not counted_packages and not counted_loose:
+        return PackagingService.format_difference(product, base_delta)
+
+    expected_packages, expected_loose_split = PackagingService.split(
+        expected_base, expected_loose or 0, factor
+    )
+    return PackagingService.format_difference(
+        product,
+        base_delta,
+        package_delta=counted_packages - expected_packages,
+        loose_delta=counted_loose - expected_loose_split,
+    )
+
+
+# =============================================================================
 # STOCK SERIALIZERS
 # =============================================================================
 
@@ -140,6 +180,14 @@ class StockListSerializer(serializers.ModelSerializer):
     stock_display = serializers.SerializerMethodField()
     stock_packages = serializers.SerializerMethodField()
     stock_loose = serializers.SerializerMethodField()
+    available_display = serializers.SerializerMethodField()
+    available_packages = serializers.SerializerMethodField()
+    available_loose = serializers.SerializerMethodField()
+    reserved_display = serializers.SerializerMethodField()
+    packaging_factor = serializers.SerializerMethodField()
+    package_unit_symbol = serializers.CharField(
+        source='product.packaging_unit.symbol', read_only=True
+    )
 
     class Meta:
         model = Stock
@@ -148,15 +196,20 @@ class StockListSerializer(serializers.ModelSerializer):
             'variant', 'variant_name',
             'warehouse', 'warehouse_name',
             'quantity', 'reserved_quantity', 'available_quantity',
-            'loose_quantity', 'stock_display', 'stock_packages', 'stock_loose',
-            'unit_symbol',
+            'loose_quantity', 'package_quantity',
+            'stock_display', 'stock_packages', 'stock_loose',
+            'available_display', 'available_packages', 'available_loose',
+            'reserved_display', 'packaging_factor',
+            'unit_symbol', 'package_unit_symbol',
             'avg_cost', 'stock_value',
             'last_movement_at'
         ]
         read_only_fields = ['id', 'last_movement_at']
 
     def _get_effective_cost(self, obj):
-        return obj.avg_cost if obj.avg_cost > 0 else (obj.product.cost_price or Decimal('0.00'))
+        # Règle portée par le modèle, pour que l'écran, l'API et les exports
+        # valorisent le stock avec exactement le même coût.
+        return obj.effective_cost
 
     def get_avg_cost(self, obj):
         return str(self._get_effective_cost(obj))
@@ -168,10 +221,36 @@ class StockListSerializer(serializers.ModelSerializer):
         """Quantité prête à afficher : « 1 paquet + 10 bouteilles »."""
         from apps.inventory.packaging import PackagingService
 
-        return PackagingService.format_quantity(
-            obj.product, obj.quantity,
-            min(obj.loose_quantity, max(obj.quantity, Decimal('0.000'))),
-        )
+        return PackagingService.format_stock(obj)
+
+    def get_available_display(self, obj):
+        """
+        Disponible dans les mêmes termes que ``stock_display``.
+
+        Un « 3 casiers + 7 bouteilles » en rayon face à un « 147 » disponible
+        obligeait le gérant à faire la division de tête, et à la refaire à
+        chaque écran : les deux se lisent désormais pareil.
+        """
+        from apps.inventory.packaging import PackagingService
+
+        return PackagingService.format_available(obj)
+
+    def get_reserved_display(self, obj):
+        """
+        Réservé, en unité de détail nommée.
+
+        Une réservation n'est PAS posée sur des contenants précis : la traduire
+        en « 2 casiers » affirmerait que deux casiers scellés sont bloqués, ce
+        que rien ne garantit. On nomme donc l'unité sans inventer de partage.
+        """
+        from apps.inventory.packaging import PackagingService
+
+        return PackagingService.format_base_total(obj.product, obj.reserved_quantity)
+
+    def get_packaging_factor(self, obj):
+        from apps.inventory.packaging import PackagingService
+
+        return PackagingService.factor(obj.product)
 
     def _split(self, obj):
         """Partage lu sur les compteurs, jamais redivisé depuis le total."""
@@ -182,12 +261,28 @@ class StockListSerializer(serializers.ModelSerializer):
             return None
         return PackagingService.stored_split(obj, factor)
 
+    def _available_split(self, obj):
+        from apps.inventory.packaging import PackagingService
+
+        factor = PackagingService.factor(obj.product)
+        if factor is None:
+            return None
+        return PackagingService.available_split(obj, factor)
+
     def get_stock_packages(self, obj):
         split = self._split(obj)
         return split[0] if split else None
 
     def get_stock_loose(self, obj):
         split = self._split(obj)
+        return str(split[1]) if split else None
+
+    def get_available_packages(self, obj):
+        split = self._available_split(obj)
+        return split[0] if split else None
+
+    def get_available_loose(self, obj):
+        split = self._available_split(obj)
         return str(split[1]) if split else None
 
 
@@ -211,6 +306,14 @@ class StockDetailSerializer(serializers.ModelSerializer):
     stock_display = serializers.SerializerMethodField()
     stock_packages = serializers.SerializerMethodField()
     stock_loose = serializers.SerializerMethodField()
+    available_display = serializers.SerializerMethodField()
+    available_packages = serializers.SerializerMethodField()
+    available_loose = serializers.SerializerMethodField()
+    reserved_display = serializers.SerializerMethodField()
+    packaging_factor = serializers.SerializerMethodField()
+    package_unit_symbol = serializers.CharField(
+        source='product.packaging_unit.symbol', read_only=True
+    )
 
     class Meta:
         model = Stock
@@ -220,8 +323,11 @@ class StockDetailSerializer(serializers.ModelSerializer):
             'warehouse', 'warehouse_name',
             'location', 'location_name',
             'quantity', 'reserved_quantity', 'available_quantity',
-            'loose_quantity', 'stock_display', 'stock_packages', 'stock_loose',
-            'unit_symbol',
+            'loose_quantity', 'package_quantity',
+            'stock_display', 'stock_packages', 'stock_loose',
+            'available_display', 'available_packages', 'available_loose',
+            'reserved_display', 'packaging_factor',
+            'unit_symbol', 'package_unit_symbol',
             'avg_cost', 'stock_value', 'last_counted_at', 'last_movement_at',
             'recent_movements', 'batches',
             'created_at', 'updated_at'
@@ -229,7 +335,9 @@ class StockDetailSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
     def _get_effective_cost(self, obj):
-        return obj.avg_cost if obj.avg_cost > 0 else (obj.product.cost_price or Decimal('0.00'))
+        # Règle portée par le modèle, pour que l'écran, l'API et les exports
+        # valorisent le stock avec exactement le même coût.
+        return obj.effective_cost
 
     def get_avg_cost(self, obj):
         return str(self._get_effective_cost(obj))
@@ -239,9 +347,15 @@ class StockDetailSerializer(serializers.ModelSerializer):
 
     # Partage scellé/vrac - même logique que la liste, déléguée au service.
     get_stock_display = StockListSerializer.get_stock_display
+    get_available_display = StockListSerializer.get_available_display
+    get_reserved_display = StockListSerializer.get_reserved_display
+    get_packaging_factor = StockListSerializer.get_packaging_factor
     _split = StockListSerializer._split
+    _available_split = StockListSerializer._available_split
     get_stock_packages = StockListSerializer.get_stock_packages
     get_stock_loose = StockListSerializer.get_stock_loose
+    get_available_packages = StockListSerializer.get_available_packages
+    get_available_loose = StockListSerializer.get_available_loose
 
     def get_recent_movements(self, obj):
         """Retourne les 10 derniers mouvements."""
@@ -259,7 +373,9 @@ class StockDetailSerializer(serializers.ModelSerializer):
             product=obj.product,
             warehouse=obj.warehouse,
             quantity__gt=0
-        )
+        # `product__unit` alimente `quantity_display` du lot : sans elle, une
+        # requête de plus par lot.
+        ).select_related('product', 'product__unit')
         return StockBatchSerializer(batches, many=True).data
 
 
@@ -275,18 +391,32 @@ class StockBatchSerializer(serializers.ModelSerializer):
     location_name = serializers.CharField(source='location.name', read_only=True)
     is_expired = serializers.BooleanField(read_only=True)
     days_until_expiry = serializers.SerializerMethodField()
+    quantity_display = serializers.SerializerMethodField()
     
     class Meta:
         model = StockBatch
         fields = [
             'id', 'product', 'product_name', 'variant',
             'warehouse', 'warehouse_name', 'location', 'location_name',
-            'batch_number', 'quantity', 'cost_price',
+            'batch_number', 'quantity', 'quantity_display', 'cost_price',
             'manufacturing_date', 'expiry_date',
             'is_expired', 'days_until_expiry',
             'received_at', 'notes'
         ]
         read_only_fields = ['id', 'received_at']
+
+    def get_quantity_display(self, obj):
+        """
+        Restant du lot en unité de détail nommée : « 240 bouteilles ».
+
+        Un lot suit une date de péremption, pas un emballage : rien ne dit
+        combien de ses unités sont encore scellées. On nomme donc l'unité sans
+        annoncer de contenants, ce qui laisse quand même la quantité lisible
+        pour un produit vendu en gros.
+        """
+        from apps.inventory.packaging import PackagingService
+
+        return PackagingService.format_base_total(obj.product, obj.quantity)
 
     def get_days_until_expiry(self, obj):
         if obj.expiry_date:
@@ -313,6 +443,18 @@ class StockMovementListSerializer(serializers.ModelSerializer):
     # Quantité telle qu'elle a été saisie : « 10 cartons + 5 bouteilles ».
     # `quantity` reste la valeur en unité de base et fait foi pour tout calcul.
     quantity_display = serializers.SerializerMethodField()
+    input_package_quantity = serializers.DecimalField(
+        max_digits=15, decimal_places=3, read_only=True
+    )
+    input_loose_quantity = serializers.DecimalField(
+        max_digits=15, decimal_places=3, read_only=True
+    )
+    package_unit_symbol = serializers.CharField(
+        source='product.packaging_unit.symbol', read_only=True
+    )
+    unit_symbol = serializers.CharField(source='product.unit.symbol', read_only=True)
+    quantity_before_display = serializers.SerializerMethodField()
+    quantity_after_display = serializers.SerializerMethodField()
 
     class Meta:
         model = StockMovement
@@ -322,7 +464,10 @@ class StockMovementListSerializer(serializers.ModelSerializer):
             'movement_type', 'movement_type_display',
             'quantity', 'quantity_display', 'unit_cost',
             'quantity_before', 'quantity_after',
+            'quantity_before_display', 'quantity_after_display',
             'packaging_factor',
+            'input_package_quantity', 'input_loose_quantity',
+            'unit_symbol', 'package_unit_symbol',
             'reference_type', 'reference_id',
             'notes',
             'created_by', 'created_by_name',
@@ -334,6 +479,28 @@ class StockMovementListSerializer(serializers.ModelSerializer):
         from .packaging import PackagingService
 
         return PackagingService.format_movement_quantity(obj)
+
+    def _stock_level_display(self, obj, value):
+        """
+        Niveau de stock avant ou après le mouvement, en unité de détail nommée.
+
+        Le mouvement n'enregistre que des TOTAUX pour ces deux bornes : le
+        partage scellé/vrac du rayon à cet instant n'est nulle part. Le
+        reconstituer au facteur écrirait « 4 casiers + 3 bouteilles » pour un
+        rayon qui portait « 3 casiers + 27 bouteilles », c'est-à-dire une
+        contrevérité présentée avec l'aplomb d'un chiffre exact. On nomme donc
+        l'unité de détail et on s'arrête là : « 99 bouteilles » se lit et ne
+        ment pas.
+        """
+        from .packaging import PackagingService
+
+        return PackagingService.format_base_total(obj.product, value)
+
+    def get_quantity_before_display(self, obj):
+        return self._stock_level_display(obj, obj.quantity_before)
+
+    def get_quantity_after_display(self, obj):
+        return self._stock_level_display(obj, obj.quantity_after)
 
 
 class StockMovementDetailSerializer(StockMovementListSerializer):
@@ -834,6 +1001,13 @@ class StockAdjustmentItemSerializer(serializers.ModelSerializer):
     product_sku = serializers.CharField(source='product.sku', read_only=True)
     counted_display = serializers.SerializerMethodField()
     expected_display = serializers.SerializerMethodField()
+    difference_display = serializers.SerializerMethodField()
+    package_unit_name = serializers.CharField(
+        source='product.packaging_unit.name', read_only=True, default=None
+    )
+    unit_name = serializers.CharField(
+        source='product.unit.name', read_only=True, default=None
+    )
     package_unit_cost = serializers.DecimalField(
         max_digits=15, decimal_places=2, required=False, write_only=True
     )
@@ -844,10 +1018,15 @@ class StockAdjustmentItemSerializer(serializers.ModelSerializer):
             'id', 'product', 'product_name', 'product_sku', 'variant', 'batch',
             'quantity_counted', 'quantity_expected', 'quantity_difference',
             'counted_package_quantity', 'counted_loose_quantity',
+            'expected_loose_quantity',
             'packaging_factor', 'counted_display', 'expected_display',
+            'difference_display', 'unit_name', 'package_unit_name',
             'unit_cost', 'package_unit_cost', 'notes'
         ]
-        read_only_fields = ['id', 'quantity_difference', 'packaging_factor']
+        read_only_fields = [
+            'id', 'quantity_difference', 'packaging_factor',
+            'expected_loose_quantity',
+        ]
         extra_kwargs = {'quantity_counted': {'required': False}}
 
     def get_counted_display(self, obj):
@@ -860,7 +1039,26 @@ class StockAdjustmentItemSerializer(serializers.ModelSerializer):
     def get_expected_display(self, obj):
         from apps.inventory.packaging import PackagingService
 
-        return PackagingService.format_quantity(obj.product, obj.quantity_expected)
+        return PackagingService.format_quantity(
+            obj.product, obj.quantity_expected, obj.expected_loose_quantity
+        )
+
+    def get_difference_display(self, obj):
+        """
+        Écart ventilé par canal : « -2 casiers, +5 bouteilles ».
+
+        Un manquant de contenants scellés et un surplus d'unités isolées se
+        compensent en unité de base et disparaissent du total ; ventilés, ils
+        désignent chacun leur cause.
+        """
+        return _difference_display(
+            obj.product,
+            expected_base=obj.quantity_expected,
+            expected_loose=obj.expected_loose_quantity,
+            counted_packages=obj.counted_package_quantity,
+            counted_loose=obj.counted_loose_quantity,
+            base_delta=obj.quantity_difference,
+        )
 
     def validate(self, data):
         """Recompose la quantité comptée et le coût unitaire de base."""
@@ -993,12 +1191,27 @@ class StockAdjustmentCreateSerializer(serializers.ModelSerializer):
         validated_data['created_by'] = self.context['request'].user
         
         adjustment = StockAdjustment.objects.create(**validated_data)
-        
+
+        # Part vrac du stock théorique, relevée en UNE requête sur l'entrepôt
+        # visé : c'est elle qui permet d'afficher plus tard l'attendu tel qu'il
+        # se présentait en rayon plutôt qu'un partage recalculé au facteur.
+        product_ids = [item['product'].id for item in items_data if item.get('product')]
+        loose_by_product = dict(
+            Stock.objects.filter(
+                organization=org,
+                warehouse=adjustment.warehouse,
+                product_id__in=product_ids,
+            ).values_list('product_id', 'loose_quantity')
+        )
+
         for item_data in items_data:
             # Calculer la différence
             item_data['quantity_difference'] = (
                 item_data['quantity_counted'] - item_data['quantity_expected']
             )
+            product = item_data.get('product')
+            if product is not None:
+                item_data['expected_loose_quantity'] = loose_by_product.get(product.id)
             StockAdjustmentItem.objects.create(
                 adjustment=adjustment,
                 organization=org,
@@ -1026,6 +1239,7 @@ class InventoryCountSerializer(serializers.ModelSerializer):
     )
     expected_display = serializers.SerializerMethodField()
     counted_display = serializers.SerializerMethodField()
+    difference_display = serializers.SerializerMethodField()
 
     class Meta:
         model = InventoryCount
@@ -1035,7 +1249,7 @@ class InventoryCountSerializer(serializers.ModelSerializer):
             'quantity_expected', 'quantity_counted', 'quantity_difference',
             'expected_loose_quantity', 'counted_package_quantity',
             'counted_loose_quantity', 'packaging_factor',
-            'expected_display', 'counted_display',
+            'expected_display', 'counted_display', 'difference_display',
             'package_unit_name',
             'unit_cost', 'difference_value',
             'is_counted', 'counted_by', 'counted_by_name', 'counted_at',
@@ -1077,6 +1291,19 @@ class InventoryCountSerializer(serializers.ModelSerializer):
             return None
         return PackagingService.format_quantity(
             obj.product, obj.quantity_counted, obj.counted_loose_quantity
+        )
+
+    def get_difference_display(self, obj):
+        """Écart ventilé par canal : « -2 casiers, +5 bouteilles »."""
+        if not obj.is_counted:
+            return None
+        return _difference_display(
+            obj.product,
+            expected_base=obj.quantity_expected,
+            expected_loose=obj.expected_loose_quantity,
+            counted_packages=obj.counted_package_quantity,
+            counted_loose=obj.counted_loose_quantity,
+            base_delta=obj.quantity_difference,
         )
 
 

@@ -453,15 +453,14 @@ class ProductListSerializer(serializers.ModelSerializer):
         if stock is None:
             quantity = self.get_stock_quantity(obj)
             return PackagingService.format_quantity(obj, quantity or 0)
-        # Même partage que `stock_packages` / `stock_loose`, pour que le libellé
-        # et les deux compteurs affichés ne puissent jamais se contredire.
+        # Même partage que `stock_packages` / `stock_loose`, RENDU tel quel :
+        # le repasser par `format_quantity` le ferait redécouper depuis le total
+        # et les deux lectures pourraient se mettre à diverger.
         split = self._packaging_split(obj)
         if split is None:
             return PackagingService.format_quantity(obj, stock.available_quantity)
         sealed, loose = split
-        return PackagingService.format_quantity(
-            obj, stock.available_quantity, loose,
-        )
+        return PackagingService.format_split(obj, sealed, loose)
 
 
 class ProductDetailSerializer(serializers.ModelSerializer):
@@ -574,15 +573,22 @@ class ProductDetailSerializer(serializers.ModelSerializer):
                 'quantity': str(stock.quantity),
                 'available': str(stock.available_quantity),
                 'reserved': str(stock.reserved_quantity),
-                'display': PackagingService.format_quantity(
-                    obj, stock.available_quantity,
-                    min(stock.loose_quantity, max(stock.available_quantity, 0)),
+                # `display` porte le DISPONIBLE depuis l'origine : c'est ce que
+                # le POS y lit. Le total en rayon et le réservé s'y ajoutent
+                # sous leurs propres noms plutôt que de changer ce sens.
+                'display': PackagingService.format_available(stock),
+                'quantity_display': PackagingService.format_stock(stock),
+                'reserved_display': PackagingService.format_base_total(
+                    obj, stock.reserved_quantity
                 ),
             }
             if factor is not None:
                 sealed, loose = PackagingService.available_split(stock, factor)
                 entry['packages'] = sealed
                 entry['loose'] = str(loose)
+                stored_packages, stored_loose = PackagingService.stored_split(stock, factor)
+                entry['quantity_packages'] = stored_packages
+                entry['quantity_loose'] = str(stored_loose)
             result.append(entry)
         return result
 

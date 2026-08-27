@@ -7,6 +7,43 @@ from django.utils import timezone
 from datetime import timedelta
 
 
+def _expiring_quantity(batch):
+    """
+    Restant d'un lot qui périme, en unité de détail nommée.
+
+    Un lot suit une date de péremption et non un emballage : rien n'y indique
+    combien de ses unités sont encore scellées. Annoncer des contenants ferait
+    donc dire au lot ce qu'il ne sait pas.
+    """
+    from apps.inventory.packaging import PackagingService
+
+    return PackagingService.format_base_total(batch.product, batch.quantity)
+
+
+def _readable_stock(product, total_available):
+    """
+    Stock d'un produit dans ses propres termes, tous entrepôts confondus.
+
+    Le total qui déclenche l'alerte est un DISPONIBLE (quantité moins réservé),
+    alors que les deux compteurs cumulés portent la quantité brute. Les
+    présenter ensemble laisserait croire que 4 casiers sont libres alors qu'un
+    est réservé : la ventilation n'est donc rendue que lorsque rien n'est
+    réservé, c'est-à-dire quand les deux lectures coïncident. Sinon on nomme
+    l'unité de détail, ce qui reste lisible sans rien affirmer de faux.
+    """
+    from apps.inventory.packaging import PackagingService
+
+    factor = PackagingService.factor(product)
+    if factor is None:
+        return PackagingService.format_base_total(product, total_available)
+
+    packages = getattr(product, 'total_packages', 0) or 0
+    loose = getattr(product, 'total_loose', 0) or 0
+    if packages * factor + loose == total_available:
+        return PackagingService.format_split(product, packages, loose)
+    return PackagingService.format_base_total(product, total_available)
+
+
 @shared_task
 def check_low_stock_alerts():
     """Check for products with low stock and create alerts."""
@@ -14,19 +51,30 @@ def check_low_stock_alerts():
     from django.db.models.functions import Coalesce
     from apps.products.models import Product
     from apps.notifications.models import Alert
+    from apps.inventory.packaging import PackagingService
 
     # Stock disponible total agrégé en base + filtre directement sur les produits
     # sous le seuil (une requête au lieu d'une requête Stock par produit).
     # Un produit sans ligne de stock → total 0 (out-of-stock), comme avant.
+    # `unit` et `packaging_unit` alimentent le libellé « 3 casiers +
+    # 7 bouteilles » de l'alerte : sans eux, deux requêtes par produit alerté.
     products = list(Product.objects.filter(
         is_active=True,
         is_deleted=False,
         track_inventory=True
-    ).select_related('organization').annotate(
+    ).select_related('organization', 'unit', 'packaging_unit').annotate(
         total_available=Coalesce(
             Sum(F('stocks__quantity') - F('stocks__reserved_quantity')),
             Value(0, output_field=DecimalField(max_digits=20, decimal_places=3)),
-        )
+        ),
+        total_packages=Coalesce(
+            Sum('stocks__package_quantity'),
+            Value(0, output_field=DecimalField(max_digits=20, decimal_places=3)),
+        ),
+        total_loose=Coalesce(
+            Sum('stocks__loose_quantity'),
+            Value(0, output_field=DecimalField(max_digits=20, decimal_places=3)),
+        ),
     ).filter(total_available__lte=F('reorder_point')))
 
     if not products:
@@ -53,19 +101,27 @@ def check_low_stock_alerts():
         severity = Alert.Severity.CRITICAL if total_stock == 0 else Alert.Severity.HIGH
         alert_type = Alert.AlertType.OUT_OF_STOCK if total_stock == 0 else Alert.AlertType.LOW_STOCK
 
+        # « un stock de 147.000 » ne dit rien au gérant d'un produit vendu au
+        # casier : il ne saura pas s'il lui reste six casiers ou trois. Les deux
+        # compteurs sont cumulés tous entrepôts confondus, comme le total qui
+        # déclenche l'alerte, et le seuil est rendu dans la même unité.
+        stock_text = _readable_stock(product, total_stock)
+        reorder_text = PackagingService.format_base_total(product, product.reorder_point)
+
         Alert.objects.create(
             organization=product.organization,
             alert_type=alert_type,
             severity=severity,
             title=f"Stock bas: {product.name}",
-            message=f"Le produit {product.name} (SKU: {product.sku}) a un stock de {total_stock}. "
-                   f"Le seuil de réapprovisionnement est de {product.reorder_point}.",
+            message=f"Le produit {product.name} (SKU: {product.sku}) a un stock de {stock_text}. "
+                   f"Le seuil de réapprovisionnement est de {reorder_text}.",
             resource_type='product',
             resource_id=product.id,
             data={
                 'product_id': str(product.id),
                 'product_name': product.name,
                 'current_stock': float(total_stock),
+                'current_stock_display': stock_text,
                 'reorder_point': product.reorder_point
             }
         )
@@ -85,7 +141,7 @@ def check_expiring_products():
         expiry_date__lte=warning_date,
         expiry_date__gte=timezone.now().date(),
         quantity__gt=0
-    ).select_related('product', 'organization')
+    ).select_related('product', 'product__unit', 'organization')
     
     for batch in expiring_batches:
         existing_alert = Alert.objects.filter(
@@ -105,7 +161,8 @@ def check_expiring_products():
                 severity=Alert.Severity.HIGH if days_until_expiry <= 7 else Alert.Severity.MEDIUM,
                 title=f"Produit bientôt périmé: {batch.product.name}",
                 message=f"Le lot {batch.batch_number} du produit {batch.product.name} "
-                       f"expire le {batch.expiry_date}. Quantité: {batch.quantity}",
+                       f"expire le {batch.expiry_date}. "
+                       f"Quantité: {_expiring_quantity(batch)}",
                 resource_type='stock_batch',
                 resource_id=batch.id,
                 data={

@@ -1117,6 +1117,12 @@ class ProductExcelService:
 
         stocks = list(product.stocks.all())
         total_stock = sum((s.quantity or Decimal("0") for s in stocks), Decimal("0"))
+        # Les deux compteurs sont cumulés TELS QUELS d'un entrepôt à l'autre :
+        # dériver les contenants du total reviendrait à rescoller en casiers des
+        # bouteilles isolées éparpillées sur trois dépôts.
+        total_packages = sum(
+            (s.package_quantity or Decimal("0") for s in stocks), Decimal("0")
+        )
         total_loose = sum((s.loose_quantity or Decimal("0") for s in stocks), Decimal("0"))
         return {
             "name": product.name or "",
@@ -1142,7 +1148,11 @@ class ProductExcelService:
             # plutôt que « 147 », qui ne lui dit pas s'il peut servir une
             # commande en gros.
             "stock_display": (
-                PackagingService.format_quantity(product, total_stock, total_loose)
+                (
+                    PackagingService.format_split(product, total_packages, total_loose)
+                    if PackagingService.factor(product) is not None
+                    else PackagingService.format_quantity(product, total_stock)
+                )
                 if product.track_inventory else ""
             ),
             "min_stock_level": product.min_stock_level or 0,
@@ -1239,6 +1249,25 @@ class ProductExcelService:
             fontSize=8,
             leading=10,
         )
+        # Un `Paragraph` porte son propre alignement : les directives `ALIGN`
+        # d'un `TableStyle` ne l'atteignent pas. Les quatre colonnes de prix
+        # étaient donc déclarées à droite et sortaient à gauche, la règle
+        # n'ayant jamais eu d'effet. L'alignement se pose ici, sur le style.
+        cell_right = ParagraphStyle("CellR", parent=cell_style, alignment=2)
+        cell_center = ParagraphStyle("CellC", parent=cell_style, alignment=1)
+
+        # Colonnes qui se rangent à droite : les prix, et le stock - écrit en
+        # mots (« 12 cartons + 3 bouteilles ») mais lu comme une grandeur.
+        RIGHT_COLUMNS = {"cost_price", "selling_price", "package_cost_price",
+                         "wholesale_price", "stock_display"}
+        CENTER_COLUMNS = {"is_active"}
+
+        def column_style(key):
+            if key in RIGHT_COLUMNS:
+                return cell_right
+            if key in CENTER_COLUMNS:
+                return cell_center
+            return cell_style
 
         # Les prix sont groupés par canal, détail puis gros, comme à l'écran.
         # La colonne « Unité » disparaît : le stock détaillé porte désormais les
@@ -1268,14 +1297,28 @@ class ProductExcelService:
             Spacer(1, 6 * mm),
         ]
 
-        data = [[Paragraph(f"<b>{c['header']}</b>", cell_style) for c in pdf_columns]]
+        # L'en-tête se range comme sa colonne, sinon « Achat détail » collé à
+        # gauche ne coiffe plus visuellement les montants collés à droite.
+        data = [[
+            Paragraph(f"<b>{c['header']}</b>", column_style(c["key"]))
+            for c in pdf_columns
+        ]]
+
+        # Décimales de la devise de l'organisation, et convention francophone :
+        # le `.2f` codé en dur imprimait « 10 198.20 » pour un catalogue en
+        # francs congolais, une devise qui n'a pas de décimale, et posait un
+        # point là où tous les autres documents posent une virgule.
+        from apps.core.exports import currency_decimals, format_number
+        from apps.settings.services import CurrencyService
+
+        decimals = currency_decimals(CurrencyService.primary_code(organization))
 
         def fmt_money(value):
             if value in (None, ""):
                 return ""
             try:
-                return f"{float(value):,.2f}".replace(",", " ")
-            except (TypeError, ValueError):
+                return format_number(value, decimals)
+            except (TypeError, ValueError, ArithmeticError):
                 return str(value)
 
         for product in queryset.iterator(chunk_size=500):
@@ -1287,12 +1330,12 @@ class ProductExcelService:
                 Paragraph(str(row_dict["sku"] or ""), cell_style),
                 Paragraph(str(row_dict["category"] or "-"), cell_style),
                 Paragraph(str(row_dict["brand"] or "-"), cell_style),
-                Paragraph(fmt_money(row_dict["cost_price"]) or "-", cell_style),
-                Paragraph(fmt_money(row_dict["selling_price"]) or "-", cell_style),
-                Paragraph(fmt_money(row_dict["package_cost_price"]) or "-", cell_style),
-                Paragraph(fmt_money(row_dict["wholesale_price"]) or "-", cell_style),
-                Paragraph(str(row_dict["stock_display"] or "-"), cell_style),
-                Paragraph(str(row_dict["is_active"]), cell_style),
+                Paragraph(fmt_money(row_dict["cost_price"]) or "-", cell_right),
+                Paragraph(fmt_money(row_dict["selling_price"]) or "-", cell_right),
+                Paragraph(fmt_money(row_dict["package_cost_price"]) or "-", cell_right),
+                Paragraph(fmt_money(row_dict["wholesale_price"]) or "-", cell_right),
+                Paragraph(str(row_dict["stock_display"] or "-"), cell_right),
+                Paragraph(str(row_dict["is_active"]), cell_center),
             ])
 
         if total == 0:
@@ -1308,9 +1351,9 @@ class ProductExcelService:
                 [
                     ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F97316")),
                     ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                    # Les quatre colonnes de prix alignées à droite
-                    ("ALIGN", (4, 1), (7, -1), "RIGHT"),
-                    ("ALIGN", (-1, 1), (-1, -1), "CENTER"),
+                    # L'alignement est porté par le style de chaque `Paragraph`
+                    # (voir `column_style`) : une règle `ALIGN` posée ici serait
+                    # sans effet, comme elle l'a été jusqu'à présent.
                     ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                     ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#E5E7EB")),
                     ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#D1D5DB")),

@@ -12,7 +12,9 @@ from django.db import transaction
 from django.utils import timezone
 from decimal import Decimal
 
-from apps.core.api_mixins import TenantViewSetMixin, AuditMixin, WarehouseScopedQuerysetMixin
+from apps.core.api_mixins import (
+    TenantViewSetMixin, AuditMixin, WarehouseScopedQuerysetMixin, ExportResponseMixin,
+)
 from apps.core.warehouse_scope import (
     accessible_warehouse_ids,
     assert_warehouse_allowed_for_request,
@@ -29,6 +31,8 @@ from .models import (
     StockTransfer, StockTransferItem, StockAdjustment, StockAdjustmentItem,
     InventorySession, InventoryCount, STOCK_IN_MOVEMENT_TYPES
 )
+from .filters import StockFilter, StockMovementFilter
+from .report_params import build_export_context
 from .serializers import (
     WarehouseListSerializer, WarehouseDetailSerializer, WarehouseCreateSerializer,
     StockLocationSerializer,
@@ -184,7 +188,7 @@ class StockLocationViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, vie
 # STOCK VIEWSET
 # =============================================================================
 
-class StockViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, viewsets.ModelViewSet):
+class StockViewSet(ExportResponseMixin, WarehouseScopedQuerysetMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet pour la consultation du stock.
     
@@ -200,7 +204,7 @@ class StockViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, viewsets.Mo
     queryset = Stock.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['warehouse', 'product', 'variant']
+    filterset_class = StockFilter
     search_fields = ['product__name', 'product__sku']
     ordering_fields = ['quantity', 'last_movement_at']
     ordering = ['-last_movement_at']
@@ -219,6 +223,7 @@ class StockViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, viewsets.Mo
         'by_warehouse': 'stock.view',
         'low_stock': 'stock.view',
         'expiring': 'stock.view',
+        'export': 'stock.view',
         'unpack': 'stock_movements.create',
     }
 
@@ -237,6 +242,37 @@ class StockViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, viewsets.Mo
         if self.action == 'list':
             return StockListSerializer
         return StockDetailSerializer
+
+    @action(detail=False, methods=['get'], url_path='export')
+    def export(self, request):
+        """
+        Exporte la situation de stock filtrée, en PDF ou en Excel.
+
+        Le fichier porte TOUTES les lignes du périmètre, pas la seule page
+        affichée : c'est la raison d'être d'un export côté serveur. Le queryset
+        traverse les mêmes filtres et le même scoping d'entrepôt que la liste,
+        donc un magasinier n'exporte jamais un entrepôt qui ne lui est pas
+        assigné.
+        """
+        from apps.settings.services import CurrencyService
+
+        from .reports import build_stock_levels_report
+
+        organization = self.get_organization()
+        fmt = self.get_export_format(request)
+        queryset = self.filter_queryset(self.get_queryset())
+
+        filters_applied, _ = build_export_context(request, organization)
+        group_by_category = request.query_params.get('group_by', 'category') == 'category'
+
+        spec = build_stock_levels_report(
+            queryset,
+            organization,
+            currency=CurrencyService.primary_code(organization),
+            filters_applied=filters_applied,
+            group_by_category=group_by_category,
+        )
+        return self.render_export(spec, 'niveau_de_stock', fmt)
 
     @action(detail=True, methods=['post'])
     def unpack(self, request, pk=None):
@@ -365,7 +401,7 @@ class StockViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, viewsets.Mo
             expiry_date__lte=expiry_date,
             expiry_date__gte=timezone.now().date(),
             quantity__gt=0
-        ).select_related('product', 'warehouse').order_by('expiry_date')
+        ).select_related('product', 'product__unit', 'warehouse').order_by('expiry_date')
         m = get_membership_for_request(request)
         if m:
             batches = filter_queryset_by_warehouse_ids(batches, m, 'warehouse_id')
@@ -389,7 +425,7 @@ class StockViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, viewsets.Mo
         batches = StockBatch.objects.filter(
             organization=organization,
             product_id=product_id
-        ).select_related('product', 'warehouse', 'variant')
+        ).select_related('product', 'product__unit', 'warehouse', 'variant')
         
         if warehouse_id:
             assert_warehouse_allowed_for_request(request, warehouse_id)
@@ -443,7 +479,9 @@ class StockBatchViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, viewse
     ordering_fields = ['expiry_date', 'received_at']
     ordering = ['expiry_date']
     
-    select_related_fields = ['product', 'warehouse']
+    # `product__unit` alimente `quantity_display` (« 240 bouteilles ») : sans
+    # elle, une requête de plus par lot listé.
+    select_related_fields = ['product', 'product__unit', 'warehouse']
     
     # Lots en lecture seule - créés via réception de marchandises
     http_method_names = ['get', 'head', 'options']
@@ -453,7 +491,7 @@ class StockBatchViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, viewse
 # STOCK MOVEMENT VIEWSET
 # =============================================================================
 
-class StockMovementViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, viewsets.ModelViewSet):
+class StockMovementViewSet(ExportResponseMixin, WarehouseScopedQuerysetMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet pour les mouvements de stock.
     
@@ -466,7 +504,7 @@ class StockMovementViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, vie
     queryset = StockMovement.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['warehouse', 'product', 'movement_type']
+    filterset_class = StockMovementFilter
     search_fields = ['product__name', 'product__sku', 'notes']
     ordering_fields = ['created_at', 'quantity']
     ordering = ['-created_at']
@@ -482,6 +520,8 @@ class StockMovementViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, vie
         'list': 'stock_movements.view',
         'retrieve': 'stock_movements.view',
         'create': 'stock_movements.create',
+        'export': 'stock_movements.view',
+        'supplies_export': 'stock_movements.view',
     }
 
     def get_serializer_class(self):
@@ -490,6 +530,74 @@ class StockMovementViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, vie
         elif self.action == 'create':
             return StockMovementCreateSerializer
         return StockMovementDetailSerializer
+
+    @action(detail=False, methods=['get'], url_path='export')
+    def export(self, request):
+        """Exporte le journal des mouvements filtré, en PDF ou en Excel."""
+        from apps.settings.services import CurrencyService
+
+        from .reports import build_movements_report
+
+        organization = self.get_organization()
+        fmt = self.get_export_format(request)
+        queryset = self.filter_queryset(self.get_queryset())
+
+        filters_applied, period = build_export_context(
+            request, organization, include_period=True,
+        )
+
+        spec = build_movements_report(
+            queryset,
+            organization,
+            currency=CurrencyService.primary_code(organization),
+            filters_applied=filters_applied,
+            period_label=period,
+        )
+        return self.render_export(spec, 'mouvements_de_stock', fmt)
+
+    @action(detail=False, methods=['get'], url_path='supplies-export')
+    def supplies_export(self, request):
+        """
+        Exporte le rapport d'approvisionnement valorisé.
+
+        Part des mouvements qui font ENTRER de la marchandise. Le paramètre
+        `source` resserre au besoin sur les seules réceptions fournisseur :
+        `all` (défaut) répond à « tout ce qui est entré », `receipts` à « ce que
+        j'ai acheté », deux questions distinctes que le même écran doit servir.
+
+        `group_by=product` (défaut) donne la valeur d'achat par produit,
+        `group_by=movement` déroule le détail chronologique.
+        """
+        from apps.settings.services import CurrencyService
+
+        from .reports import build_supplies_report
+
+        organization = self.get_organization()
+        fmt = self.get_export_format(request)
+
+        queryset = self.filter_queryset(self.get_queryset()).filter(
+            movement_type__in=STOCK_IN_MOVEMENT_TYPES,
+        )
+        if request.query_params.get('source') == 'receipts':
+            queryset = queryset.filter(reference_type='goods_receipt')
+
+        filters_applied, period = build_export_context(
+            request, organization, include_period=True,
+        )
+        group_by = (
+            'movement' if request.query_params.get('group_by') == 'movement'
+            else 'product'
+        )
+
+        spec = build_supplies_report(
+            queryset,
+            organization,
+            currency=CurrencyService.primary_code(organization),
+            filters_applied=filters_applied,
+            group_by=group_by,
+            period_label=period,
+        )
+        return self.render_export(spec, 'approvisionnement', fmt)
 
     @transaction.atomic
     def perform_create(self, serializer):

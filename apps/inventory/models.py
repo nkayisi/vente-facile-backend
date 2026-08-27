@@ -189,6 +189,25 @@ class Stock(TenantModel):
         """Quantity available for sale (excluding reserved)."""
         return self.quantity - self.reserved_quantity
 
+    @property
+    def effective_cost(self):
+        """
+        Coût unitaire retenu pour valoriser ce stock.
+
+        Le coût moyen pondéré de l'entrepôt fait foi : c'est l'argent réellement
+        immobilisé, réception après réception. On ne retombe sur le prix d'achat
+        catalogue du produit que pour un stock jamais approvisionné, dont
+        l'``avg_cost`` vaut encore zéro.
+        """
+        if self.avg_cost and self.avg_cost > 0:
+            return self.avg_cost
+        return self.product.cost_price or Decimal('0.00')
+
+    @property
+    def stock_value(self):
+        """Valeur du stock au coût, dans la devise principale de l'organisation."""
+        return self.quantity * self.effective_cost
+
     def save(self, *args, **kwargs):
         from django.core.exceptions import ValidationError
 
@@ -717,6 +736,14 @@ class StockAdjustmentItem(TenantModel):
     # Part comptée hors emballage scellé. Elle fait autorité à l'approbation :
     # un comptage physique constate le vrac réel, il ne le déduit pas.
     counted_loose_quantity = models.DecimalField(
+        max_digits=15, decimal_places=3, null=True, blank=True
+    )
+    # Part vrac du stock théorique, relevée sur la ligne de stock au moment où
+    # l'ajustement est créé. Sans elle, l'écran redécoupe `quantity_expected` au
+    # facteur et annonce « 4 casiers + 3 bouteilles » là où le rayon portait
+    # « 3 casiers + 27 bouteilles » : l'écart affiché porterait alors sur un
+    # attendu qui n'a jamais existé.
+    expected_loose_quantity = models.DecimalField(
         max_digits=15, decimal_places=3, null=True, blank=True
     )
     # Nombre de contenants scellés comptés. `quantity_counted` en est la somme

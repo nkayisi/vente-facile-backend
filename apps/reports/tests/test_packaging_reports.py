@@ -16,7 +16,8 @@ from apps.sales.models import Sale, SaleItem
 from apps.sales.tests._helpers import make_org_with_users
 
 
-class PackagingReportTests(APITestCase):
+class _PackagingReportSetup(APITestCase):
+    """Fixtures communes : Eau 50cl, paquet de 12, vendue en gros et au détail."""
 
     def setUp(self):
         ctx = make_org_with_users()
@@ -66,6 +67,9 @@ class PackagingReportTests(APITestCase):
             packaging_factor=factor if packages else None,
         )
         return sale
+
+
+class PackagingReportTests(_PackagingReportSetup):
 
     def _report(self):
         response = self.client.get(
@@ -154,3 +158,144 @@ class PackagingReportTests(APITestCase):
         _, rows = self._report()
         self.assertEqual(Decimal(rows['retail']['revenue']), Decimal('2400.00'))
         self.assertEqual(Decimal(rows['wholesale']['revenue']), Decimal('0.00'))
+
+class QuantitesLisiblesTests(_PackagingReportSetup):
+    """
+    Les rapports rendent les quantités dans les termes de l'opération.
+
+    « 245 » ne dit pas au gérant si ses clients lui ont pris vingt casiers ou
+    cinq casiers et un carton de bouteilles à l'unité : ces deux ventes ne se
+    réapprovisionnent pas de la même façon, et leur marge n'est pas la même.
+    """
+
+    def _stock(self, packages, loose):
+        from apps.inventory.models import Stock
+
+        return Stock.objects.create(
+            organization=self.org,
+            product=self.product,
+            warehouse=self.warehouse,
+            quantity=Decimal(packages * 12 + loose),
+            package_quantity=Decimal(packages),
+            loose_quantity=Decimal(loose),
+            avg_cost=Decimal('400.00'),
+        )
+
+    def test_top_products_ventile_la_quantite_vendue(self):
+        # 5 casiers facturés au paquet, plus 12 bouteilles à la pièce : le
+        # total (72) se lirait « 6 casiers » si on le redécoupait au facteur.
+        self._make_sale('VTE-G-1', packages=5)
+        self._make_sale('VTE-D-1', loose=12)
+
+        response = self.client.get(
+            '/api/v1/reports/statistics/top_products/', **self._headers
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        row = response.data['results'][0]
+
+        self.assertEqual(row['quantity_display'], '5 paquets + 12 bouteilles')
+        self.assertEqual(Decimal(row['packages_sold']), Decimal('5.000'))
+        self.assertEqual(Decimal(row['loose_sold']), Decimal('12.000'))
+        self.assertEqual(row['packaging_factor'], 12)
+
+    def test_top_products_d_un_produit_simple_reste_en_unites(self):
+        simple = Product.objects.create(
+            organization=self.org,
+            name='Savon', slug='savon', sku='SAV-01',
+            unit=self.bottle,
+            cost_price=Decimal('500.00'), selling_price=Decimal('800.00'),
+            is_taxable=False, track_inventory=True, is_active=True,
+        )
+        sale = Sale.objects.create(
+            organization=self.org, reference='VTE-S-1',
+            warehouse=self.warehouse, register=self.register,
+            status='completed', currency='CDF',
+            subtotal=Decimal('7200.00'), total=Decimal('7200.00'),
+            amount_paid=Decimal('7200.00'),
+            sold_by=self.owner, sale_date=timezone.now(),
+        )
+        SaleItem.objects.create(
+            organization=self.org, sale=sale, product=simple,
+            quantity=Decimal('9.000'), unit_price=Decimal('800.00'),
+            cost_price=Decimal('500.00'),
+        )
+
+        response = self.client.get(
+            '/api/v1/reports/statistics/top_products/', **self._headers
+        )
+        row = next(
+            r for r in response.data['results'] if r['product_sku'] == 'SAV-01'
+        )
+        self.assertEqual(row['quantity_display'], '9 bouteilles')
+        self.assertIsNone(row['packaging_factor'])
+
+    def test_stock_details_lit_les_deux_compteurs(self):
+        """
+        3 paquets + 27 bouteilles reste tel quel.
+
+        Reconstitué depuis le total (63), il deviendrait « 5 paquets +
+        3 bouteilles » : un rayon qui n'a jamais existé.
+        """
+        self._stock(3, 27)
+
+        response = self.client.get(
+            '/api/v1/reports/statistics/stock_details/', **self._headers
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        row = response.data['results'][0]
+
+        self.assertEqual(row['stock_display'], '3 paquets + 27 bouteilles')
+        self.assertEqual(row['available_display'], '3 paquets + 27 bouteilles')
+        self.assertEqual(row['packaging_factor'], 12)
+        self.assertEqual(Decimal(row['stock_packages']), Decimal('3.000'))
+
+    def test_stock_details_reserve_ne_devient_pas_des_paquets(self):
+        stock = self._stock(3, 7)
+        stock.reserved_quantity = Decimal('12.000')
+        stock.save(update_fields=['reserved_quantity'])
+
+        response = self.client.get(
+            '/api/v1/reports/statistics/stock_details/', **self._headers
+        )
+        row = response.data['results'][0]
+
+        self.assertEqual(row['reserved_display'], '12 bouteilles')
+        self.assertEqual(row['available_display'], '2 paquets + 7 bouteilles')
+
+    def test_product_supplies_rend_la_saisie_de_reception(self):
+        from apps.inventory.models import StockMovement
+
+        StockMovement.objects.create(
+            organization=self.org, product=self.product,
+            warehouse=self.warehouse,
+            movement_type=StockMovement.MovementType.PURCHASE,
+            quantity=Decimal('125.000'),
+            quantity_before=Decimal('0.000'), quantity_after=Decimal('125.000'),
+            input_package_quantity=Decimal('10.000'),
+            input_loose_quantity=Decimal('5.000'),
+            packaging_factor=12,
+        )
+
+        response = self.client.get(
+            '/api/v1/reports/statistics/product_supplies/', **self._headers
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        entry = response.data[str(self.product.id)]
+
+        self.assertEqual(entry['display'], '10 paquets + 5 bouteilles')
+        self.assertEqual(entry['quantity'], 125.0)
+        self.assertEqual(entry['packages'], 10.0)
+        self.assertEqual(entry['loose'], 5.0)
+
+    def test_product_profits_ventile_aussi_la_quantite(self):
+        self._make_sale('VTE-G-1', packages=5)
+        self._make_sale('VTE-D-1', loose=12)
+
+        response = self.client.get(
+            '/api/v1/reports/statistics/product_profits/', **self._headers
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        row = response.data['results'][0]
+
+        self.assertEqual(row['quantity_display'], '5 paquets + 12 bouteilles')
+        self.assertEqual(row['packaging_factor'], 12)
