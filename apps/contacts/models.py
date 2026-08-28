@@ -78,6 +78,10 @@ class Customer(TenantSyncableModel):
         db_table = 'customers'
         ordering = ['name']
         indexes = [
+            # Index du tirage de synchronisation. L'ordre `(organisation,
+            # updated_at, id)` est celui de la pagination par curseur : sans lui,
+            # chaque page fait un balayage complet suivi d'un tri.
+            models.Index(fields=['organization', 'updated_at', 'id']),
             models.Index(fields=['organization', 'is_active']),
             models.Index(fields=['code']),
             models.Index(fields=['phone']),
@@ -250,6 +254,10 @@ class CustomerTransaction(TenantModel):
         db_table = 'customer_transactions'
         ordering = ['-created_at']
         indexes = [
+            # Index du tirage de synchronisation. L'ordre `(organisation,
+            # updated_at, id)` est celui de la pagination par curseur : sans lui,
+            # chaque page fait un balayage complet suivi d'un tri.
+            models.Index(fields=['organization', 'updated_at', 'id']),
             models.Index(fields=['customer', 'transaction_type']),
             models.Index(fields=['customer', 'created_at']),
         ]

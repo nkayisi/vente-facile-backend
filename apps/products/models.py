@@ -373,6 +373,10 @@ class Product(TenantSyncableModel):
         db_table = 'products'
         ordering = ['name']
         indexes = [
+            # Index du tirage de synchronisation. L'ordre `(organisation,
+            # updated_at, id)` est celui de la pagination par curseur : sans lui,
+            # chaque page fait un balayage complet suivi d'un tri.
+            models.Index(fields=['organization', 'updated_at', 'id']),
             models.Index(fields=['organization', 'is_active']),
             models.Index(fields=['organization', 'category']),
             models.Index(fields=['sku']),
@@ -489,6 +493,10 @@ class ProductVariant(TenantSyncableModel):
     class Meta:
         db_table = 'product_variants'
         indexes = [
+            # Index du tirage de synchronisation. L'ordre `(organisation,
+            # updated_at, id)` est celui de la pagination par curseur : sans lui,
+            # chaque page fait un balayage complet suivi d'un tri.
+            models.Index(fields=['organization', 'updated_at', 'id']),
             models.Index(fields=['product']),
             models.Index(fields=['sku']),
         ]

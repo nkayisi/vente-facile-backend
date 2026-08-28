@@ -204,6 +204,10 @@ class Expense(TenantModel):
         db_table = 'expenses'
         ordering = ['-expense_date', '-created_at']
         indexes = [
+            # Index du tirage de synchronisation. L'ordre `(organisation,
+            # updated_at, id)` est celui de la pagination par curseur : sans lui,
+            # chaque page fait un balayage complet suivi d'un tri.
+            models.Index(fields=['organization', 'updated_at', 'id']),
             models.Index(fields=['organization', 'status']),
             models.Index(fields=['organization', 'category']),
             models.Index(fields=['expense_date']),
@@ -400,6 +404,10 @@ class CashMovement(TenantModel):
         db_table = 'cash_movements'
         ordering = ['-movement_date', '-created_at']
         indexes = [
+            # Index du tirage de synchronisation. L'ordre `(organisation,
+            # updated_at, id)` est celui de la pagination par curseur : sans lui,
+            # chaque page fait un balayage complet suivi d'un tri.
+            models.Index(fields=['organization', 'updated_at', 'id']),
             models.Index(fields=['organization', 'direction']),
             models.Index(fields=['organization', 'movement_type']),
             models.Index(fields=['organization', 'movement_date']),

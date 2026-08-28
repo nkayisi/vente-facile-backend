@@ -89,6 +89,11 @@ INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    # Compression des reponses. Un tirage de synchronisation transporte des
+    # milliers de lignes JSON tres repetitives : le gain mesure est d'un facteur
+    # 6 a 8, soit la difference entre 40 secondes et 6 sur un lien EDGE. Place
+    # en tete pour compresser aussi ce que produisent les middlewares suivants.
+    'django.middleware.gzip.GZipMiddleware',
     "whitenoise.middleware.WhiteNoiseMiddleware",
     'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',

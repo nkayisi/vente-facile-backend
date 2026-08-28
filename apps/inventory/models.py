@@ -171,6 +171,10 @@ class Stock(TenantModel):
         db_table = 'stocks'
         unique_together = ['product', 'variant', 'warehouse', 'location']
         indexes = [
+            # Index du tirage de synchronisation. L'ordre `(organisation,
+            # updated_at, id)` est celui de la pagination par curseur : sans lui,
+            # chaque page fait un balayage complet suivi d'un tri.
+            models.Index(fields=['organization', 'updated_at', 'id']),
             models.Index(fields=['organization', 'product']),
             models.Index(fields=['warehouse']),
             # Requêtes de stock à périmètre entrepôt (POS, valeur de stock,
@@ -475,6 +479,10 @@ class StockMovement(TenantModel, SyncableModel):
         db_table = 'stock_movements'
         ordering = ['-created_at']
         indexes = [
+            # Index du tirage de synchronisation. L'ordre `(organisation,
+            # updated_at, id)` est celui de la pagination par curseur : sans lui,
+            # chaque page fait un balayage complet suivi d'un tri.
+            models.Index(fields=['organization', 'updated_at', 'id']),
             models.Index(fields=['organization', 'product']),
             models.Index(fields=['movement_type']),
             models.Index(fields=['created_at']),

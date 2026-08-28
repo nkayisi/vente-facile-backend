@@ -353,6 +353,10 @@ class Sale(TenantSyncableModel):
         db_table = 'sales'
         ordering = ['-sale_date']
         indexes = [
+            # Index du tirage de synchronisation. L'ordre `(organisation,
+            # updated_at, id)` est celui de la pagination par curseur : sans lui,
+            # chaque page fait un balayage complet suivi d'un tri.
+            models.Index(fields=['organization', 'updated_at', 'id']),
             models.Index(fields=['organization', 'status']),
             models.Index(fields=['organization', 'customer']),
             models.Index(fields=['sale_date']),
@@ -543,6 +547,10 @@ class SaleItem(TenantModel, SyncableModel):
     class Meta:
         db_table = 'sale_items'
         indexes = [
+            # Index du tirage de synchronisation. L'ordre `(organisation,
+            # updated_at, id)` est celui de la pagination par curseur : sans lui,
+            # chaque page fait un balayage complet suivi d'un tri.
+            models.Index(fields=['organization', 'updated_at', 'id']),
             models.Index(fields=['sale']),
             models.Index(fields=['product']),
         ]
@@ -721,6 +729,10 @@ class Payment(TenantModel, SyncableModel):
         db_table = 'payments'
         ordering = ['-paid_at']
         indexes = [
+            # Index du tirage de synchronisation. L'ordre `(organisation,
+            # updated_at, id)` est celui de la pagination par curseur : sans lui,
+            # chaque page fait un balayage complet suivi d'un tri.
+            models.Index(fields=['organization', 'updated_at', 'id']),
             models.Index(fields=['sale']),
             models.Index(fields=['paid_at']),
         ]
