@@ -244,6 +244,11 @@ REST_FRAMEWORK = {
         # par scope reste appliqué tant que la classe est attachée à l'action,
         # indépendamment de DEFAULT_THROTTLE_CLASSES).
         'moko_callback': '60/minute',
+        # Reveil d'un terminal enrole. Le jeton d'appareil est un secret de
+        # 256 bits, il ne se devine pas : la limite protege contre le rejeu en
+        # rafale, pas contre la force brute, et cinq essais par minute couvrent
+        # largement un usage legitime.
+        'device_session': '5/min',
     },
     # Handler custom : garantit une réponse JSON structurée (jamais de 500 HTML)
     # et logue/remonte les exceptions non gérées. Voir apps/core/exception_handler.py
