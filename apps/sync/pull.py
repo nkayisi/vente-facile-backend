@@ -138,7 +138,12 @@ class PullTable:
 class PullChild:
     """Enfant tiré avec son parent et remplacé en bloc côté client."""
 
+    #: Clé sous laquelle l'enfant s'imbrique dans le parent : `items`.
     name: str
+    #: Nom de la table locale : `sale_items`. Distinct de `name`, qui n'est
+    #: qu'une clé de charge utile ; les confondre engendrerait une table
+    #: nommée « items », sans rapport avec ce qu'elle contient.
+    table: str
     model: str
     parent_field: str
     fields: tuple = ALL
@@ -329,8 +334,10 @@ def read_tombstones(table, organization, membership, cursor, limit):
 #: Enfants d'une vente. Sans suppression douce, aucune pierre tombale ne
 #: circulerait : on les remplace en bloc avec leur parent.
 SALE_CHILDREN = (
-    PullChild(name='items', model='sales.SaleItem', parent_field='sale'),
-    PullChild(name='payments', model='sales.Payment', parent_field='sale'),
+    PullChild(name='items', table='sale_items', model='sales.SaleItem',
+              parent_field='sale'),
+    PullChild(name='payments', table='payments', model='sales.Payment',
+              parent_field='sale'),
 )
 
 #: Ordre de tirage. Les référentiels d'abord : le point de vente s'ouvre dès que
@@ -383,6 +390,59 @@ PULL_TABLES = (
 )
 
 PULL_TABLES_BY_NAME = {table.name: table for table in PULL_TABLES}
+
+
+# ------------------------------------------------- description pour le client
+
+#: Type de chaque colonne, tel que le client doit la ranger.
+#:
+#: Une décimale est du TEXTE, jamais un flottant : un panier en francs congolais
+#: à sept chiffres perd ses unités en virgule flottante. La règle vaut des deux
+#: côtés du réseau, et c'est ce tableau qui la fait respecter sans y penser.
+FIELD_KINDS = {
+    'DecimalField': 'decimal',
+    'UUIDField': 'text',
+    'CharField': 'text',
+    'TextField': 'text',
+    'SlugField': 'text',
+    'EmailField': 'text',
+    'URLField': 'text',
+    'GenericIPAddressField': 'text',
+    'FileField': 'text',
+    'ImageField': 'text',
+    'JSONField': 'json',
+    'BooleanField': 'boolean',
+    'IntegerField': 'integer',
+    'PositiveIntegerField': 'integer',
+    'PositiveSmallIntegerField': 'integer',
+    'SmallIntegerField': 'integer',
+    'BigIntegerField': 'integer',
+    'FloatField': 'real',
+    'DateTimeField': 'datetime',
+    'DateField': 'date',
+    'TimeField': 'text',
+    'DurationField': 'text',
+}
+
+
+def describe_columns(model, declared):
+    """
+    Colonnes et types, pour que le client engendre son schéma au lieu de le
+    recopier. Quatre cents colonnes écrites à la main, c'est autant d'occasions
+    de se tromper, et un champ ajouté ici n'atteindrait jamais le mobile.
+    """
+    exposed = set(resolve_fields(model, declared))
+    columns = []
+    for f in model._meta.concrete_fields:
+        if f.attname not in exposed:
+            continue
+        columns.append({
+            'name': f.attname,
+            'kind': FIELD_KINDS.get(type(f).__name__, 'text'),
+            'null': bool(f.null),
+            'pk': bool(f.primary_key),
+        })
+    return columns
 
 
 # ------------------------------------------------------------------------ vue
@@ -479,8 +539,33 @@ class SyncManifestView(APIView):
 
     permission_classes = [IsAuthenticated, IsTenantMember]
 
-    @extend_schema(summary="Tables à tirer, dans l'ordre", responses={200: OpenApiTypes.OBJECT})
+    @extend_schema(
+        summary="Tables à tirer, dans l'ordre",
+        parameters=[OpenApiParameter(
+            'counts', bool,
+            description="Ajoute le nombre de lignes par table, pour afficher une "
+                        "progression chiffrée pendant la première synchronisation.",
+        )],
+        responses={200: OpenApiTypes.OBJECT},
+    )
     def get(self, request):
+        # Les décomptes coûtent 31 requêtes : on ne les rend que sur demande,
+        # c'est-à-dire au début d'une synchronisation complète. Sans eux,
+        # l'écran d'attente ne saurait afficher qu'une roue, et une roue ne dit
+        # pas si l'on en a pour dix secondes ou pour dix minutes.
+        with_counts = request.query_params.get('counts') in ('1', 'true', 'yes')
+        counts = {}
+        if with_counts:
+            membership = _get_membership(request)
+            organization = membership.organization
+            for t in PULL_TABLES:
+                model = t.get_model()
+                queryset = _scope_to_org(model._base_manager.all(), t, organization)
+                queryset = _scope_to_warehouses(queryset, t, membership)
+                if t.soft_delete:
+                    queryset = queryset.filter(is_deleted=False)
+                counts[t.name] = queryset.count()
+
         return Response({
             'schema_version': PULL_SCHEMA_VERSION,
             'default_page_size': DEFAULT_PAGE_SIZE,
@@ -488,7 +573,17 @@ class SyncManifestView(APIView):
                 {
                     'name': t.name,
                     'has_tombstones': t.soft_delete,
-                    'children': [c.name for c in t.children],
+                    'row_count': counts.get(t.name),
+                    'columns': describe_columns(t.get_model(), t.fields),
+                    'children': [
+                        {
+                            'name': c.name,
+                            'table': c.table,
+                            'parent_field': f'{c.parent_field}_id',
+                            'columns': describe_columns(c.get_model(), c.fields),
+                        }
+                        for c in t.children
+                    ],
                 }
                 for t in PULL_TABLES
             ],
