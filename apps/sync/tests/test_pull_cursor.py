@@ -342,7 +342,15 @@ class ContractTests(_PullBaseTest):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         manifest = self.client.get('/api/v1/sync/pull/manifest/', **self._headers())
         vente = next(t for t in manifest.data['tables'] if t['name'] == 'sales')
-        self.assertEqual(vente['children'], ['items', 'payments'])
+
+        # Chaque enfant porte sa cle d'imbrication ET son nom de table locale :
+        # les confondre engendrerait une table nommee « items », sans rapport
+        # avec ce qu'elle contient.
+        self.assertEqual([c['name'] for c in vente['children']], ['items', 'payments'])
+        self.assertEqual(
+            [c['table'] for c in vente['children']], ['sale_items', 'payments']
+        )
+        self.assertTrue(all(c['columns'] for c in vente['children']))
 
     def test_membership_is_required(self):
         self.client.force_authenticate(user=None)

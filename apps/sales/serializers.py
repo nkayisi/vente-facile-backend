@@ -1102,16 +1102,24 @@ class SaleCreateSerializer(serializers.ModelSerializer):
 
         request = self.context['request']
 
-        # Lock pour la génération de référence : on verrouille la dernière vente
-        # du jour pour l'org. C'est suffisant car ReferenceGenerator lit le MAX.
-        from django.utils import timezone as _tz
-        today_prefix = f"VT-{_tz.now().strftime('%Y%m%d')}"
-        _ = list(
-            Sale.objects.select_for_update().filter(
-                organization=org, reference__startswith=today_prefix
-            ).order_by('-reference').values_list('id', flat=True)[:1]
-        )
-        validated_data['reference'] = ReferenceGenerator.generate_sale_reference(org)
+        # Une vente encaissée hors ligne apporte SA référence, déjà imprimée sur
+        # le ticket que le client a emporté. La réécrire ici donnerait deux
+        # numéros pour une seule vente, ce qui est précisément le défaut que la
+        # numérotation serveur avait été créée pour supprimer. Sa forme
+        # (VT-AAAAMMJJ-XXXX-nnnn, avec le code du terminal) ne peut pas entrer en
+        # collision avec la série du serveur.
+        if not validated_data.get('reference'):
+            # Lock pour la génération de référence : on verrouille la dernière
+            # vente du jour pour l'org. C'est suffisant car ReferenceGenerator
+            # lit le MAX.
+            from django.utils import timezone as _tz
+            today_prefix = f"VT-{_tz.now().strftime('%Y%m%d')}"
+            _ = list(
+                Sale.objects.select_for_update().filter(
+                    organization=org, reference__startswith=today_prefix
+                ).order_by('-reference').values_list('id', flat=True)[:1]
+            )
+            validated_data['reference'] = ReferenceGenerator.generate_sale_reference(org)
         validated_data['organization'] = org
         validated_data['sold_by'] = request.user
 

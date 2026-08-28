@@ -68,12 +68,29 @@ class SubscriptionMiddleware(MiddlewareMixin):
         '/api/v1/users/me/',
         '/api/v1/organizations/',
         '/api/v1/subscriptions/',
-        '/api/v1/sync/',  # Mobile sync must work even with expired subscription
         '/admin/',
         '/api/schema/',
         '/api/docs/',
         '/api/redoc/',
     ]
+
+    # Chemins de synchronisation exemptés, en correspondance EXACTE.
+    #
+    # `/api/v1/sync/` figurait dans la liste ci-dessus, or celle-ci est testée
+    # en `startswith` : tout chemin commençant par `/api/v1/sync/` en héritait,
+    # y compris ceux qui n'existaient pas encore. `/api/v1/sync/operations/`
+    # serait donc né exempté, et un marchand dont l'abonnement a expiré aurait
+    # pu écrire des ventes indéfiniment.
+    #
+    # La LECTURE reste ouverte : consulter ses propres données ne se monnaie
+    # pas, et un marchand impayé doit pouvoir sortir son historique. C'est
+    # l'écriture qui se ferme.
+    EXEMPT_EXACT_PATHS = {
+        '/api/v1/sync/',
+        '/api/v1/sync/status/',
+        '/api/v1/sync/pull/',
+        '/api/v1/sync/pull/manifest/',
+    }
 
     # Méthodes HTTP considérées comme "lecture seule"
     SAFE_METHODS = ('GET', 'HEAD', 'OPTIONS')
@@ -84,6 +101,8 @@ class SubscriptionMiddleware(MiddlewareMixin):
             return None
 
         # Chemins exemptés
+        if request.path in self.EXEMPT_EXACT_PATHS:
+            return None
         for exempt in self.EXEMPT_PATHS:
             if request.path.startswith(exempt):
                 return None
