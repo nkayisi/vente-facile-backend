@@ -25,6 +25,14 @@ for _local_host in ('127.0.0.1', 'localhost'):
     if _local_host not in ALLOWED_HOSTS:
         ALLOWED_HOSTS.append(_local_host)
 
+# En développement, on accepte n'importe quel hôte. L'alternative, qui était en
+# place, consistait à lister les IP de la machine dans le .env : elles se
+# périmaient à chaque changement de réseau (.128, puis .154, puis .116), et un
+# téléphone sur le Wi-Fi de la boutique recevait un 400 DisallowedHost sans
+# rapport apparent avec la cause. Sans effet en production, où DEBUG est faux.
+if DEBUG:
+    ALLOWED_HOSTS = ['*']
+
 if not DEBUG and SECRET_KEY.startswith('django-insecure'):
     raise ImproperlyConfigured(
         "SECRET_KEY must be set to a strong value (env var) when DEBUG=False."
