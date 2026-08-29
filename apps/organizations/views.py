@@ -253,11 +253,24 @@ class OrganizationViewSet(viewsets.ModelViewSet):
             sale_date__date__lte=today
         )
         
+        # DEUX agrégats, et c'est OBLIGATOIRE : mêler dans un seul `aggregate`
+        # un `Sum` sur la vente et un `Sum` sur `items__…` fait joindre les
+        # lignes, et chaque vente est alors comptée UNE FOIS PAR LIGNE. Mesuré
+        # sur un mois réel : `Sum('total')` seul rendait 107 356,40, la même
+        # somme jointe rendait 217 227,70, soit un facteur 2,02 pour 22 lignes
+        # réparties sur 12 ventes. Le chiffre d'affaires ET le nombre de ventes
+        # étaient donc gonflés, et le bénéfice avec eux puisqu'il vaut ce total
+        # moins un coût, lui correct : la marge affichée passait de 28,4 % à
+        # 64,6 %. Un marchand décide sur ce chiffre.
         current_stats = current_sales.aggregate(
             total_sales=Sum('total'),
-            total_cost=Sum(F('items__cost_price') * F('items__quantity')),
             count=Count('id'),
-            units_sold=Sum('items__quantity')
+        )
+        current_stats.update(
+            SaleItem.objects.filter(sale__in=current_sales).aggregate(
+                total_cost=Sum(F('cost_price') * F('quantity')),
+                units_sold=Sum('quantity'),
+            )
         )
         
         # Ventes période précédente
@@ -269,10 +282,17 @@ class OrganizationViewSet(viewsets.ModelViewSet):
             sale_date__date__lte=previous_end
         )
         
+        # Même séparation pour la période précédente : sans elle, la VARIATION
+        # comparerait un total gonflé à un autre, avec des facteurs de jointure
+        # différents selon le nombre de lignes de chaque période.
         previous_stats = previous_sales.aggregate(
             total_sales=Sum('total'),
             count=Count('id'),
-            units_sold=Sum('items__quantity')
+        )
+        previous_stats.update(
+            SaleItem.objects.filter(sale__in=previous_sales).aggregate(
+                units_sold=Sum('quantity'),
+            )
         )
         
         # Calcul des variations
