@@ -17,35 +17,43 @@ from apps.organizations.models import OrganizationMembership
 
 
 def get_membership_for_request(request):
-    """Membership actif pour ``request.user`` et ``X-Organization-ID``."""
-    if not getattr(request, "user", None) or not request.user.is_authenticated:
-        return None
-    org_id = request.headers.get("X-Organization-ID")
-    if not org_id:
-        return None
-    return (
-        OrganizationMembership.objects.filter(
-            user=request.user,
-            organization_id=org_id,
-            is_active=True,
-        )
-        .prefetch_related("assigned_warehouses")
-        .first()
-    )
+    """
+    Membership actif pour ``request.user`` et ``X-Organization-ID``.
+
+    Délègue au résolveur unique de ``api_permissions``, qui mémoïse sur l'objet
+    ``request``. Cette fonction émettait auparavant sa propre requête, à chacun
+    de ses 37 sites d'appel, alors que `IsTenantMember` venait de résoudre
+    exactement le même membership quelques lignes plus haut.
+
+    Elle portait aussi un ``prefetch_related("assigned_warehouses")`` qui n'a
+    jamais servi : `accessible_warehouse_ids` filtrait ensuite le manager M2M,
+    et un ``.filter()`` court-circuite le cache de prefetch. Le préchargement
+    était donc payé puis jeté, à chaque appel.
+    """
+    from apps.core.api_permissions import _get_membership
+
+    return _get_membership(request)
 
 
 def accessible_warehouse_ids(membership: OrganizationMembership) -> Optional[list[UUID]]:
     """
     Retourne ``None`` si pas de restriction (owner), sinon liste d'UUID d'entrepôts.
+
+    Le résultat est mémoïsé sur l'instance de membership. Comme celle-ci est
+    elle-même mémoïsée sur la requête, la liste n'est lue qu'une fois par
+    requête HTTP, là où `reports/summary` la relisait six fois.
     """
     if membership.role == OrganizationMembership.Role.OWNER:
         return None
-    ids = list(
-        membership.assigned_warehouses.filter(is_deleted=False).values_list(
-            "id", flat=True
+    cached = getattr(membership, "_accessible_warehouse_ids", None)
+    if cached is None:
+        cached = list(
+            membership.assigned_warehouses.filter(is_deleted=False).values_list(
+                "id", flat=True
+            )
         )
-    )
-    return ids
+        membership._accessible_warehouse_ids = cached
+    return cached
 
 
 def restrict_visibility_for_membership(

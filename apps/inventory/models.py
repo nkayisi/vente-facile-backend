@@ -212,6 +212,42 @@ class Stock(TenantModel):
         """Valeur du stock au coût, dans la devise principale de l'organisation."""
         return self.quantity * self.effective_cost
 
+    @staticmethod
+    def unit_cost_expression():
+        """
+        `effective_cost`, exprimé en SQL, pour valoriser un lot de stocks en
+        UNE requête au lieu d'hydrater chaque ligne.
+
+        Existe pour que la règle « ``avg_cost`` s'il est renseigné, sinon le
+        prix d'achat catalogue » n'ait qu'une seule écriture. Elle en avait
+        trois : la propriété Python ci-dessus, une agrégation recopiée dans le
+        tableau de bord des organisations, et `reports/summary` qui, lui,
+        valorisait au seul ``product.cost_price``. Le même stock s'affichait
+        donc à deux valeurs différentes selon l'écran ouvert.
+        """
+        from django.db.models import Case, DecimalField, F, Value, When
+        from django.db.models.functions import Coalesce
+
+        return Case(
+            When(avg_cost__gt=0, then=F('avg_cost')),
+            default=Coalesce(F('product__cost_price'), Value(Decimal('0'))),
+            output_field=DecimalField(max_digits=20, decimal_places=4),
+        )
+
+    @classmethod
+    def total_value_for(cls, queryset):
+        """Valeur totale d'un ensemble de stocks, agrégée en base."""
+        from django.db.models import DecimalField, ExpressionWrapper, F, Sum
+
+        return queryset.aggregate(
+            v=Sum(
+                ExpressionWrapper(
+                    F('quantity') * cls.unit_cost_expression(),
+                    output_field=DecimalField(max_digits=24, decimal_places=4),
+                )
+            )
+        )['v'] or Decimal('0')
+
     def save(self, *args, **kwargs):
         from django.core.exceptions import ValidationError
 

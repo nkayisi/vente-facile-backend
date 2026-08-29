@@ -198,7 +198,7 @@ class OrganizationViewSet(viewsets.ModelViewSet):
     def dashboard(self, request, pk=None):
         """Statistiques complètes pour le dashboard avec données d'évolution."""
         from django.core.cache import cache
-        from django.db.models import Sum, Count, Avg, F, Case, When, Value, DecimalField, ExpressionWrapper
+        from django.db.models import Sum, Count, Avg, F, DecimalField
         from django.db.models.functions import TruncDate, TruncWeek, TruncMonth, Coalesce
         from decimal import Decimal
         from apps.products.models import Product
@@ -382,24 +382,16 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         ).count()
         
         # Valeur totale du stock - agrégée en base (une seule requête) au lieu de
-        # charger tous les stocks en mémoire et sommer en Python. Coût unitaire :
-        # avg_cost s'il est > 0, sinon le cost_price du produit (0 par défaut).
-        unit_cost = Case(
-            When(avg_cost__gt=0, then=F('avg_cost')),
-            default=Coalesce(F('product__cost_price'), Value(Decimal('0'))),
-            output_field=DecimalField(max_digits=20, decimal_places=4),
-        )
-        stock_value = Stock.objects.filter(
-            organization=organization,
-            product__is_deleted=False
-        ).aggregate(
-            v=Sum(
-                ExpressionWrapper(
-                    F('quantity') * unit_cost,
-                    output_field=DecimalField(max_digits=24, decimal_places=4),
-                )
+        # charger tous les stocks en mémoire et sommer en Python. La règle de
+        # coût unitaire vit dans `Stock.unit_cost_expression()` : elle était
+        # recopiée ici, et `reports/summary` en appliquait une troisième,
+        # différente. Un même stock s'affichait donc à deux valeurs.
+        stock_value = Stock.total_value_for(
+            Stock.objects.filter(
+                organization=organization,
+                product__is_deleted=False,
             )
-        )['v'] or Decimal('0')
+        )
 
         payload = {
             'cards': {

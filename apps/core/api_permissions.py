@@ -14,8 +14,21 @@ from rest_framework import status as http_status
 
 
 def _get_membership(request):
-    """Helper : récupère le membership de l'utilisateur pour l'organisation courante."""
-    if not request.user.is_authenticated:
+    """
+    Membership actif de l'utilisateur pour l'organisation portée par l'en-tête.
+
+    **Point d'entrée UNIQUE pour résoudre l'identité tenant d'une requête.**
+    C'est important : le membership était résolu par trois chemins qui ne
+    partageaient pas ce cache (`warehouse_scope.get_membership_for_request`,
+    utilisé sur 37 sites, et `TenantViewSetMixin.get_organization`), si bien
+    qu'une simple liste payait cinq résolutions de la même identité. Tout
+    nouveau besoin doit passer par ici, jamais par une requête neuve.
+
+    Le cache porte sur l'objet ``request``, donc sa durée de vie est celle de la
+    requête HTTP : un changement d'appartenance est visible au prochain appel.
+    """
+    user = getattr(request, 'user', None)
+    if user is None or not user.is_authenticated:
         return None
     org_id = request.headers.get('X-Organization-ID')
     if not org_id:
@@ -29,6 +42,11 @@ def _get_membership(request):
         ).select_related('organization').first()
         setattr(request, cache_key, membership)
     return getattr(request, cache_key)
+
+
+def get_request_membership(request):
+    """Alias public de :func:`_get_membership`, pour les appelants hors module."""
+    return _get_membership(request)
 
 
 def has_perm_code(request, perm_code: str) -> bool:

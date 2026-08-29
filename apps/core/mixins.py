@@ -1,6 +1,6 @@
+from django.http import Http404
 from rest_framework import status
 from rest_framework.response import Response
-from django.shortcuts import get_object_or_404
 from apps.organizations.models import Organization
 
 
@@ -11,18 +11,24 @@ class TenantQuerysetMixin:
     """
     
     def get_organization(self):
-        """Get organization from header."""
+        """
+        Organisation portée par l'en-tête, via le résolveur mémoïsé.
+
+        Même raison que dans ``api_mixins.TenantViewSetMixin`` : cette méthode
+        est rappelée à chaque action et refaisait sa propre requête, alors que
+        `IsTenantMember` avait déjà résolu le membership. Le 404 est conservé,
+        sans quoi `get_queryset` cesserait de filtrer par organisation.
+        """
+        from apps.core.api_permissions import _get_membership
+
         org_id = self.request.headers.get('X-Organization-ID')
         if not org_id:
             return None
-        
-        return get_object_or_404(
-            Organization.objects.filter(
-                memberships__user=self.request.user,
-                memberships__is_active=True
-            ),
-            id=org_id
-        )
+
+        membership = _get_membership(self.request)
+        if membership is None:
+            raise Http404('Organisation introuvable pour cet utilisateur.')
+        return membership.organization
 
     def get_queryset(self):
         """Filter queryset by organization."""

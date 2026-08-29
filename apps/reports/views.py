@@ -1121,20 +1121,32 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         else:
             total_products = products.count()
         
-        # Valeur totale du stock
-        total_value = Decimal('0')
-        low_stock = 0
-        out_of_stock = 0
-        
-        for stock in stocks.select_related('product'):
-            qty = Decimal(str(stock.quantity))
-            cost = stock.product.cost_price or Decimal('0')
-            total_value += qty * cost
-            
-            if qty <= 0:
-                out_of_stock += 1
-            elif stock.product.min_stock_level and qty <= stock.product.min_stock_level:
-                low_stock += 1
+        # Valeur totale du stock, et décomptes de rupture / stock bas.
+        #
+        # Tout est agrégé en BASE. Ce bloc hydratait auparavant chaque ligne de
+        # stock pour sommer en Python : sur une organisation de 5 000 produits
+        # répartis sur trois entrepôts, cela fabriquait quinze mille objets à
+        # chaque ouverture du rapport, sans cache ni pagination.
+        #
+        # La valorisation passe par `Stock.unit_cost_expression()`, donc par la
+        # règle unique « ``avg_cost`` s'il est renseigné, sinon le prix d'achat
+        # catalogue ». Elle valorisait ici au seul ``cost_price`` : le même
+        # stock ressortait à une valeur au tableau de bord et à une autre dans
+        # ce rapport.
+        total_value = Stock.total_value_for(stocks)
+
+        decomptes = stocks.aggregate(
+            out_of_stock=Count('id', filter=Q(quantity__lte=0)),
+            low_stock=Count(
+                'id',
+                filter=Q(quantity__gt=0)
+                & Q(product__min_stock_level__isnull=False)
+                & Q(product__min_stock_level__gt=0)
+                & Q(quantity__lte=F('product__min_stock_level')),
+            ),
+        )
+        out_of_stock = decomptes['out_of_stock']
+        low_stock = decomptes['low_stock']
         
         # Lots expirant bientôt (30 jours)
         expiring_date = timezone.now().date() + timedelta(days=30)

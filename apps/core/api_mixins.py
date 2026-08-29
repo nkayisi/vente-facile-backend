@@ -1,12 +1,11 @@
 """
 Mixins DRF pour les ViewSets multi-tenant.
 """
-from django.http import HttpResponse
+from django.http import Http404, HttpResponse
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
-from django.shortcuts import get_object_or_404
 from guardian.shortcuts import assign_perm
 
 from apps.organizations.models import Organization
@@ -27,18 +26,28 @@ class TenantViewSetMixin:
         """
         Récupère l'organisation depuis le header X-Organization-ID.
         Vérifie que l'utilisateur est bien membre de cette organisation.
+
+        Passe par le résolveur mémoïsé de ``api_permissions`` plutôt que par une
+        requête neuve : `IsTenantMember` vient de résoudre le même membership
+        pour autoriser l'appel, et `get_queryset` rappelle cette méthode à
+        chaque action. L'objet ``Organization`` arrive par le
+        ``select_related`` déjà porté par le résolveur, donc sans requête.
+
+        Le 404 est conservé, et il n'est pas cosmétique : rendre ``None`` pour
+        un en-tête présent mais sans appartenance ferait sauter le filtre
+        ``organization`` de `get_queryset`, donc ouvrirait la lecture aux
+        données des autres organisations.
         """
+        from apps.core.api_permissions import _get_membership
+
         org_id = self.request.headers.get('X-Organization-ID')
         if not org_id:
             return None
-        
-        return get_object_or_404(
-            Organization.objects.filter(
-                memberships__user=self.request.user,
-                memberships__is_active=True
-            ),
-            id=org_id
-        )
+
+        membership = _get_membership(self.request)
+        if membership is None:
+            raise Http404('Organisation introuvable pour cet utilisateur.')
+        return membership.organization
 
     def get_queryset(self):
         """
