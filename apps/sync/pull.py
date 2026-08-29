@@ -314,7 +314,16 @@ def read_tombstones(table, organization, membership, cursor, limit):
 
     model = table.get_model()
     queryset = _scope_to_org(model._base_manager.all(), table, organization)
-    queryset = queryset.filter(is_deleted=True)
+    # `deleted_at__isnull=False` n'est pas une précaution de style : le curseur
+    # des suppressions EST cet horodatage, et `encode_cursor` appelle
+    # `.isoformat()` dessus. Une ligne marquée supprimée sans date faisait donc
+    # répondre 500 à `GET /sync/pull/`, ce qui bloque la synchronisation de
+    # toute la table, sur tous les terminaux, jusqu'à correction manuelle.
+    # `soft_delete()` pose toujours les deux champs ; le cas n'est atteignable
+    # qu'en écrivant `is_deleted` autrement, par l'admin Django ou un
+    # `queryset.update()`. C'est un défaut de données, mais il ne doit pas
+    # pouvoir arrêter le tirage.
+    queryset = queryset.filter(is_deleted=True, deleted_at__isnull=False)
     queryset = _scope_to_warehouses(queryset, table, membership)
     queryset = _after_cursor(queryset, cursor, column='deleted_at')
     queryset = queryset.order_by('deleted_at', 'id')
@@ -526,6 +535,137 @@ class SyncPullView(APIView):
             'server_time': timezone.now().isoformat(),
             'schema_version': PULL_SCHEMA_VERSION,
         })
+
+
+class SyncChangedTablesView(APIView):
+    """
+    `POST /api/v1/sync/pull/changed/`
+
+    Quelles tables ont du neuf depuis les curseurs du client.
+
+    Corps attendu : ``{"cursors": {"products": "<curseur>", ...}}``. Une table
+    absente du dictionnaire, ou dont le curseur est nul, est réputée jamais
+    tirée, donc modifiée.
+
+    Réponse : ``{"changed": ["stocks", "sales"], "tables": 31}``.
+
+    **Pourquoi cet endpoint existe.** Le tirage complet parcourait les trente
+    et une tables du manifeste, une requête HTTP séquentielle chacune, MÊME
+    QUAND RIEN N'AVAIT CHANGÉ. Observé en journal : vingt et une réponses
+    consécutives de 250 à 300 octets, c'est-à-dire « rien de neuf » répété
+    vingt et une fois. Sur un réseau mobile congolais à 300 ms de latence, cela
+    fait une dizaine de secondes d'attente pour zéro donnée. Une sonde unique
+    ramène ce cas à UN aller-retour.
+
+    **Pourquoi un POST, et pourquoi la comparaison est faite ici.** Le curseur
+    est opaque par choix (voir `encode_cursor`) : sa forme doit pouvoir
+    changer. Laisser le client comparer des horodatages l'obligerait à le
+    décoder, et exposerait la décision à la dérive d'horloge du terminal, qui
+    n'est pas garantie sur un téléphone d'occasion. Le serveur compare, avec sa
+    propre horloge et le curseur qu'il a lui-même émis. Trente et un curseurs
+    ne tiennent pas dans une chaîne de requête, d'où le corps.
+
+    Le coût est une sonde d'existence par table, servie par l'index
+    ``(organization, updated_at, id)`` déjà posé pour la pagination.
+    """
+
+    permission_classes = [IsAuthenticated, IsTenantMember]
+
+    @extend_schema(
+        summary="Tables ayant du neuf depuis les curseurs du client",
+        request=OpenApiTypes.OBJECT,
+        responses={200: OpenApiTypes.OBJECT},
+    )
+    def post(self, request):
+        cursors = request.data.get('cursors') or {}
+        deleted_cursors = request.data.get('deleted_cursors') or {}
+        if not isinstance(cursors, dict) or not isinstance(deleted_cursors, dict):
+            return Response(
+                {
+                    'detail': "`cursors` et `deleted_cursors` doivent être des objets.",
+                    'code': 'invalid_cursors',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        membership = _get_membership(request)
+        organization = membership.organization
+
+        changed = [
+            table.name for table in PULL_TABLES
+            if _table_has_changes(
+                table, organization, membership,
+                # La PRÉSENCE de la clé dit « j'ai déjà tiré cette table », sa
+                # valeur dit jusqu'où. Les deux sont nécessaires : une table
+                # vide se tire entièrement et rend un curseur nul. Confondre ce
+                # nul avec « jamais tirée » ferait redemander toutes les tables
+                # vides à chaque synchronisation, et sur une jeune organisation
+                # elles sont la majorité : la sonde n'économiserait plus rien.
+                connue=table.name in cursors,
+                raw_cursor=cursors.get(table.name),
+                raw_deleted_cursor=deleted_cursors.get(table.name),
+            )
+        ]
+
+        return Response({
+            'changed': changed,
+            'tables': len(PULL_TABLES),
+            'server_time': timezone.now().isoformat(),
+            'schema_version': PULL_SCHEMA_VERSION,
+        })
+
+
+def _table_has_changes(
+    table, organization, membership, *, connue, raw_cursor, raw_deleted_cursor,
+) -> bool:
+    """
+    Une seule question, posée à l'index : reste-t-il quelque chose après ces
+    curseurs ?
+
+    Une table absente de ``cursors`` n'a jamais été tirée : elle est modifiée
+    par définition. Un curseur illisible retombe sur le même cas, par le
+    ``None`` de `decode_cursor`, et c'est le bon parti pris : rendre « rien de
+    neuf » sur un curseur qu'on ne sait pas lire ferait manquer des données en
+    silence, alors qu'un tirage de trop ne coûte que du temps.
+
+    **Les deux curseurs sont distincts, et il faut les deux.** Les écritures
+    avancent sur ``updated_at``, les suppressions sur ``deleted_at``, chacune
+    à son rythme : `read_page` et `read_tombstones` les paginent séparément
+    pour cette raison. Sonder les pierres tombales avec le curseur des
+    écritures manquerait toutes celles situées entre les deux, dans le cas
+    très ordinaire d'une table beaucoup écrite et peu supprimée. La ligne
+    supprimée resterait alors visible sur le terminal, indéfiniment.
+    """
+    if not connue:
+        return True
+
+    # Un curseur nul sur une table déjà tirée signifie « elle était vide ».
+    # `_after_cursor(qs, None)` ne filtre alors rien, et la sonde répond donc
+    # « du neuf » dès qu'une première ligne apparaît. C'est exactement voulu.
+    cursor = decode_cursor(raw_cursor)
+
+    model = table.get_model()
+
+    ecritures = _scope_to_org(model._base_manager.all(), table, organization)
+    ecritures = _scope_to_warehouses(ecritures, table, membership)
+    if table.soft_delete:
+        ecritures = ecritures.filter(is_deleted=False)
+    if _after_cursor(ecritures, cursor).exists():
+        return True
+
+    if not table.soft_delete:
+        return False
+
+    # Nul : aucune suppression encore reçue, toute pierre tombale est nouvelle.
+    deleted_cursor = decode_cursor(raw_deleted_cursor)
+
+    tombes = _scope_to_org(model._base_manager.all(), table, organization)
+    tombes = _scope_to_warehouses(tombes, table, membership)
+    # Même filtre que `read_tombstones`. Sans lui, la sonde annoncerait « du
+    # neuf » pour une pierre tombale sans date, que le tirage ne rendra jamais :
+    # le client repartirait en boucle sur une table qui ne bouge plus.
+    tombes = tombes.filter(is_deleted=True, deleted_at__isnull=False)
+    return _after_cursor(tombes, deleted_cursor, column='deleted_at').exists()
 
 
 class SyncManifestView(APIView):
