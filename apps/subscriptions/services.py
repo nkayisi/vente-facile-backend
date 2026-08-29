@@ -7,6 +7,7 @@ from datetime import timedelta
 from decimal import Decimal
 from django.core.cache import cache
 from django.db import transaction
+from django.db.models import F, Q
 from django.utils import timezone
 
 from rest_framework.exceptions import ValidationError
@@ -959,6 +960,69 @@ class SubscriptionService:
         )
         return 'unknown'
 
+    # Cadence de réinterrogation, en secondes, selon l'âge du règlement.
+    #
+    # La réconciliation repart de la BASE, et elle DOIT continuer à voir les
+    # `FAILED` : un paiement encaissé que MOKO n'a pas su confirmer du premier
+    # coup ne doit jamais rester échoué. Mais la revoir toutes les 30 minutes
+    # pendant 30 jours revenait à 1 440 appels HTTP pour un dossier clos.
+    #
+    # D'où une cadence qui se détend avec l'âge, sans jamais s'arrêter :
+    # renoncer tout à fait rouvrirait exactement le trou que cette tâche
+    # existe pour boucher. Un `PENDING` reste serré, parce que c'est là que
+    # l'argent peut être en transit ; un `FAILED` est plus lâche, parce que le
+    # dernier mot de MOKO était « pas d'argent ».
+    RECONCILE_CADENCE = {
+        # (statut local, âge maximal) -> intervalle minimal entre deux appels
+        SubscriptionPayment.Status.PENDING: (
+            (timedelta(days=1), timedelta(0)),          # frais : chaque passage
+            (timedelta(days=7), timedelta(hours=1)),
+            (None, timedelta(days=1)),
+        ),
+        SubscriptionPayment.Status.FAILED: (
+            (timedelta(days=1), timedelta(hours=1)),
+            (timedelta(days=7), timedelta(days=1)),
+            (None, timedelta(days=7)),
+        ),
+    }
+
+    # Plafond par passage. La tâche tourne sous `soft_time_limit = 120 s` et
+    # chaque règlement coûte un appel HTTP séquentiel : sans borne, un pic de
+    # paiements en attente faisait couper la tâche en plein traitement, à un
+    # endroit imprévisible. Avec le tri par `last_reconciled_at`, un règlement
+    # repoussé hors du lot passe en tête du lot suivant : rien ne meurt de faim.
+    RECONCILE_BATCH_SIZE = 200
+
+    @classmethod
+    def _reconcile_due_filter(cls, now) -> Q:
+        """
+        La cadence, exprimée en SQL.
+
+        Elle DOIT être appliquée avant le plafond de lot, et c'est la seule
+        raison pour laquelle elle n'est pas écrite en Python. Filtrer après
+        avoir coupé les 200 premiers laisserait un scénario de famine bien
+        réel : le tri place en tête les règlements réconciliés il y a le plus
+        longtemps, or l'ancienneté du dernier passage ne dit pas si un
+        règlement est dû. Deux cents vieux échecs, tous hors cadence, y
+        occuperaient tout le lot et évinceraient un `pending` de dix minutes,
+        pourtant à voir à chaque passage. C'est précisément le règlement dont
+        l'argent peut être en transit.
+        """
+        due = Q(last_reconciled_at__isnull=True)
+
+        for statut, paliers in cls.RECONCILE_CADENCE.items():
+            borne_haute = None  # âge minimal du palier, sous forme de date
+            for age_max, interval in paliers:
+                palier = Q(status=statut, last_reconciled_at__lte=now - interval)
+                if borne_haute is not None:
+                    palier &= Q(created_at__lte=borne_haute)
+                if age_max is not None:
+                    palier &= Q(created_at__gt=now - age_max)
+                    borne_haute = now - age_max
+                due |= palier
+
+        return due
+
     @staticmethod
     def reconcile_moko_payments(max_age_days: int = 30, dry_run: bool = False,
                                 reference: str = ''):
@@ -970,8 +1034,12 @@ class SubscriptionService:
         un worker arrêté, ou à l'expiration du TTL des métadonnées. Reprend aussi
         les paiements marqués ``FAILED`` à tort par l'ancienne logique de poll.
 
+        Le balayage est cadencé (``RECONCILE_CADENCE``) et borné
+        (``RECONCILE_BATCH_SIZE``). Une référence explicite passe outre : c'est
+        le geste d'un exploitant qui veut une réponse maintenant.
+
         Renvoie un rapport : reconciled / still_pending / really_failed /
-        unresolved.
+        unresolved / skipped.
         """
         from .moko_client import (
             extract_payment_status_v2,
@@ -981,6 +1049,8 @@ class SubscriptionService:
             is_payment_successful_v2,
         )
         from .moko_pending import remove_pending_payment
+
+        now = timezone.now()
 
         qs = SubscriptionPayment.objects.filter(
             payment_method=SubscriptionPayment.PaymentMethod.MOBILE_MONEY,
@@ -992,20 +1062,45 @@ class SubscriptionService:
         if reference:
             qs = qs.filter(reference=reference)
         else:
-            cutoff = timezone.now() - timedelta(days=max_age_days)
+            cutoff = now - timedelta(days=max_age_days)
             qs = qs.filter(created_at__gte=cutoff)
 
         report = {
             'checked': 0,
+            'skipped': 0,
             'reconciled': [],
             'still_pending': [],
             'really_failed': [],
             'unresolved': [],
         }
 
-        for payment in qs.select_related('organization').order_by('created_at'):
+        cls = SubscriptionService
+        # Le plus anciennement réconcilié d'abord (jamais vu = `null` = en
+        # tête). Départage par `created_at` pour que l'ordre reste déterministe.
+        candidates = qs.select_related('organization').order_by(
+            F('last_reconciled_at').asc(nulls_first=True), 'created_at',
+        )
+        if not reference:
+            # La cadence d'abord, le plafond ensuite : voir
+            # `_reconcile_due_filter` pour ce que l'ordre inverse coûterait.
+            hors_cadence = qs.exclude(cls._reconcile_due_filter(now)).count()
+            report['skipped'] = hors_cadence
+            candidates = candidates.filter(cls._reconcile_due_filter(now))
+            candidates = candidates[: cls.RECONCILE_BATCH_SIZE]
+
+        for payment in candidates:
             report['checked'] += 1
             ref = payment.reference
+
+            # Le passage est enregistré AVANT l'appel réseau. Si MOKO ne répond
+            # pas, ou si la tâche est coupée par sa limite de temps juste après,
+            # ce règlement ne doit pas être réessayé en boucle serrée au
+            # battement suivant : c'est précisément l'emballement qu'on corrige.
+            if not dry_run:
+                SubscriptionPayment.objects.filter(pk=payment.pk).update(
+                    last_reconciled_at=now,
+                    reconcile_attempts=F('reconcile_attempts') + 1,
+                )
 
             try:
                 code, data = get_payment_status_v2(ref)

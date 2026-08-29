@@ -163,7 +163,10 @@ def initiate_payment_v2(
     return code, data
 
 
-def get_payment_status_v2(reference: str) -> tuple[int, dict[str, Any] | list | str]:
+def get_payment_status_v2(
+    reference: str,
+    timeout: int = 60,
+) -> tuple[int, dict[str, Any] | list | str]:
     """
     Vérifie le statut d'un paiement via MOKO API v2.
     
@@ -171,6 +174,12 @@ def get_payment_status_v2(reference: str) -> tuple[int, dict[str, Any] | list | 
     
     Args:
         reference: Référence du paiement à vérifier
+        timeout: Secondes d'attente réseau. Le défaut de 60 s convient à un
+            worker Celery, qui n'a que son propre temps à perdre. Il ne convient
+            PAS à une vue HTTP : gunicorn tourne à 2 workers × 4 threads avec
+            `--timeout 60` (voir entrypoint.sh), donc un MOKO lent y bloquerait
+            un huitième de la capacité de la plateforme et atteindrait la limite
+            de gunicorn elle-même. Les appelants HTTP passent une valeur courte.
     
     Returns:
         Tuple (http_code, response_data)
@@ -204,7 +213,7 @@ def get_payment_status_v2(reference: str) -> tuple[int, dict[str, Any] | list | 
     
     logger.debug("MOKO v2 check status: ref=%s", reference)
     
-    code, data = _get_json(url, headers=headers)
+    code, data = _get_json(url, headers=headers, timeout=timeout)
     
     if code >= 400:
         logger.warning("MOKO v2 status check failed: ref=%s code=%s", reference, code)

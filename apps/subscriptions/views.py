@@ -556,9 +556,19 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
         # Troisième voie de confirmation, indépendante de Celery et de Redis :
         # le navigateur du marchand déclenche lui-même la vérification. Si le
         # worker est arrêté, l'abonnement s'active quand même.
+        #
+        # Timeout court, et c'est essentiel ici : la page de suivi rappelle
+        # cette vue toutes les 12 s, or gunicorn ne dispose que de 2 workers ×
+        # 4 threads. Au défaut de 60 s du client MOKO, quelques marchands en
+        # attente pendant une lenteur de la passerelle suffisaient à immobiliser
+        # toute la capacité HTTP, et l'appel dépassait la limite de gunicorn
+        # avant de rendre la main. Huit secondes laissent largement le temps
+        # d'une réponse normale ; au-delà, le poller Celery et le webhook
+        # restent les deux autres voies, et le prochain battement du navigateur
+        # réessaiera de toute façon.
         if payment.status == SubscriptionPayment.Status.PENDING:
             try:
-                code, data = get_payment_status_v2(reference)
+                code, data = get_payment_status_v2(reference, timeout=8)
                 if code < 400:
                     moko_status = extract_payment_status_v2(data)
                     if moko_status and not is_payment_pending_v2(moko_status):

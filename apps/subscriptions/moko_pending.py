@@ -17,18 +17,31 @@ PENDING_SET_KEY = "vf:moko:pending_payment_refs"
 META_KEY_PREFIX = "vf:moko:pending_meta:"
 
 
+# Client mémoïsé. `redis.from_url` construit un ConnectionPool neuf à chaque
+# appel : le fabriquer par appel de fonction, comme c'était le cas, ouvrait une
+# connexion TCP par lecture de la file et la laissait au ramasse-miettes. Un
+# seul passage de `poll_moko_pending_payments` en créait deux, plus deux par
+# référence en attente. Un client redis-py est sûr entre threads et porte son
+# propre pool : un par processus suffit.
+_REDIS_CLIENT: redis.Redis | None = None
+
+
 def _client() -> redis.Redis | None:
-    url = getattr(settings, "REDIS_URL", None) or getattr(
-        settings, "REDIS_URL", ""
-    )
+    global _REDIS_CLIENT
+    if _REDIS_CLIENT is not None:
+        return _REDIS_CLIENT
+    url = getattr(settings, "REDIS_URL", "")
     if not url:
-        logger.warning("MOKO pending queue: no REDIS_URL / REDIS_URL")
+        logger.warning("MOKO pending queue: no REDIS_URL")
         return None
     try:
-        return redis.from_url(url, decode_responses=True)
+        # Non mémoïsé en cas d'échec : `from_url` ne se connecte pas, une
+        # exception ici signale une URL invalide, pas une panne passagère.
+        _REDIS_CLIENT = redis.from_url(url, decode_responses=True)
     except Exception as e:
         logger.exception("MOKO pending queue: redis connect failed: %s", e)
         return None
+    return _REDIS_CLIENT
 
 
 def pending_queue_empty() -> bool:

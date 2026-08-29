@@ -262,6 +262,214 @@ class ReconciliationTests(_MokoBaseTest):
         self.assertEqual(len(report['unresolved']), 1)
 
 
+class ReconciliationCadenceTests(_MokoBaseTest):
+    """
+    Le balayage se détend avec l'âge, mais ne s'arrête jamais.
+
+    La réconciliation repart de la BASE, toutes les 30 minutes, sur 30 jours de
+    règlements MOBILE MONEY `pending` ou `failed`, à raison d'un appel HTTP par
+    règlement. Un échec définitif y était donc réinterrogé 1 440 fois. Renoncer
+    tout à fait rouvrirait le trou que cette tâche existe pour boucher : la
+    cadence espace, elle n'abandonne pas.
+    """
+
+    def _aged(self, payment, *, days_old, last_reconciled_ago=None):
+        """Vieillit un règlement en base (`created_at` est en auto_now_add)."""
+        now = timezone.now()
+        SubscriptionPayment.objects.filter(pk=payment.pk).update(
+            created_at=now - timedelta(days=days_old),
+            last_reconciled_at=(
+                None if last_reconciled_ago is None else now - last_reconciled_ago
+            ),
+        )
+        payment.refresh_from_db()
+        return payment
+
+    def test_never_reconciled_payment_is_always_due(self):
+        payment = self._aged(self._pending_payment(), days_old=20)
+
+        with patch(
+            'apps.subscriptions.moko_client.get_payment_status_v2',
+            return_value=_moko_status_payload('Submitted'),
+        ) as call:
+            report = SubscriptionService.reconcile_moko_payments()
+
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(report['checked'], 1)
+        self.assertEqual(report['skipped'], 0)
+
+    def test_fresh_pending_payment_is_seen_at_every_pass(self):
+        """Moins de 24 h : c'est là que l'argent peut être en transit."""
+        payment = self._aged(
+            self._pending_payment(), days_old=0,
+            last_reconciled_ago=timedelta(minutes=30),
+        )
+
+        with patch(
+            'apps.subscriptions.moko_client.get_payment_status_v2',
+            return_value=_moko_status_payload('Submitted'),
+        ) as call:
+            report = SubscriptionService.reconcile_moko_payments()
+
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(report['skipped'], 0)
+
+    def test_old_failed_payment_is_skipped_between_passes(self):
+        """Le cas qui coûtait 1 440 appels : échec définitif, vieux de 15 jours."""
+        payment = self._pending_payment()
+        payment.status = SubscriptionPayment.Status.FAILED
+        payment.save(update_fields=['status'])
+        self._aged(payment, days_old=15, last_reconciled_ago=timedelta(days=1))
+
+        with patch(
+            'apps.subscriptions.moko_client.get_payment_status_v2',
+            return_value=_moko_status_payload('Failed'),
+        ) as call:
+            report = SubscriptionService.reconcile_moko_payments()
+
+        self.assertEqual(call.call_count, 0, 'aucun appel MOKO ne devait partir')
+        self.assertEqual(report['checked'], 0)
+        self.assertEqual(report['skipped'], 1)
+
+    def test_old_failed_payment_is_still_revisited_eventually(self):
+        """Espacer n'est pas renoncer : au-delà de l'intervalle, on rappelle."""
+        payment = self._pending_payment()
+        payment.status = SubscriptionPayment.Status.FAILED
+        payment.save(update_fields=['status'])
+        self._aged(payment, days_old=15, last_reconciled_ago=timedelta(days=8))
+
+        with patch(
+            'apps.subscriptions.moko_client.get_payment_status_v2',
+            return_value=_moko_status_payload('Successful'),
+        ) as call:
+            report = SubscriptionService.reconcile_moko_payments()
+
+        self.assertEqual(call.call_count, 1)
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, SubscriptionPayment.Status.COMPLETED)
+        self.assertEqual(len(report['reconciled']), 1)
+
+    def test_explicit_reference_ignores_the_cadence(self):
+        """Un exploitant qui nomme une référence veut une réponse maintenant."""
+        payment = self._pending_payment()
+        payment.status = SubscriptionPayment.Status.FAILED
+        payment.save(update_fields=['status'])
+        self._aged(payment, days_old=15, last_reconciled_ago=timedelta(minutes=1))
+
+        with patch(
+            'apps.subscriptions.moko_client.get_payment_status_v2',
+            return_value=_moko_status_payload('Successful'),
+        ) as call:
+            report = SubscriptionService.reconcile_moko_payments(
+                reference=payment.reference,
+            )
+
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(len(report['reconciled']), 1)
+
+    def test_pass_is_recorded_even_when_moko_is_unreachable(self):
+        """
+        Sans cela, un MOKO en panne ferait repasser les mêmes règlements en
+        boucle serrée à chaque battement : exactement l'emballement corrigé.
+        """
+        payment = self._aged(self._pending_payment(), days_old=15)
+
+        with patch(
+            'apps.subscriptions.moko_client.get_payment_status_v2',
+            side_effect=OSError('timeout'),
+        ):
+            SubscriptionService.reconcile_moko_payments()
+
+        payment.refresh_from_db()
+        self.assertIsNotNone(payment.last_reconciled_at)
+        self.assertEqual(payment.reconcile_attempts, 1)
+
+    def test_dry_run_does_not_record_a_pass(self):
+        payment = self._aged(self._pending_payment(), days_old=15)
+
+        with patch(
+            'apps.subscriptions.moko_client.get_payment_status_v2',
+            return_value=_moko_status_payload('Submitted'),
+        ):
+            SubscriptionService.reconcile_moko_payments(dry_run=True)
+
+        payment.refresh_from_db()
+        self.assertIsNone(payment.last_reconciled_at)
+        self.assertEqual(payment.reconcile_attempts, 0)
+
+    def test_a_fresh_pending_is_never_starved_by_old_failures(self):
+        """
+        Le piège que la première version de ce lot contenait.
+
+        Le plafond de lot s'appliquait AVANT la cadence. Le tri place en tête
+        les règlements réconciliés il y a le plus longtemps, or l'ancienneté du
+        dernier passage ne dit pas si un règlement est dû : de vieux échecs
+        hors cadence occupaient tout le lot et évinçaient un `pending` récent,
+        pourtant à voir à chaque passage. C'est exactement le règlement dont
+        l'argent peut être en transit.
+        """
+        for _ in range(3):
+            vieux = self._pending_payment()
+            vieux.status = SubscriptionPayment.Status.FAILED
+            vieux.save(update_fields=['status'])
+            # Vieux, réconcilié il y a longtemps : en tête de tri, hors cadence.
+            self._aged(vieux, days_old=20, last_reconciled_ago=timedelta(days=2))
+
+        frais = self._aged(
+            self._pending_payment(), days_old=0,
+            last_reconciled_ago=timedelta(minutes=5),
+        )
+
+        with patch.object(SubscriptionService, 'RECONCILE_BATCH_SIZE', 2):
+            with patch(
+                'apps.subscriptions.moko_client.get_payment_status_v2',
+                return_value=_moko_status_payload('Successful'),
+            ) as call:
+                SubscriptionService.reconcile_moko_payments()
+
+        self.assertEqual(
+            call.call_count, 1,
+            'seul le règlement en cadence devait provoquer un appel',
+        )
+        frais.refresh_from_db()
+        self.assertEqual(
+            frais.status, SubscriptionPayment.Status.COMPLETED,
+            'le paiement récent a été évincé du lot par de vieux échecs',
+        )
+
+    def test_batch_is_capped_and_oldest_pass_comes_first(self):
+        """
+        Le lot est borné pour tenir dans `soft_time_limit`. Le tri par
+        `last_reconciled_at` garantit qu'un règlement repoussé hors du lot passe
+        en tête du suivant : rien ne meurt de faim.
+        """
+        recent = self._aged(
+            self._pending_payment(), days_old=0,
+            last_reconciled_ago=timedelta(minutes=1),
+        )
+        vu_avant = recent.last_reconciled_at
+        jamais_vu = self._aged(self._pending_payment(), days_old=0)
+
+        with patch.object(SubscriptionService, 'RECONCILE_BATCH_SIZE', 1):
+            with patch(
+                'apps.subscriptions.moko_client.get_payment_status_v2',
+                return_value=_moko_status_payload('Submitted'),
+            ) as call:
+                SubscriptionService.reconcile_moko_payments()
+
+        self.assertEqual(call.call_count, 1)
+        jamais_vu.refresh_from_db()
+        recent.refresh_from_db()
+        self.assertIsNotNone(
+            jamais_vu.last_reconciled_at,
+            'le règlement jamais réconcilié devait passer en premier',
+        )
+        self.assertEqual(
+            recent.last_reconciled_at, vu_avant,
+            'le règlement hors lot ne devait pas être touché',
+        )
+
+
 class MokoStatusVocabularyTests(_MokoBaseTest):
     """Les statuts que le client MOKO connaît doivent tous être interprétés."""
 

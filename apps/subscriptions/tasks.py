@@ -8,23 +8,32 @@ from celery import shared_task
 logger = logging.getLogger(__name__)
 
 
-@shared_task(name='apps.subscriptions.tasks.poll_moko_pending_payments')
+# `ignore_result` : la tâche ne renvoie rien et personne ne lit son AsyncResult.
+# Sans cela, `CELERY_RESULT_BACKEND = 'django-db'` écrivait une ligne
+# `django_celery_results_taskresult` à chaque battement, soit 1 440 par jour
+# pour une tâche qui sort immédiatement 99 % du temps, dans une table qu'aucune
+# purge ne visite.
+@shared_task(
+    name='apps.subscriptions.tasks.poll_moko_pending_payments',
+    ignore_result=True,
+)
 def poll_moko_pending_payments():
     """
     Vérifie le statut des paiements MOKO en attente via l'API v2.
-    
+
     Si la file Redis des références pending est vide, ne fait rien.
     Sinon interroge GET /v1/payments/status?reference=xxx pour chaque entrée.
-    
-    Fréquence recommandée: toutes les 15 secondes (configurable via Celery Beat).
+
+    Fréquence réelle : toutes les 60 secondes. La vérité est en base
+    (`django_celery_beat`, migration `0012_moko_poll_interval_60s`), pas ici :
+    le scheduler est `DatabaseScheduler` et l'intervalle est modifiable depuis
+    l'admin Django sans passer par le code.
     """
     from django.conf import settings
 
     from apps.subscriptions.moko_client import (
         get_payment_status_v2,
         extract_payment_status_v2,
-        is_payment_successful_v2,
-        is_payment_failed_v2,
         is_payment_pending_v2,
     )
     from apps.subscriptions.moko_pending import (

@@ -442,6 +442,16 @@ class SubscriptionPayment(TimeStampedModel, UUIDModel):
     
     metadata = models.JSONField(default=dict, blank=True)
 
+    # Dernier passage de `reconcile_moko_payments` sur ce règlement. Sert
+    # uniquement à espacer les réinterrogations : la réconciliation repart de la
+    # BASE et balayait donc, toutes les 30 minutes, TOUS les paiements MOBILE
+    # MONEY `pending` ou `failed` des 30 derniers jours, à raison d'un appel
+    # HTTP MOKO par paiement. Un échec définitif restait ainsi réinterrogé
+    # 1 440 fois avant de sortir de la fenêtre. `null` signifie « jamais
+    # réconcilié », et passe donc en tête de file.
+    last_reconciled_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    reconcile_attempts = models.PositiveIntegerField(default=0)
+
     class Meta:
         db_table = 'subscription_payments'
         ordering = ['-created_at']
