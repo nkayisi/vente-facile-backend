@@ -384,6 +384,29 @@ PULL_TABLES = (
     PullTable('organization_currencies', 'settings.OrganizationCurrency'),
     PullTable('memberships', 'organizations.OrganizationMembership'),
 
+    # -- les gens
+    #
+    # Les utilisateurs sont bornés par leur APPARTENANCE : un compte peut
+    # servir plusieurs établissements, et tirer la table entière en donnerait
+    # la liste à n'importe quel caissier. `unique_together` sur
+    # (user, organization) garantit qu'une jointure ne duplique aucune ligne,
+    # ce dont la pagination dépend.
+    #
+    # Les COLONNES sont restreintes, et cela n'est pas cosmétique : ni mot de
+    # passe, ni jeton, ni drapeau `is_superuser` ne doivent atteindre un
+    # terminal, qui peut être volé et dont la base n'est pas chiffrée.
+    PullTable('users', 'users.User', org_field='memberships__organization',
+              fields=('id', 'updated_at', 'email', 'first_name', 'last_name',
+                      'phone', 'is_active', 'date_joined')),
+
+    # Les appareils enrôlés, pour que le marchand voie SON parc et puisse
+    # reconnaître un terminal perdu. `token_hash` reste au serveur.
+    PullTable('devices', 'users.Device',
+              fields=('id', 'updated_at', 'user_id', 'name', 'platform',
+                      'model', 'os_version', 'app_version', 'device_code',
+                      'created_at', 'last_seen_at', 'expires_at',
+                      'revoked_at')),
+
     # -- référentiels du catalogue
     PullTable('units', 'products.Unit'),
     PullTable('categories', 'products.Category', soft_delete=True),

@@ -51,6 +51,11 @@ class User(AbstractBaseUser, PermissionsMixin):
     
     date_joined = models.DateTimeField(default=timezone.now)
     last_login = models.DateTimeField(null=True, blank=True)
+
+    # Indispensable au TIRAGE : le curseur de `/sync/pull/` pagine sur
+    # `(updated_at, id)`. Sans ce champ, la table ne peut pas descendre sur les
+    # terminaux, et le nom d'un caissier n'y apparaîtrait jamais.
+    updated_at = models.DateTimeField(auto_now=True)
     
     active_organization = models.ForeignKey(
         'organizations.Organization',
@@ -212,6 +217,8 @@ class Device(models.Model):
     token_hash = models.CharField(max_length=64, db_index=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
+    #: Même raison que sur `User` : le tirage pagine sur `(updated_at, id)`.
+    updated_at = models.DateTimeField(auto_now=True)
     last_seen_at = models.DateTimeField(null=True, blank=True)
     last_ip = models.GenericIPAddressField(null=True, blank=True)
     expires_at = models.DateTimeField()
