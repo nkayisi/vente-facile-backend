@@ -5,12 +5,45 @@ from django.utils import timezone
 
 class TimeStampedModel(models.Model):
     """Base model with created/updated timestamps."""
-    
+
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         abstract = True
+
+    def save(self, *args, **kwargs):
+        """
+        ``updated_at`` suit TOUJOURS, même sur un ``save(update_fields=[...])``.
+
+        Django n'ajoute pas les champs ``auto_now`` à ``update_fields`` : un
+        ``save(update_fields=['amount'])`` écrit le montant et laisse
+        ``updated_at`` où il était. Mesuré sur Django 5.2, ce n'est pas une
+        supposition.
+
+        Ce n'est pas un détail cosmétique, c'est une FAILLE DE SYNCHRONISATION.
+        Le tirage pagine sur un curseur ``(updated_at, id)`` : une ligne dont
+        ``updated_at`` ne bouge pas est INVISIBLE au tirage, définitivement.
+        Constaté sur `CustomerBalance`, dont l'horodatage était figé depuis deux
+        semaines pendant que le solde changeait à chaque règlement : le terminal
+        affichait la dette du client telle qu'elle était le jour de la création
+        de la ligne, et un caissier décide d'accorder du crédit sur ce chiffre.
+
+        Le même piège attendait `Stock.package_quantity`, `CustomerLoyalty
+        .current_points` et `Sale.amount_due`, chacun écrit par un
+        ``update_fields`` quelque part. Le corriger appel par appel laisserait
+        le treizième à écrire ; ici il n'y a plus rien à oublier.
+
+        `auto_now_add` n'est pas concerné : `created_at` ne doit pas bouger.
+        """
+        champs = kwargs.get('update_fields')
+        if champs is not None:
+            champs = set(champs)
+            # Une création ne passe pas par `update_fields` ; on ne touche donc
+            # qu'à des mises à jour, où `updated_at` doit avancer.
+            champs.add('updated_at')
+            kwargs['update_fields'] = frozenset(champs)
+        return super().save(*args, **kwargs)
 
 
 class UUIDModel(models.Model):

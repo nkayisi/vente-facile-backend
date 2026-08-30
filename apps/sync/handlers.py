@@ -102,6 +102,11 @@ def sale_add_payment(ctx, payload):
         change_currency=payload.get('change_currency'),
         reference=payload.get('reference', ''),
         notes=payload.get('notes', ''),
+        # Le terminal a DÉJÀ imprimé le reçu quand cet acte remonte : son numéro
+        # est sur le papier que le client détient. Laisser le serveur en allouer
+        # un second donnerait deux numéros pour un seul versement, et le ticket
+        # ne désignerait plus rien de retrouvable.
+        receipt_number=payload.get('receipt_number'),
     )
 
     return {
@@ -245,12 +250,24 @@ def customer_record_payment(ctx, payload):
     """
     Règlement porté au compte d'un client.
 
-    `record_payment` impute sur les factures ouvertes, la plus ancienne d'abord,
-    dans la devise du règlement, et le reliquat devient une avance. Toute cette
-    logique reste côté serveur.
+    Le corps est celui du back-office (`contacts.services.record_payment`) : il
+    impute sur les factures ouvertes, la plus ancienne d'abord, dans la devise
+    d'imputation, et le reliquat devient une avance.
+
+    Ce gestionnaire en tenait auparavant sa PROPRE version, et elle avait déjà
+    dérivé sur trois points : elle ignorait `settle_currency` (un client devant
+    en USD et payant en francs ne voyait pas sa dette bouger), elle ne résolvait
+    pas le taux de change, et elle numérotait toujours en `RGL` - un versement
+    sans facture ouverte est une avance, et son reçu porte `AVC`.
+
+    « Avance » et « règlement » sont d'ailleurs le MÊME acte depuis que
+    `record_advance` est devenu un alias : inscrire une avance sans toucher aux
+    factures d'un client déjà endetté faisait diverger son solde de la somme de
+    ses `amount_due`.
     """
     from apps.contacts.models import Customer
     from apps.contacts.views import CustomerViewSet  # noqa: F401 - documente le chemin
+    from apps.contacts import services as contacts_services
 
     _require(payload, 'customer', 'amount')
 
@@ -260,40 +277,73 @@ def customer_record_payment(ctx, payload):
     if customer is None:
         raise OperationRejected("Client introuvable.", code='customer_not_found')
 
-    from apps.sales.services import apply_payment_to_sale
-    from apps.contacts import services as contacts_services
-    from apps.core.numbering import PREFIX_DEBT_PAYMENT, allocate_document_number
-
-    receipt = payload.get('receipt_number') or allocate_document_number(
-        ctx.organization, PREFIX_DEBT_PAYMENT
+    resultat = contacts_services.record_payment(
+        customer, payload['amount'],
+        user=ctx.user,
+        currency=payload.get('currency'),
+        exchange_rate=payload.get('exchange_rate'),
+        settle_currency=payload.get('settle_currency'),
+        payment_method=payload.get('payment_method', 'cash'),
+        reference=payload.get('reference', ''),
+        notes=payload.get('notes', ''),
+        # Numéro imposé par le terminal : le reçu est sorti hors ligne, sous ce
+        # numéro-là, et il ne peut plus changer.
+        receipt_number=payload.get('receipt_number'),
     )
-    reste = contacts_services._quantize(payload['amount'])
-    devise = payload.get('currency')
 
-    for vente in contacts_services.open_credit_sales(customer, devise):
-        if reste <= 0:
-            break
-        part = min(reste, vente.amount_due)
-        apply_payment_to_sale(
-            vente.id, ctx.user,
-            payment_method_id=payload.get('payment_method'),
-            tendered_amount=part, currency=devise,
-            notes=payload.get('notes', ''), receipt_number=receipt,
-        )
-        reste -= part
-
-    if reste > 0:
-        contacts_services.settle_debt(
-            customer, reste, currency=devise, user=ctx.user,
-            notes=payload.get('notes', ''), receipt_number=receipt,
-        )
-
-    customer.refresh_from_db()
     return {
-        'server_ids': {'customer': str(customer.id), 'receipt_number': receipt},
+        'server_ids': {
+            'customer': str(customer.id),
+            'receipt_number': resultat['receipt_number'],
+        },
         'authoritative': {
             'id': str(customer.id),
-            'current_balance': str(customer.current_balance),
+            'current_balance': resultat['new_balance'],
+            'balances': resultat['balances'],
+            'settled_invoices': resultat['settled_invoices'],
+            'advance_amount': resultat['advance_amount'],
+        },
+    }
+
+
+@handler('customer.adjust_balance')
+def customer_adjust_balance(ctx, payload):
+    """
+    Ajustement manuel du solde d'un client.
+
+    Positif : dette de plus. Négatif : dette réduite, et l'argent entre au
+    tiroir. Même corps que `CustomerViewSet.adjust_balance`.
+    """
+    from apps.contacts.models import Customer
+    from apps.contacts.views import CustomerViewSet  # noqa: F401 - documente le chemin
+    from apps.contacts import services as contacts_services
+
+    _require(payload, 'customer', 'amount')
+
+    customer = Customer.objects.filter(
+        id=payload['customer'], organization=ctx.organization
+    ).first()
+    if customer is None:
+        raise OperationRejected("Client introuvable.", code='customer_not_found')
+
+    resultat = contacts_services.adjust_customer_balance(
+        customer, payload['amount'],
+        user=ctx.user,
+        currency=payload.get('currency'),
+        exchange_rate=payload.get('exchange_rate'),
+        notes=payload.get('notes', ''),
+        receipt_number=payload.get('receipt_number'),
+    )
+
+    return {
+        'server_ids': {
+            'customer': str(customer.id),
+            'receipt_number': resultat['receipt_number'],
+        },
+        'authoritative': {
+            'id': str(customer.id),
+            'current_balance': resultat['new_balance'],
+            'balances': resultat['balances'],
         },
     }
 
