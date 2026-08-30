@@ -264,177 +264,39 @@ class RegisterSessionViewSet(
 
         - Tout membre ayant accès à l'entrepôt de la caisse peut fermer la
           session, y compris une session ouverte par un autre utilisateur
-          (``get_object`` est déjà filtré par périmètre entrepôt, donc on ne
-          peut fermer que les sessions de ses propres entrepôts). L'identité du
-          clôtureur est journalisée (voir ``UserActivity`` en fin de méthode).
-        - Accepte `counted_balance` optionnel (comptage manuel) ; calcule
-          `difference = counted_balance - expected_balance` si fourni.
-        - Si différence non nulle, `notes` est obligatoire.
+          (``get_object`` est déjà filtré par périmètre entrepôt).
+        - Accepte `counted_balance` / `counted_balances` (comptage manuel) ;
+          calcule l'écart par devise.
+        - Si un écart est non nul, `notes` est obligatoire.
+
+        Le corps vit dans `sales.session_close`, que le journal d'opérations du
+        terminal rejoue aussi : le Z de caisse se tire au comptoir, souvent
+        avant que le réseau ne revienne.
         """
-        session = self.get_object()
+        from .session_close import (
+            NoteRequise, TransitionRefusee, close_register_session,
+        )
 
-        if session.status != 'open':
-            return Response(
-                {'error': 'Cette session est déjà fermée'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        serializer = RegisterSessionCloseSerializer(data=request.data if request.data else {})
+        serializer = RegisterSessionCloseSerializer(
+            data=request.data if request.data else {}
+        )
         serializer.is_valid(raise_exception=True)
-        notes_input = (serializer.validated_data.get('notes') or '').strip()
 
-        from django.db.models import Q as _Q
-        from django.db.models.functions import Coalesce
-        from apps.cashbook.models import CashMovement
-        from .models import RegisterSessionCurrencyBalance
-
-        primary = session.organization.currency or 'CDF'
-        TWO = Decimal('0.01')
-
-        # Fonds d'ouverture PAR DEVISE : depuis les currency_balances de la session
-        # si présents (nouvelles sessions), sinon la devise principale = scalaire.
-        opening_by_ccy = {
-            cb.currency: cb.opening_balance
-            for cb in session.currency_balances.all()
-        }
-        if not opening_by_ccy:
-            opening_by_ccy = {primary: session.opening_balance}
-
-        # Entrées espèces par devise = somme des règlements cash (montant remis)
-        # des ventes de la session.
-        cash_in_rows = Payment.objects.filter(
-            sale__session=session,
-            payment_method__method_type='cash',
-            status='completed',
-        ).values('currency').annotate(
-            total=Sum(Coalesce('tendered_amount', 'amount'))
-        )
-        cash_in_by_ccy = {
-            (r['currency'] or primary): (r['total'] or Decimal('0.00'))
-            for r in cash_in_rows
-        }
-
-        # Sorties espèces par devise = mouvements cash 'out' rattachés à la session
-        # (dépenses, monnaie rendue, retraits). payment_method NULL = espèces comptoir.
-        cash_out_rows = CashMovement.objects.filter(
-            session=session,
-            direction='out',
-            is_cancelled=False,
-        ).filter(
-            _Q(payment_method__isnull=True) | _Q(payment_method__method_type='cash')
-        ).values('currency').annotate(total=Sum('amount'))
-        cash_out_by_ccy = {
-            (r['currency'] or primary): (r['total'] or Decimal('0.00'))
-            for r in cash_out_rows
-        }
-
-        # Comptage manuel par devise (+ compat scalaire = devise principale).
-        counted_by_ccy = {}
-        if serializer.validated_data.get('counted_balance') is not None:
-            counted_by_ccy[primary] = Decimal(serializer.validated_data['counted_balance'])
-        for item in serializer.validated_data.get('counted_balances') or []:
-            counted_by_ccy[item['currency']] = Decimal(item['amount'])
-
-        currencies = (
-            set(opening_by_ccy) | set(cash_in_by_ccy)
-            | set(cash_out_by_ccy) | set(counted_by_ccy)
-        )
-
-        rows = []
-        any_diff = False
-        for ccy in sorted(currencies):
-            opening = opening_by_ccy.get(ccy, Decimal('0.00'))
-            cin = cash_in_by_ccy.get(ccy, Decimal('0.00'))
-            cout = cash_out_by_ccy.get(ccy, Decimal('0.00'))
-            expected = (opening + cin - cout).quantize(TWO)
-            counted = counted_by_ccy.get(ccy)
-            if counted is not None:
-                counted = counted.quantize(TWO)
-                diff = (counted - expected).quantize(TWO)
-            else:
-                diff = Decimal('0.00')
-            if diff != 0:
-                any_diff = True
-            rows.append({
-                'currency': ccy, 'opening_balance': opening,
-                'expected_balance': expected, 'counted_balance': counted,
-                'difference': diff,
-            })
-
-        # Notes obligatoires si un écart est non nul dans une devise.
-        if any_diff and not notes_input:
-            return Response(
-                {'notes': "Une note explicative est obligatoire lorsque le comptage diffère du solde attendu."},
-                status=status.HTTP_400_BAD_REQUEST,
+        try:
+            session = close_register_session(
+                self.get_object(), request.user, serializer.validated_data,
+                ip=request.META.get('REMOTE_ADDR'),
+                agent=request.META.get('HTTP_USER_AGENT', '')[:500],
             )
-
-        # Persister les soldes par devise.
-        for row in rows:
-            RegisterSessionCurrencyBalance.objects.update_or_create(
-                session=session, currency=row['currency'],
-                defaults={
-                    'organization': session.organization,
-                    'opening_balance': row['opening_balance'],
-                    'expected_balance': row['expected_balance'],
-                    'counted_balance': row['counted_balance'],
-                    'difference': row['difference'],
-                },
-            )
-
-        # Renseigner les champs scalaires (devise principale) pour compat ascendante.
-        primary_row = next((r for r in rows if r['currency'] == primary), None)
-        if primary_row is None:
-            primary_row = {
-                'opening_balance': session.opening_balance,
-                'expected_balance': session.opening_balance,
-                'counted_balance': None, 'difference': Decimal('0.00'),
-            }
-        session.expected_balance = primary_row['expected_balance']
-        session.counted_balance = primary_row['counted_balance']
-        session.difference = primary_row['difference']
-        session.closing_balance = (
-            primary_row['counted_balance'] if primary_row['counted_balance'] is not None
-            else primary_row['expected_balance']
-        )
-        session.closed_by = request.user
-        session.closed_at = timezone.now()
-        session.status = 'closed'
-        session.notes = notes_input
-        session.save()
-
-        # Audit log de la fermeture - détail par devise inclus.
-        from apps.users.models import UserActivity
-
-        closed_by_other = session.opened_by_id != request.user.id
-        UserActivity.objects.create(
-            user=request.user,
-            organization=session.organization,
-            action=UserActivity.ActionType.UPDATE,
-            resource_type='register_session',
-            resource_id=str(session.id),
-            details={
-                'event': 'session_closed',
-                'register_id': str(session.register_id),
-                'opened_by_id': str(session.opened_by_id),
-                'closed_by_id': str(request.user.id),
-                'closed_by_other_user': closed_by_other,
-                'currency_balances': [
-                    {
-                        'currency': r['currency'],
-                        'opening_balance': str(r['opening_balance']),
-                        'expected_balance': str(r['expected_balance']),
-                        'counted_balance': str(r['counted_balance']) if r['counted_balance'] is not None else None,
-                        'difference': str(r['difference']),
-                    }
-                    for r in rows
-                ],
-                'notes': notes_input,
-            },
-            ip_address=request.META.get('REMOTE_ADDR'),
-            user_agent=request.META.get('HTTP_USER_AGENT', '')[:500],
-        )
+        except NoteRequise as exc:
+            # `notes` et non `error` : contrat publié, sur lequel le
+            # back-office branche son message de champ.
+            return Response({'notes': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except TransitionRefusee as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response(RegisterSessionDetailSerializer(session).data)
+
 
     @action(detail=False, methods=['get'])
     def current(self, request):

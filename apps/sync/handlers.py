@@ -383,6 +383,55 @@ def stock_movement_create(ctx, payload):
     }
 
 
+@handler('register_session.close')
+def register_session_close(ctx, payload):
+    """
+    Clôture d'une session de caisse.
+
+    ELLE PASSE PAR LE JOURNAL, et ce n'est pas un luxe : le Z se tire au
+    comptoir, à la fermeture, souvent avant que le réseau ne revienne. Le
+    caissier compte son tiroir, imprime, et rentre chez lui ; l'opération part
+    plus tard.
+
+    Le comptage arrive PAR DEVISE (`counted_balances`) : un tiroir contient des
+    billets de plusieurs devises, et les additionner donnerait un nombre qui ne
+    correspond à aucune liasse.
+    """
+    from apps.sales.models import RegisterSession
+    from apps.sales.serializers import RegisterSessionDetailSerializer
+    from apps.sales.session_close import close_register_session
+
+    _require(payload, 'session')
+    session = RegisterSession.objects.filter(
+        id=payload['session'], organization=ctx.organization,
+    ).first()
+    if session is None:
+        raise OperationRejected("Cette session n'existe pas.", code='session_not_found')
+
+    _refus_si_impossible_caisse(
+        close_register_session, session, ctx.user,
+        {
+            'notes': payload.get('notes', ''),
+            'counted_balance': payload.get('counted_balance'),
+            'counted_balances': payload.get('counted_balances') or [],
+        },
+    )
+    session.refresh_from_db()
+    return {
+        'server_ids': {'register_session': str(session.id)},
+        'authoritative': RegisterSessionDetailSerializer(session).data,
+    }
+
+
+def _refus_si_impossible_caisse(fonction, *args, **kwargs):
+    """Traduit un refus de clôture en refus d'opération, donc en quarantaine."""
+    from apps.sales.session_close import TransitionRefusee
+    try:
+        return fonction(*args, **kwargs)
+    except TransitionRefusee as exc:
+        raise OperationRejected(str(exc), code='transition_refused')
+
+
 # --------------------------------------------------------- opérations de stock
 #
 # Les transitions d'un transfert ou d'un ajustement passent par les MÊMES
