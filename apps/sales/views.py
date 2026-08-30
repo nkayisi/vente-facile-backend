@@ -785,95 +785,28 @@ class SaleReturnViewSet(
 
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
-        """Approuve un retour et remet le stock."""
-        from django.db import transaction
-        from apps.inventory.models import Stock, StockMovement
-        
-        sale_return = self.get_object()
-        
-        if sale_return.status != 'draft':
-            return Response(
-                {'error': 'Seuls les retours en brouillon peuvent être approuvés'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        with transaction.atomic():
-            # Remise en stock déléguée au service, qui centralise le recalcul du
-            # coût moyen et la mise à jour du partage scellé/vrac.
-            from .services import SaleStockService
-            SaleStockService.apply_return(sale_return, request.user)
+        """
+        Approuve un retour et remet le stock.
 
-            sale_return.status = 'completed'
-            sale_return.approved_by = request.user
-            sale_return.approved_at = timezone.now()
-            sale_return.save()
-
-            sale = sale_return.original_sale
-            refund_amount = sale_return.refund_amount or Decimal('0.00')
-
-            # Un retour sur une facture encore due éteint d'abord la dette : le
-            # client a rendu la marchandise, il n'a plus à la payer. Seul le
-            # reliquat sort physiquement de la caisse. Sans cela le client rendait
-            # le produit ET continuait de devoir la totalité, et le marchand lui
-            # remboursait en espèces de l'argent jamais encaissé.
-            debt_offset = Decimal('0.00')
-            if sale and sale.customer and sale.amount_due > 0 and refund_amount > 0:
-                from apps.contacts import services as contacts_services
-
-                debt_offset = min(refund_amount, sale.amount_due)
-                contacts_services.settle_debt(
-                    sale.customer, debt_offset,
-                    currency=sale.currency,
-                    transaction_type=(
-                        contacts_services.CustomerTransaction.TransactionType.REFUND
-                    ),
-                    sale=sale,
-                    reference=sale_return.reference,
-                    notes=f"Retour {sale_return.reference} sur vente {sale.reference}",
-                    user=request.user,
-                )
-                sale.amount_due = (sale.amount_due - debt_offset).quantize(Decimal('0.01'))
-                sale.save(update_fields=['amount_due'])
-
-            # Mouvement de caisse pour la seule part réellement remboursée.
-            cash_refund = refund_amount - debt_offset
-            if cash_refund > 0:
-                from apps.cashbook.services import record_sale_return_refund
-                record_sale_return_refund(
-                    organization=sale_return.organization,
-                    sale_return=sale_return,
-                    amount=cash_refund,
-                    user=request.user,
-                )
-
-            # Reverser les points : seule l'annulation le faisait, un retour
-            # laissait le client garder les points d'une vente rendue.
-            # Un retour TOTAL seulement : sur un retour partiel, les points
-            # gagnés sur la part conservée restent acquis.
-            if sale and sale_return.total_amount >= sale.total:
-                from apps.settings.services import LoyaltyService
-                LoyaltyService.reverse_sale_transactions(
-                    sale, request.user, label='retour',
-                )
-
+        Corps dans `sales.returns_quotations`, partagé avec le journal du
+        terminal : créer et approuver un retour sont des gestes de comptoir.
+        """
+        from .returns_quotations import TransitionRefusee, approve_return
+        try:
+            approve_return(self.get_object(), request.user)
+        except TransitionRefusee as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response({'status': 'approved'})
 
     @action(detail=True, methods=['post'])
     def reject(self, request, pk=None):
         """Rejette un retour."""
-        sale_return = self.get_object()
-        
-        if sale_return.status != 'draft':
-            return Response(
-                {'error': 'Seuls les retours en brouillon peuvent être rejetés'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        sale_return.status = 'rejected'
-        sale_return.save()
-        
+        from .returns_quotations import TransitionRefusee, reject_return
+        try:
+            reject_return(self.get_object(), request.user)
+        except TransitionRefusee as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response({'status': 'rejected'})
-
 
 # =============================================================================
 # QUOTATION VIEWSET
@@ -923,152 +856,39 @@ class QuotationViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def convert(self, request, pk=None):
-        """Convertit un devis en vente."""
-        from django.db import transaction
-        from apps.inventory.models import Stock
-        from .services import SaleStockService
+        """
+        Convertit un devis en vente.
+
+        Le corps vit dans `sales.returns_quotations` ; la RÉSOLUTION de
+        l'entrepôt reste ici, parce que c'est elle qui a besoin de la requête
+        pour contrôler le périmètre du membre.
+        """
+        from .returns_quotations import (
+            TransitionRefusee, convert_quotation, resolve_conversion_warehouse,
+        )
 
         quotation = self.get_object()
-        
-        if quotation.status == 'converted':
-            return Response(
-                {'error': 'Ce devis a déjà été converti'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        if quotation.status == 'expired':
-            return Response(
-                {'error': 'Ce devis est expiré'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Récupérer l'entrepôt cible : prioriser l'entrepôt envoyé,
-        # sinon le premier entrepôt assigné au membre, sinon le défaut.
-        from apps.inventory.models import Warehouse
-
         membership = get_membership_for_request(request)
-        allowed_ids = accessible_warehouse_ids(membership) if membership else None
+        autorises = accessible_warehouse_ids(membership) if membership else None
 
-        warehouse = None
-        explicit_wh = request.data.get('warehouse') if hasattr(request, 'data') else None
-        if explicit_wh:
-            assert_warehouse_allowed_for_request(request, explicit_wh)
-            warehouse = Warehouse.objects.filter(
-                id=explicit_wh,
-                organization=quotation.organization,
-                is_active=True,
-                is_deleted=False,
-            ).first()
+        explicite = request.data.get('warehouse') if hasattr(request, 'data') else None
+        if explicite:
+            assert_warehouse_allowed_for_request(request, explicite)
 
-        if warehouse is None:
-            base_qs = Warehouse.objects.filter(
-                organization=quotation.organization,
-                is_active=True,
-                is_deleted=False,
+        warehouse = resolve_conversion_warehouse(quotation, explicite, autorises)
+
+        try:
+            sale = convert_quotation(
+                quotation, request.user, warehouse,
+                perimetre_borne=autorises is not None,
             )
-            if allowed_ids is not None:
-                base_qs = base_qs.filter(id__in=allowed_ids)
-            warehouse = (
-                base_qs.filter(is_default=True).first()
-                or base_qs.first()
-            )
-
-        if warehouse is None and allowed_ids is not None:
-            return Response(
-                {'error': "Aucun entrepôt accessible pour convertir ce devis."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        
-        # Vérifier le stock si un entrepôt est disponible
-        if warehouse:
-            for item in quotation.items.all():
-                if item.product.track_inventory and not item.product.allow_negative_stock:
-                    stock = Stock.objects.filter(
-                        product=item.product,
-                        variant=item.variant,
-                        warehouse=warehouse
-                    ).first()
-                    
-                    available = stock.available_quantity if stock else 0
-                    if item.quantity > available:
-                        return Response(
-                            {'error': f"Stock insuffisant pour {item.product.name}. Disponible: {available}"},
-                            status=status.HTTP_400_BAD_REQUEST
-                        )
-        
-        with transaction.atomic():
-            # Créer la vente à partir du devis
-            from apps.core.utils import ReferenceGenerator
-            
-            sale = Sale.objects.create(
-                organization=quotation.organization,
-                reference=ReferenceGenerator.generate_sale_reference(quotation.organization),
-                customer=quotation.customer,
-                warehouse=warehouse,
-                sale_type='retail',
-                status='pending',
-                subtotal=quotation.subtotal,
-                tax_amount=quotation.tax_amount,
-                discount_amount=quotation.discount_amount,
-                total=quotation.total,
-                amount_due=quotation.total,
-                notes=quotation.notes,
-                sold_by=request.user,
-                is_pos=False
-            )
-            
-            # Copier les items
-            for item in quotation.items.all():
-                SaleItem.objects.create(
-                    sale=sale,
-                    organization=quotation.organization,
-                    product=item.product,
-                    variant=item.variant,
-                    description=item.description,
-                    quantity=item.quantity,
-                    unit_price=item.unit_price,
-                    cost_price=item.product.cost_price,
-                    discount_percentage=item.discount_percentage,
-                    tax_rate=item.tax_rate,
-                    subtotal=item.quantity * item.unit_price,
-                    total=item.total
-                )
-            
-            quotation.status = 'converted'
-            quotation.converted_sale = sale
-            quotation.save()
-
-            # Réserver immédiatement le stock pour éviter qu'un autre cashier
-            # ne vende les mêmes unités pendant la fenêtre conversion →
-            # encaissement. Le décrément effectif sera fait par
-            # ``SaleStockService.apply_decrement`` lors du ``add_payment``.
-            if sale.warehouse:
-                SaleStockService.reserve_stock(sale, request.user)
-
-            # Un devis converti est une facture émise et non payée : c'est une
-            # dette, au même titre qu'une vente à crédit. Sans cet appel la
-            # facture était retenue par `open_credit_sales` (statut `pending`,
-            # `amount_due > 0`) alors qu'aucune dette n'avait été inscrite - son
-            # règlement ultérieur décrémentait donc un solde jamais incrémenté et
-            # rendait le client artificiellement créditeur. C'est aussi ici que
-            # passent le contrôle de limite de crédit et la consommation d'une
-            # avance, jusque-là contournés sur ce chemin.
-            #
-            # Après la réservation : si une avance solde entièrement la facture,
-            # `register_sale_debt` enchaîne sur le décrément, dans le même ordre
-            # réservation → décrément que le chemin `add_payment`.
-            if sale.customer and sale.amount_due > 0:
-                from .services import register_sale_debt
-
-                register_sale_debt(
-                    sale, request.user,
-                    notes=f"Devis {quotation.reference} converti en vente {sale.reference}",
-                )
+        except TransitionRefusee as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response({
             'status': 'converted',
             'sale_id': str(sale.id),
-            'sale_reference': sale.reference
+            'sale_reference': sale.reference,
         })
 
     @action(detail=True, methods=['post'])

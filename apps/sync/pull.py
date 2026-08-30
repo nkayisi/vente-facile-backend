@@ -368,6 +368,16 @@ ADJUSTMENT_CHILDREN = (
 #: parce que c'est ce qui rend le comptage possible hors ligne : le magasinier
 #: ouvre la session, et il a déjà toutes ses lignes, avec le stock théorique
 #: figé au démarrage.
+RETURN_CHILDREN = (
+    PullChild(name='items', table='sale_return_items',
+              model='sales.SaleReturnItem', parent_field='sale_return'),
+)
+
+QUOTATION_CHILDREN = (
+    PullChild(name='items', table='quotation_items',
+              model='sales.QuotationItem', parent_field='quotation'),
+)
+
 INVENTORY_CHILDREN = (
     PullChild(name='counts', table='inventory_counts',
               model='inventory.InventoryCount', parent_field='session'),
@@ -437,6 +447,16 @@ PULL_TABLES = (
     PullTable('sales', 'sales.Sale', soft_delete=True, warehouse_path='warehouse_id',
               children=SALE_CHILDREN),
     PullTable('stock_movements', 'inventory.StockMovement', warehouse_path='warehouse_id'),
+
+    # -- retours et devis
+    #
+    # Ni l'un ni l'autre n'avait d'écran, nulle part : le terminal crée la
+    # référence. Leurs lignes descendent IMBRIQUÉES, comme celles d'une vente -
+    # elles n'ont pas de suppression douce.
+    PullTable('sale_returns', 'sales.SaleReturn', soft_delete=True,
+              warehouse_path='warehouse_id', children=RETURN_CHILDREN),
+    PullTable('quotations', 'sales.Quotation', soft_delete=True,
+              children=QUOTATION_CHILDREN),
 
     # -- opérations de stock
     #

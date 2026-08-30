@@ -613,6 +613,132 @@ def stock_adjustment_reject(ctx, payload):
     return _transition_ajustement(ctx, payload, reject_adjustment)
 
 
+# ------------------------------------------------------------ retours et devis
+#
+# Ni le retour ni le devis n'avait d'écran, nulle part - ni sur le web, ni sur
+# le mobile. Le terminal crée donc la référence, et ces actes sont le seul
+# chemin d'écriture depuis un comptoir.
+
+
+def _refus_vente(fonction, *args, **kwargs):
+    from apps.sales.returns_quotations import TransitionRefusee
+    try:
+        return fonction(*args, **kwargs)
+    except TransitionRefusee as exc:
+        raise OperationRejected(str(exc), code='transition_refused')
+
+
+@handler('sale_return.create')
+def sale_return_create(ctx, payload):
+    from apps.sales.serializers import (
+        SaleReturnCreateSerializer, SaleReturnDetailSerializer,
+    )
+
+    local_id = payload.pop('id', None)
+    serializer = SaleReturnCreateSerializer(data=payload, context={'request': ctx.request})
+    serializer.is_valid(raise_exception=True)
+    assert_warehouse_allowed_for_request(
+        ctx.request,
+        getattr(serializer.validated_data.get('warehouse'), 'id', None),
+        allow_none=True,
+    )
+    retour = serializer.save(
+        organization=ctx.organization, **({'id': local_id} if local_id else {})
+    )
+    return {
+        'server_ids': {'sale_return': str(retour.id)},
+        'authoritative': SaleReturnDetailSerializer(retour).data,
+    }
+
+
+def _transition_retour(ctx, payload, fonction):
+    from apps.sales.models import SaleReturn
+    from apps.sales.serializers import SaleReturnDetailSerializer
+
+    _require(payload, 'sale_return')
+    retour = _objet_de_lorg(SaleReturn, ctx, payload['sale_return'], 'Ce retour')
+    _refus_vente(fonction, retour, ctx.user)
+    retour.refresh_from_db()
+    return {
+        'server_ids': {'sale_return': str(retour.id)},
+        'authoritative': SaleReturnDetailSerializer(retour).data,
+    }
+
+
+@handler('sale_return.approve')
+def sale_return_approve(ctx, payload):
+    from apps.sales.returns_quotations import approve_return
+    return _transition_retour(ctx, payload, approve_return)
+
+
+@handler('sale_return.reject')
+def sale_return_reject(ctx, payload):
+    from apps.sales.returns_quotations import reject_return
+    return _transition_retour(ctx, payload, reject_return)
+
+
+@handler('quotation.create')
+def quotation_create(ctx, payload):
+    from apps.sales.serializers import (
+        QuotationCreateSerializer, QuotationDetailSerializer,
+    )
+
+    local_id = payload.pop('id', None)
+    serializer = QuotationCreateSerializer(data=payload, context={'request': ctx.request})
+    serializer.is_valid(raise_exception=True)
+    devis = serializer.save(
+        organization=ctx.organization, **({'id': local_id} if local_id else {})
+    )
+    return {
+        'server_ids': {'quotation': str(devis.id)},
+        'authoritative': QuotationDetailSerializer(devis).data,
+    }
+
+
+@handler('quotation.convert')
+def quotation_convert(ctx, payload):
+    """
+    Conversion d'un devis en vente.
+
+    **La DETTE est inscrite par le service**, comme sur le chemin web : un devis
+    converti est une facture émise et non payée. L'oublier rendait le client
+    artificiellement créditeur au règlement suivant - c'est le défaut que la
+    session 2026-08-24 a corrigé, et il ne doit pas revenir par cette porte.
+    """
+    from apps.core.warehouse_scope import accessible_warehouse_ids
+    from apps.sales.models import Quotation
+    from apps.sales.serializers import QuotationDetailSerializer
+    from apps.sales.returns_quotations import (
+        convert_quotation, resolve_conversion_warehouse,
+    )
+
+    _require(payload, 'quotation')
+    devis = _objet_de_lorg(Quotation, ctx, payload['quotation'], 'Ce devis')
+
+    explicite = payload.get('warehouse')
+    if explicite:
+        assert_warehouse_allowed_for_request(ctx.request, explicite)
+
+    membership = _membership_du_contexte(ctx)
+    autorises = accessible_warehouse_ids(membership) if membership else None
+    warehouse = resolve_conversion_warehouse(devis, explicite, autorises)
+
+    vente = _refus_vente(
+        convert_quotation, devis, ctx.user, warehouse,
+        perimetre_borne=autorises is not None,
+    )
+    devis.refresh_from_db()
+    return {
+        'server_ids': {'quotation': str(devis.id), 'sale': str(vente.id)},
+        'authoritative': QuotationDetailSerializer(devis).data,
+    }
+
+
+def _membership_du_contexte(ctx):
+    from apps.core.warehouse_scope import get_membership_for_request
+    return get_membership_for_request(ctx.request)
+
+
 # ------------------------------------------------------------- inventaire
 #
 # COMPTER EST LE MEILLEUR USAGE MOBILE DU PRODUIT : on compte debout dans le
