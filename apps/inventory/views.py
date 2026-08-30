@@ -698,7 +698,37 @@ class StockMovementViewSet(ExportResponseMixin, WarehouseScopedQuerysetMixin, Te
 # STOCK TRANSFER VIEWSET
 # =============================================================================
 
-class StockTransferViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
+class TransitionActionMixin:
+    """
+    Exécute une transition de `inventory.services` et traduit son refus.
+
+    Le refus est DÉTERMINISTE (« déjà expédié », « pas en révision ») : il
+    devient un 400 ici, et un verdict `rejected` côté journal - jamais un
+    réessai, qui rejouerait un effet déjà appliqué.
+
+    En mixin plutôt qu'en trois copies : les transferts, les ajustements et les
+    sessions d'inventaire appellent tous le même schéma, et trois copies
+    auraient divergé sur le traitement de l'erreur.
+    """
+
+    #: Serializer employé quand la transition rend un OBJET. Sans lui, le
+    #: résultat de la fonction part tel quel : les transferts et les
+    #: ajustements rendent `{'status': 'shipped'}`, et ce contrat était déjà
+    #: publié - le changer casserait le back-office en silence.
+    transition_serializer = None
+
+    def _transition(self, fonction, serialiser=False, **extra):
+        from .services import TransitionRefusee
+        try:
+            resultat = fonction(self.get_object(), self.request.user, **extra)
+        except TransitionRefusee as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        if serialiser and self.transition_serializer is not None:
+            return Response(self.transition_serializer(resultat).data)
+        return Response(resultat)
+
+
+class StockTransferViewSet(TransitionActionMixin, TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     """
     ViewSet pour les transferts de stock entre entrepôts.
     
@@ -760,13 +790,6 @@ class StockTransferViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
     # mobile rejoue aussi. Deux corps auraient divergé, comme la dette client
     # l'avait fait avant le lot 6.
 
-    def _transition(self, fonction, **extra):
-        from .services import TransitionRefusee
-        try:
-            return Response(fonction(self.get_object(), self.request.user, **extra))
-        except TransitionRefusee as exc:
-            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
         """Approuve un transfert en attente."""
@@ -795,7 +818,7 @@ class StockTransferViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
 
 
 
-class StockAdjustmentViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
+class StockAdjustmentViewSet(TransitionActionMixin, WarehouseScopedQuerysetMixin, TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     """
     ViewSet pour les ajustements de stock (inventaire).
     
@@ -850,13 +873,6 @@ class StockAdjustmentViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, A
 
     # Corps dans `inventory.services`, partagé avec le journal du terminal.
 
-    def _transition(self, fonction, **extra):
-        from .services import TransitionRefusee
-        try:
-            return Response(fonction(self.get_object(), self.request.user, **extra))
-        except TransitionRefusee as exc:
-            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
         """Approuve et applique l'ajustement de stock."""
@@ -872,7 +888,7 @@ class StockAdjustmentViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, A
 
 # =============================================================================
 
-class InventorySessionViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
+class InventorySessionViewSet(TransitionActionMixin, WarehouseScopedQuerysetMixin, TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     """
     ViewSet pour la gestion des sessions d'inventaire.
     
@@ -889,6 +905,8 @@ class InventorySessionViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, 
     - GET    /inventory-sessions/{id}/counts/        : Liste des lignes de comptage
     - GET    /inventory-sessions/{id}/print-data/    : Données pour impression
     """
+
+    transition_serializer = InventorySessionDetailSerializer
     
     queryset = InventorySession.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission, TenantObjectPermission]
@@ -937,288 +955,45 @@ class InventorySessionViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, 
         return super().destroy(request, *args, **kwargs)
 
     def _get_target_products(self, session):
-        """Retourne les produits ciblés par la session selon son scope."""
-        from apps.products.models import Product
-        
-        organization = session.organization
-        base_qs = Product.objects.filter(
-            organization=organization,
-            is_active=True,
-            track_inventory=True,
-        )
-        
-        if session.scope_type == 'category':
-            category_ids = list(session.categories.values_list('id', flat=True))
-            if category_ids:
-                base_qs = base_qs.filter(category_id__in=category_ids)
-        elif session.scope_type == 'product':
-            product_ids = list(session.products.values_list('id', flat=True))
-            if product_ids:
-                base_qs = base_qs.filter(id__in=product_ids)
-
-        # N'inclure que les produits avec stock disponible dans l'entrepôt ciblé.
-        # available_quantity = quantity - reserved_quantity > 0
-        return base_qs.filter(
-            stocks__warehouse=session.warehouse,
-            stocks__variant__isnull=True,
-            stocks__quantity__gt=F('stocks__reserved_quantity'),
-        ).distinct()
+        """Produits visés. Corps dans `inventory.services.target_products`."""
+        from .services import target_products
+        return target_products(session)
 
     @action(detail=True, methods=['post'])
     def start(self, request, pk=None):
-        """
-        Démarre une session d'inventaire :
-        1. Verrouille le stock des produits ciblés dans l'entrepôt
-        2. Prend un snapshot du stock actuel
-        3. Génère les lignes de comptage (InventoryCount)
-        """
-        session = self.get_object()
-        
-        if session.status != 'draft':
-            return Response(
-                {'error': 'Seules les sessions en brouillon peuvent être démarrées'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        with transaction.atomic():
-            products = self._get_target_products(session)
-            
-            # Generate count lines with stock snapshot
-            count_objects = []
-            for product in products:
-                stock = Stock.objects.filter(
-                    organization=session.organization,
-                    product=product,
-                    warehouse=session.warehouse,
-                    variant=None,
-                ).first()
-                
-                current_qty = stock.quantity if stock else Decimal('0.000')
-                unit_cost = Decimal('0.00')
-                if stock and stock.avg_cost > 0:
-                    unit_cost = stock.avg_cost
-                elif product.cost_price:
-                    unit_cost = product.cost_price
-                
-                from .packaging import PackagingService
-                factor = PackagingService.factor(product)
-
-                count_objects.append(InventoryCount(
-                    organization=session.organization,
-                    session=session,
-                    product=product,
-                    variant=None,
-                    quantity_expected=current_qty,
-                    expected_loose_quantity=(
-                        stock.loose_quantity if stock else Decimal('0.000')
-                    ),
-                    packaging_factor=factor,
-                    unit_cost=unit_cost,
-                ))
-            
-            InventoryCount.objects.bulk_create(count_objects)
-            
-            # Lock stock
-            session.status = 'in_progress'
-            session.is_stock_locked = True
-            session.started_at = timezone.now()
-            session.save()
-        
-        serializer = InventorySessionDetailSerializer(session)
-        return Response(serializer.data)
+        """Démarre la session : verrouille le stock, engendre les comptages."""
+        from .services import start_inventory_session
+        return self._transition(start_inventory_session, serialiser=True)
 
     @action(detail=True, methods=['post'])
     def count(self, request, pk=None):
         """
         Enregistre les comptages pour une ou plusieurs lignes.
-        
+
         Body: { "counts": [{ "id": "<count_id>", "quantity_counted": 10, "notes": "" }, ...] }
         """
-        session = self.get_object()
-        
-        if session.status != 'in_progress':
-            return Response(
-                {'error': "L'inventaire doit être en cours pour enregistrer des comptages"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        counts_data = request.data.get('counts', [])
-        if not counts_data:
-            return Response(
-                {'error': 'Aucun comptage fourni'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        updated_ids = []
-        with transaction.atomic():
-            for item in counts_data:
-                count_id = item.get('id')
-                quantity_counted = item.get('quantity_counted')
-                notes = item.get('notes', '')
-                
-                if count_id is None or quantity_counted is None:
-                    continue
-                
-                try:
-                    count = InventoryCount.objects.select_for_update().get(
-                        id=count_id,
-                        session=session,
-                    )
-                    # Comptage en « X conditionnements + Y unités » : le modèle
-                    # recompose la quantité de base. La saisie simple reste
-                    # acceptée pour les produits vendus à l'unité.
-                    packages = item.get('counted_package_quantity')
-                    loose = item.get('counted_loose_quantity')
-                    if count.packaging_factor and (packages is not None or loose is not None):
-                        count.counted_package_quantity = Decimal(str(packages or 0))
-                        count.counted_loose_quantity = Decimal(str(loose or 0))
-                    else:
-                        count.quantity_counted = Decimal(str(quantity_counted))
-                        count.counted_loose_quantity = Decimal(str(quantity_counted))
-                    count.is_counted = True
-                    count.counted_by = request.user
-                    count.counted_at = timezone.now()
-                    if notes:
-                        count.notes = notes
-                    count.save()
-                    updated_ids.append(str(count.id))
-                except InventoryCount.DoesNotExist:
-                    continue
-        
-        return Response({
-            'status': 'counted',
-            'updated_count': len(updated_ids),
-            'updated_ids': updated_ids,
-        })
+        from .services import record_inventory_counts
+        return self._transition(
+            record_inventory_counts, lignes=request.data.get('counts', []),
+        )
 
     @action(detail=True, methods=['post'])
     def submit(self, request, pk=None):
         """Soumet la session pour révision après le comptage."""
-        session = self.get_object()
-        
-        if session.status != 'in_progress':
-            return Response(
-                {'error': "Seules les sessions en cours peuvent être soumises"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Check that all items have been counted
-        uncounted = session.counts.filter(is_counted=False).count()
-        if uncounted > 0:
-            return Response(
-                {'error': f'{uncounted} produit(s) n\'ont pas encore été comptés'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Compute summary
-        from django.db.models import Sum
-        totals = session.counts.aggregate(
-            total_expected=Sum('quantity_expected'),
-            total_counted=Sum('quantity_counted'),
-            total_diff=Sum('quantity_difference'),
-            total_diff_value=Sum('difference_value'),
-        )
-        
-        session.total_expected_quantity = totals['total_expected'] or Decimal('0.000')
-        session.total_counted_quantity = totals['total_counted'] or Decimal('0.000')
-        session.total_difference_quantity = totals['total_diff'] or Decimal('0.000')
-        session.total_difference_value = totals['total_diff_value'] or Decimal('0.00')
-        session.status = 'review'
-        session.completed_at = timezone.now()
-        session.save()
-        
-        serializer = InventorySessionDetailSerializer(session)
-        return Response(serializer.data)
+        from .services import submit_inventory_session
+        return self._transition(submit_inventory_session, serialiser=True)
 
     @action(detail=True, methods=['post'])
     def validate(self, request, pk=None):
-        """
-        Valide la session d'inventaire :
-        1. Applique les ajustements de stock pour chaque différence
-        2. Crée les mouvements de stock correspondants
-        3. Déverrouille le stock
-        """
-        session = self.get_object()
-        
-        if session.status != 'review':
-            return Response(
-                {'error': 'Seules les sessions en révision peuvent être validées'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        with transaction.atomic():
-            for count in session.counts.filter(is_counted=True).select_related('product'):
-                if count.quantity_difference == 0:
-                    continue
-                
-                product_cost = count.unit_cost or (count.product.cost_price or Decimal('0.00'))
-                stock, created = Stock.objects.select_for_update().get_or_create(
-                    organization=session.organization,
-                    product=count.product,
-                    variant=count.variant,
-                    warehouse=session.warehouse,
-                    defaults={'quantity': Decimal('0.000'), 'avg_cost': product_cost}
-                )
-                
-                if not created and stock.avg_cost == 0 and product_cost > 0:
-                    stock.avg_cost = product_cost
-                
-                quantity_before = stock.quantity
-                # Le comptage physique constate les deux canaux : ses valeurs
-                # écrasent les anciennes, sinon l'affichage continuerait
-                # d'annoncer des paquets qui n'existent plus.
-                stock.quantity = count.quantity_counted
-                if count.packaging_factor:
-                    stock.loose_quantity = count.counted_loose_quantity
-                    stock.package_quantity = count.counted_package_quantity or Decimal('0.000')
-                stock.last_counted_at = timezone.now()
-                stock.last_movement_at = timezone.now()
-                stock.save()
-                
-                movement_type = 'adjustment_in' if count.quantity_difference > 0 else 'adjustment_out'
-                
-                StockMovement.objects.create(
-                    organization=session.organization,
-                    product=count.product,
-                    variant=count.variant,
-                    warehouse=session.warehouse,
-                    movement_type=movement_type,
-                    quantity=count.quantity_difference,
-                    unit_cost=count.unit_cost,
-                    quantity_before=quantity_before,
-                    quantity_after=stock.quantity,
-                    reference_type='inventory_session',
-                    reference_id=session.id,
-                    notes=f"Inventaire {session.reference}: {session.name}",
-                    created_by=request.user
-                )
-            
-            # Unlock stock and finalize
-            session.status = 'validated'
-            session.is_stock_locked = False
-            session.validated_at = timezone.now()
-            session.validated_by = request.user
-            session.save()
-        
-        serializer = InventorySessionDetailSerializer(session)
-        return Response(serializer.data)
+        """Valide la session : applique les écarts et déverrouille le stock."""
+        from .services import validate_inventory_session
+        return self._transition(validate_inventory_session, serialiser=True)
 
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
         """Annule une session d'inventaire et déverrouille le stock."""
-        session = self.get_object()
-        
-        if session.status in ['validated', 'cancelled']:
-            return Response(
-                {'error': 'Cette session ne peut pas être annulée'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        session.status = 'cancelled'
-        session.is_stock_locked = False
-        session.save()
-        
-        return Response({'status': 'cancelled'})
+        from .services import cancel_inventory_session
+        return self._transition(cancel_inventory_session)
 
     @action(detail=True, methods=['get'])
     def counts(self, request, pk=None):

@@ -364,6 +364,15 @@ ADJUSTMENT_CHILDREN = (
               model='inventory.StockAdjustmentItem', parent_field='adjustment'),
 )
 
+#: Feuille de comptage d'une session d'inventaire. Elle descend AVEC sa session
+#: parce que c'est ce qui rend le comptage possible hors ligne : le magasinier
+#: ouvre la session, et il a déjà toutes ses lignes, avec le stock théorique
+#: figé au démarrage.
+INVENTORY_CHILDREN = (
+    PullChild(name='counts', table='inventory_counts',
+              model='inventory.InventoryCount', parent_field='session'),
+)
+
 #: Ordre de tirage. Les référentiels d'abord : le point de vente s'ouvre dès que
 #: l'organisation, les moyens de paiement, les produits et les stocks sont là,
 #: le reste continue en arrière-plan.
@@ -416,6 +425,8 @@ PULL_TABLES = (
               children=TRANSFER_CHILDREN),
     PullTable('stock_adjustments', 'inventory.StockAdjustment', soft_delete=True,
               warehouse_path='warehouse_id', children=ADJUSTMENT_CHILDREN),
+    PullTable('inventory_sessions', 'inventory.InventorySession', soft_delete=True,
+              warehouse_path='warehouse_id', children=INVENTORY_CHILDREN),
 
     # -- livre de caisse
     PullTable('income_categories', 'cashbook.IncomeCategory'),

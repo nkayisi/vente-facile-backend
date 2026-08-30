@@ -7,7 +7,7 @@ from django.db import transaction
 from django.db.models import F, Q
 from django.utils import timezone
 
-from .models import Stock, StockBatch, StockMovement
+from .models import InventoryCount, Stock, StockBatch, StockMovement
 
 
 class BatchAllocation:
@@ -952,3 +952,273 @@ def unpack_stock(stock, user, packages=1):
             product, locked.quantity, locked.loose_quantity
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Transitions d'une SESSION D'INVENTAIRE.
+#
+# Même partage que les transferts : le back-office et le journal du terminal
+# appellent ces fonctions, il n'y a plus qu'un corps. C'est ici que se joue le
+# meilleur usage mobile du produit - on compte debout dans le rayon, souvent
+# sans réseau - donc chaque transition doit être rejouable par le journal.
+# ---------------------------------------------------------------------------
+
+
+def target_products(session):
+    """
+    Produits visés par la session, selon son périmètre.
+
+    Extrait de la vue avec le reste : le journal démarre des sessions, et il
+    doit cibler exactement les mêmes produits que le back-office.
+    """
+    from django.db.models import F
+    from apps.products.models import Product
+
+    base_qs = Product.objects.filter(
+        organization=session.organization, is_active=True, track_inventory=True,
+    )
+    if session.scope_type == 'category':
+        ids = set()
+        for categorie in session.categories.all():
+            ids |= set(categorie.subtree_ids())
+        base_qs = base_qs.filter(category_id__in=ids)
+    elif session.scope_type == 'product':
+        base_qs = base_qs.filter(id__in=session.products.values_list('id', flat=True))
+
+    # Seuls les produits RÉELLEMENT présents dans l'entrepôt, disponibles.
+    return base_qs.filter(
+        stocks__warehouse=session.warehouse,
+        stocks__variant__isnull=True,
+        stocks__quantity__gt=F('stocks__reserved_quantity'),
+    ).distinct()
+
+
+def start_inventory_session(session, user):
+    """
+    Démarre une session : verrouille le stock ciblé, en prend un INSTANTANÉ et
+    engendre les lignes de comptage.
+
+    L'instantané compte : la ligne retient le stock théorique ET sa part vrac au
+    moment du départ. Sans elle, l'écart se comparerait à un attendu redécoupé
+    au conditionnement du jour, c'est-à-dire à un attendu qui n'a jamais existé.
+    """
+    from .packaging import PackagingService
+
+    if session.status != 'draft':
+        raise TransitionRefusee(
+            "Seules les sessions en brouillon peuvent être démarrées"
+        )
+
+    with transaction.atomic():
+        lignes = []
+        for product in target_products(session):
+            stock = Stock.objects.filter(
+                organization=session.organization,
+                product=product,
+                warehouse=session.warehouse,
+                variant=None,
+            ).first()
+
+            quantite = stock.quantity if stock else Decimal('0.000')
+            cout = Decimal('0.00')
+            if stock and stock.avg_cost > 0:
+                cout = stock.avg_cost
+            elif product.cost_price:
+                cout = product.cost_price
+
+            lignes.append(InventoryCount(
+                organization=session.organization,
+                session=session,
+                product=product,
+                variant=None,
+                quantity_expected=quantite,
+                expected_loose_quantity=(
+                    stock.loose_quantity if stock else Decimal('0.000')
+                ),
+                packaging_factor=PackagingService.factor(product),
+                unit_cost=cout,
+            ))
+
+        InventoryCount.objects.bulk_create(lignes)
+
+        session.status = 'in_progress'
+        session.is_stock_locked = True
+        session.started_at = timezone.now()
+        session.save()
+
+    return session
+
+
+def record_inventory_counts(session, user, lignes=None):
+    """
+    Enregistre le comptage d'une ou plusieurs lignes.
+
+    Le comptage arrive en « X conditionnements + Y unités » dès que la ligne
+    porte un facteur : c'est la forme sous laquelle on compte un rayon. La
+    saisie simple reste acceptée pour les produits vendus à l'unité.
+
+    Une ligne inconnue est IGNORÉE, pas refusée : un lot de comptages envoyé
+    depuis un terminal ne doit pas être condamné en entier par une ligne
+    supprimée entre-temps.
+    """
+    if session.status != 'in_progress':
+        raise TransitionRefusee(
+            "L'inventaire doit être en cours pour enregistrer des comptages"
+        )
+
+    lignes = lignes or []
+    if not lignes:
+        raise TransitionRefusee("Aucun comptage fourni")
+
+    modifiees = []
+    with transaction.atomic():
+        for item in lignes:
+            identifiant = item.get('id')
+            compte = item.get('quantity_counted')
+            notes = item.get('notes', '')
+
+            if identifiant is None or compte is None:
+                continue
+
+            try:
+                ligne = InventoryCount.objects.select_for_update().get(
+                    id=identifiant, session=session,
+                )
+            except InventoryCount.DoesNotExist:
+                continue
+
+            paquets = item.get('counted_package_quantity')
+            vrac = item.get('counted_loose_quantity')
+            if ligne.packaging_factor and (paquets is not None or vrac is not None):
+                ligne.counted_package_quantity = Decimal(str(paquets or 0))
+                ligne.counted_loose_quantity = Decimal(str(vrac or 0))
+            else:
+                ligne.quantity_counted = Decimal(str(compte))
+                ligne.counted_loose_quantity = Decimal(str(compte))
+            ligne.is_counted = True
+            ligne.counted_by = user
+            ligne.counted_at = timezone.now()
+            if notes:
+                ligne.notes = notes
+            ligne.save()
+            modifiees.append(str(ligne.id))
+
+    return {
+        'status': 'counted',
+        'updated_count': len(modifiees),
+        'updated_ids': modifiees,
+    }
+
+
+def submit_inventory_session(session, user):
+    """
+    Soumet la session pour révision, une fois TOUT compté.
+
+    Le refus sur les lignes non comptées est volontaire : une session soumise à
+    moitié appliquerait des écarts sur les seuls produits regardés, et
+    laisserait croire que les autres sont justes.
+    """
+    from django.db.models import Sum
+
+    if session.status != 'in_progress':
+        raise TransitionRefusee("Seules les sessions en cours peuvent être soumises")
+
+    manquants = session.counts.filter(is_counted=False).count()
+    if manquants > 0:
+        raise TransitionRefusee(
+            f"{manquants} produit(s) n'ont pas encore été comptés"
+        )
+
+    totaux = session.counts.aggregate(
+        total_expected=Sum('quantity_expected'),
+        total_counted=Sum('quantity_counted'),
+        total_diff=Sum('quantity_difference'),
+        total_diff_value=Sum('difference_value'),
+    )
+    session.total_expected_quantity = totaux['total_expected'] or Decimal('0.000')
+    session.total_counted_quantity = totaux['total_counted'] or Decimal('0.000')
+    session.total_difference_quantity = totaux['total_diff'] or Decimal('0.000')
+    session.total_difference_value = totaux['total_diff_value'] or Decimal('0.00')
+    session.status = 'review'
+    session.completed_at = timezone.now()
+    session.save()
+
+    return session
+
+
+def validate_inventory_session(session, user):
+    """
+    Valide la session : APPLIQUE les écarts au stock, écrit les mouvements et
+    déverrouille.
+
+    **Le comptage physique écrase les DEUX canaux.** Un rayon compté constate ce
+    qui s'y trouve ; conserver l'ancien partage continuerait d'annoncer des
+    contenants scellés qui n'existent plus.
+    """
+    if session.status != 'review':
+        raise TransitionRefusee("Seules les sessions en révision peuvent être validées")
+
+    with transaction.atomic():
+        for ligne in session.counts.filter(is_counted=True).select_related('product'):
+            if ligne.quantity_difference == 0:
+                continue
+
+            cout = ligne.unit_cost or (ligne.product.cost_price or Decimal('0.00'))
+            stock, cree = Stock.objects.select_for_update().get_or_create(
+                organization=session.organization,
+                product=ligne.product,
+                variant=ligne.variant,
+                warehouse=session.warehouse,
+                defaults={'quantity': Decimal('0.000'), 'avg_cost': cout},
+            )
+            if not cree and stock.avg_cost == 0 and cout > 0:
+                stock.avg_cost = cout
+
+            avant = stock.quantity
+            stock.quantity = ligne.quantity_counted
+            if ligne.packaging_factor:
+                stock.loose_quantity = ligne.counted_loose_quantity
+                stock.package_quantity = (
+                    ligne.counted_package_quantity or Decimal('0.000')
+                )
+            stock.last_counted_at = timezone.now()
+            stock.last_movement_at = timezone.now()
+            stock.save()
+
+            StockMovement.objects.create(
+                organization=session.organization,
+                product=ligne.product,
+                variant=ligne.variant,
+                warehouse=session.warehouse,
+                movement_type=(
+                    'adjustment_in' if ligne.quantity_difference > 0
+                    else 'adjustment_out'
+                ),
+                quantity=ligne.quantity_difference,
+                unit_cost=ligne.unit_cost,
+                quantity_before=avant,
+                quantity_after=stock.quantity,
+                reference_type='inventory_session',
+                reference_id=session.id,
+                notes=f"Inventaire {session.reference}: {session.name}",
+                created_by=user,
+            )
+
+        session.status = 'validated'
+        session.is_stock_locked = False
+        session.validated_at = timezone.now()
+        session.validated_by = user
+        session.save()
+
+    return session
+
+
+def cancel_inventory_session(session, user):
+    """Annule la session. Le stock ne bouge pas, et se déverrouille."""
+    if session.status in ['validated', 'cancelled']:
+        raise TransitionRefusee("Cette session ne peut pas être annulée")
+
+    session.status = 'cancelled'
+    session.is_stock_locked = False
+    session.save()
+    return session

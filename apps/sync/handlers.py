@@ -564,6 +564,164 @@ def stock_adjustment_reject(ctx, payload):
     return _transition_ajustement(ctx, payload, reject_adjustment)
 
 
+# ------------------------------------------------------------- inventaire
+#
+# COMPTER EST LE MEILLEUR USAGE MOBILE DU PRODUIT : on compte debout dans le
+# rayon, souvent au fond d'un dépôt sans réseau. Les cinq transitions passent
+# donc par le journal, et leurs corps sont ceux du back-office.
+
+
+def _transition_inventaire(ctx, payload, fonction, serialiser=True, **extra):
+    from apps.inventory.models import InventorySession
+    from apps.inventory.serializers import InventorySessionDetailSerializer
+
+    _require(payload, 'session')
+    session = _objet_de_lorg(
+        InventorySession, ctx, payload['session'], "Cette session d'inventaire",
+    )
+    assert_warehouse_allowed_for_request(ctx.request, session.warehouse_id)
+
+    resultat = _refus_si_impossible(fonction, session, ctx.user, **extra)
+    session.refresh_from_db()
+    return {
+        'server_ids': {'inventory_session': str(session.id)},
+        'authoritative': (
+            InventorySessionDetailSerializer(session).data if serialiser else resultat
+        ),
+    }
+
+
+@handler('inventory_session.create')
+def inventory_session_create(ctx, payload):
+    from apps.inventory.serializers import (
+        InventorySessionCreateSerializer, InventorySessionDetailSerializer,
+    )
+
+    local_id = payload.pop('id', None)
+    serializer = InventorySessionCreateSerializer(
+        data=payload, context={'request': ctx.request}
+    )
+    serializer.is_valid(raise_exception=True)
+    assert_warehouse_allowed_for_request(
+        ctx.request,
+        getattr(serializer.validated_data.get('warehouse'), 'id', None),
+        allow_none=True,
+    )
+
+    session = serializer.save(
+        organization=ctx.organization, **({'id': local_id} if local_id else {})
+    )
+    return {
+        'server_ids': {'inventory_session': str(session.id)},
+        'authoritative': InventorySessionDetailSerializer(session).data,
+    }
+
+
+@handler('inventory_session.start')
+def inventory_session_start(ctx, payload):
+    from apps.inventory.services import start_inventory_session
+    return _transition_inventaire(ctx, payload, start_inventory_session)
+
+
+@handler('inventory_session.count')
+def inventory_session_count(ctx, payload):
+    """
+    Comptages d'une ou plusieurs lignes.
+
+    Une ligne inconnue est IGNORÉE côté service, pas refusée : un lot de
+    comptages remonté d'un terminal ne doit pas être condamné en entier par une
+    ligne supprimée entre-temps.
+    """
+    from apps.inventory.services import record_inventory_counts
+    return _transition_inventaire(
+        ctx, payload, record_inventory_counts, serialiser=False,
+        lignes=payload.get('counts') or [],
+    )
+
+
+@handler('inventory_session.submit')
+def inventory_session_submit(ctx, payload):
+    from apps.inventory.services import submit_inventory_session
+    return _transition_inventaire(ctx, payload, submit_inventory_session)
+
+
+@handler('inventory_session.validate')
+def inventory_session_validate(ctx, payload):
+    from apps.inventory.services import validate_inventory_session
+    return _transition_inventaire(ctx, payload, validate_inventory_session)
+
+
+@handler('inventory_session.cancel')
+def inventory_session_cancel(ctx, payload):
+    from apps.inventory.services import cancel_inventory_session
+    return _transition_inventaire(
+        ctx, payload, cancel_inventory_session, serialiser=False,
+    )
+
+
+# --------------------------------------------------------------- catalogue
+
+
+@handler('product.create')
+def product_create(ctx, payload):
+    """
+    Création d'un article, par le serializer du back-office.
+
+    Le SKU et le code-barres restent facultatifs et uniques par organisation :
+    deux terminaux hors ligne en fabriqueraient fatalement le même, et le
+    serveur refuserait le second - refus déterministe, donc quarantaine, avec
+    le message qui va bien.
+    """
+    from apps.products.serializers import ProductCreateSerializer, ProductDetailSerializer
+
+    local_id = payload.pop('id', None)
+    serializer = ProductCreateSerializer(data=payload, context={'request': ctx.request})
+    serializer.is_valid(raise_exception=True)
+    produit = serializer.save(
+        organization=ctx.organization, **({'id': local_id} if local_id else {})
+    )
+    return {
+        'server_ids': {'product': str(produit.id)},
+        'authoritative': ProductDetailSerializer(produit).data,
+    }
+
+
+def _referentiel_create(ctx, payload, modele, serializer_classe, cle):
+    local_id = payload.pop('id', None)
+    serializer = serializer_classe(data=payload, context={'request': ctx.request})
+    serializer.is_valid(raise_exception=True)
+    objet = serializer.save(
+        organization=ctx.organization, **({'id': local_id} if local_id else {})
+    )
+    return {
+        'server_ids': {cle: str(objet.id)},
+        'authoritative': serializer_classe(objet).data,
+    }
+
+
+@handler('category.create')
+def category_create(ctx, payload):
+    from apps.products.models import Category
+    from apps.products.serializers import CategoryCreateSerializer
+    return _referentiel_create(
+        ctx, payload, Category, CategoryCreateSerializer, 'category',
+    )
+
+
+@handler('brand.create')
+def brand_create(ctx, payload):
+    from apps.products.models import Brand
+    from apps.products.serializers import BrandSerializer
+    return _referentiel_create(ctx, payload, Brand, BrandSerializer, 'brand')
+
+
+@handler('unit.create')
+def unit_create(ctx, payload):
+    from apps.products.models import Unit
+    from apps.products.serializers import UnitSerializer
+    return _referentiel_create(ctx, payload, Unit, UnitSerializer, 'unit')
+
+
 # ------------------------------------------------------------------- livre de caisse
 
 
