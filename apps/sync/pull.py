@@ -349,6 +349,21 @@ SALE_CHILDREN = (
               parent_field='sale'),
 )
 
+#: Lignes d'un transfert et d'un ajustement. Comme les lignes de vente, elles
+#: n'ont pas de suppression douce : elles sont tirées IMBRIQUÉES dans leur
+#: parent et remplacées en bloc. Autrement, une ligne retirée d'un transfert
+#: resterait à jamais en base locale, et le terminal afficherait un transfert
+#: dont le contenu ne correspondrait plus à ce que le serveur expédie.
+TRANSFER_CHILDREN = (
+    PullChild(name='items', table='stock_transfer_items',
+              model='inventory.StockTransferItem', parent_field='transfer'),
+)
+
+ADJUSTMENT_CHILDREN = (
+    PullChild(name='items', table='stock_adjustment_items',
+              model='inventory.StockAdjustmentItem', parent_field='adjustment'),
+)
+
 #: Ordre de tirage. Les référentiels d'abord : le point de vente s'ouvre dès que
 #: l'organisation, les moyens de paiement, les produits et les stocks sont là,
 #: le reste continue en arrière-plan.
@@ -391,6 +406,17 @@ PULL_TABLES = (
               children=SALE_CHILDREN),
     PullTable('stock_movements', 'inventory.StockMovement', warehouse_path='warehouse_id'),
 
+    # -- opérations de stock
+    #
+    # Un TRANSFERT n'est PAS borné par `warehouse_path` : il relie deux
+    # entrepôts, et le borner sur l'un des deux cacherait au magasinier de
+    # destination les transferts qu'on lui expédie - c'est-à-dire précisément
+    # ceux qu'il doit réceptionner. Le périmètre est celui de l'organisation.
+    PullTable('stock_transfers', 'inventory.StockTransfer', soft_delete=True,
+              children=TRANSFER_CHILDREN),
+    PullTable('stock_adjustments', 'inventory.StockAdjustment', soft_delete=True,
+              warehouse_path='warehouse_id', children=ADJUSTMENT_CHILDREN),
+
     # -- livre de caisse
     PullTable('income_categories', 'cashbook.IncomeCategory'),
     PullTable('expense_categories', 'cashbook.ExpenseCategory'),
@@ -399,6 +425,31 @@ PULL_TABLES = (
 )
 
 PULL_TABLES_BY_NAME = {table.name: table for table in PULL_TABLES}
+
+
+def describe_table(table, row_count=None):
+    """
+    Forme d'une table au manifeste.
+
+    Extraite de la vue parce que `dump_pull_manifest` la rend aussi : le schéma
+    local du terminal est engendré depuis ce manifeste, et deux descriptions
+    auraient fini par décrire deux schémas.
+    """
+    return {
+        'name': table.name,
+        'has_tombstones': table.soft_delete,
+        'row_count': row_count,
+        'columns': describe_columns(table.get_model(), table.fields),
+        'children': [
+            {
+                'name': c.name,
+                'table': c.table,
+                'parent_field': f'{c.parent_field}_id',
+                'columns': describe_columns(c.get_model(), c.fields),
+            }
+            for c in table.children
+        ],
+    }
 
 
 # ------------------------------------------------- description pour le client
@@ -710,21 +761,6 @@ class SyncManifestView(APIView):
             'schema_version': PULL_SCHEMA_VERSION,
             'default_page_size': DEFAULT_PAGE_SIZE,
             'tables': [
-                {
-                    'name': t.name,
-                    'has_tombstones': t.soft_delete,
-                    'row_count': counts.get(t.name),
-                    'columns': describe_columns(t.get_model(), t.fields),
-                    'children': [
-                        {
-                            'name': c.name,
-                            'table': c.table,
-                            'parent_field': f'{c.parent_field}_id',
-                            'columns': describe_columns(c.get_model(), c.fields),
-                        }
-                        for c in t.children
-                    ],
-                }
-                for t in PULL_TABLES
+                describe_table(t, counts.get(t.name)) for t in PULL_TABLES
             ],
         })

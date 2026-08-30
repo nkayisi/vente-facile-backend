@@ -383,6 +383,187 @@ def stock_movement_create(ctx, payload):
     }
 
 
+# --------------------------------------------------------- opérations de stock
+#
+# Les transitions d'un transfert ou d'un ajustement passent par les MÊMES
+# fonctions que le back-office (`inventory.services`). Un refus métier y est
+# déterministe : il devient verdict `rejected`, jamais `retry`. Réessayer un
+# transfert déjà expédié le réexpédierait, et le stock sortirait deux fois.
+
+
+def _refus_si_impossible(fonction, *args, **kwargs):
+    """Traduit un refus de transition en refus d'opération, donc en quarantaine."""
+    from apps.inventory.services import TransitionRefusee
+    try:
+        return fonction(*args, **kwargs)
+    except TransitionRefusee as exc:
+        raise OperationRejected(str(exc), code='transition_refused')
+
+
+def _objet_de_lorg(modele, ctx, identifiant, quoi):
+    objet = modele.objects.filter(id=identifiant, organization=ctx.organization).first()
+    if objet is None:
+        raise OperationRejected(f"{quoi} introuvable.", code='not_found')
+    return objet
+
+
+@handler('stock.unpack')
+def stock_unpack(ctx, payload):
+    """
+    Ouvre des conditionnements scellés. Geste de comptoir, donc hors ligne.
+    """
+    from apps.inventory.models import Stock
+    from apps.inventory.serializers import StockDetailSerializer
+    from apps.inventory.services import unpack_stock
+
+    _require(payload, 'stock')
+    stock = _objet_de_lorg(Stock, ctx, payload['stock'], 'Cette ligne de stock')
+    assert_warehouse_allowed_for_request(ctx.request, stock.warehouse_id)
+
+    resultat = _refus_si_impossible(
+        unpack_stock, stock, ctx.user, payload.get('packages', 1),
+    )
+    stock.refresh_from_db()
+    return {
+        'server_ids': {'stock': str(stock.id)},
+        'authoritative': {
+            **StockDetailSerializer(stock).data,
+            'packages_opened': resultat['packages_opened'],
+        },
+    }
+
+
+@handler('stock_transfer.create')
+def stock_transfer_create(ctx, payload):
+    from apps.inventory.serializers import (
+        StockTransferCreateSerializer, StockTransferDetailSerializer,
+    )
+
+    local_id = payload.pop('id', None)
+    serializer = StockTransferCreateSerializer(
+        data=payload, context={'request': ctx.request}
+    )
+    serializer.is_valid(raise_exception=True)
+
+    # Les DEUX entrepôts sont contrôlés, comme dans `perform_create` : un
+    # magasinier ne doit pas pouvoir sortir du stock d'un dépôt qu'il ne voit
+    # pas, ni s'en faire livrer.
+    for cle in ('source_warehouse', 'destination_warehouse'):
+        assert_warehouse_allowed_for_request(
+            ctx.request, getattr(serializer.validated_data.get(cle), 'id', None),
+            allow_none=True,
+        )
+
+    transfert = serializer.save(
+        organization=ctx.organization, **({'id': local_id} if local_id else {})
+    )
+    return {
+        'server_ids': {'stock_transfer': str(transfert.id)},
+        'authoritative': StockTransferDetailSerializer(transfert).data,
+    }
+
+
+def _transition_transfert(ctx, payload, fonction, **extra):
+    from apps.inventory.models import StockTransfer
+    from apps.inventory.serializers import StockTransferDetailSerializer
+
+    _require(payload, 'transfer')
+    transfert = _objet_de_lorg(
+        StockTransfer, ctx, payload['transfer'], 'Ce transfert',
+    )
+    _refus_si_impossible(fonction, transfert, ctx.user, **extra)
+    transfert.refresh_from_db()
+    return {
+        'server_ids': {'stock_transfer': str(transfert.id)},
+        'authoritative': StockTransferDetailSerializer(transfert).data,
+    }
+
+
+@handler('stock_transfer.approve')
+def stock_transfer_approve(ctx, payload):
+    from apps.inventory.services import approve_transfer
+    return _transition_transfert(ctx, payload, approve_transfer)
+
+
+@handler('stock_transfer.ship')
+def stock_transfer_ship(ctx, payload):
+    from apps.inventory.services import ship_transfer
+    return _transition_transfert(ctx, payload, ship_transfer)
+
+
+@handler('stock_transfer.receive')
+def stock_transfer_receive(ctx, payload):
+    """
+    Réception. `items` porte ce que le magasinier a RÉELLEMENT compté, en
+    contenants ou en total : une réception partielle est le cas courant.
+    """
+    from apps.inventory.services import receive_transfer
+    return _transition_transfert(
+        ctx, payload, receive_transfer, received_items=payload.get('items') or [],
+    )
+
+
+@handler('stock_transfer.cancel')
+def stock_transfer_cancel(ctx, payload):
+    from apps.inventory.services import cancel_transfer
+    return _transition_transfert(ctx, payload, cancel_transfer)
+
+
+@handler('stock_adjustment.create')
+def stock_adjustment_create(ctx, payload):
+    from apps.inventory.serializers import (
+        StockAdjustmentCreateSerializer, StockAdjustmentDetailSerializer,
+    )
+
+    local_id = payload.pop('id', None)
+    serializer = StockAdjustmentCreateSerializer(
+        data=payload, context={'request': ctx.request}
+    )
+    serializer.is_valid(raise_exception=True)
+    assert_warehouse_allowed_for_request(
+        ctx.request,
+        getattr(serializer.validated_data.get('warehouse'), 'id', None),
+        allow_none=True,
+    )
+
+    ajustement = serializer.save(
+        organization=ctx.organization, **({'id': local_id} if local_id else {})
+    )
+    return {
+        'server_ids': {'stock_adjustment': str(ajustement.id)},
+        'authoritative': StockAdjustmentDetailSerializer(ajustement).data,
+    }
+
+
+def _transition_ajustement(ctx, payload, fonction):
+    from apps.inventory.models import StockAdjustment
+    from apps.inventory.serializers import StockAdjustmentDetailSerializer
+
+    _require(payload, 'adjustment')
+    ajustement = _objet_de_lorg(
+        StockAdjustment, ctx, payload['adjustment'], 'Cet ajustement',
+    )
+    assert_warehouse_allowed_for_request(ctx.request, ajustement.warehouse_id)
+    _refus_si_impossible(fonction, ajustement, ctx.user)
+    ajustement.refresh_from_db()
+    return {
+        'server_ids': {'stock_adjustment': str(ajustement.id)},
+        'authoritative': StockAdjustmentDetailSerializer(ajustement).data,
+    }
+
+
+@handler('stock_adjustment.approve')
+def stock_adjustment_approve(ctx, payload):
+    from apps.inventory.services import approve_adjustment
+    return _transition_ajustement(ctx, payload, approve_adjustment)
+
+
+@handler('stock_adjustment.reject')
+def stock_adjustment_reject(ctx, payload):
+    from apps.inventory.services import reject_adjustment
+    return _transition_ajustement(ctx, payload, reject_adjustment)
+
+
 # ------------------------------------------------------------------- livre de caisse
 
 
