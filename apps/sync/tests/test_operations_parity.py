@@ -411,3 +411,151 @@ class SubscriptionGateTests(_OperationsBaseTest):
             self._op('sale.create', self._cart(), 'ffff6666-0000-4000-8000-000000000002')
         ])
         self.assertEqual(web.status_code, mobile.status_code)
+
+
+class RefusDeterministeTests(_OperationsBaseTest):
+    """
+    Un refus métier ne se réessaie pas. La frontière `retry` / `rejected`.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ CE QUE `_classify` NE RECONNAÎT PAS TOMBE EN `retry`.                    │
+    │                                                                          │
+    │ Deux refus parfaitement déterministes étaient levés en `ValueError` nue  │
+    │ et repartaient donc à CHAQUE synchronisation, pour une vente que le      │
+    │ serveur refusera toujours. C'est le défaut de l'ancienne file, pris par  │
+    │ l'autre bout : au lieu de condamner tout un lot, on le martèle sans fin. │
+    │                                                                          │
+    │ Ils portent désormais un nom, `RefusMetier`, et non pas le type          │
+    │ `ValueError` en bloc : ranger celui-ci du côté des refus enverrait les   │
+    │ erreurs de programmation en quarantaine, comme si le marchand avait mal  │
+    │ saisi.                                                                   │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
+    def test_les_deux_sites_levent_un_refus_NOMME(self):
+        """
+        Les deux refus déterministes portent bien `RefusMetier`.
+
+        Test direct, et non par une vente : les deux sites sont gardés en amont
+        par des contrôles de serializer qui refusent d'abord (stock scellé,
+        plafond de rédemption). Monter une vente qui les atteigne demanderait
+        de contourner ces gardes, et le test passerait alors pour une raison
+        qui n'est pas celle qu'il annonce - c'est exactement le défaut que ce
+        dépôt a déjà payé sur `permissions.test.ts`.
+        """
+        from apps.core.exceptions import RefusMetier
+        from apps.sales.models import SaleItem
+        from apps.settings.models import CustomerLoyalty
+
+        ligne = SaleItem(
+            quantity=Decimal('10.000'),
+            package_quantity=Decimal('2.000'),
+            package_unit_price=Decimal('40000.00'),
+            packaging_factor=24,
+            unit_price=Decimal('2000.00'),
+        )
+        with self.assertRaises(RefusMetier):
+            ligne.save()
+
+        fidelite = CustomerLoyalty(current_points=Decimal('10'))
+        with self.assertRaises(RefusMetier):
+            fidelite.redeem_points(Decimal('500'), save=False)
+
+    def test_la_classification_nomme_le_refus_sans_ranger_toute_ValueError(self):
+        """
+        Le garde-fou du garde-fou.
+
+        Sans lui, quelqu'un « simplifierait » en rangeant `ValueError` en bloc,
+        et les erreurs de programmation partiraient en quarantaine.
+        """
+        from apps.core.exceptions import RefusMetier
+        from apps.sync.operations import _classify
+
+        verdict, corps = _classify(RefusMetier("Points insuffisants"))
+        self.assertEqual(verdict, SyncOperation.Verdict.REJECTED)
+        self.assertEqual(corps['code'], 'refus_metier')
+
+        verdict, corps = _classify(ValueError("indice hors bornes"))
+        self.assertEqual(
+            verdict, SyncOperation.Verdict.RETRY,
+            "Une `ValueError` anonyme est une panne, pas un refus du marchand.",
+        )
+        self.assertEqual(corps['code'], 'unexpected')
+
+
+class PlafondAbonnementTests(_OperationsBaseTest):
+    """
+    Le plafond du plan s'oppose AUSSI au terminal.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ `assert_can_add_products` vivait dans `ProductViewSet.perform_create`,   │
+    │ donc hors d'atteinte du journal : le plafond n'était opposé qu'au        │
+    │ back-office, et le contourner tenait à ouvrir l'application sur son      │
+    │ téléphone.                                                               │
+    │                                                                          │
+    │ Le terminal ne peut pas l'annoncer d'avance - `subscriptions` n'est pas  │
+    │ au manifeste de tirage, arbitrage délibéré du lot 11. Le refus arrive    │
+    │ donc à la poussée, en quarantaine, avec son message.                     │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
+    def setUp(self):
+        super().setUp()
+        # Le GÉRANT est le rôle le plus faible qui porte `products.create` :
+        # un caissier est désormais bloqué sur cet acte, comme au back-office.
+        self.client.force_authenticate(user=self.manager)
+
+    def _payload_article(self, op_id, sku):
+        return {
+            'id': op_id,
+            'name': f'Article {sku}',
+            'sku': sku,
+            'selling_price': '1000.00',
+            'cost_price': '700.00',
+        }
+
+    def test_le_plafond_du_plan_refuse_aussi_une_creation_du_journal(self):
+        from apps.subscriptions.models import Subscription
+
+        abonnement = Subscription.objects.get(organization=self.org)
+        # Un article existe déjà (celui du `setUp`) : le plafond est atteint.
+        abonnement.plan.max_products = 1
+        abonnement.plan.save(update_fields=['max_products'])
+
+        reponse = self._send([self._op(
+            'product.create',
+            self._payload_article('99999999-9999-4999-8999-999999999999', 'TROP-1'),
+            '99999999-9999-4999-8999-999999999999',
+        )])
+        self.assertEqual(reponse.status_code, status.HTTP_200_OK, reponse.data)
+        verdict = reponse.data['results'][0]
+        self.assertEqual(
+            verdict['verdict'], SyncOperation.Verdict.REJECTED,
+            "Le plafond du plan doit être opposé au terminal comme au back-office.",
+        )
+        self.assertEqual(
+            Product.objects.filter(sku='TROP-1').count(), 0,
+            "L'article a été écrit malgré le refus.",
+        )
+
+    def test_sous_le_plafond_la_creation_passe(self):
+        """Le garde-fou du garde-fou : le plafond ne doit pas tout refuser."""
+        from apps.subscriptions.models import Subscription
+
+        abonnement = Subscription.objects.get(organization=self.org)
+        abonnement.plan.max_products = 500
+        abonnement.plan.save(update_fields=['max_products'])
+
+        reponse = self._send([self._op(
+            'product.create',
+            self._payload_article('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'OK-1'),
+            'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        )])
+        verdict = reponse.data['results'][0]
+        self.assertEqual(
+            verdict['verdict'], SyncOperation.Verdict.APPLIED, verdict.get('errors'),
+        )
+        # L'auteur, que le handler laissait nul.
+        self.assertEqual(
+            Product.objects.get(sku='OK-1').created_by_id, self.manager.id,
+        )

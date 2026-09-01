@@ -8,10 +8,11 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils import timezone
-from datetime import timedelta
+from datetime import date, timedelta
 
 from apps.core.api_mixins import TenantViewSetMixin, AuditMixin
 from apps.core.api_permissions import (
+    DENY,
     IsTenantMember, IsTenantAdmin, IsTenantOwner, IsTenantManager,
     HasActiveSubscription, HasPermission, _get_membership
 )
@@ -33,6 +34,64 @@ from .serializers import (
 # =============================================================================
 # ORGANIZATION VIEWSET
 # =============================================================================
+
+#: Longueur des trois périodes glissantes exprimées en jours, bornes incluses.
+#: `year` fait bande à part : elle recule de douze MOIS, dont la longueur varie.
+_LONGUEUR_EN_JOURS = {'day': 1, 'week': 7, 'month': 30}
+
+
+def _premier_du_mois_recule(jour, mois):
+    """Le 1er du mois situé `mois` mois avant celui de `jour`."""
+    rang = jour.year * 12 + (jour.month - 1) - mois
+    return date(rang // 12, rang % 12 + 1, 1)
+
+
+def _periode_glissante(period, today):
+    """
+    Bornes du tableau de bord : ``(début, début précédent, fin précédente)``.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ LES QUATRE PÉRIODES SONT GLISSANTES, ET C'EST LA SEULE FAÇON DE LES      │
+    │ EMBOÎTER.                                                                │
+    │                                                                          │
+    │ Elles ne parlaient pas la même langue : `week` était glissante           │
+    │ (`today - 6`), `month` et `year` calendaires (le 1er du mois, le 1er     │
+    │ janvier). Le 1er septembre, « Mois » couvrait donc UNE SEULE JOURNÉE     │
+    │ pendant que « Semaine » remontait au 26 août : une vente du 28 août      │
+    │ figurait dans « Semaine » et dans « Année », et disparaissait de         │
+    │ « Mois ». Le marchand y lisait une perte de données, et le défaut        │
+    │ revenait les six premiers jours de CHAQUE mois.                          │
+    │                                                                          │
+    │ Tout passer en calendaire n'aurait rien réglé : le 1er septembre, la     │
+    │ semaine calendaire commence le 31 août et déborde encore du mois. Seul   │
+    │ le glissant garantit `jour ⊆ semaine ⊆ mois ⊆ année`, quel que soit le   │
+    │ quantième. Les libellés le disent : « 7 jours », « 30 jours », « 12      │
+    │ mois ».                                                                  │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    L'ANNÉE part du 1er d'un mois et non de ``today - 364`` : le graphique
+    groupe par mois (``TruncMonth``), et une fenêtre à cheval rendrait treize
+    seaux dont deux partiels, avec deux étiquettes « sept. » sur le même axe.
+
+    La borne haute est toujours ``today``, jamais le futur. La période
+    précédente s'arrête la veille du début de la courante et a la même
+    longueur : sans cela, la variation comparerait deux fenêtres inégales et
+    inventerait une hausse.
+
+    **Recopiée dans `mobile/vf-marchand/src/features/tableau-de-bord/series.ts`**
+    (`bornes`), et son invariant y est tenu par les mêmes dates témoins.
+    La changer d'un côté seulement ferait donner deux chiffres différents au
+    même établissement, sans que rien ne le signale.
+    """
+    if period == 'year':
+        debut = _premier_du_mois_recule(today, 11)
+        return debut, _premier_du_mois_recule(today, 23), debut - timedelta(days=1)
+
+    jours = _LONGUEUR_EN_JOURS.get(period, _LONGUEUR_EN_JOURS['month'])
+    debut = today - timedelta(days=jours - 1)
+    fin_precedente = debut - timedelta(days=1)
+    return debut, fin_precedente - timedelta(days=jours - 1), fin_precedente
+
 
 def _dashboard_top_product(row):
     """
@@ -205,6 +264,8 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         from apps.contacts.models import Customer, Supplier
         from apps.sales.models import Sale, SaleItem, Payment
         from apps.inventory.models import Stock
+        from apps.cashbook.services import primary_sum
+        from apps.settings.services import CurrencyService
 
         organization = self.get_object()
         period = request.query_params.get('period', 'month')  # day, week, month, year
@@ -218,31 +279,14 @@ class OrganizationViewSet(viewsets.ModelViewSet):
             return Response(cached_payload)
 
         today = timezone.now().date()
-        
-        # Définir les périodes
-        if period == 'day':
-            current_start = today
-            previous_start = today - timedelta(days=1)
-            previous_end = today - timedelta(days=1)
-            chart_days = 24  # heures
-        elif period == 'week':
-            current_start = today - timedelta(days=6)
-            previous_start = today - timedelta(days=13)
-            previous_end = today - timedelta(days=7)
-            chart_days = 7
-        elif period == 'year':
-            current_start = today.replace(month=1, day=1)
-            previous_start = (today.replace(month=1, day=1) - timedelta(days=365)).replace(month=1, day=1)
-            previous_end = today.replace(month=1, day=1) - timedelta(days=1)
-            chart_days = 12  # mois
-        else:  # month
-            current_start = today.replace(day=1)
-            if today.month == 1:
-                previous_start = today.replace(year=today.year-1, month=12, day=1)
-            else:
-                previous_start = today.replace(month=today.month-1, day=1)
-            previous_end = current_start - timedelta(days=1)
-            chart_days = 30
+
+        # Les quatre périodes sont GLISSANTES et donc emboîtées : voir
+        # `_periode_glissante`, qui porte la règle et le motif.
+        current_start, previous_start, previous_end = _periode_glissante(period, today)
+
+        # Devise de lecture de TOUT cet écran. Chaque montant y est converti au
+        # taux figé sur sa vente : voir l'encadré sur `primary_sum` plus bas.
+        primary_currency = CurrencyService.primary_code(organization)
         
         # Ventes période actuelle
         current_sales = Sale.objects.filter(
@@ -253,6 +297,30 @@ class OrganizationViewSet(viewsets.ModelViewSet):
             sale_date__date__lte=today
         )
         
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ LE TABLEAU DE BORD EST UN ÉCRAN EN DEVISE PRINCIPALE.            │
+        # │                                                                  │
+        # │ Il sommait `Sum('total')` sans regarder `currency` : sur un       │
+        # │ établissement qui facture en francs ET en dollars, il ajoutait    │
+        # │ 107 000 à 50 et affichait 107 050 sous le symbole de la           │
+        # │ principale, `CurrencyProvider` l'ayant posé pour tout le          │
+        # │ back-office. Le chiffre n'existait pas, et rien ne le signalait.  │
+        # │                                                                  │
+        # │ `primary_sum` multiplie par `exchange_rate`, le taux FIGÉ sur la  │
+        # │ vente au moment où elle a été faite. Jamais le taux du jour : un  │
+        # │ tableau de bord dont les chiffres d'hier bougent avec le cours    │
+        # │ n'est pas relisable, et le marchand ne saurait pas lequel croire. │
+        # │                                                                  │
+        # │ LE COÛT, LUI, N'EST PAS CONVERTI. `SaleItem.cost_price` vient de  │
+        # │ `product.cost_price` ou du FIFO, et le catalogue n'a pas de       │
+        # │ devise : il est DÉJÀ en principale. Lui appliquer le taux d'une   │
+        # │ vente en francs le diviserait par deux mille huit cents, et la    │
+        # │ marge affichée passerait de 40 % à 100 %.                         │
+        # │                                                                  │
+        # │ Le livre de caisse, lui, RESTE multi-devise : il rend la réalité  │
+        # │ physique du tiroir, où les liasses ne se mélangent pas.           │
+        # └──────────────────────────────────────────────────────────────────┘
+        #
         # DEUX agrégats, et c'est OBLIGATOIRE : mêler dans un seul `aggregate`
         # un `Sum` sur la vente et un `Sum` sur `items__…` fait joindre les
         # lignes, et chaque vente est alors comptée UNE FOIS PAR LIGNE. Mesuré
@@ -263,7 +331,7 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         # moins un coût, lui correct : la marge affichée passait de 28,4 % à
         # 64,6 %. Un marchand décide sur ce chiffre.
         current_stats = current_sales.aggregate(
-            total_sales=Sum('total'),
+            total_sales=primary_sum('total'),
             count=Count('id'),
         )
         current_stats.update(
@@ -286,7 +354,7 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         # comparerait un total gonflé à un autre, avec des facteurs de jointure
         # différents selon le nombre de lignes de chaque période.
         previous_stats = previous_sales.aggregate(
-            total_sales=Sum('total'),
+            total_sales=primary_sum('total'),
             count=Count('id'),
         )
         previous_stats.update(
@@ -301,13 +369,19 @@ class OrganizationViewSet(viewsets.ModelViewSet):
                 return 100 if current else 0
             return round(((current - previous) / previous) * 100, 1)
         
-        current_total = current_stats['total_sales'] or Decimal('0')
-        previous_total = previous_stats['total_sales'] or Decimal('0')
+        # Le produit d'un montant par un taux à douze décimales en rend autant :
+        # on arrête à deux, comme tout montant affiché. Le calcul, lui, s'est
+        # fait en pleine précision.
+        def en_principale(montant):
+            return (montant or Decimal('0')).quantize(Decimal('0.01'))
+
+        current_total = en_principale(current_stats['total_sales'])
+        previous_total = en_principale(previous_stats['total_sales'])
         current_count = current_stats['count'] or 0
         previous_count = previous_stats['count'] or 0
         current_units = current_stats['units_sold'] or 0
         previous_units = previous_stats['units_sold'] or 0
-        current_cost = current_stats['total_cost'] or Decimal('0')
+        current_cost = en_principale(current_stats['total_cost'])
         gross_profit = current_total - current_cost
         
         # Clients
@@ -328,38 +402,25 @@ class OrganizationViewSet(viewsets.ModelViewSet):
             created_at__date__lte=previous_end
         ).count()
         
-        # Données pour le graphique d'évolution des ventes
-        if period == 'year':
-            # Grouper par mois
-            sales_evolution = current_sales.annotate(
-                period=TruncMonth('sale_date')
-            ).values('period').annotate(
-                total=Sum('total'),
-                count=Count('id')
-            ).order_by('period')
-        elif period == 'week' or period == 'month':
-            # Grouper par jour
-            sales_evolution = current_sales.annotate(
-                period=TruncDate('sale_date')
-            ).values('period').annotate(
-                total=Sum('total'),
-                count=Count('id')
-            ).order_by('period')
-        else:
-            # Jour: grouper par heure (simplifié en jour)
-            sales_evolution = current_sales.annotate(
-                period=TruncDate('sale_date')
-            ).values('period').annotate(
-                total=Sum('total'),
-                count=Count('id')
-            ).order_by('period')
+        # Données pour le graphique d'évolution des ventes. L'année groupe par
+        # MOIS (elle en couvre douze, d'où le départ au 1er d'un mois dans
+        # `_periode_glissante`), tout le reste par jour. Les trois branches
+        # d'origine écrivaient la même requête à deux détails près, dont un
+        # commentaire annonçant des heures que `TruncDate` ne produisait pas.
+        troncature = TruncMonth('sale_date') if period == 'year' else TruncDate('sale_date')
+        sales_evolution = current_sales.annotate(
+            period=troncature
+        ).values('period').annotate(
+            total=primary_sum('total'),
+            count=Count('id')
+        ).order_by('period')
         
         # Formater les données d'évolution
         evolution_data = []
         for item in sales_evolution:
             evolution_data.append({
                 'date': item['period'].isoformat() if item['period'] else None,
-                'total': str(item['total'] or 0),
+                'total': str(en_principale(item['total'])),
                 'count': item['count'] or 0
             })
         
@@ -381,17 +442,61 @@ class OrganizationViewSet(viewsets.ModelViewSet):
                 Sum(F('package_quantity') * F('packaging_factor')),
                 Decimal('0'), output_field=DecimalField(),
             ),
-            total_revenue=Sum('total')
+            # `SaleItem` ne porte pas de taux : c'est celui de sa VENTE qui
+            # ramène la recette en devise principale.
+            total_revenue=Coalesce(
+                Sum(F('total') * F('sale__exchange_rate')),
+                Decimal('0'),
+                output_field=DecimalField(max_digits=24, decimal_places=6),
+            )
         ).order_by('-quantity_sold')[:10]
         
-        # Ventes par méthode de paiement
-        by_payment_method = Payment.objects.filter(
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ `Payment.amount` EST DÉJÀ DANS LA DEVISE DE LA VENTE.            │
+        # │                                                                  │
+        # │ Ce n'est PAS le billet reçu : celui-là est `tendered_amount`,     │
+        # │ exprimé dans `Payment.currency`, et c'est lui qui entre           │
+        # │ physiquement au tiroir. Pour ramener un règlement en principale,  │
+        # │ le taux qui compte est donc celui de la VENTE, pas celui du       │
+        # │ règlement (qui, lui, convertit le billet vers la facture).        │
+        # └──────────────────────────────────────────────────────────────────┘
+        paiements_periode = Payment.objects.filter(
             sale__in=current_sales,
             status='completed'
-        ).values('payment_method__name').annotate(
-            total=Sum('amount'),
+        )
+        reglement_converti = Coalesce(
+            Sum(F('amount') * F('sale__exchange_rate')),
+            Decimal('0'),
+            output_field=DecimalField(max_digits=24, decimal_places=6),
+        )
+
+        # Ventes par méthode de paiement
+        by_payment_method = paiements_periode.values(
+            'payment_method__name'
+        ).annotate(
+            total=reglement_converti,
             count=Count('id')
         ).order_by('-total')
+
+        # Encaissements par DEVISE du billet reçu. C'est la question première
+        # d'un établissement multi-devise - « en quelle monnaie l'argent est
+        # entré » - et elle ne se lit nulle part ailleurs sur cet écran, qui est
+        # tout entier converti. La PART se calcule sur le montant converti, sans
+        # quoi 7 728 FC et 132 775 $ ne seraient pas comparables et l'anneau
+        # mentirait ; le montant natif, lui, est celui que le caissier a compté.
+        #
+        # `tendered_amount` est nullable pour compatibilité : les anciennes
+        # lignes mono-devise sont backfillées à `amount`, et le repli n'est juste
+        # que dans ce cas précis - devise du règlement égale à celle de la vente.
+        by_currency = paiements_periode.values('currency').annotate(
+            native_total=Coalesce(
+                Sum(Coalesce(F('tendered_amount'), F('amount'))),
+                Decimal('0'),
+                output_field=DecimalField(max_digits=24, decimal_places=6),
+            ),
+            primary_total=reglement_converti,
+            count=Count('id'),
+        ).order_by('-primary_total')
         
         # Stock bas
         low_stock_count = Stock.objects.filter(
@@ -438,8 +543,21 @@ class OrganizationViewSet(viewsets.ModelViewSet):
             'charts': {
                 'sales_evolution': evolution_data,
                 'by_payment_method': [
-                    {'name': p['payment_method__name'] or 'Non défini', 'value': str(p['total']), 'count': p['count']}
+                    {
+                        'name': p['payment_method__name'] or 'Non défini',
+                        'value': str(en_principale(p['total'])),
+                        'count': p['count'],
+                    }
                     for p in by_payment_method
+                ],
+                'by_currency': [
+                    {
+                        'code': c['currency'] or primary_currency,
+                        'native_total': str(en_principale(c['native_total'])),
+                        'primary_total': str(en_principale(c['primary_total'])),
+                        'count': c['count'],
+                    }
+                    for c in by_currency
                 ],
                 'top_products': [
                     _dashboard_top_product(p) for p in top_products
@@ -450,6 +568,10 @@ class OrganizationViewSet(viewsets.ModelViewSet):
                 'stock_value': str(stock_value)
             },
             'period': period,
+            # La devise de lecture de tout l'écran. Exposée plutôt que devinée :
+            # le frontend étiquetterait sinon des montants convertis avec le
+            # symbole que son contexte porte, sans jamais savoir s'ils le sont.
+            'currency': primary_currency,
             'date_range': {
                 'start': current_start.isoformat(),
                 'end': today.isoformat()
@@ -989,6 +1111,10 @@ class OrganizationInvitationViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         'create': 'users.create',
         'destroy': 'users.deactivate',
         'resend': 'users.create',
+        # Une invitation se renvoie (`resend`) ou s'annule (`destroy`). La
+        # modifier changerait le rôle promis à une adresse déjà prévenue.
+        'update': DENY,
+        'partial_update': DENY,
     }
 
     def get_serializer_class(self):

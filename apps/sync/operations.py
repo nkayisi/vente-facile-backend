@@ -51,6 +51,8 @@ from apps.core.api_permissions import (
     IsTenantMember,
     _get_membership,
 )
+from apps.core.clock import horloge_de_l_acte
+from apps.core.exceptions import RefusMetier
 
 from .models import SyncOperation
 
@@ -79,6 +81,10 @@ class OperationContext:
     organization: object
     membership: object
     user: object
+    #: Permissions effectives du membre, calculées UNE FOIS par lot. Le droit
+    #: se vérifie par OPÉRATION (voir `_assert_kind_allowed`), mais le calculer
+    #: à chaque opération ferait deux cents lectures pour un envoi de deux cents.
+    permissions: frozenset = frozenset()
     device: object = None
     #: Identifiants attribués par les opérations déjà appliquées de ce lot,
     #: pour qu'un règlement puisse viser une vente créée juste avant.
@@ -126,12 +132,56 @@ class OperationRejected(Exception):
 #: fonction qui délègue au serializer existant. Rien d'autre.
 HANDLERS = {}
 
+#: kind -> code de permission, miroir des `action_permissions` de la vue qui
+#: rejoue le même acte. Croisé avec elles par `test_parity_contract`.
+#:
+#: ┌──────────────────────────────────────────────────────────────────────────┐
+#: │ UN ACTE SANS PERMISSION DÉCLARÉE EST REFUSÉ.                            │
+#: │                                                                          │
+#: │ C'est la règle de `HasPermission` transposée au journal : « action non   │
+#: │ listée = accès refusé ». Un acte ajouté sans y penser sera bloqué, et    │
+#: │ non ouvert à tous - c'est le défaut qu'a connu `product_supplies`, en    │
+#: │ 403 pour tous les rôles pendant des mois faute d'entrée.                 │
+#: └──────────────────────────────────────────────────────────────────────────┘
+HANDLER_PERMISSIONS = {}
 
-def handler(kind):
+
+def handler(kind, *, permission):
     def register(fn):
         HANDLERS[kind] = fn
+        HANDLER_PERMISSIONS[kind] = permission
         return fn
     return register
+
+
+def _assert_kind_allowed(ctx, kind):
+    """
+    Le droit de poser CET acte, vérifié par OPÉRATION.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ SURTOUT PAS `HasPermission` DANS `permission_classes`.                  │
+    │                                                                          │
+    │ C'est une permission de VUE : un échec rendrait 403 pour tout l'envoi.  │
+    │ Un caissier avec deux cents ventes en file et une seule opération        │
+    │ d'inventaire les perdrait toutes. C'est le défaut exact de l'ancienne    │
+    │ file, que §5.5 interdit : « verdict PAR OPÉRATION, jamais par lot ».     │
+    │                                                                          │
+    │ Levée ici, `PermissionDenied` devient le verdict `blocked` : conservée,  │
+    │ non réessayée, message distinct - et repassera au prochain envoi, car    │
+    │ `blocked` n'est pas `is_settled`. Le jour où la permission est accordée, │
+    │ l'opération repart d'elle-même.                                          │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+    besoin = HANDLER_PERMISSIONS.get(kind)
+    if besoin is None:
+        raise PermissionDenied(
+            f"L'opération « {kind} » ne déclare aucune permission et ne peut pas être appliquée."
+        )
+    if besoin not in ctx.permissions:
+        raise PermissionDenied(
+            f"Votre compte n'a pas la permission « {besoin} », "
+            f"nécessaire pour cette opération."
+        )
 
 
 def resolve_refs(ctx, payload):
@@ -188,6 +238,12 @@ def _classify(exc):
         # donnée fautive, pas un aléa.
         return SyncOperation.Verdict.REJECTED, {
             'code': 'integrity', 'detail': str(exc),
+        }
+    if isinstance(exc, RefusMetier):
+        # Déterministe par construction : le renvoyer le referait refuser à
+        # l'identique, à chaque synchronisation, indéfiniment.
+        return SyncOperation.Verdict.REJECTED, {
+            'code': 'refus_metier', 'detail': str(exc),
         }
     if isinstance(exc, (OperationalError, DatabaseError)):
         return SyncOperation.Verdict.RETRY, {'code': 'database', 'detail': str(exc)}
@@ -259,10 +315,32 @@ def dispatch(ctx, operations):
             refused.add(op_id)
             continue
 
+        # L'HEURE DE L'ACTE, POSÉE POUR TOUTE LA DURÉE DE L'OPÉRATION.
+        #
+        # Le terminal est le seul à savoir quand l'argent est entré ; le serveur
+        # ne sait que quand il l'a appris. Sans cela, `sale_date` et tous les
+        # horodatages écrits en aval portaient le jour de la POUSSÉE : trois
+        # jours hors ligne empilaient trois journées de recette sur celle du
+        # retour, dans les rapports comme sur l'écran du marchand.
+        #
+        # Elle est posée AUTOUR du gestionnaire, pas passée en paramètre : la
+        # traverser demanderait de modifier `SaleCreateSerializer.create()`,
+        # `apply_payment_to_sale`, `register_sale_debt` et le décrément de
+        # stock, corps que le back-office appelle aussi, pour une valeur qu'il
+        # ne fournit jamais. Voir `apps.core.clock`.
+        quand = op.get('occurred_at')
+
         try:
             with transaction.atomic():
-                payload = resolve_refs(ctx, op.get('payload') or {})
-                outcome = json_safe(fn(ctx, payload) or {})
+                # L'horloge n'enveloppe QUE le gestionnaire, jamais la trace :
+                # `SyncOperation` répond à « quand le serveur l'a appris », et
+                # la backdater effacerait le seul repère qui reste pour dire
+                # qu'une écriture est arrivée en retard. Elle reste dans le même
+                # `atomic` que l'effet, comme le contrat l'exige.
+                with horloge_de_l_acte(quand):
+                    _assert_kind_allowed(ctx, kind)
+                    payload = resolve_refs(ctx, op.get('payload') or {})
+                    outcome = json_safe(fn(ctx, payload) or {})
 
                 SyncOperation.objects.update_or_create(
                     pk=op_id,
@@ -277,7 +355,7 @@ def dispatch(ctx, operations):
                         'error': None,
                         'verdict': SyncOperation.Verdict.APPLIED,
                         'http_status': 201,
-                        'occurred_at': op.get('occurred_at') or timezone.now(),
+                        'occurred_at': quand or timezone.now(),
                     },
                 )
 
@@ -313,7 +391,7 @@ def dispatch(ctx, operations):
                             'result': None,
                             'error': error,
                             'verdict': verdict,
-                            'occurred_at': op.get('occurred_at') or timezone.now(),
+                            'occurred_at': quand or timezone.now(),
                         },
                     )
                 refused.add(op_id)
@@ -396,11 +474,16 @@ class SyncOperationsView(APIView):
                 id=device_id, organization=membership.organization
             ).first()
 
+        from apps.core.services import PermissionService
+
         ctx = OperationContext(
             request=request,
             organization=membership.organization,
             membership=membership,
             user=request.user,
+            permissions=frozenset(
+                PermissionService.get_effective_permissions(membership)
+            ),
             device=device,
         )
 

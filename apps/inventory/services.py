@@ -8,6 +8,7 @@ from django.db.models import F, Q
 from django.utils import timezone
 
 from .models import InventoryCount, Stock, StockBatch, StockMovement
+from apps.core.clock import maintenant
 
 
 class BatchAllocation:
@@ -594,7 +595,7 @@ def ship_transfer(transfer, user):
             item.save()
         
         transfer.status = 'in_transit'
-        transfer.shipped_at = timezone.now()
+        transfer.shipped_at = maintenant()
         transfer.save()
     
     return {'status': 'shipped'}
@@ -718,7 +719,7 @@ def receive_transfer(transfer, user, received_items=None):
             )
         
         transfer.status = 'completed'
-        transfer.received_at = timezone.now()
+        transfer.received_at = maintenant()
         transfer.save()
     
     return {'status': 'received'}
@@ -885,7 +886,7 @@ def approve_adjustment(adjustment, user):
         
         adjustment.status = 'approved'
         adjustment.approved_by = user
-        adjustment.approved_at = timezone.now()
+        adjustment.approved_at = maintenant()
         adjustment.save()
     
     return {'status': 'approved'}
@@ -970,17 +971,23 @@ def target_products(session):
 
     Extrait de la vue avec le reste : le journal démarre des sessions, et il
     doit cibler exactement les mêmes produits que le back-office.
+
+    `Category.subtree_ids` est une méthode de CLASSE, et prend la liste des
+    racines. L'appeler sur une instance sans argument lève `TypeError` : toute
+    session portant sur une catégorie échouait donc au démarrage, en 500, des
+    deux côtés (vue et journal). Aucun test ne l'avait vu, tous démarrant des
+    sessions de périmètre `full`. Un seul parcours pour toutes les racines, ce
+    qui est aussi ce qu'il fallait faire : une descente par catégorie visée
+    rejouerait la même hiérarchie autant de fois qu'il y a de racines.
     """
     from django.db.models import F
-    from apps.products.models import Product
+    from apps.products.models import Category, Product
 
     base_qs = Product.objects.filter(
         organization=session.organization, is_active=True, track_inventory=True,
     )
     if session.scope_type == 'category':
-        ids = set()
-        for categorie in session.categories.all():
-            ids |= set(categorie.subtree_ids())
+        ids = Category.subtree_ids(list(session.categories.values_list('id', flat=True)))
         base_qs = base_qs.filter(category_id__in=ids)
     elif session.scope_type == 'product':
         base_qs = base_qs.filter(id__in=session.products.values_list('id', flat=True))
@@ -1043,7 +1050,7 @@ def start_inventory_session(session, user):
 
         session.status = 'in_progress'
         session.is_stock_locked = True
-        session.started_at = timezone.now()
+        session.started_at = maintenant()
         session.save()
 
     return session
@@ -1097,7 +1104,7 @@ def record_inventory_counts(session, user, lignes=None):
                 ligne.counted_loose_quantity = Decimal(str(compte))
             ligne.is_counted = True
             ligne.counted_by = user
-            ligne.counted_at = timezone.now()
+            ligne.counted_at = maintenant()
             if notes:
                 ligne.notes = notes
             ligne.save()
@@ -1140,7 +1147,7 @@ def submit_inventory_session(session, user):
     session.total_difference_quantity = totaux['total_diff'] or Decimal('0.000')
     session.total_difference_value = totaux['total_diff_value'] or Decimal('0.00')
     session.status = 'review'
-    session.completed_at = timezone.now()
+    session.completed_at = maintenant()
     session.save()
 
     return session
@@ -1206,7 +1213,7 @@ def validate_inventory_session(session, user):
 
         session.status = 'validated'
         session.is_stock_locked = False
-        session.validated_at = timezone.now()
+        session.validated_at = maintenant()
         session.validated_by = user
         session.save()
 

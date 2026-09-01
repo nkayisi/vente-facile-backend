@@ -4,6 +4,7 @@ Serializers for settings module.
 from rest_framework import serializers
 from decimal import Decimal
 from drf_spectacular.utils import extend_schema_field
+from apps.core.bulk import bulk_update_rows
 from .models import (
     MAX_REDEMPTION_PERCENT_CEILING,
     Currency, OrganizationCurrency, LoyaltyProgram, LoyaltyReward,
@@ -67,10 +68,17 @@ class OrganizationCurrencyCreateSerializer(serializers.ModelSerializer):
         
         # Si c'est la devise principale, désactiver les autres devises principales
         if validated_data.get('is_primary'):
-            OrganizationCurrency.objects.filter(
-                organization=organization,
-                is_primary=True
-            ).update(is_primary=False)
+            # `bulk_update_rows` : rétrograder l'ancienne devise principale par
+            # un `update()` nu laissait sa ligne avec l'horodatage d'avant, donc
+            # INVISIBLE au tirage. Le terminal gardait DEUX devises principales,
+            # et c'est le taux de change qui décide de chaque montant au comptoir.
+            bulk_update_rows(
+                OrganizationCurrency.objects.filter(
+                    organization=organization,
+                    is_primary=True,
+                ),
+                is_primary=False,
+            )
         
         return super().create(validated_data)
 
@@ -87,10 +95,17 @@ class OrganizationCurrencyUpdateSerializer(serializers.ModelSerializer):
         
         # Si on définit cette devise comme principale
         if validated_data.get('is_primary') and not instance.is_primary:
-            OrganizationCurrency.objects.filter(
-                organization=organization,
-                is_primary=True
-            ).update(is_primary=False)
+            # `bulk_update_rows` : rétrograder l'ancienne devise principale par
+            # un `update()` nu laissait sa ligne avec l'horodatage d'avant, donc
+            # INVISIBLE au tirage. Le terminal gardait DEUX devises principales,
+            # et c'est le taux de change qui décide de chaque montant au comptoir.
+            bulk_update_rows(
+                OrganizationCurrency.objects.filter(
+                    organization=organization,
+                    is_primary=True,
+                ),
+                is_primary=False,
+            )
         
         return super().update(instance, validated_data)
 

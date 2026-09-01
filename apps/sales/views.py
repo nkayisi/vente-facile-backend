@@ -25,6 +25,7 @@ from apps.core.warehouse_scope import (
     get_membership_for_request,
 )
 from apps.core.api_permissions import (
+    DENY,
     IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission,
     has_perm_code, is_manager_or_above,
 )
@@ -130,6 +131,11 @@ class RegisterSessionViewSet(
         'open': 'sales.create',
         'close': 'sales.create',
         'current': 'sales.view',
+        # Une session de caisse s'ouvre par `open` et se ferme par `close` :
+        # ces deux actes portent l'héritage des fonds par devise, le
+        # périmètre entrepôt et le comptage. Un POST direct en fabriquerait
+        # une sans rien de tout cela.
+        'create': DENY,
     }
     
     # Sessions en lecture seule sauf pour open/close
@@ -149,104 +155,32 @@ class RegisterSessionViewSet(
         """
         Ouvre une nouvelle session de caisse.
 
-        - Bloque la création si une session est déjà ouverte sur cette caisse
-          (check applicatif + UniqueConstraint DB en filet de sécurité).
-        - Hérite `opening_balance` du `closing_balance` de la dernière session
-          fermée sur cette caisse (sinon 0).
+        Le corps vit dans `sales.register_sessions`, que le journal
+        d'opérations du terminal appelle aussi : le fonds d'ouverture est
+        hérité PAR DEVISE de la dernière clôture, et une seule écriture de
+        cette arithmétique garantit que les deux surfaces la font pareil.
         """
-        from django.db import transaction, IntegrityError
+        from .register_sessions import (
+            CaisseIntrouvable, SessionDejaOuverte, open_register_session,
+        )
 
         serializer = RegisterSessionOpenSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        organization = self.get_organization()
-        register_id = serializer.validated_data['register']
-
-        # Caisse dans l'org, active, et dans le périmètre entrepôt du membre
-        register_qs = Register.objects.filter(
-            id=register_id,
-            organization=organization,
-            is_active=True,
-        )
-        membership = get_membership_for_request(request)
-        if membership:
-            register_qs = filter_queryset_by_warehouse_ids(
-                register_qs, membership, 'warehouse_id'
-            )
-        register = register_qs.first()
-
-        if not register:
-            return Response(
-                {'error': 'Caisse non trouvée ou inactive'},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
         try:
-            with transaction.atomic():
-                # Lock sur les sessions existantes de cette caisse pour exclure
-                # toute requête concurrente avant la vérification + insertion.
-                existing_session = (
-                    RegisterSession.objects.select_for_update()
-                    .filter(register=register, status='open')
-                    .first()
-                )
-                if existing_session:
-                    return Response(
-                        {'error': 'Une session est déjà ouverte sur cette caisse'},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-
-                from .models import RegisterSessionCurrencyBalance
-                primary = organization.currency or 'CDF'
-
-                # Hériter le solde d'ouverture, PAR DEVISE, de la dernière
-                # session fermée sur cette caisse.
-                previous = (
-                    RegisterSession.objects.filter(
-                        register=register, status='closed'
-                    )
-                    .order_by('-closed_at', '-opened_at')
-                    .first()
-                )
-                inherited_by_ccy = {}
-                if previous is not None:
-                    for cb in previous.currency_balances.all():
-                        val = (
-                            cb.counted_balance if cb.counted_balance is not None
-                            else (cb.expected_balance or Decimal('0.00'))
-                        )
-                        inherited_by_ccy[cb.currency] = val
-                    if not inherited_by_ccy:
-                        # Session héritée sans ventilation par devise (legacy).
-                        inherited_by_ccy[primary] = (
-                            previous.counted_balance
-                            if previous.counted_balance is not None
-                            else (previous.closing_balance or previous.expected_balance or Decimal('0.00'))
-                        )
-
-                # Surcharge éventuelle des fonds d'ouverture par devise.
-                for item in serializer.validated_data.get('opening_balances') or []:
-                    inherited_by_ccy[item['currency']] = Decimal(item['amount'])
-
-                primary_opening = inherited_by_ccy.get(primary, Decimal('0.00'))
-
-                session = RegisterSession.objects.create(
-                    organization=organization,
-                    register=register,
-                    opened_by=request.user,
-                    opening_balance=primary_opening,
-                    notes='',
-                    status='open',
-                )
-                for ccy, amount in inherited_by_ccy.items():
-                    RegisterSessionCurrencyBalance.objects.create(
-                        organization=organization,
-                        session=session,
-                        currency=ccy,
-                        opening_balance=amount,
-                    )
-        except IntegrityError:
-            # UniqueConstraint DB : une autre requête a créé la session en parallèle
+            session = open_register_session(
+                self.get_organization(),
+                serializer.validated_data['register'],
+                request.user,
+                opening_balance=serializer.validated_data.get('opening_balance'),
+                opening_balances=serializer.validated_data.get('opening_balances'),
+                request=request,
+            )
+        except CaisseIntrouvable as e:
+            return Response({'error': str(e)}, status=status.HTTP_404_NOT_FOUND)
+        except SessionDejaOuverte:
+            # Le contrat de réponse ne bouge pas : le back-office branche son
+            # message sur cette phrase exacte.
             return Response(
                 {'error': 'Une session est déjà ouverte sur cette caisse'},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -254,7 +188,7 @@ class RegisterSessionViewSet(
 
         return Response(
             RegisterSessionDetailSerializer(session).data,
-            status=status.HTTP_201_CREATED
+            status=status.HTTP_201_CREATED,
         )
 
     @action(detail=True, methods=['post'])
@@ -269,11 +203,11 @@ class RegisterSessionViewSet(
           calcule l'écart par devise.
         - Si un écart est non nul, `notes` est obligatoire.
 
-        Le corps vit dans `sales.session_close`, que le journal d'opérations du
+        Le corps vit dans `sales.register_sessions`, que le journal d'opérations du
         terminal rejoue aussi : le Z de caisse se tire au comptoir, souvent
         avant que le réseau ne revienne.
         """
-        from .session_close import (
+        from .register_sessions import (
             NoteRequise, TransitionRefusee, close_register_session,
         )
 
@@ -415,6 +349,13 @@ class SaleViewSet(
         'cancel': 'sales.cancel',
         'today': 'sales.view',
         'stats': 'sales.view',
+        # Marquer un reçu imprimé est la CONSÉQUENCE d'une impression, donc de
+        # la lecture d'une vente. `frontend/actions/sales.actions.ts` l'appelle
+        # depuis le POS et depuis le détail de vente ; l'action n'était pas
+        # déclarée, donc 403 pour tous les rôles, en silence. `receipt_printed`
+        # n'a jamais été écrit depuis le web, et la pastille DUPLICATA ne
+        # pouvait donc pas distinguer une réimpression d'une première sortie.
+        'mark_receipt_printed': 'sales.view',
     }
 
     def get_serializer_class(self):
@@ -563,79 +504,26 @@ class SaleViewSet(
         """
         Annule une vente.
 
-        Permission : sold_by (caissier auteur) OU manager+. Refusée pour les
-        ventes déjà annulées/remboursées.
+        Permission : `sold_by` (le caissier auteur) OU manager+. Le corps vit
+        dans `services.cancel_sale`, que le journal du terminal appelle aussi.
         """
-        from django.db import transaction
-        from .services import SaleStockService
+        from .services import AnnulationRefusee, cancel_sale
 
         sale = self.get_object()
-
-        if sale.sold_by_id != request.user.id and not is_manager_or_above(request):
-            return Response(
-                {'error': "Vous ne pouvez annuler que vos propres ventes."},
-                status=status.HTTP_403_FORBIDDEN,
+        try:
+            annulee = cancel_sale(
+                sale, request.user,
+                reason=request.data.get('reason', ''),
+                autorise_toutes_ventes=is_manager_or_above(request),
             )
+        except AnnulationRefusee as e:
+            return Response({'error': str(e)}, status=status.HTTP_403_FORBIDDEN)
 
-        if sale.status in ['cancelled', 'refunded']:
+        if not annulee:
             return Response(
                 {'error': 'Cette vente est déjà annulée'},
-                status=status.HTTP_400_BAD_REQUEST
+                status=status.HTTP_400_BAD_REQUEST,
             )
-
-        with transaction.atomic():
-            # Si la vente provient d'un devis converti mais n'a pas encore
-            # été encaissée, libérer la réservation de stock. Idempotent :
-            # ne fait rien pour les ventes POS directes (stock_reserved=False).
-            SaleStockService.release_reservation(sale, request.user)
-
-            # Restitution centralisée (idempotente : ne fait rien si stock pas committed)
-            SaleStockService.revert(sale, request.user)
-
-            # Enregistrer le mouvement de caisse (remboursement) si la vente avait été payée
-            if sale.amount_paid > 0:
-                from apps.cashbook.services import record_sale_cancellation
-                record_sale_cancellation(
-                    organization=sale.organization,
-                    sale=sale,
-                    amount=sale.amount_paid,
-                    user=request.user,
-                )
-
-            # Restaurer le solde client.
-            #
-            # À la création on a inscrit `amount_due` en dette ; chaque règlement
-            # en a soldé exactement la part réellement due (jamais le surplus,
-            # qui est rendu en monnaie). L'impact net encore porté par le solde
-            # est donc simplement le `amount_due` courant : c'est ce qu'on retire.
-            if sale.customer and sale.amount_due > 0:
-                from apps.contacts import services as contacts_services
-                contacts_services.settle_debt(
-                    sale.customer, sale.amount_due,
-                    currency=sale.currency,
-                    transaction_type=(
-                        contacts_services.CustomerTransaction.TransactionType.ADJUSTMENT
-                    ),
-                    sale=sale,
-                    reference=sale.reference,
-                    notes=f"Annulation vente {sale.reference}",
-                    user=request.user,
-                )
-
-            # Reverser les transactions de fidélité liées à cette vente.
-            # Idempotent : on ne crée un REVERSAL que s'il n'existe pas déjà.
-            from apps.settings.services import LoyaltyService
-            LoyaltyService.reverse_sale_transactions(sale, request.user)
-
-            # Une vente annulée ne doit plus rien : laisser `amount_due` positif
-            # la faisait ressortir de tout filtre `amount_due__gt=0` (l'index
-            # `sales_org_status_due_idx` invite précisément à écrire ce filtre) et
-            # elle serait recomptée en créance alors que la dette vient d'être
-            # retirée du solde client juste au-dessus.
-            sale.amount_due = Decimal('0.00')
-            sale.status = 'cancelled'
-            sale.save()
-
         return Response({'status': 'cancelled'})
 
     @action(detail=False, methods=['get'])
@@ -774,6 +662,12 @@ class SaleReturnViewSet(
         'create': 'sale_returns.create',
         'approve': 'sale_returns.approve',
         'reject': 'sale_returns.approve',
+        # Un retour avance par `approve` / `reject` : c'est là que le stock
+        # est remis et la dette éteinte. Le réécrire ensuite ferait mentir
+        # le bon déjà imprimé.
+        'update': DENY,
+        'partial_update': DENY,
+        'destroy': DENY,
     }
 
     def get_serializer_class(self):

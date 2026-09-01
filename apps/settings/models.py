@@ -366,8 +366,16 @@ class CustomerLoyalty(TenantModel):
             self.last_points_earned_at = timezone.now()
             return
 
+        from apps.core.bulk import bulk_update_rows
+
         now = timezone.now()
-        type(self).objects.filter(pk=self.pk).update(
+        # `bulk_update_rows` et non `update()` : un `queryset.update()` ne passe
+        # pas par `save()`, donc `updated_at` ne bouge pas, donc la ligne devient
+        # INVISIBLE au tirage. Relevé en base : 704,13 points côté serveur,
+        # 372,65 sur le terminal, avec le même horodatage. Le `F()` reste : c'est
+        # lui qui sérialise deux ventes simultanées du même client.
+        bulk_update_rows(
+            type(self).objects.filter(pk=self.pk),
             current_points=F('current_points') + points,
             total_points_earned=F('total_points_earned') + points,
             last_points_earned_at=now,
@@ -389,11 +397,13 @@ class CustomerLoyalty(TenantModel):
         from django.db import transaction
         from django.utils import timezone
 
+        from apps.core.exceptions import RefusMetier
+
         points = _as_points(points)
 
         if not save:
             if points > self.current_points:
-                raise ValueError("Points insuffisants")
+                raise RefusMetier("Points insuffisants")
             self.current_points -= points
             self.total_points_redeemed += points
             self.last_points_redeemed_at = timezone.now()
@@ -402,7 +412,7 @@ class CustomerLoyalty(TenantModel):
         with transaction.atomic():
             fresh = type(self).objects.select_for_update().get(pk=self.pk)
             if points > fresh.current_points:
-                raise ValueError("Points insuffisants")
+                raise RefusMetier("Points insuffisants")
             fresh.current_points -= points
             fresh.total_points_redeemed += points
             fresh.last_points_redeemed_at = timezone.now()

@@ -19,6 +19,7 @@ le serveur doit le reprendre, pas en allouer un second.
 """
 from decimal import Decimal
 
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -62,6 +63,19 @@ class _DebtBaseTest(APITestCase):
         return customer, vente
 
     def _send(self, kind, payload, op_id):
+        """
+        Le MÊME instant des deux côtés, et ce n'est pas une commodité.
+
+        Ces tests comparent l'état laissé par le MÊME acte joué de deux façons.
+        Depuis que le journal date ses écritures à l'heure de l'acte
+        (`apps.core.clock`), une date figée dans le passé décalerait les rangs
+        du grand livre du seul côté mobile : l'écriture s'y rangerait avant la
+        facture que la fixture vient de créer, et la comparaison échouerait sur
+        un ORDRE, non sur un effet. « Même acte » comprend « même moment ».
+
+        La parité des DATES a son propre fichier,
+        `test_operation_dates.py`, où elle est vérifiée pour elle-même.
+        """
         return self.client.post(
             OPERATIONS,
             {'operations': [{
@@ -69,7 +83,7 @@ class _DebtBaseTest(APITestCase):
                 'kind': kind,
                 'seq': 1,
                 'depends_on': [],
-                'occurred_at': '2026-08-29T09:00:00Z',
+                'occurred_at': timezone.now().isoformat(),
                 'payload': payload,
             }]},
             format='json', **self._headers(),

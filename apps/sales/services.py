@@ -12,6 +12,7 @@ from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
+from apps.core.bulk import bulk_update_rows
 
 
 TWO_PLACES = Decimal('0.01')
@@ -796,7 +797,8 @@ def apply_payment_to_sale(sale_id, user, *, payment_method_id=None,
         p.receipt_number = receipt_number
     from apps.sales.models import Payment as _PaymentModel
 
-    _PaymentModel.objects.filter(pk__in=[p.pk for p in payments]).update(
+    bulk_update_rows(
+        _PaymentModel.objects.filter(pk__in=[p.pk for p in payments]),
         receipt_number=receipt_number,
     )
 
@@ -922,3 +924,103 @@ def resolve_change(sale, change_currency=None):
         overpay, sale.currency, change_currency, sale.organization
     )
     return result['converted_amount'], change_currency, result['exchange_rate']
+
+
+# ---------------------------------------------------------------------------
+# ANNULATION D'UNE VENTE : le corps partagé par la vue et par le journal.
+# ---------------------------------------------------------------------------
+
+
+class AnnulationRefusee(Exception):
+    """Refus métier déterministe sur une annulation : à ne jamais réessayer."""
+
+
+def cancel_sale(sale, user, *, reason='', autorise_toutes_ventes=False):
+    """
+    Annule une vente et défait tout ce qu'elle avait fait.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ QUATRE DIVERGENCES ENTRE LA VUE ET LE JOURNAL, TOUTES SUR DE L'ARGENT.  │
+    │                                                                          │
+    │ 1. « On n'annule que ses propres ventes » : le back-office refuse 403 à  │
+    │    un caissier qui touche la vente d'un autre. Le journal l'acceptait.   │
+    │ 2. Le MOUVEMENT DE CAISSE d'annulation, quand la vente avait été payée : │
+    │    la vue l'écrit, le journal non. Le tiroir gardait donc en caisse un   │
+    │    encaissement qui venait d'être annulé, et le Z du soir constatait un  │
+    │    écart inexplicable.                                                   │
+    │ 3. L'écriture client : la vue passe par `settle_debt` de type            │
+    │    ADJUSTMENT, RATTACHÉE à la vente ; le journal par `adjust_balance`,   │
+    │    qui écrit un autre type et ne rattache rien. Deux annulations         │
+    │    identiques laissaient deux traces différentes selon la surface.       │
+    │ 4. `sale.notes` : le journal l'ÉCRASAIT avec le motif, la vue n'y touche │
+    │    pas. Un motif d'annulation effaçait la note du caissier.              │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ``autorise_toutes_ventes`` porte le droit du gérant. Il est passé par
+    l'appelant, qui seul sait de quelle requête il vient.
+
+    Rend `True` si l'annulation a eu lieu, `False` si la vente l'était déjà :
+    dans ce second cas le verdict doit être un SUCCÈS, sans quoi le terminal
+    réessaierait indéfiniment une annulation déjà faite.
+    """
+    from django.db import transaction
+
+    from apps.contacts import services as contacts_services
+    from apps.settings.services import LoyaltyService
+
+    if sale.sold_by_id != user.id and not autorise_toutes_ventes:
+        raise AnnulationRefusee("Vous ne pouvez annuler que vos propres ventes.")
+
+    if sale.status in ('cancelled', 'refunded'):
+        return False
+
+    with transaction.atomic():
+        # Idempotents tous les deux : ne font rien si la réservation n'existe
+        # pas, ou si le stock n'a jamais été engagé.
+        SaleStockService.release_reservation(sale, user)
+        SaleStockService.revert(sale, user)
+
+        if sale.amount_paid > 0:
+            from apps.cashbook.services import record_sale_cancellation
+
+            record_sale_cancellation(
+                organization=sale.organization,
+                sale=sale,
+                amount=sale.amount_paid,
+                user=user,
+            )
+
+        # À la création on a inscrit `amount_due` en dette ; chaque règlement en
+        # a soldé exactement la part réellement due. L'impact net encore porté
+        # par le solde est donc le `amount_due` courant : c'est ce qu'on retire.
+        if sale.customer and sale.amount_due > 0:
+            contacts_services.settle_debt(
+                sale.customer, sale.amount_due,
+                currency=sale.currency,
+                transaction_type=(
+                    contacts_services.CustomerTransaction.TransactionType.ADJUSTMENT
+                ),
+                sale=sale,
+                reference=sale.reference,
+                notes=f"Annulation vente {sale.reference}",
+                user=user,
+            )
+
+        # Idempotent : on ne crée un REVERSAL que s'il n'en existe pas déjà.
+        LoyaltyService.reverse_sale_transactions(sale, user)
+
+        # Une vente annulée ne doit plus rien : laisser `amount_due` positif la
+        # ferait ressortir de tout filtre `amount_due__gt=0` et elle serait
+        # recomptée en créance alors que la dette vient d'être retirée.
+        sale.amount_due = Decimal('0.00')
+        sale.status = 'cancelled'
+        if reason:
+            # Le motif s'AJOUTE, il n'efface pas : la note du caissier peut
+            # porter ce qu'il faut pour comprendre l'annulation.
+            sale.internal_notes = (
+                f"{sale.internal_notes}\n{reason}".strip()
+                if sale.internal_notes else reason
+            )
+        sale.save()
+
+    return True

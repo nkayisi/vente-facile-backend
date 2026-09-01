@@ -47,6 +47,7 @@ from apps.cashbook.models import CashMovement, Expense
 from apps.cashbook.services import (
     balance_in_primary,
     last_balance_by_currency,
+    primary_avg,
     primary_sum,
 )
 
@@ -87,6 +88,10 @@ class ReportTemplateViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
         'retrieve': 'reports.view',
         'create': 'reports.create',
         'update': 'reports.create',
+        # PATCH était absent quand PUT était là : la modification partielle
+        # répondait 403 pendant que la modification complète passait. Une
+        # asymétrie de ce genre ne se lit dans aucun message d'erreur.
+        'partial_update': 'reports.create',
         'destroy': 'reports.delete',
     }
     
@@ -109,6 +114,10 @@ class DashboardViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
         'retrieve': 'reports.view',
         'create': 'reports.create',
         'update': 'reports.create',
+        # PATCH était absent quand PUT était là : la modification partielle
+        # répondait 403 pendant que la modification complète passait. Une
+        # asymétrie de ce genre ne se lit dans aucun message d'erreur.
+        'partial_update': 'reports.create',
         'destroy': 'reports.delete',
     }
     
@@ -376,7 +385,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         completed_sales = sales.filter(status__in=['completed', 'partially_paid'])
         sales_agg = completed_sales.aggregate(
             count=Count('id'),
-            total=Coalesce(Sum('total'), Decimal('0'), **money),
+            total=primary_sum('total'),
         )
 
         # Ventilation par méthode de paiement
@@ -389,11 +398,16 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
                 created_at__date__lte=end_date,
             ),
             request,
-        ).select_related('payment_method')
+        ).select_related('payment_method', 'sale')
         by_method = {}
         for p in payments:
             name = p.payment_method.name if p.payment_method else 'Autre'
-            by_method[name] = by_method.get(name, Decimal('0')) + p.amount
+            # `Payment.amount` est déjà dans la devise de la VENTE : c'est donc
+            # le taux de celle-ci qui ramène en principale, pas le sien, qui
+            # convertit le billet reçu vers la facture. Sans `select_related`
+            # sur la vente, cette ligne ferait une requête par règlement.
+            taux = (p.sale.exchange_rate if p.sale_id else None) or Decimal('1')
+            by_method[name] = by_method.get(name, Decimal('0')) + p.amount * taux
 
         # --- Dépenses créées par l'utilisateur ---
         expenses = self._scope_expenses(
@@ -435,7 +449,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             .values('bucket')
             .annotate(
                 count=Count('id'),
-                total=Coalesce(Sum('total'), Decimal('0'), **money),
+                total=primary_sum('total'),
             )
             .order_by('bucket')
         )
@@ -444,10 +458,21 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             {
                 'bucket': row['bucket'].strftime(fmt) if row['bucket'] else '',
                 'count': row['count'],
-                'total': row['total'],
+                'total': (row['total'] or Decimal('0')).quantize(Decimal('0.01')),
             }
             for row in breakdown_qs
         ]
+
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ CET ENDPOINT N'A PAS DE SERIALIZER : IL QUANTIFIE LUI-MÊME.      │
+        # │                                                                  │
+        # │ Un montant converti est le produit d'une somme par un taux à      │
+        # │ douze décimales, et il sortait ici tel quel : la dépense d'un     │
+        # │ vendeur s'affichait « 1.5217391315 ». Ses voisins passent par un  │
+        # │ serializer qui arrondit ; celui-ci rend un dictionnaire nu.       │
+        # └──────────────────────────────────────────────────────────────────┘
+        def sou(montant):
+            return (montant or Decimal('0')).quantize(Decimal('0.01'))
 
         return Response({
             'user': {
@@ -463,19 +488,19 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             },
             'sales': {
                 'count': sales_agg['count'],
-                'total': sales_agg['total'],
+                'total': sou(sales_agg['total']),
                 'by_payment_method': [
-                    {'method': k, 'total': v} for k, v in by_method.items()
+                    {'method': k, 'total': sou(v)} for k, v in by_method.items()
                 ],
             },
             'expenses': {
                 'count': expenses_agg['count'],
-                'total': expenses_agg['total'],
+                'total': sou(expenses_agg['total']),
             },
             'cash': {
-                'cash_in': cash_in,
-                'cash_out': cash_out,
-                'net': cash_in - cash_out,
+                'cash_in': sou(cash_in),
+                'cash_out': sou(cash_out),
+                'net': sou(cash_in - cash_out),
             },
             'breakdown': breakdown,
         })
@@ -540,7 +565,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         data = sales.annotate(
             period=trunc_func
         ).values('period').annotate(
-            total=Coalesce(Sum('total'), Decimal('0'), output_field=DecimalField()),
+            total=primary_sum('total'),
             count=Count('id')
         ).order_by('period')
         
@@ -591,7 +616,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             'product__category__id',
             'product__category__name'
         ).annotate(
-            total_revenue=Coalesce(Sum('total'), Decimal('0'), output_field=DecimalField()),
+            total_revenue=primary_sum('total', rate='sale__exchange_rate'),
             quantity_sold=Coalesce(Sum('quantity'), Decimal('0'), output_field=DecimalField())
         ).order_by('-total_revenue')
         
@@ -646,7 +671,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             'payment_method__id',
             'payment_method__name'
         ).annotate(
-            total=Coalesce(Sum('amount'), Decimal('0'), output_field=DecimalField()),
+            total=primary_sum('amount', rate='sale__exchange_rate'),
             count=Count('id')
         ).order_by('-total')
         
@@ -759,7 +784,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
                 Sum(F('package_quantity') * F('packaging_factor')),
                 Decimal('0'), output_field=DecimalField(),
             ),
-            total_revenue=Coalesce(Sum('total'), Decimal('0'), output_field=DecimalField())
+            total_revenue=primary_sum('total', rate='sale__exchange_rate')
         ).order_by('-quantity_sold')
         
         # Pagination
@@ -1049,15 +1074,11 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         
         completed_sales = sales.filter(status__in=['completed', 'partially_paid'])
         
-        total_sales = completed_sales.aggregate(
-            total=Coalesce(Sum('total'), Decimal('0'), output_field=DecimalField())
-        )['total']
+        total_sales = completed_sales.aggregate(total=primary_sum('total'))['total']
         
         total_orders = completed_sales.count()
         
-        avg_order = completed_sales.aggregate(
-            avg=Coalesce(Avg('total'), Decimal('0'))
-        )['avg']
+        avg_order = completed_sales.aggregate(avg=primary_avg('total'))['avg']
         
         total_items = SaleItem.objects.filter(
             sale__in=completed_sales
@@ -1075,9 +1096,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         if request is not None:
             prev_sales = self._scope_sales(prev_sales, request)
         
-        prev_total = prev_sales.aggregate(
-            total=Coalesce(Sum('total'), Decimal('0'), output_field=DecimalField())
-        )['total']
+        prev_total = prev_sales.aggregate(total=primary_sum('total'))['total']
         
         prev_orders = prev_sales.count()
         
@@ -1442,13 +1461,30 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             request,
         )
         
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ LE BÉNÉFICE SE LIT EN DEVISE PRINCIPALE, DES DEUX CÔTÉS.         │
+        # │                                                                  │
+        # │ Ce rapport retranchait des dépenses CONVERTIES (`primary_sum`,   │
+        # │ plus bas) d'un chiffre d'affaires BRUT, et le commentaire d'à     │
+        # │ côté affirmait pourtant que les deux étaient « en principale ».   │
+        # │ Sur un établissement qui facture en francs et en dollars, le      │
+        # │ chiffre d'affaires ajoutait 107 000 à 50 : le bénéfice net qui en │
+        # │ sortait n'avait aucun sens, et rien ne le signalait.              │
+        # │                                                                  │
+        # │ LE COÛT, LUI, RESTE BRUT, et c'est correct : `cost_price` vient   │
+        # │ du catalogue, qui n'a pas de devise, donc il est DÉJÀ en          │
+        # │ principale. Le convertir au taux de sa vente diviserait le coût   │
+        # │ d'une vente en francs par deux mille huit cents, et la marge      │
+        # │ passerait de 40 % à 100 %. Un test l'épingle explicitement.       │
+        # └──────────────────────────────────────────────────────────────────┘
+        #
         # CA HT net (toutes remises), cohérent avec sale.total = subtotal - discount_amount + tax
         revenue_expr = ExpressionWrapper(
-            F('subtotal') - F('discount_amount'),
-            output_field=DecimalField(max_digits=15, decimal_places=2),
+            (F('subtotal') - F('discount_amount')) * F('exchange_rate'),
+            output_field=DecimalField(max_digits=24, decimal_places=6),
         )
         total_revenue = sales.aggregate(
-            total=Coalesce(Sum(revenue_expr), Decimal('0'), output_field=DecimalField(max_digits=15, decimal_places=2))
+            total=Coalesce(Sum(revenue_expr), Decimal('0'), output_field=DecimalField(max_digits=24, decimal_places=6))
         )['total']
         total_revenue = (total_revenue or Decimal('0')).quantize(Decimal('0.01'))
 
@@ -1472,7 +1508,8 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         gross_margin = (gross_profit / total_revenue * 100) if total_revenue > 0 else Decimal('0')
         
         # Dépenses de la période, converties en devise principale (montant × taux)
-        # pour être soustraites d'un chiffre d'affaires lui aussi en principale.
+        # pour être soustraites d'un chiffre d'affaires lui aussi en principale,
+        # ce qu'il est désormais.
         expenses = self._scope_expenses(
             Expense.objects.filter(
                 organization=org,
@@ -1509,6 +1546,10 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         rapport rend visible. Une ligne mixte (« 2 paquets + 3 bouteilles ») est
         répartie **au prorata** de chaque part, de sorte que la somme des deux
         colonnes égale exactement le chiffre d'affaires de la période.
+
+        La recette est convertie en devise principale au taux figé sur sa vente,
+        le coût NON : il vient du catalogue, qui n'a pas de devise. Voir
+        l'encadré de `profit_margins`, dont ce rapport est la ventilation.
         """
         from apps.sales.profit_allocation import (
             allocated_line_ht_revenues_for_sale, effective_unit_cost,
@@ -1533,7 +1574,13 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         }
 
         for sale in sales:
+            # `allocated_line_ht_revenues_for_sale` rend des montants dans la
+            # devise de la FACTURE : la conversion se fait ici, une fois par
+            # vente, plutôt que dans le module d'allocation, qui répartit une
+            # recette entre deux canaux et n'a pas à connaître les monnaies.
+            taux = sale.exchange_rate or Decimal('1')
             for item, line_revenue in allocated_line_ht_revenues_for_sale(sale):
+                line_revenue = (line_revenue * taux).quantize(Decimal('0.01'))
                 unit_cost = effective_unit_cost(item)
                 line_cost = (item.quantity * unit_cost).quantize(Decimal('0.01'))
 

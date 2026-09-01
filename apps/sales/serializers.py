@@ -196,9 +196,17 @@ class RegisterSessionOpenSerializer(serializers.Serializer):
     Le solde d'ouverture est hérité automatiquement, PAR DEVISE, de la dernière
     session fermée sur cette caisse (ou 0). `opening_balances` permet de surcharger
     les fonds d'ouverture par devise (ex. [{"currency": "USD", "amount": 20}]).
+
+    `opening_balance` est le SCALAIRE, appliqué à la devise principale : c'est
+    ce qu'un formulaire mono-devise envoie, et le terminal n'en envoie pas
+    d'autre. Même compatibilité que `counted_balance` à la clôture, et même
+    ordre de composition : le scalaire d'abord, la ventilation ensuite.
     """
 
     register = serializers.UUIDField()
+    opening_balance = serializers.DecimalField(
+        max_digits=15, decimal_places=2, required=False, allow_null=True,
+    )
     opening_balances = CurrencyAmountSerializer(many=True, required=False)
 
 

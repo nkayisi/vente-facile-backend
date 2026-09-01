@@ -1,8 +1,28 @@
 """
 Serializers DRF pour l'app Organizations.
 """
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 from .models import Organization, OrganizationMembership, Branch, OrganizationInvitation
+
+
+def _get_max_sale_discount_percent(organization):
+    """
+    Plafond de remise RÉSOLU, tel que le serveur l'opposera à la vente.
+
+    Exposé plutôt que déduit du champ `settings` brut, pour la même raison que
+    `max_redemption_percent_ceiling` : la règle (valeur réglée, défaut à 50,
+    plancher à 0, plafond à 100) vit dans `apps.sales.sale_validation` et nulle
+    part ailleurs. La laisser reconstruire par chaque surface, c'est l'écrire
+    trois fois et diverger au premier cas limite - le POS web la codait en dur
+    à 50, et le terminal bornait à 100.
+
+    Conséquence concrète des deux côtés : un marchand qui abaisse son plafond à
+    20 voyait le comptoir accepter 45 %, puis le serveur refuser la vente
+    ENTIÈRE, après l'annonce du prix au client.
+    """
+    from apps.sales.sale_validation import max_sale_discount_percent
+    return max_sale_discount_percent(organization)
 
 
 def _get_default_currency_info(organization):
@@ -51,14 +71,16 @@ class OrganizationListSerializer(serializers.ModelSerializer):
     )
     members_count = serializers.SerializerMethodField()
     default_currency_info = serializers.SerializerMethodField()
-    
+    max_sale_discount_percent = serializers.SerializerMethodField()
+
     class Meta:
         model = Organization
         fields = [
             'id', 'name', 'slug', 'business_type', 'business_type_display',
             'logo', 'email', 'phone', 'address', 'city', 'country',
             'tax_id', 'rccm', 'id_nat',
-            'is_active', 'members_count', 'default_currency_info', 'created_at'
+            'is_active', 'members_count', 'default_currency_info',
+            'max_sale_discount_percent', 'created_at'
         ]
         read_only_fields = ['id', 'slug', 'created_at']
 
@@ -67,6 +89,10 @@ class OrganizationListSerializer(serializers.ModelSerializer):
 
     def get_default_currency_info(self, obj):
         return _get_default_currency_info(obj)
+
+    @extend_schema_field(serializers.DecimalField(max_digits=5, decimal_places=2))
+    def get_max_sale_discount_percent(self, obj):
+        return _get_max_sale_discount_percent(obj)
 
 
 class OrganizationDetailSerializer(serializers.ModelSerializer):
@@ -77,7 +103,8 @@ class OrganizationDetailSerializer(serializers.ModelSerializer):
     )
     subscription_status = serializers.SerializerMethodField()
     default_currency_info = serializers.SerializerMethodField()
-    
+    max_sale_discount_percent = serializers.SerializerMethodField()
+
     class Meta:
         model = Organization
         fields = [
@@ -86,12 +113,17 @@ class OrganizationDetailSerializer(serializers.ModelSerializer):
             'tax_id', 'rccm', 'id_nat',
             'currency', 'timezone', 'is_active',
             'settings', 'subscription_status', 'default_currency_info',
+            'max_sale_discount_percent',
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'slug', 'created_at', 'updated_at']
 
     def get_default_currency_info(self, obj):
         return _get_default_currency_info(obj)
+
+    @extend_schema_field(serializers.DecimalField(max_digits=5, decimal_places=2))
+    def get_max_sale_discount_percent(self, obj):
+        return _get_max_sale_discount_percent(obj)
 
     def get_subscription_status(self, obj):
         subscription = obj.get_active_subscription()

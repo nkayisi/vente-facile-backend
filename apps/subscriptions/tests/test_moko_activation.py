@@ -274,7 +274,7 @@ class ReconciliationCadenceTests(_MokoBaseTest):
     """
 
     def _aged(self, payment, *, days_old, last_reconciled_ago=None):
-        """Vieillit un règlement en base (`created_at` est en auto_now_add)."""
+        """Vieillit un règlement en base, `created_at` étant posé à la création."""
         now = timezone.now()
         SubscriptionPayment.objects.filter(pk=payment.pk).update(
             created_at=now - timedelta(days=days_old),

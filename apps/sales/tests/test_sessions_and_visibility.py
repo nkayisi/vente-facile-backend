@@ -84,13 +84,35 @@ class RegisterSessionCloseTests(APITestCase):
     def _close_url(self):
         return f'/api/v1/register-sessions/{self.session.id}/close/'
 
-    def test_other_cashier_cannot_close(self):
+    def test_another_cashier_CAN_close(self):
+        """
+        Un autre caissier PEUT clôturer, et c'est délibéré.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ CE TEST AFFIRMAIT L'INVERSE, ET IL AVAIT TORT DEPUIS LONGTEMPS.     │
+        │                                                                      │
+        │ Il attendait un 403, en rouge permanent, noté « périmé » dans        │
+        │ CLAUDE.md depuis deux sessions. La docstring de `close` dit la règle  │
+        │ retenue : « tout membre ayant accès à l'entrepôt de la caisse peut    │
+        │ fermer la session, y compris une session ouverte par un autre         │
+        │ utilisateur ». Le périmètre entrepôt suffit, et il est déjà appliqué  │
+        │ par `get_object`.                                                     │
+        │                                                                      │
+        │ Le motif est concret : un caissier qui part à dix-huit heures sans    │
+        │ avoir tiré son Z ne doit pas bloquer la fermeture du magasin. Le      │
+        │ comptage porte le nom de qui clôture (`closed_by`), donc la           │
+        │ responsabilité reste traçable.                                        │
+        └──────────────────────────────────────────────────────────────────────┘
+        """
         self.client.force_authenticate(user=self.cashier_b)
         resp = self.client.post(
             self._close_url(), {}, format='json',
             HTTP_X_ORGANIZATION_ID=str(self.org.id),
         )
-        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN, resp.content)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.status, 'closed')
+        self.assertEqual(self.session.closed_by_id, self.cashier_b.id)
 
     def test_manager_can_close_other_user_session(self):
         self.client.force_authenticate(user=self.manager)

@@ -23,6 +23,7 @@ from apps.core.warehouse_scope import (
     get_membership_for_request,
 )
 from apps.core.api_permissions import (
+    DENY,
     IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission
 )
 from apps.subscriptions.services import SubscriptionService
@@ -223,8 +224,16 @@ class StockViewSet(ExportResponseMixin, WarehouseScopedQuerysetMixin, TenantView
         'by_warehouse': 'stock.view',
         'low_stock': 'stock.view',
         'expiring': 'stock.view',
+        # Lots d'un produit, en ordre FIFO : une lecture de stock comme ses
+        # voisines. Non déclarée, elle répondait 403 à tous les rôles.
+        'product_batches': 'stock.view',
         'export': 'stock.view',
         'unpack': 'stock_movements.create',
+        # Le corps de `create` répond déjà 405 avec la marche à suivre. Le
+        # laisser non déclaré le rendait inatteignable derrière un 403, qui
+        # dit « il vous manque un droit » là où la vérité est « cette écriture
+        # n'existe pas ». C'est la vue qui refuse, et elle le dit mieux.
+        'create': '*',
     }
 
     # Stock est en lecture seule - les modifications passent par les mouvements.
@@ -489,6 +498,13 @@ class StockMovementViewSet(ExportResponseMixin, WarehouseScopedQuerysetMixin, Te
         'create': 'stock_movements.create',
         'export': 'stock_movements.view',
         'supplies_export': 'stock_movements.view',
+        # Un mouvement de stock est une ÉCRITURE, au sens comptable : il se
+        # contrepasse par un autre mouvement, il ne se rature pas. Le
+        # modifier laisserait les `quantity_before`/`after` des mouvements
+        # suivants décrire un stock qui n'a jamais existé.
+        'update': DENY,
+        'partial_update': DENY,
+        'destroy': DENY,
     }
 
     def get_serializer_class(self):
@@ -566,132 +582,21 @@ class StockMovementViewSet(ExportResponseMixin, WarehouseScopedQuerysetMixin, Te
         )
         return self.render_export(spec, 'approvisionnement', fmt)
 
-    @transaction.atomic
     def perform_create(self, serializer):
-        """Crée un mouvement et met à jour le stock."""
-        from .packaging import PackagingService
-        from .services import FIFOService
+        """Le corps vit dans `stock_movements.create_stock_movement`.
 
-        organization = self.get_organization()
-        data = serializer.validated_data
-        assert_warehouse_allowed_for_request(self.request, data['warehouse'].id)
+        Il y est descendu pour que le journal de synchronisation puisse le
+        rejouer : `stock_movement.create` appelait `serializer.save()` en
+        direct, et ni le stock ni les lots ne bougeaient.
+        """
+        from .stock_movements import create_stock_movement
 
-        # Récupérer ou créer le stock avec verrouillage
-        product = data['product']
-        product_cost = product.cost_price if product.cost_price else Decimal('0.00')
-        stock, created = Stock.objects.select_for_update().get_or_create(
-            organization=organization,
-            product=product,
-            variant=data.get('variant'),
-            warehouse=data['warehouse'],
-            defaults={'quantity': Decimal('0.000'), 'avg_cost': product_cost}
+        create_stock_movement(
+            serializer,
+            organization=self.get_organization(),
+            user=self.request.user,
+            request=self.request,
         )
-        
-        quantity_before = stock.quantity
-        unit_cost = data.get('unit_cost') or Decimal('0.00')
-        movement_type = data.get('movement_type', '')
-        
-        # Si le stock existait mais sans avg_cost, initialiser depuis le produit
-        if not created and stock.avg_cost == 0 and product_cost > 0:
-            stock.avg_cost = product_cost
-        
-        # Pour les entrées de stock (approvisionnements), créer un lot
-        batch = data.get('batch')
-        if data['quantity'] > 0 and movement_type in STOCK_IN_MOVEMENT_TYPES:
-            # Créer un lot avec numéro auto-généré
-            location = data.get('location')
-            expiry_date = data.get('expiry_date')
-            
-            batch = FIFOService.add_to_batch(
-                organization=organization,
-                product=product,
-                warehouse=data['warehouse'],
-                quantity=data['quantity'],
-                cost_price=unit_cost if unit_cost > 0 else product_cost,
-                batch_number=None,  # Auto-généré par le service
-                variant=data.get('variant'),
-                location=location,
-                expiry_date=expiry_date,
-                notes=data.get('notes', ''),
-                user=self.request.user
-            )
-        
-        # Pour les sorties de stock, consommer les lots en FIFO
-        elif data['quantity'] < 0 and movement_type in ['sale', 'damage', 'expired', 'transfer_out', 'adjustment_out', 'production_out']:
-            quantity_to_consume = abs(data['quantity'])
-            allocations, remaining = FIFOService.consume_from_batches(
-                organization=organization,
-                product=product,
-                warehouse=data['warehouse'],
-                quantity=quantity_to_consume,
-                variant=data.get('variant'),
-                reference_type=movement_type,
-                reference_id=data.get('reference_id'),
-                user=self.request.user,
-                notes=data.get('notes', ''),
-                exclude_expired=(movement_type != 'expired'),
-                use_fefo=product.has_expiry_date if hasattr(product, 'has_expiry_date') else False
-            )
-            
-            # Associer le premier lot consommé au mouvement
-            if allocations:
-                batch = allocations[0].batch
-        
-        # Mettre à jour le coût moyen pondéré pour les entrées
-        if data['quantity'] > 0 and unit_cost > 0:
-            if stock.quantity > 0:
-                total_existing_value = stock.quantity * stock.avg_cost
-                total_new_value = data['quantity'] * unit_cost
-                stock.avg_cost = (
-                    (total_existing_value + total_new_value) /
-                    (stock.quantity + data['quantity'])
-                ).quantize(Decimal('0.01'))
-            else:
-                stock.avg_cost = unit_cost
-        
-        # Part de la saisie exprimée à l'unité : elle alimente (ou prélève) le
-        # vrac. Une entrée en conditionnements entiers laisse le vrac inchangé,
-        # puisque les emballages arrivent scellés.
-        delta_loose = data.get('input_loose_quantity')
-        if delta_loose is None:
-            # Saisie en quantité simple : sans indication de conditionnement, on
-            # considère qu'elle porte sur des unités hors emballage.
-            PackagingService.apply_base_delta(stock, product, data['quantity'])
-        else:
-            # Saisie « X contenants + Y unités » : chaque part va dans son
-            # compteur, sans jamais se convertir dans l'autre.
-            sign = -1 if data['quantity'] < 0 else 1
-            delta_packages = data.get('input_package_quantity') or Decimal('0.000')
-            PackagingService.apply_delta(
-                stock, product,
-                delta_packages=sign * abs(delta_packages),
-                delta_loose=sign * abs(delta_loose),
-            )
-        stock.last_movement_at = timezone.now()
-        stock.save()
-
-        # Créer le mouvement
-        serializer.save(
-            organization=organization,
-            batch=batch,
-            quantity_before=quantity_before,
-            quantity_after=stock.quantity,
-            created_by=self.request.user
-        )
-
-        # Report des prix sur la fiche produit, en dernier et dans la même
-        # transaction. En dernier parce que l'initialisation de `avg_cost`
-        # ci-dessus lit `product.cost_price` : écrire la fiche avant ferait
-        # démarrer un stock neuf au nouveau prix au lieu de l'ancien.
-        product_prices = serializer.validated_data.get('_product_prices')
-        if product_prices:
-            from apps.products.models import Product
-            from apps.products.pricing import ProductPricingService
-
-            # Verrou pris après celui du stock : ordre d'acquisition constant,
-            # sinon deux approvisionnements simultanés peuvent s'interbloquer.
-            locked_product = Product.objects.select_for_update().get(pk=product.pk)
-            ProductPricingService.apply(locked_product, product_prices)
 
 
 # =============================================================================
@@ -930,6 +835,18 @@ class InventorySessionViewSet(TransitionActionMixin, WarehouseScopedQuerysetMixi
         'cancel': 'inventory.cancel',
         'counts': 'inventory.view',
         'print_data': 'inventory.print',
+        # Le VERROU se lit au comptoir, donc par le caissier, qui n'a pas
+        # `inventory.view`. Sans cette ligne l'action n'était pas listée, donc
+        # refusée (403) à TOUS les rôles : le POS web appelait une route qui
+        # refusait, échouait en silence, et n'a jamais posé le moindre verrou.
+        # C'est ce qui a fait refuser une vente déjà encaissée et imprimée.
+        'locked_products': ['sales.view', 'inventory.view'],
+        # Une session avance par ses transitions. La modifier en écriture
+        # directe permettrait d'en changer le périmètre ou l'entrepôt après
+        # le verrouillage du stock, donc de compter un jeu de produits et
+        # d'en ajuster un autre.
+        'update': DENY,
+        'partial_update': DENY,
     }
 
     def perform_create(self, serializer):

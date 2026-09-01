@@ -37,6 +37,7 @@ from .serializers import (
     ProductBulkUpdateSerializer
 )
 from .services import ProductExcelService
+from apps.core.bulk import bulk_update_rows
 
 
 def _truthy_query_param(value) -> bool:
@@ -444,14 +445,14 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
         return queryset
 
     def perform_create(self, serializer):
-        organization = self.get_organization()
-        SubscriptionService.assert_can_add_products(organization, 1)
-        extra_kwargs = {}
-        if hasattr(serializer.Meta.model, "created_by"):
-            extra_kwargs["created_by"] = self.request.user
-        instance = serializer.save(organization=organization, **extra_kwargs)
-        self._assign_guardian_permissions(instance)
-        return instance
+        """Le corps vit dans `services.create_product`, partagé avec le journal."""
+        from .services import create_product
+
+        return create_product(
+            serializer,
+            organization=self.get_organization(),
+            user=self.request.user,
+        )
 
     @action(detail=True, methods=['get'])
     def stock(self, request, pk=None):
@@ -569,9 +570,11 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        queryset = self.get_queryset().filter(id__in=ids)
-        count = queryset.update(**update_data)
-        
+        # Une modification de prix en lot qui ne touche pas `updated_at`
+        # n'atteint AUCUN terminal : le comptoir vend au prix d'avant sans que
+        # rien ne le signale.
+        count = bulk_update_rows(self.get_queryset().filter(id__in=ids), **update_data)
+
         return Response({'updated': count})
 
     @action(detail=False, methods=['post'], url_path='bulk-delete')

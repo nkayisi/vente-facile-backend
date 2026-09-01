@@ -37,7 +37,8 @@ api_v1_patterns = [
     path('', include('apps.subscriptions.urls')),
     path('platform-admin/', include('apps.platform_admin.urls')),
     
-    # Sync API (WatermelonDB)
+    # Sync API : /sync/pull/ et /sync/operations/ pour vf-marchand, plus
+    # l'ancien /sync/ conserve pour l'application heritee.
     path('', include('apps.sync.urls')),
 ]
 

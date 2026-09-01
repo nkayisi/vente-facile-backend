@@ -85,9 +85,11 @@ class SubscriptionMiddleware(MiddlewareMixin):
     # La LECTURE reste ouverte : consulter ses propres données ne se monnaie
     # pas, et un marchand impayé doit pouvoir sortir son historique. C'est
     # l'écriture qui se ferme.
+    #
+    # `/api/v1/sync/` et `/api/v1/sync/status/` ont disparu avec l'application
+    # héritée : ne pas les réintroduire ici, une exemption sur une route morte
+    # rouvrirait le trou le jour où le chemin resservirait.
     EXEMPT_EXACT_PATHS = {
-        '/api/v1/sync/',
-        '/api/v1/sync/status/',
         '/api/v1/sync/pull/',
         '/api/v1/sync/pull/manifest/',
     }

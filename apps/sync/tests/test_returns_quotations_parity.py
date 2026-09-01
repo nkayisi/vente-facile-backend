@@ -248,3 +248,113 @@ class RetourTests(_BaseTest):
         ).quantity
         self.assertEqual(avant, apres)
         self.assertEqual(SaleReturn.objects.get(id=retour).status, 'rejected')
+
+
+class RetourEnRolBorneTests(_BaseTest):
+    """
+    Le retour vu par un rôle BORNÉ, et non par le propriétaire.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ C'EST LE RÔLE QUI RÉVÈLE LE DÉFAUT, PAS LE SCÉNARIO.                     │
+    │                                                                          │
+    │ Toutes les vérifications du lot 11 ont été faites en propriétaire, pour  │
+    │ qui `accessible_warehouse_ids` sort en amont. Sous un rôle borné, le     │
+    │ handler refusait TOUT retour : `SaleReturnCreateSerializer` ne porte pas │
+    │ `warehouse` dans ses champs (un retour n'a pas d'entrepôt à lui, il      │
+    │ hérite de celui de sa vente), donc `validated_data.get('warehouse')`     │
+    │ valait toujours `None`, et `assert_warehouse_allowed_for_request` répond │
+    │ « Un entrepôt est requis pour votre compte » à quiconque n'est pas       │
+    │ propriétaire.                                                            │
+    │                                                                          │
+    │ Le handler avait ajouté une règle que la VUE n'a pas : `SaleReturnViewSet`│
+    │ n'appelle jamais cette assertion. Le périmètre est déjà vérifié, au bon  │
+    │ endroit, sur la vente d'origine (`SaleReturnCreateSerializer.validate`). │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
+    def setUp(self):
+        super().setUp()
+        # Le gérant est le rôle le plus faible qui porte `sale_returns.create`.
+        self.client.force_authenticate(user=self.manager)
+
+    def _vente_due(self):
+        corps = {
+            'register': str(self.register.id),
+            'warehouse': str(self.warehouse.id),
+            'sale_type': 'credit',
+            'is_pos': True,
+            'customer': str(self.acheteur.id),
+            'items': [{
+                'product': str(self.produit.id),
+                'quantity': '2',
+                'unit_price': '1000.00',
+            }],
+            'payments': [],
+        }
+        reponse = self.client.post(
+            '/api/v1/sales/', corps, format='json', **self._headers()
+        )
+        self.assertEqual(reponse.status_code, status.HTTP_201_CREATED, reponse.data)
+        return Sale.objects.get(id=reponse.data['id'])
+
+    def test_un_gerant_peut_creer_un_retour_depuis_son_terminal(self):
+        vente = self._vente_due()
+        ligne = vente.items.first()
+        verdict = self._verdict(self._send(
+            'sale_return.create',
+            {
+                'original_sale': str(vente.id),
+                'reason': 'Article défectueux',
+                'items': [{
+                    'original_item': str(ligne.id),
+                    'product': str(self.produit.id),
+                    'quantity': '1',
+                    'unit_price': '1000.00',
+                    'total': '1000.00',
+                }],
+            },
+            '66666666-6666-4666-8666-666666666666',
+        ))
+        self.assertEqual(SaleReturn.objects.count(), 1)
+        self.assertIn('sale_return', verdict['server_ids'])
+        # L'AUTEUR : le back-office le pose par `AuditMixin`, les handlers le
+        # laissaient nul. « Qui a créé ce retour » est une question qu'on pose
+        # toujours après coup, et à laquelle un champ vide ne répond pas.
+        retour = SaleReturn.objects.get()
+        self.assertEqual(retour.created_by_id, self.manager.id)
+
+    def test_une_vente_hors_perimetre_reste_refusee(self):
+        """
+        La suppression du contrôle en trop ne doit pas ouvrir la porte.
+
+        Le vrai périmètre vit dans le serializer, sur la vente d'ORIGINE : un
+        retour sur une vente d'un entrepôt qu'on ne couvre pas reste refusé.
+        """
+        from apps.inventory.models import Warehouse
+
+        vente = self._vente_due()
+        ailleurs = Warehouse.objects.create(
+            organization=self.org, name='Dépôt 2', code='D2',
+        )
+        Sale.objects.filter(id=vente.id).update(warehouse=ailleurs)
+
+        ligne = vente.items.first()
+        self._verdict(
+            self._send(
+                'sale_return.create',
+                {
+                    'original_sale': str(vente.id),
+                    'reason': 'Article défectueux',
+                    'items': [{
+                        'original_item': str(ligne.id),
+                        'product': str(self.produit.id),
+                        'quantity': '1',
+                        'unit_price': '1000.00',
+                        'total': '1000.00',
+                    }],
+                },
+                '77777777-7777-4777-8777-777777777777',
+            ),
+            'rejected',
+        )
+        self.assertEqual(SaleReturn.objects.count(), 0)

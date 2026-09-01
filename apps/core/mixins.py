@@ -2,6 +2,7 @@ from django.http import Http404
 from rest_framework import status
 from rest_framework.response import Response
 from apps.organizations.models import Organization
+from apps.core.bulk import bulk_update_rows
 
 
 class TenantQuerysetMixin:
@@ -83,9 +84,8 @@ class BulkActionMixin:
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        queryset = self.get_queryset().filter(id__in=ids)
-        count = queryset.update(**data)
-        
+        count = bulk_update_rows(self.get_queryset().filter(id__in=ids), **data)
+
         return Response({'updated': count})
 
 

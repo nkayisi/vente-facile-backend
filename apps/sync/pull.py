@@ -22,10 +22,19 @@ Trois principes ici :
    client d'en décider, d'où `has_more` : il conserve son curseur tant que le
    serveur annonce des pages restantes.
 
-Réserve connue : `queryset.update()` ne déclenche pas `auto_now` et rend donc
-une écriture invisible au tirage. Le défaut existait déjà avec `sync_updated_at`,
-qui n'est posé que dans `save()`. Toute écriture en masse doit toucher
-`updated_at` explicitement.
+Réserve LEVÉE, mais à ne pas rouvrir : `queryset.update()` ne déclenche pas
+`auto_now` et rend donc une écriture invisible au tirage, définitivement et sur
+tous les terminaux. Cette réserve était écrite ici depuis le lot 2, et les NEUF
+sites du dépôt l'ignoraient : les points de fidélité, le catalogue en lot, la
+devise principale, les deux mixins d'écriture en masse et les règlements. Le
+défaut a été relevé en base, pas déduit (704,13 points côté serveur, 372,65 sur
+le terminal, même horodatage).
+
+Toute écriture en masse passe désormais par
+[`apps.core.bulk.bulk_update_rows`](../core/bulk.py), et
+`apps/core/tests/test_bulk_write_visibility.py` refuse tout `update()` nu sur un
+queryset, en lisant l'AST du dépôt. Une règle qu'il faut se rappeler à chaque
+appel finit par être oubliée.
 """
 import base64
 import json
@@ -453,8 +462,17 @@ PULL_TABLES = (
     # Ni l'un ni l'autre n'avait d'écran, nulle part : le terminal crée la
     # référence. Leurs lignes descendent IMBRIQUÉES, comme celles d'une vente -
     # elles n'ont pas de suppression douce.
+    #
+    # Un RETOUR n'a pas d'entrepôt à lui : il en hérite de sa vente d'origine.
+    # Écrire `warehouse_id` ici lève un `FieldError`, donc un 500 sur le tirage
+    # de la table, sur la sonde `pull/changed/` ET sur `pull/manifest/?counts=1`
+    # - c'est-à-dire la PREMIÈRE synchronisation d'un terminal, bloquée net,
+    # pour tout membre non-owner ayant un entrepôt assigné. Un `owner` sort du
+    # périmètre avant le filtre : les tests qui n'ouvrent qu'une session de
+    # propriétaire ne touchent jamais cette ligne.
     PullTable('sale_returns', 'sales.SaleReturn', soft_delete=True,
-              warehouse_path='warehouse_id', children=RETURN_CHILDREN),
+              warehouse_path='original_sale__warehouse_id',
+              children=RETURN_CHILDREN),
     PullTable('quotations', 'sales.Quotation', soft_delete=True,
               children=QUOTATION_CHILDREN),
 

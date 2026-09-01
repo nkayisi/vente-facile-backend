@@ -22,6 +22,7 @@ from apps.core.warehouse_scope import (
     get_membership_for_request,
 )
 from apps.core.api_permissions import (
+    DENY,
     IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission
 )
 from .models import (
@@ -88,6 +89,10 @@ class PurchaseOrderViewSet(
         'approve': 'purchases.edit',
         'send': 'purchases.edit',
         'cancel': 'purchases.edit',
+        # Lecture des commandes en attente de réception. Non déclarée, donc
+        # refusée à tous : l'endpoint figure au schéma OpenAPI et ne répondait
+        # à personne.
+        'pending': 'purchases.view',
     }
 
     def get_serializer_class(self):
@@ -231,6 +236,11 @@ class GoodsReceiptViewSet(
         'create': 'purchases.receive',
         'complete': 'purchases.receive',
         'cancel': 'purchases.edit',
+        # Une réception se complète ou s'annule, elle ne se réécrit pas :
+        # ses lignes ont déjà bougé le stock et le coût moyen pondéré.
+        'update': DENY,
+        'partial_update': DENY,
+        'destroy': DENY,
     }
 
     def get_serializer_class(self):
@@ -336,6 +346,11 @@ class SupplierPaymentViewSet(
         'retrieve': 'purchases.view',
         'create': 'purchases.edit',
         'cancel': 'purchases.edit',
+        # Un règlement fournisseur s'annule, il ne se corrige pas : le
+        # réécrire changerait un montant déjà imputé à des factures.
+        'update': DENY,
+        'partial_update': DENY,
+        'destroy': DENY,
     }
 
     def get_queryset(self):
@@ -441,6 +456,12 @@ class PurchaseReturnViewSet(
         'approve': 'purchases.edit',
         'ship': 'purchases.receive',
         'cancel': 'purchases.edit',
+        # Un retour fournisseur avance par ses transitions (`approve`,
+        # `ship`, `cancel`). Le modifier après coup ferait diverger le stock
+        # sorti de la pièce qui le justifie.
+        'update': DENY,
+        'partial_update': DENY,
+        'destroy': DENY,
     }
 
     def get_serializer_class(self):

@@ -234,38 +234,15 @@ class ExpenseViewSet(
 
         return queryset
 
-    @staticmethod
-    def _resolve_currency(serializer, organization):
-        """Devise + taux d'une dépense, résolus côté serveur.
-
-        ``Expense.exchange_rate`` a un défaut modèle de 1.000000, donc
-        ``validated_data`` en contient toujours un : on ne considère un taux
-        comme « fourni par le client » que s'il est présent dans le payload
-        brut. Sinon une dépense en USD serait enregistrée au taux 1.
-        """
-        from .services import resolve_currency_rate
-        rate = (
-            serializer.validated_data.get('exchange_rate')
-            if 'exchange_rate' in serializer.initial_data
-            else None
-        )
-        return resolve_currency_rate(
-            organization, serializer.validated_data.get('currency'), rate
-        )
-
     def perform_create(self, serializer):
-        # Vérifie le périmètre warehouse avant de générer la référence.
-        self._assert_warehouse_on_save(serializer)
-        from apps.core.utils import ReferenceGenerator
-        organization = self.get_organization()
-        reference = ReferenceGenerator.generate_expense_reference(organization)
-        currency, exchange_rate = self._resolve_currency(serializer, organization)
-        serializer.save(
-            organization=organization,
-            reference=reference,
-            currency=currency,
-            exchange_rate=exchange_rate,
-            created_by=self.request.user,
+        """Le corps vit dans `services.create_expense`, que le journal appelle aussi."""
+        from .services import create_expense
+
+        create_expense(
+            serializer,
+            organization=self.get_organization(),
+            user=self.request.user,
+            request=self.request,
         )
 
     def perform_update(self, serializer):
@@ -280,7 +257,13 @@ class ExpenseViewSet(
         organization = self.get_organization()
         if 'currency' not in serializer.validated_data:
             serializer.validated_data['currency'] = expense.currency
-        currency, exchange_rate = self._resolve_currency(serializer, organization)
+        from .services import resolve_currency_rate, _taux_du_client
+
+        currency, exchange_rate = resolve_currency_rate(
+            organization,
+            serializer.validated_data.get('currency'),
+            _taux_du_client(serializer),
+        )
         serializer.save(currency=currency, exchange_rate=exchange_rate)
 
     @action(detail=True, methods=['post'])
@@ -659,45 +642,13 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         return queryset
 
     def perform_create(self, serializer):
-        """Créer un mouvement de caisse manuel (multi-devise)."""
-        from apps.core.utils import ReferenceGenerator
-        from .services import (
-            get_open_session_for_user, _get_last_balance, resolve_currency_rate,
-        )
-        organization = self.get_organization()
+        """Le corps vit dans `services.create_manual_cash_movement`, partagé avec le journal."""
+        from .services import create_manual_cash_movement
 
-        amount = serializer.validated_data['amount']
-        direction = serializer.validated_data['direction']
-
-        # Devise + taux résolus côté serveur (le taux sert à reconvertir en
-        # devise principale dans les rapports comptables). Le défaut modèle de
-        # `exchange_rate` étant 1.000000, on ne retient un taux client que s'il
-        # figure explicitement dans le payload.
-        rate = (
-            serializer.validated_data.get('exchange_rate')
-            if 'exchange_rate' in serializer.initial_data
-            else None
-        )
-        currency, exchange_rate = resolve_currency_rate(
-            organization, serializer.validated_data.get('currency'), rate
-        )
-
-        # Solde courant DE LA DEVISE du mouvement (le tiroir est suivi par devise).
-        previous_balance = _get_last_balance(organization, currency)
-        new_balance = previous_balance + amount if direction == 'in' else previous_balance - amount
-
-        # Rattache l'apport/retrait à la session ouverte du membre (caisse nette
-        # + visibilité entrepôt des mouvements manuels via session.register).
-        session = get_open_session_for_user(organization, self.request.user)
-
-        serializer.save(
-            organization=organization,
-            reference=ReferenceGenerator.generate_cash_movement_reference(organization),
-            currency=currency,
-            exchange_rate=exchange_rate,
-            balance_after=new_balance,
-            session=session,
-            created_by=self.request.user,
+        create_manual_cash_movement(
+            serializer,
+            organization=self.get_organization(),
+            user=self.request.user,
         )
 
     @action(detail=True, methods=['post'])

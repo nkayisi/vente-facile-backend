@@ -11,7 +11,7 @@ from django.utils import timezone
 from decimal import Decimal
 
 from apps.core.mixins import TenantQuerysetMixin
-from apps.core.api_permissions import IsTenantMember, HasActiveSubscription, HasPermission
+from apps.core.api_permissions import IsTenantMember, HasActiveSubscription, HasPermission, DENY
 from apps.contacts.models import Customer
 
 from .models import (
@@ -29,6 +29,7 @@ from .serializers import (
     UpdateExchangeRateSerializer, CurrencyConversionSerializer
 )
 from .services import CurrencyService
+from apps.core.bulk import bulk_update_rows
 
 
 class CurrencyViewSet(viewsets.ReadOnlyModelViewSet):
@@ -125,10 +126,17 @@ class OrganizationCurrencyViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
         
         with transaction.atomic():
             # Désactiver l'ancienne devise principale (si aucune n'existe encore)
-            OrganizationCurrency.objects.filter(
-                organization=org,
-                is_primary=True
-            ).update(is_primary=False)
+            # `bulk_update_rows` : rétrograder l'ancienne devise principale par
+            # un `update()` nu laissait sa ligne avec l'horodatage d'avant, donc
+            # INVISIBLE au tirage. Le terminal gardait DEUX devises principales,
+            # et c'est le taux de change qui décide de chaque montant au comptoir.
+            bulk_update_rows(
+                OrganizationCurrency.objects.filter(
+                    organization=org,
+                    is_primary=True,
+                ),
+                is_primary=False,
+            )
             
             # Activer la nouvelle
             instance.is_primary = True
@@ -137,8 +145,9 @@ class OrganizationCurrencyViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
             
             # Synchroniser Organization.currency
             from apps.organizations.models import Organization
-            Organization.objects.filter(id=org.id).update(
-                currency=instance.currency.code
+            bulk_update_rows(
+                Organization.objects.filter(id=org.id),
+                currency=instance.currency.code,
             )
 
         # Sans cela, les caches 5 min de CurrencyService continueraient de servir
@@ -333,6 +342,14 @@ class CustomerLoyaltyViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
         'adjust_points': 'settings.manage',
         'redeem': 'sales.create',
         'transactions': 'customers.view',
+        # Une fiche de fidélité NAÎT avec son client et se modifie par les
+        # actions ci-dessus (`adjust_points`, `redeem`), jamais en écriture
+        # directe : un PATCH sur `current_points` ne laisserait aucune trace
+        # de transaction, et le solde du client cesserait d'être justifiable.
+        'create': DENY,
+        'update': DENY,
+        'partial_update': DENY,
+        'destroy': DENY,
     }
     
     def get_queryset(self):
@@ -499,6 +516,10 @@ class OrganizationSettingsViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
         'create': 'settings.manage',
         'update': 'settings.manage',
         'partial_update': 'settings.manage',
+        # Les paramètres d'une organisation se modifient, ils ne se
+        # suppriment pas : l'absence de ligne ferait retomber devise,
+        # fiscalité et en-tête de reçu sur des défauts, en silence.
+        'destroy': DENY,
     }
     
     def list(self, request, *args, **kwargs):

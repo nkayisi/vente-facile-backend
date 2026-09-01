@@ -22,10 +22,41 @@ def _require(payload, *keys):
         )
 
 
+def _sauver_avec_audit(ctx, serializer, local_id=None, **extra):
+    """
+    Enregistre comme le ferait `AuditMixin.perform_create`.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ L'AUTEUR D'UNE PIÈCE N'EST PAS UN ORNEMENT.                              │
+    │                                                                          │
+    │ `created_by` répond à « qui a créé ce retour, cet ajustement, cette      │
+    │ session d'inventaire ». Le back-office le pose par son mixin ; les       │
+    │ handlers appelaient `serializer.save(organization=...)` et le laissaient │
+    │ nul. Une pièce créée depuis un terminal n'avait donc pas d'auteur, et    │
+    │ les permissions d'objet (`django-guardian`), sur lesquelles trois vues   │
+    │ s'appuient, n'étaient jamais attribuées.                                 │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+    from guardian.shortcuts import assign_perm
+
+    champs = {'organization': ctx.organization, **extra}
+    if hasattr(serializer.Meta.model, 'created_by'):
+        champs['created_by'] = ctx.user
+    if local_id:
+        champs['id'] = local_id
+
+    instance = serializer.save(**champs)
+
+    nom = instance._meta.model_name
+    for perm in (f'view_{nom}', f'change_{nom}', f'delete_{nom}'):
+        assign_perm(perm, ctx.user, instance)
+    return instance
+
+
 # ----------------------------------------------------------------------- vente
 
 
-@handler('sale.create')
+@handler('sale.create', permission='sales.create')
 def sale_create(ctx, payload):
     """
     Une vente, par le chemin exact du point de vente web.
@@ -70,7 +101,7 @@ def sale_create(ctx, payload):
     }
 
 
-@handler('sale.add_payment')
+@handler('sale.add_payment', permission='sales.create')
 def sale_add_payment(ctx, payload):
     """
     Un règlement sur une facture déjà émise.
@@ -119,11 +150,20 @@ def sale_add_payment(ctx, payload):
     }
 
 
-@handler('sale.cancel')
+@handler('sale.cancel', permission='sales.cancel')
 def sale_cancel(ctx, payload):
+    """
+    Annule une vente, par le SERVICE du back-office.
+
+    Ce handler réécrivait le corps de la vue, et avait déjà dérivé sur quatre
+    points : la règle « on n'annule que ses propres ventes », le mouvement de
+    caisse d'annulation, le type d'écriture client, et l'écrasement des notes.
+    Voir `sales.services.cancel_sale`.
+    """
+    from apps.core.api_permissions import is_manager_or_above
     from apps.sales.models import Sale
     from apps.sales.serializers import SaleDetailSerializer
-    from apps.sales.views import SaleViewSet  # noqa: F401 - documente le chemin web
+    from apps.sales.services import AnnulationRefusee, cancel_sale
 
     _require(payload, 'sale')
     sale = Sale.objects.filter(
@@ -132,37 +172,19 @@ def sale_cancel(ctx, payload):
     if sale is None:
         raise OperationRejected("Cette vente n'existe pas.", code='sale_not_found')
 
-    from apps.sales.services import SaleStockService
-    from apps.settings.services import LoyaltyService
-    from apps.contacts import services as contacts_services
-
-    if sale.status in ('cancelled', 'refunded'):
-        # Déjà annulée : le verdict est le même qu'un succès, sans quoi le
-        # terminal réessaierait indéfiniment une annulation déjà faite.
-        return {
-            'server_ids': {'sale': str(sale.id)},
-            'authoritative': SaleDetailSerializer(sale).data,
-        }
-
-    if sale.stock_reserved:
-        SaleStockService.release_reservation(sale, ctx.user)
-    if SaleStockService.is_committed(sale):
-        SaleStockService.revert(sale, ctx.user)
-
-    if sale.customer and sale.amount_due > 0:
-        contacts_services.adjust_balance(
-            sale.customer, -sale.amount_due,
-            currency=sale.currency, exchange_rate=sale.exchange_rate,
-            notes=f"Annulation de la vente {sale.reference}", user=ctx.user,
+    try:
+        cancel_sale(
+            sale, ctx.user,
+            reason=payload.get('reason', ''),
+            autorise_toutes_ventes=is_manager_or_above(ctx.request),
         )
+    except AnnulationRefusee as e:
+        # Déterministe : la vente ne deviendra pas la sienne en réessayant.
+        raise OperationRejected(str(e), code='not_own_sale')
 
-    LoyaltyService.reverse_sale_transactions(sale, ctx.user)
-
-    sale.status = 'cancelled'
-    sale.amount_due = 0
-    sale.notes = (payload.get('reason') or sale.notes)
-    sale.save()
-
+    # Une vente déjà annulée rend un SUCCÈS : le contraire ferait réessayer
+    # indéfiniment une annulation déjà faite.
+    sale.refresh_from_db()
     return {
         'server_ids': {'sale': str(sale.id)},
         'authoritative': SaleDetailSerializer(sale).data,
@@ -172,53 +194,52 @@ def sale_cancel(ctx, payload):
 # ----------------------------------------------------------------------- caisse
 
 
-@handler('register_session.open')
+@handler('register_session.open', permission='sales.create')
 def register_session_open(ctx, payload):
     """
-    Ouvre une session de caisse.
+    Ouvre une session de caisse, par le SERVICE du back-office.
 
     Le refus le plus probable et le plus important : une contrainte d'unicité
-    interdit deux sessions ouvertes sur une même caisse. Un terminal qui a ouvert
-    une session hors ligne pendant qu'un autre le faisait aussi verra son
+    interdit deux sessions ouvertes sur une même caisse. Un terminal qui a
+    ouvert une session hors ligne pendant qu'un autre le faisait aussi verra son
     opération refusée, et toutes les ventes qui s'y rattachaient avec elle. Le
-    message doit donc dire QUI l'a ouverte et QUAND.
+    message doit donc dire QUI l'a ouverte et QUAND - c'est `SessionDejaOuverte`
+    qui le porte.
+
+    Ce handler créait la session à la main, sans périmètre entrepôt et sans
+    aucune ligne `RegisterSessionCurrencyBalance` : le tiroir en devise
+    secondaire partait de zéro, et le Z annonçait un écart tous les soirs.
+
+    LE FONDS COMPTÉ PAR LE CAISSIER EST UN SCALAIRE, et il faut le transmettre.
+    L'écran d'ouverture du terminal ne demande qu'un montant, en devise
+    principale, et l'envoie sous `opening_balance` (singulier). Ne relayer que
+    `opening_balances` le jetait en silence : la session ouvrait à zéro, et le
+    Z du soir annonçait un excédent égal au fonds, tous les soirs, sur toutes
+    les caisses ouvertes depuis un terminal. Les deux champs sont passés au
+    service, qui les compose dans le même ordre qu'à la clôture.
     """
-    from apps.sales.models import Register, RegisterSession
+    from apps.sales.register_sessions import (
+        CaisseIntrouvable, SessionDejaOuverte, open_register_session,
+    )
     from apps.sales.serializers import RegisterSessionDetailSerializer
 
     _require(payload, 'register')
 
-    register = Register.objects.filter(
-        id=payload['register'], organization=ctx.organization, is_active=True
-    ).first()
-    if register is None:
-        raise OperationRejected("Caisse introuvable ou inactive.", code='register_not_found')
-
-    ouverte = RegisterSession.objects.select_for_update().filter(
-        register=register, status='open'
-    ).first()
-    if ouverte is not None:
-        if str(ouverte.id) == str(payload.get('id')):
-            return {
-                'server_ids': {'session': str(ouverte.id)},
-                'authoritative': RegisterSessionDetailSerializer(ouverte).data,
-            }
-        raise OperationRejected(
-            f"Une session est déjà ouverte sur {register.name}, "
-            f"par {ouverte.opened_by.full_name if ouverte.opened_by else 'un autre utilisateur'} "
-            f"le {ouverte.opened_at:%d/%m à %H:%M}.",
-            code='session_already_open',
+    try:
+        session = open_register_session(
+            ctx.organization,
+            payload['register'],
+            ctx.user,
+            opening_balance=payload.get('opening_balance'),
+            opening_balances=payload.get('opening_balances'),
+            session_id=payload.get('id'),
+            request=ctx.request,
         )
+    except CaisseIntrouvable as e:
+        raise OperationRejected(str(e), code='register_not_found')
+    except SessionDejaOuverte as e:
+        raise OperationRejected(str(e), code='session_already_open')
 
-    session = RegisterSession.objects.create(
-        id=payload.get('id') or None,
-        organization=ctx.organization,
-        register=register,
-        opened_by=ctx.user,
-        opening_balance=payload.get('opening_balance') or 0,
-        status='open',
-        notes=payload.get('notes', ''),
-    )
     return {
         'server_ids': {'session': str(session.id)},
         'authoritative': RegisterSessionDetailSerializer(session).data,
@@ -228,7 +249,7 @@ def register_session_open(ctx, payload):
 # ---------------------------------------------------------------------- clients
 
 
-@handler('customer.create')
+@handler('customer.create', permission='customers.create')
 def customer_create(ctx, payload):
     from apps.contacts.serializers import CustomerCreateSerializer, CustomerDetailSerializer
 
@@ -245,7 +266,7 @@ def customer_create(ctx, payload):
     }
 
 
-@handler('customer.record_payment')
+@handler('customer.record_payment', permission='customers.edit')
 def customer_record_payment(ctx, payload):
     """
     Règlement porté au compte d'un client.
@@ -306,7 +327,7 @@ def customer_record_payment(ctx, payload):
     }
 
 
-@handler('customer.adjust_balance')
+@handler('customer.adjust_balance', permission='customers.edit')
 def customer_adjust_balance(ctx, payload):
     """
     Ajustement manuel du solde d'un client.
@@ -351,7 +372,7 @@ def customer_adjust_balance(ctx, payload):
 # ------------------------------------------------------------------------ stock
 
 
-@handler('stock_movement.create')
+@handler('stock_movement.create', permission='stock_movements.create')
 def stock_movement_create(ctx, payload):
     """
     Un mouvement de stock, par le serializer du back-office.
@@ -364,26 +385,30 @@ def stock_movement_create(ctx, payload):
     """
     from apps.inventory.serializers import StockMovementCreateSerializer, StockMovementDetailSerializer
 
+    from apps.inventory.stock_movements import create_stock_movement
+
     local_id = payload.pop('id', None)
     serializer = StockMovementCreateSerializer(
         data=payload, context={'request': ctx.request}
     )
     serializer.is_valid(raise_exception=True)
-
-    assert_warehouse_allowed_for_request(
-        ctx.request,
-        getattr(serializer.validated_data.get('warehouse'), 'id', None),
-        allow_none=True,
+    # Le périmètre entrepôt est vérifié DANS le service, comme pour la vue :
+    # l'entrepôt n'est jamais facultatif sur un mouvement, et le tolérer nul
+    # ici était une règle que la vue n'avait pas.
+    movement = create_stock_movement(
+        serializer,
+        organization=ctx.organization,
+        user=ctx.user,
+        request=ctx.request,
+        **({'id': local_id} if local_id else {}),
     )
-
-    movement = serializer.save(**({'id': local_id} if local_id else {}))
     return {
         'server_ids': {'stock_movement': str(movement.id)},
         'authoritative': StockMovementDetailSerializer(movement).data,
     }
 
 
-@handler('register_session.close')
+@handler('register_session.close', permission='sales.create')
 def register_session_close(ctx, payload):
     """
     Clôture d'une session de caisse.
@@ -399,7 +424,7 @@ def register_session_close(ctx, payload):
     """
     from apps.sales.models import RegisterSession
     from apps.sales.serializers import RegisterSessionDetailSerializer
-    from apps.sales.session_close import close_register_session
+    from apps.sales.register_sessions import close_register_session
 
     _require(payload, 'session')
     session = RegisterSession.objects.filter(
@@ -425,7 +450,7 @@ def register_session_close(ctx, payload):
 
 def _refus_si_impossible_caisse(fonction, *args, **kwargs):
     """Traduit un refus de clôture en refus d'opération, donc en quarantaine."""
-    from apps.sales.session_close import TransitionRefusee
+    from apps.sales.register_sessions import TransitionRefusee
     try:
         return fonction(*args, **kwargs)
     except TransitionRefusee as exc:
@@ -456,7 +481,7 @@ def _objet_de_lorg(modele, ctx, identifiant, quoi):
     return objet
 
 
-@handler('stock.unpack')
+@handler('stock.unpack', permission='stock_movements.create')
 def stock_unpack(ctx, payload):
     """
     Ouvre des conditionnements scellés. Geste de comptoir, donc hors ligne.
@@ -482,7 +507,7 @@ def stock_unpack(ctx, payload):
     }
 
 
-@handler('stock_transfer.create')
+@handler('stock_transfer.create', permission='stock_transfers.create')
 def stock_transfer_create(ctx, payload):
     from apps.inventory.serializers import (
         StockTransferCreateSerializer, StockTransferDetailSerializer,
@@ -503,9 +528,7 @@ def stock_transfer_create(ctx, payload):
             allow_none=True,
         )
 
-    transfert = serializer.save(
-        organization=ctx.organization, **({'id': local_id} if local_id else {})
-    )
+    transfert = _sauver_avec_audit(ctx, serializer, local_id)
     return {
         'server_ids': {'stock_transfer': str(transfert.id)},
         'authoritative': StockTransferDetailSerializer(transfert).data,
@@ -528,19 +551,19 @@ def _transition_transfert(ctx, payload, fonction, **extra):
     }
 
 
-@handler('stock_transfer.approve')
+@handler('stock_transfer.approve', permission='stock_transfers.ship')
 def stock_transfer_approve(ctx, payload):
     from apps.inventory.services import approve_transfer
     return _transition_transfert(ctx, payload, approve_transfer)
 
 
-@handler('stock_transfer.ship')
+@handler('stock_transfer.ship', permission='stock_transfers.ship')
 def stock_transfer_ship(ctx, payload):
     from apps.inventory.services import ship_transfer
     return _transition_transfert(ctx, payload, ship_transfer)
 
 
-@handler('stock_transfer.receive')
+@handler('stock_transfer.receive', permission='stock_transfers.receive')
 def stock_transfer_receive(ctx, payload):
     """
     Réception. `items` porte ce que le magasinier a RÉELLEMENT compté, en
@@ -552,13 +575,13 @@ def stock_transfer_receive(ctx, payload):
     )
 
 
-@handler('stock_transfer.cancel')
+@handler('stock_transfer.cancel', permission='stock_transfers.cancel')
 def stock_transfer_cancel(ctx, payload):
     from apps.inventory.services import cancel_transfer
     return _transition_transfert(ctx, payload, cancel_transfer)
 
 
-@handler('stock_adjustment.create')
+@handler('stock_adjustment.create', permission='stock_adjustments.create')
 def stock_adjustment_create(ctx, payload):
     from apps.inventory.serializers import (
         StockAdjustmentCreateSerializer, StockAdjustmentDetailSerializer,
@@ -575,9 +598,7 @@ def stock_adjustment_create(ctx, payload):
         allow_none=True,
     )
 
-    ajustement = serializer.save(
-        organization=ctx.organization, **({'id': local_id} if local_id else {})
-    )
+    ajustement = _sauver_avec_audit(ctx, serializer, local_id)
     return {
         'server_ids': {'stock_adjustment': str(ajustement.id)},
         'authoritative': StockAdjustmentDetailSerializer(ajustement).data,
@@ -601,13 +622,13 @@ def _transition_ajustement(ctx, payload, fonction):
     }
 
 
-@handler('stock_adjustment.approve')
+@handler('stock_adjustment.approve', permission='stock_adjustments.approve')
 def stock_adjustment_approve(ctx, payload):
     from apps.inventory.services import approve_adjustment
     return _transition_ajustement(ctx, payload, approve_adjustment)
 
 
-@handler('stock_adjustment.reject')
+@handler('stock_adjustment.reject', permission='stock_adjustments.approve')
 def stock_adjustment_reject(ctx, payload):
     from apps.inventory.services import reject_adjustment
     return _transition_ajustement(ctx, payload, reject_adjustment)
@@ -628,23 +649,30 @@ def _refus_vente(fonction, *args, **kwargs):
         raise OperationRejected(str(exc), code='transition_refused')
 
 
-@handler('sale_return.create')
+@handler('sale_return.create', permission='sale_returns.create')
 def sale_return_create(ctx, payload):
     from apps.sales.serializers import (
         SaleReturnCreateSerializer, SaleReturnDetailSerializer,
     )
 
+    # ┌──────────────────────────────────────────────────────────────────────┐
+    # │ AUCUN CONTRÔLE DE PÉRIMÈTRE ICI, ET C'EST VOULU.                     │
+    # │                                                                      │
+    # │ Un retour n'a pas d'entrepôt à lui : il hérite de celui de sa vente. │
+    # │ `SaleReturnCreateSerializer` ne porte donc pas `warehouse`, et le    │
+    # │ périmètre est vérifié au bon endroit, dans son `validate`, sur la    │
+    # │ VENTE D'ORIGINE. `SaleReturnViewSet` n'appelle jamais l'assertion.   │
+    # │                                                                      │
+    # │ Ce handler l'appelait quand même, sur un champ toujours nul : tout   │
+    # │ membre non propriétaire recevait « Un entrepôt est requis pour votre │
+    # │ compte ». Aucun caissier ni gérant ne pouvait créer un retour depuis │
+    # │ son terminal, et personne ne l'a vu parce que toutes les             │
+    # │ vérifications avaient été faites en propriétaire.                    │
+    # └──────────────────────────────────────────────────────────────────────┘
     local_id = payload.pop('id', None)
     serializer = SaleReturnCreateSerializer(data=payload, context={'request': ctx.request})
     serializer.is_valid(raise_exception=True)
-    assert_warehouse_allowed_for_request(
-        ctx.request,
-        getattr(serializer.validated_data.get('warehouse'), 'id', None),
-        allow_none=True,
-    )
-    retour = serializer.save(
-        organization=ctx.organization, **({'id': local_id} if local_id else {})
-    )
+    retour = _sauver_avec_audit(ctx, serializer, local_id)
     return {
         'server_ids': {'sale_return': str(retour.id)},
         'authoritative': SaleReturnDetailSerializer(retour).data,
@@ -665,19 +693,19 @@ def _transition_retour(ctx, payload, fonction):
     }
 
 
-@handler('sale_return.approve')
+@handler('sale_return.approve', permission='sale_returns.approve')
 def sale_return_approve(ctx, payload):
     from apps.sales.returns_quotations import approve_return
     return _transition_retour(ctx, payload, approve_return)
 
 
-@handler('sale_return.reject')
+@handler('sale_return.reject', permission='sale_returns.approve')
 def sale_return_reject(ctx, payload):
     from apps.sales.returns_quotations import reject_return
     return _transition_retour(ctx, payload, reject_return)
 
 
-@handler('quotation.create')
+@handler('quotation.create', permission='sales.create')
 def quotation_create(ctx, payload):
     from apps.sales.serializers import (
         QuotationCreateSerializer, QuotationDetailSerializer,
@@ -686,16 +714,14 @@ def quotation_create(ctx, payload):
     local_id = payload.pop('id', None)
     serializer = QuotationCreateSerializer(data=payload, context={'request': ctx.request})
     serializer.is_valid(raise_exception=True)
-    devis = serializer.save(
-        organization=ctx.organization, **({'id': local_id} if local_id else {})
-    )
+    devis = _sauver_avec_audit(ctx, serializer, local_id)
     return {
         'server_ids': {'quotation': str(devis.id)},
         'authoritative': QuotationDetailSerializer(devis).data,
     }
 
 
-@handler('quotation.convert')
+@handler('quotation.convert', permission='sales.create')
 def quotation_convert(ctx, payload):
     """
     Conversion d'un devis en vente.
@@ -766,7 +792,7 @@ def _transition_inventaire(ctx, payload, fonction, serialiser=True, **extra):
     }
 
 
-@handler('inventory_session.create')
+@handler('inventory_session.create', permission='inventory.create')
 def inventory_session_create(ctx, payload):
     from apps.inventory.serializers import (
         InventorySessionCreateSerializer, InventorySessionDetailSerializer,
@@ -783,22 +809,20 @@ def inventory_session_create(ctx, payload):
         allow_none=True,
     )
 
-    session = serializer.save(
-        organization=ctx.organization, **({'id': local_id} if local_id else {})
-    )
+    session = _sauver_avec_audit(ctx, serializer, local_id)
     return {
         'server_ids': {'inventory_session': str(session.id)},
         'authoritative': InventorySessionDetailSerializer(session).data,
     }
 
 
-@handler('inventory_session.start')
+@handler('inventory_session.start', permission='inventory.start')
 def inventory_session_start(ctx, payload):
     from apps.inventory.services import start_inventory_session
     return _transition_inventaire(ctx, payload, start_inventory_session)
 
 
-@handler('inventory_session.count')
+@handler('inventory_session.count', permission='inventory.count')
 def inventory_session_count(ctx, payload):
     """
     Comptages d'une ou plusieurs lignes.
@@ -814,19 +838,19 @@ def inventory_session_count(ctx, payload):
     )
 
 
-@handler('inventory_session.submit')
+@handler('inventory_session.submit', permission='inventory.submit')
 def inventory_session_submit(ctx, payload):
     from apps.inventory.services import submit_inventory_session
     return _transition_inventaire(ctx, payload, submit_inventory_session)
 
 
-@handler('inventory_session.validate')
+@handler('inventory_session.validate', permission='inventory.validate')
 def inventory_session_validate(ctx, payload):
     from apps.inventory.services import validate_inventory_session
     return _transition_inventaire(ctx, payload, validate_inventory_session)
 
 
-@handler('inventory_session.cancel')
+@handler('inventory_session.cancel', permission='inventory.cancel')
 def inventory_session_cancel(ctx, payload):
     from apps.inventory.services import cancel_inventory_session
     return _transition_inventaire(
@@ -837,7 +861,7 @@ def inventory_session_cancel(ctx, payload):
 # --------------------------------------------------------------- catalogue
 
 
-@handler('product.create')
+@handler('product.create', permission='products.create')
 def product_create(ctx, payload):
     """
     Création d'un article, par le serializer du back-office.
@@ -848,12 +872,16 @@ def product_create(ctx, payload):
     le message qui va bien.
     """
     from apps.products.serializers import ProductCreateSerializer, ProductDetailSerializer
+    from apps.products.services import create_product
 
     local_id = payload.pop('id', None)
     serializer = ProductCreateSerializer(data=payload, context={'request': ctx.request})
     serializer.is_valid(raise_exception=True)
-    produit = serializer.save(
-        organization=ctx.organization, **({'id': local_id} if local_id else {})
+    produit = create_product(
+        serializer,
+        organization=ctx.organization,
+        user=ctx.user,
+        local_id=local_id,
     )
     return {
         'server_ids': {'product': str(produit.id)},
@@ -874,7 +902,7 @@ def _referentiel_create(ctx, payload, modele, serializer_classe, cle):
     }
 
 
-@handler('category.create')
+@handler('category.create', permission='categories.create')
 def category_create(ctx, payload):
     from apps.products.models import Category
     from apps.products.serializers import CategoryCreateSerializer
@@ -883,14 +911,14 @@ def category_create(ctx, payload):
     )
 
 
-@handler('brand.create')
+@handler('brand.create', permission='products.create')
 def brand_create(ctx, payload):
     from apps.products.models import Brand
     from apps.products.serializers import BrandSerializer
     return _referentiel_create(ctx, payload, Brand, BrandSerializer, 'brand')
 
 
-@handler('unit.create')
+@handler('unit.create', permission='products.create')
 def unit_create(ctx, payload):
     from apps.products.models import Unit
     from apps.products.serializers import UnitSerializer
@@ -900,28 +928,58 @@ def unit_create(ctx, payload):
 # ------------------------------------------------------------------- livre de caisse
 
 
-@handler('expense.create')
+@handler('expense.create', permission='cashbook.create_expense')
 def expense_create(ctx, payload):
+    """
+    Une dépense, par le SERVICE du back-office.
+
+    Ce handler appelait `serializer.save()` en direct et ne rejouait donc rien
+    de `ExpenseViewSet.perform_create` : ni l'organisation (une FK non nulle,
+    d'où un `IntegrityError` et la quarantaine), ni la référence, ni la devise
+    résolue avec son taux, ni l'auteur. Mesuré : aucune dépense saisie sur un
+    terminal n'est jamais arrivée.
+    """
     from apps.cashbook.serializers import ExpenseCreateSerializer, ExpenseDetailSerializer
+    from apps.cashbook.services import create_expense
 
     local_id = payload.pop('id', None)
     serializer = ExpenseCreateSerializer(data=payload, context={'request': ctx.request})
     serializer.is_valid(raise_exception=True)
-    expense = serializer.save(**({'id': local_id} if local_id else {}))
+    expense = create_expense(
+        serializer,
+        organization=ctx.organization,
+        user=ctx.user,
+        request=ctx.request,
+        **({'id': local_id} if local_id else {}),
+    )
     return {
         'server_ids': {'expense': str(expense.id)},
         'authoritative': ExpenseDetailSerializer(expense).data,
     }
 
 
-@handler('cash_movement.create')
+@handler('cash_movement.create', permission='cashbook.create_movement')
 def cash_movement_create(ctx, payload):
+    """
+    Un mouvement de tiroir, par le SERVICE du back-office.
+
+    Même défaut que la dépense, plus deux propres au tiroir : le solde
+    `balance_after` est suivi PAR DEVISE, et la session ouverte rattache le
+    mouvement à une caisse donc à un entrepôt. Sans elle, un apport de fonds
+    reste invisible aux magasiniers.
+    """
     from apps.cashbook.serializers import CashMovementCreateSerializer, CashMovementDetailSerializer
+    from apps.cashbook.services import create_manual_cash_movement
 
     local_id = payload.pop('id', None)
     serializer = CashMovementCreateSerializer(data=payload, context={'request': ctx.request})
     serializer.is_valid(raise_exception=True)
-    movement = serializer.save(**({'id': local_id} if local_id else {}))
+    movement = create_manual_cash_movement(
+        serializer,
+        organization=ctx.organization,
+        user=ctx.user,
+        **({'id': local_id} if local_id else {}),
+    )
     return {
         'server_ids': {'cash_movement': str(movement.id)},
         'authoritative': CashMovementDetailSerializer(movement).data,

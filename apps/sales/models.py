@@ -4,6 +4,7 @@ from django.core.validators import MinValueValidator, MaxValueValidator
 from decimal import Decimal
 from apps.core.models import TenantModel, TenantSoftDeleteModel, TenantSyncableModel, SyncableModel
 from apps.core.managers import TenantSoftDeleteManager
+from apps.core.clock import maintenant
 
 
 class Register(TenantSoftDeleteModel):
@@ -113,7 +114,9 @@ class RegisterSession(TenantModel):
         blank=True
     )
 
-    opened_at = models.DateTimeField(auto_now_add=True)
+    #: Heure de l'ACTE : une caisse ouverte hors ligne garde son heure
+    #: d'ouverture, pas celle de sa poussée. Voir `apps.core.clock`.
+    opened_at = models.DateTimeField(default=maintenant, editable=False)
     closed_at = models.DateTimeField(null=True, blank=True)
 
     notes = models.TextField(blank=True)
@@ -336,7 +339,10 @@ class Sale(TenantSyncableModel):
         related_name='sales'
     )
     
-    sale_date = models.DateTimeField(auto_now_add=True, db_index=True)
+    #: Heure de l'ENCAISSEMENT, pas de son enregistrement serveur. Un
+    #: `auto_now_add` datait au jour de la poussée toute vente faite hors
+    #: ligne, et empilait trois jours de recette sur le jour du retour.
+    sale_date = models.DateTimeField(default=maintenant, db_index=True, editable=False)
     due_date = models.DateField(null=True, blank=True)
     
     is_pos = models.BooleanField(default=True)
@@ -586,7 +592,9 @@ class SaleItem(TenantModel, SyncableModel):
         ):
             loose = self.loose_quantity
             if loose < 0:
-                raise ValueError(
+                from apps.core.exceptions import RefusMetier
+
+                raise RefusMetier(
                     "La quantité totale est inférieure au contenu des "
                     "conditionnements vendus."
                 )
@@ -721,7 +729,9 @@ class Payment(TenantModel, SyncableModel):
         related_name='received_payments'
     )
     
-    paid_at = models.DateTimeField(auto_now_add=True)
+    #: Heure du RÈGLEMENT. Le Z somme par session et non par date, mais le
+    #: reçu du client, lui, porte ce jour-là.
+    paid_at = models.DateTimeField(default=maintenant, editable=False)
     
     notes = models.TextField(blank=True)
 
@@ -815,7 +825,8 @@ class SaleReturn(TenantSoftDeleteModel):
         related_name='approved_returns'
     )
     
-    return_date = models.DateTimeField(auto_now_add=True)
+    #: Heure du RETOUR au comptoir.
+    return_date = models.DateTimeField(default=maintenant, editable=False)
     approved_at = models.DateTimeField(null=True, blank=True)
 
     objects = TenantSoftDeleteManager()

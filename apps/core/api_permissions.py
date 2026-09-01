@@ -13,6 +13,23 @@ from rest_framework.response import Response
 from rest_framework import status as http_status
 
 
+#: Fermeture DÉLIBÉRÉE d'une action, à déclarer dans `action_permissions`.
+#:
+#: « Action non listée = accès refusé » est la bonne règle - une action oubliée
+#: doit se fermer, pas s'ouvrir - mais elle n'émet aucun signal : la route
+#: répond 403, le front n'affiche rien, et personne ne cherche un bug là où il
+#: n'y a pas d'erreur. Le dépôt l'a payé sur `product_supplies`, sur
+#: `locked_products` (qui rendait le verrou d'inventaire inerte et a fait
+#: refuser une vente déjà encaissée et imprimée), et sur trois autres actions.
+#:
+#: Écrire `DENY` ne change RIEN au comportement : la valeur ne figure dans
+#: aucune permission effective, donc l'action reste refusée. Ce qu'elle change
+#: est la lecture : une fermeture voulue se distingue d'un oubli, et
+#: `apps/sync/tests/test_parity_contract.py` peut exiger que toute action
+#: routée soit l'une ou l'autre.
+DENY = '!closed'
+
+
 def _get_membership(request):
     """
     Membership actif de l'utilisateur pour l'organisation portée par l'en-tête.
@@ -194,6 +211,10 @@ class HasPermission(permissions.BasePermission):
         
         if required_perm == '*':
             return True
+
+        # Fermeture délibérée : elle se lit dans la table, et se refuse ici.
+        if required_perm == DENY:
+            return False
         
         from apps.core.services import PermissionService
         effective_perms = PermissionService.get_effective_permissions(membership)

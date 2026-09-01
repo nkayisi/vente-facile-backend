@@ -6,6 +6,7 @@ from django.core.validators import MinValueValidator
 from decimal import Decimal
 from apps.core.models import TenantModel, TenantSoftDeleteModel, SyncableModel
 from apps.core.managers import TenantSoftDeleteManager
+from apps.core.clock import maintenant
 
 
 logger = logging.getLogger(__name__)
@@ -349,7 +350,8 @@ class StockBatch(TenantModel):
     manufacturing_date = models.DateField(null=True, blank=True)
     expiry_date = models.DateField(null=True, blank=True, db_index=True)
     
-    received_at = models.DateTimeField(auto_now_add=True)
+    #: Heure de la RÉCEPTION du lot. Voir `apps.core.clock`.
+    received_at = models.DateTimeField(default=maintenant, editable=False)
     
     notes = models.TextField(blank=True)
 
@@ -592,7 +594,8 @@ class StockTransfer(TenantSoftDeleteModel):
         related_name='approved_transfers'
     )
     
-    requested_at = models.DateTimeField(auto_now_add=True)
+    #: Heure de la DEMANDE de transfert.
+    requested_at = models.DateTimeField(default=maintenant, editable=False)
     shipped_at = models.DateTimeField(null=True, blank=True)
     received_at = models.DateTimeField(null=True, blank=True)
 
@@ -977,9 +980,22 @@ class InventorySession(TenantSoftDeleteModel):
                 ).values_list('product_id', flat=True)
             )
         elif self.scope_type == self.ScopeType.CATEGORY:
-            # Produits des catégories sélectionnées
-            from apps.products.models import Product
-            category_ids = list(self.categories.values_list('id', flat=True))
+            # Produits des catégories sélectionnées, SOUS-ARBRE COMPRIS.
+            #
+            # Le sous-arbre n'est pas un raffinement : c'est exactement ce que
+            # `inventory.services.target_products` compte au démarrage. Filtrer
+            # ici les catégories EXACTES laissait un produit de « Boissons >
+            # Sodas » compté par une session portant sur « Boissons », et
+            # vendable pendant tout le comptage. L'écart constaté à la
+            # validation ne mesure alors plus un manquant mais les ventes de la
+            # journée, et c'est sur ce chiffre que le magasinier ajuste.
+            #
+            # Compter et verrouiller lisent le MÊME jeu ; un test croise les
+            # deux lectures pour qu'un filtre ajouté d'un seul côté se voie.
+            from apps.products.models import Category, Product
+            category_ids = Category.subtree_ids(
+                list(self.categories.values_list('id', flat=True))
+            )
             if category_ids:
                 product_ids = set(
                     Product.objects.filter(

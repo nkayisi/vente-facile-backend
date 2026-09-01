@@ -1,17 +1,19 @@
 """
-URL configuration for sync app.
+Routes de synchronisation.
+
+L'ancien endpoint `POST /api/v1/sync/` (protocole de l'application heritee,
+last-write-wins) a ete retire avec elle : il contournait le service de dette et
+acceptait `current_balance` en poussee, deux chemins qu'aucun client ne doit
+plus emprunter.
 """
 from django.urls import path
+
 from .operations import SyncOperationsView
 from .pull import SyncChangedTablesView, SyncManifestView, SyncPullView
-from .views import SyncView, SyncStatusView
 
 urlpatterns = [
-    path('sync/', SyncView.as_view(), name='sync'),
-    path('sync/status/', SyncStatusView.as_view(), name='sync-status'),
-
-    # Tirage a curseurs. Remplace le GET /sync/, qui tronquait au-dela de
-    # 1 000 lignes sans ordre defini et perdait le reste definitivement.
+    # Tirage a curseurs, sur le couple `(updated_at, id)`. Le point de reprise
+    # n'avance que si la table est tiree en entier.
     path('sync/pull/', SyncPullView.as_view(), name='sync-pull'),
     path('sync/pull/manifest/', SyncManifestView.as_view(), name='sync-pull-manifest'),
     # Sonde prealable : quelles tables ont du neuf. Sans elle, une sync sans

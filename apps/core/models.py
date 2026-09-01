@@ -1,12 +1,26 @@
 import uuid
+
 from django.db import models
 from django.utils import timezone
 
+from apps.core.clock import maintenant
+
 
 class TimeStampedModel(models.Model):
-    """Base model with created/updated timestamps."""
+    """
+    Horodatages de base.
 
-    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    ``created_at`` porte l'heure de l'ACTE, pas celle de son enregistrement :
+    plusieurs journaux que le marchand lit par date n'ont pas d'autre champ de
+    date (`StockMovement`, `CustomerTransaction`), et une entrée de stock saisie
+    hors ligne se rangeait au jour de sa poussée. Voir `apps.core.clock`.
+
+    ``updated_at`` reste l'heure du SERVEUR, sans exception : c'est le curseur
+    du tirage, et le reculer rendrait la ligne invisible aux terminaux déjà
+    passés par là. Un test l'interdit.
+    """
+
+    created_at = models.DateTimeField(default=maintenant, db_index=True, editable=False)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -101,7 +115,7 @@ class TenantSoftDeleteModel(TenantModel, SoftDeleteModel):
 
 class SyncableModel(models.Model):
     """
-    Base mixin for models that need to be synchronized with WatermelonDB.
+    Base mixin for models that need to be synchronized with mobile clients.
     
     Key features:
     - `sync_updated_at`: Manually settable timestamp for sync conflict resolution
@@ -180,7 +194,7 @@ class TenantSyncableModel(TenantSoftDeleteModel, SyncableModel):
     Combined model for tenant-scoped, soft-deletable, syncable records.
     
     This is the base class for all models that need to be synchronized
-    with WatermelonDB mobile clients.
+    with mobile clients.
     
     Inherits:
     - TenantModel: organization scoping, created_at, updated_at, UUID pk

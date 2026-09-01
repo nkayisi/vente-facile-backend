@@ -29,7 +29,7 @@ from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from apps.core.api_permissions import HasPermission, IsTenantMember, _get_membership
+from apps.core.api_permissions import HasPermission, IsTenantMember, _get_membership, DENY
 from apps.core.services import PermissionService
 from apps.organizations.models import Organization
 
@@ -348,6 +348,11 @@ class DeviceViewSet(viewsets.ModelViewSet):
         'retrieve': 'users.view',
         'partial_update': 'users.edit',
         'revoke': 'users.edit',
+        # Un appareil s'enrôle par `POST /auth/devices/enroll/`, sous une
+        # session déjà authentifiée : c'est là que le jeton est émis, une
+        # seule fois. Créer un Device par cette route ne produirait rien
+        # d'utilisable.
+        'create': DENY,
     }
 
     def get_queryset(self):

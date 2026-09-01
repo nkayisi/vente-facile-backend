@@ -9,6 +9,7 @@ from rest_framework.response import Response
 from guardian.shortcuts import assign_perm
 
 from apps.organizations.models import Organization
+from apps.core.bulk import bulk_update_rows
 
 
 class TenantViewSetMixin:
@@ -239,7 +240,7 @@ class BulkActionMixin:
         if allowed_fields:
             data = {k: v for k, v in data.items() if k in allowed_fields}
         
-        count = queryset.update(**data)
+        count = bulk_update_rows(queryset, **data)
         return Response({'updated': count})
 
 

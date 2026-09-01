@@ -1396,3 +1396,45 @@ class ProductExcelService:
                 duplicates["barcode"] = {"id": str(existing.id), "name": existing.name}
         
         return duplicates
+
+
+# ---------------------------------------------------------------------------
+# CRÉATION D'UN ARTICLE : le corps partagé par la vue et par le journal.
+# ---------------------------------------------------------------------------
+
+
+def create_product(serializer, *, organization, user, local_id=None):
+    """
+    Enregistre un article, plafond d'abonnement compris.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ LE PLAFOND DU PLAN VIVAIT DANS `perform_create`, DONC HORS DU JOURNAL.  │
+    │                                                                          │
+    │ `assert_can_add_products` refuse le cinq-centunième article d'une        │
+    │ formule qui en autorise cinq cents. Le terminal, lui, en créait autant   │
+    │ qu'il voulait : le plafond n'était opposé qu'au back-office, et le       │
+    │ contourner tenait à ouvrir l'application sur son téléphone.              │
+    │                                                                          │
+    │ Le terminal ne peut PAS l'annoncer d'avance : `subscriptions` n'est pas  │
+    │ au manifeste de tirage, et c'est un arbitrage délibéré du lot 11 - un    │
+    │ abonnement est une relation avec l'éditeur, pas une donnée de comptoir.  │
+    │ Le refus arrive donc à la poussée, en quarantaine, avec son message.     │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+    from guardian.shortcuts import assign_perm
+
+    from apps.subscriptions.services import SubscriptionService
+
+    SubscriptionService.assert_can_add_products(organization, 1)
+
+    champs = {'organization': organization}
+    if hasattr(serializer.Meta.model, 'created_by'):
+        champs['created_by'] = user
+    if local_id:
+        champs['id'] = local_id
+
+    instance = serializer.save(**champs)
+    nom = instance._meta.model_name
+    for perm in (f'view_{nom}', f'change_{nom}', f'delete_{nom}'):
+        assign_perm(perm, user, instance)
+    return instance
