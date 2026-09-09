@@ -222,6 +222,34 @@ class Expense(TenantModel):
         verbose_name = 'Dépense'
         verbose_name_plural = 'Dépenses'
 
+    def save(self, *args, **kwargs):
+        """Résout la devise vers celle de l'établissement, quel que soit l'appelant.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ CE MODÈLE ÉTAIT LE SEUL À NE PAS LE FAIRE, ET SON COMMENTAIRE DE     │
+        │ CHAMP AFFIRMAIT LE CONTRAIRE.                                        │
+        │                                                                      │
+        │ `Sale`, `Payment`, `CustomerTransaction`, `CustomerBalance`,         │
+        │ `PurchaseOrder` et `SupplierPayment` résolvent tous dans `save()` ;  │
+        │ `Expense` et `CashMovement` s'en remettaient à leur SERVICE. Tout    │
+        │ chemin qui ne passe pas par lui - l'admin Django, une commande de    │
+        │ gestion, un futur appelant - écrivait donc la chaîne VIDE, que la    │
+        │ colonne accepte (`blank=True`).                                      │
+        │                                                                      │
+        │ Une devise vide n'est pas un détail d'affichage : `money(x, "")`     │
+        │ rend le nombre SANS SYMBOLE, dans une application où le même chiffre │
+        │ vaut soit trois dollars, soit trois francs. Et la rature de          │
+        │ télémétrie ancre les montants sur leur devise : un montant sans      │
+        │ symbole n'est pas raturé et part en clair.                           │
+        └──────────────────────────────────────────────────────────────────────┘
+        """
+        if self.organization_id:
+            from apps.settings.services import CurrencyService
+            self.currency, self.exchange_rate = CurrencyService.resolve(
+                self.organization_id, self.currency, self.exchange_rate
+            )
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f"{self.reference} - {self.description[:50]}"
 
@@ -422,6 +450,34 @@ class CashMovement(TenantModel):
         ]
         verbose_name = 'Mouvement de caisse'
         verbose_name_plural = 'Mouvements de caisse'
+
+    def save(self, *args, **kwargs):
+        """Résout la devise vers celle de l'établissement, quel que soit l'appelant.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ CE MODÈLE ÉTAIT LE SEUL À NE PAS LE FAIRE, ET SON COMMENTAIRE DE     │
+        │ CHAMP AFFIRMAIT LE CONTRAIRE.                                        │
+        │                                                                      │
+        │ `Sale`, `Payment`, `CustomerTransaction`, `CustomerBalance`,         │
+        │ `PurchaseOrder` et `SupplierPayment` résolvent tous dans `save()` ;  │
+        │ `Expense` et `CashMovement` s'en remettaient à leur SERVICE. Tout    │
+        │ chemin qui ne passe pas par lui - l'admin Django, une commande de    │
+        │ gestion, un futur appelant - écrivait donc la chaîne VIDE, que la    │
+        │ colonne accepte (`blank=True`).                                      │
+        │                                                                      │
+        │ Une devise vide n'est pas un détail d'affichage : `money(x, "")`     │
+        │ rend le nombre SANS SYMBOLE, dans une application où le même chiffre │
+        │ vaut soit trois dollars, soit trois francs. Et la rature de          │
+        │ télémétrie ancre les montants sur leur devise : un montant sans      │
+        │ symbole n'est pas raturé et part en clair.                           │
+        └──────────────────────────────────────────────────────────────────────┘
+        """
+        if self.organization_id:
+            from apps.settings.services import CurrencyService
+            self.currency, self.exchange_rate = CurrencyService.resolve(
+                self.organization_id, self.currency, self.exchange_rate
+            )
+        super().save(*args, **kwargs)
 
     def __str__(self):
         direction_label = "+" if self.direction == 'in' else "-"

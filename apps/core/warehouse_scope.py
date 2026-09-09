@@ -118,19 +118,6 @@ def filter_queryset_by_warehouse_ids(
     return queryset.filter(**{f"{warehouse_field}__in": ids})
 
 
-def filter_sales_for_membership(queryset: QuerySet, membership: OrganizationMembership) -> QuerySet:
-    """
-    Ventes : restreint voit uniquement ``warehouse_id`` dans son périmètre.
-    Les ventes sans warehouse (legacy) sont réservées au owner.
-    """
-    ids = accessible_warehouse_ids(membership)
-    if ids is None:
-        return queryset
-    if not ids:
-        return queryset.none()
-    return queryset.filter(Q(warehouse_id__in=ids))
-
-
 def filter_queryset_by_related_warehouse(
     queryset: QuerySet,
     membership: OrganizationMembership,

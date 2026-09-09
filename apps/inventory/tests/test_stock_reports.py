@@ -16,6 +16,7 @@ from rest_framework.test import APITestCase
 
 from apps.inventory.filters import day_bounds
 from apps.inventory.models import Stock, StockMovement
+from apps.core.exports import format_quantity
 from apps.inventory.reports import build_stock_levels_report, build_supplies_report
 from apps.organizations.models import OrganizationMembership
 from apps.products.models import Category, Product, Unit
@@ -497,3 +498,177 @@ class ExportEndpointTests(_StockReportSetup):
             '/api/v1/stocks/export/?export_format=pdf', **self._headers,
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+
+
+
+class MovementSummaryTests(_StockReportSetup):
+    """
+    La synthèse du journal, et les deux défauts qui la faisaient mentir.
+
+    ``StockMovement.quantity`` est SIGNÉE : une sortie y est négative.
+    ``total_out`` accumulait la valeur brute, si bien que la synthèse écrivait
+    « Sorties (unités) : -901 » - un nombre négatif sous un libellé qui dit
+    déjà le sens. Et cette somme brute était FAUSSE : deux mouvements de type
+    ``sale`` portent « +1 » avec « 0 → -1 », des lignes anciennes à la
+    convention inverse, qui venaient EN DÉDUCTION des sorties.
+
+    Les trois lectures ont été comparées sur les 44 mouvements de
+    l'établissement de développement, contre ``quantity_after -
+    quantity_before`` qui est la vérité terrain : seul « type + magnitude »
+    lui est égal.
+    """
+
+    def _mouvement(self, type_, quantity, before='0', after=None):
+        return StockMovement.objects.create(
+            organization=self.org, product=self.eau, warehouse=self.warehouse,
+            movement_type=type_, quantity=Decimal(quantity),
+            unit_cost=Decimal('400.00'),
+            quantity_before=Decimal(before),
+            quantity_after=Decimal(after if after is not None else quantity),
+        )
+
+    def _synthese(self):
+        from apps.inventory.reports import build_movements_report
+
+        spec = build_movements_report(
+            StockMovement.objects.filter(organization=self.org),
+            self.org, currency='CDF',
+        )
+        return dict(spec.summary)
+
+    def test_les_deux_totaux_sont_des_magnitudes(self):
+        self._mouvement(StockMovement.MovementType.PURCHASE, '100')
+        self._mouvement(StockMovement.MovementType.SALE, '-30', before='100', after='70')
+
+        synthese = self._synthese()
+        self.assertEqual(synthese['Entrées (unités)'], '100')
+        # « Sorties » dit déjà le sens : un « -30 » sous ce libellé se lit deux
+        # fois, et c'est ce que la version d'origine écrivait.
+        self.assertEqual(synthese['Sorties (unités)'], '30')
+
+    def test_une_ligne_a_la_convention_de_signe_INVERSE_compte_quand_meme(self):
+        # Le cas relevé en base, à la ligne près : une vente de 1 unité écrite
+        # « +1 » avec « 0 → -1 ». La somme brute la retranchait des sorties.
+        self._mouvement(StockMovement.MovementType.PURCHASE, '100')
+        self._mouvement(StockMovement.MovementType.SALE, '-30', before='100', after='70')
+        self._mouvement(StockMovement.MovementType.SALE, '1', before='0', after='-1')
+
+        synthese = self._synthese()
+        self.assertEqual(synthese['Entrées (unités)'], '100')
+        # 30 + 1, et non 29 : c'est bien UNE unité de plus sortie.
+        self.assertEqual(synthese['Sorties (unités)'], '31')
+
+    def test_le_total_egale_la_verite_terrain_avant_apres(self):
+        # Le contrôle qui a tranché entre les trois lectures : la somme des
+        # magnitudes par type doit égaler la somme des écarts avant/après.
+        self._mouvement(StockMovement.MovementType.INITIAL, '210')
+        self._mouvement(StockMovement.MovementType.SALE, '-84', before='210', after='126')
+        self._mouvement(StockMovement.MovementType.SALE, '1', before='0', after='-1')
+        self._mouvement(StockMovement.MovementType.RETURN_IN, '2', before='126', after='128')
+
+        attendu_in = attendu_out = Decimal('0')
+        for m in StockMovement.objects.filter(organization=self.org):
+            ecart = m.quantity_after - m.quantity_before
+            if ecart > 0:
+                attendu_in += ecart
+            else:
+                attendu_out += -ecart
+
+        synthese = self._synthese()
+        self.assertEqual(synthese['Entrées (unités)'], format_quantity(attendu_in))
+        self.assertEqual(synthese['Sorties (unités)'], format_quantity(attendu_out))
+
+    def test_un_deconditionnement_ne_pese_sur_aucun_des_deux(self):
+        # Ouvrir un carton déplace des unités entre canaux : il n'en crée ni
+        # n'en détruit, et sa quantité est donc nulle. Aucun cas particulier
+        # n'est nécessaire, la magnitude le range toute seule.
+        self._mouvement(StockMovement.MovementType.UNPACK, '0', before='378', after='378')
+
+        synthese = self._synthese()
+        self.assertEqual(synthese['Mouvements'], '1')
+        self.assertEqual(synthese['Entrées (unités)'], '0')
+        self.assertEqual(synthese['Sorties (unités)'], '0')
+
+
+class EtatsDeStockPartitionnesTests(_StockReportSetup):
+    """
+    Le terminal a trois états EXCLUSIFS, le serveur n'en savait dire que deux.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ `low` ET `available` SE RECOUVRENT, ET LES CHIPS DU TERMINAL NON.        │
+    │                                                                          │
+    │ `low` (`quantity <= reorder_point`) contient les RUPTURES ; `available`  │
+    │ (`quantity > 0`) contient les stocks BAS. L'écran `/rayon`, lui, range   │
+    │ chaque rayon dans une case et une seule.                                 │
+    │                                                                          │
+    │ Traduire « bas » par `low` et « en stock » par `available` produirait    │
+    │ donc un DOCUMENT PLUS LARGE QUE L'ÉCRAN qui l'a déclenché, très          │
+    │ exactement le défaut que tous les exports de ce dépôt ont dû corriger.   │
+    │ D'où `low_only` et `healthy`, qui disent ce que le serveur ne savait pas.│
+    │                                                                          │
+    │ `low` et `available` NE BOUGENT PAS : le back-office les emploie, et son │
+    │ bouton « Stock bas » compte bien les ruptures parmi les alertes.         │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
+    def setUp(self):
+        super().setUp()
+        # Trois rayons, un par état : rupture, bas (sous le seuil de 5), sain.
+        self._stock(self.eau, '0')
+        self._stock(self.soda, '3')
+        self._stock(self.savon, '40')
+        # Un quatrième SANS seuil : le terminal le range en « ok », puisque
+        # `seuil > 0` fait partie de son critère. Sans lui, `healthy` pourrait
+        # s'écrire « au-dessus du seuil » et perdre ce rayon en silence.
+        self.sans_seuil = self._product(
+            'Sac plastique', 'SAC-01', self.hygiene, 10, 20, reorder=0,
+        )
+        self._stock(self.sans_seuil, '2')
+
+    def _skus(self, statut):
+        reponse = self.client.get(
+            '/api/v1/stocks/', {'status': statut, 'page_size': 100}, **self._headers,
+        )
+        self.assertEqual(reponse.status_code, status.HTTP_200_OK, reponse.data)
+        return {ligne['product_sku'] for ligne in reponse.data['results']}
+
+    def test_low_only_ecarte_les_ruptures(self):
+        self.assertEqual(self._skus('low_only'), {'SOD-01'})
+
+    def test_low_les_garde_et_ne_change_pas(self):
+        """Le filtre du back-office reste ce qu'il est."""
+        self.assertEqual(self._skus('low'), {'EAU-50', 'SOD-01'})
+
+    def test_healthy_est_au_dessus_du_seuil_ou_sans_seuil(self):
+        self.assertEqual(self._skus('healthy'), {'SAV-01', 'SAC-01'})
+
+    def test_les_trois_etats_du_terminal_PARTITIONNENT_le_stock(self):
+        """
+        L'invariant qui porte tout : chaque rayon dans une case, et une seule.
+
+        Sans cette assertion, un rayon pourrait n'appartenir à aucun état et
+        disparaître de TOUT document sans que rien ne le signale - un manquant
+        qu'on ne découvre qu'à l'inventaire suivant.
+        """
+        rupture = self._skus('out')
+        bas = self._skus('low_only')
+        sain = self._skus('healthy')
+        tous = self._skus('')
+
+        self.assertEqual(rupture | bas | sain, tous, 'Un rayon est tombé entre deux états.')
+        self.assertEqual(rupture & bas, set())
+        self.assertEqual(bas & sain, set())
+        self.assertEqual(rupture & sain, set())
+
+    def test_l_export_annonce_l_etat_en_toutes_lettres(self):
+        """Un code nu dans l'en-tête d'un document ne renseigne personne."""
+        reponse = self.client.get(
+            '/api/v1/stocks/export/',
+            {'status': 'low_only', 'export_format': 'csv'},
+            **self._headers,
+        )
+        self.assertEqual(reponse.status_code, status.HTTP_200_OK)
+        corps = b''.join(reponse.streaming_content).decode('utf-8-sig') \
+            if reponse.streaming else reponse.content.decode('utf-8-sig')
+        self.assertIn('Stock bas', corps)
+        self.assertNotIn('low_only', corps)

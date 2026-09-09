@@ -370,7 +370,7 @@ class StockBatch(TenantModel):
     def is_expired(self):
         from django.utils import timezone
         if self.expiry_date:
-            return self.expiry_date < timezone.now().date()
+            return self.expiry_date < timezone.localdate()
         return False
 
     def clean(self):

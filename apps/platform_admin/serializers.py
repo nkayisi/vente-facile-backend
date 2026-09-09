@@ -12,19 +12,6 @@ from apps.subscriptions.models import Plan, PlanFeature, Subscription, Subscript
 # DASHBOARD
 # =============================================================================
 
-class AdminDashboardSerializer(serializers.Serializer):
-    """Platform-wide dashboard statistics."""
-    total_organizations = serializers.IntegerField()
-    active_organizations = serializers.IntegerField()
-    total_users = serializers.IntegerField()
-    new_users_this_month = serializers.IntegerField()
-    total_revenue = serializers.DecimalField(max_digits=15, decimal_places=2)
-    revenue_this_month = serializers.DecimalField(max_digits=15, decimal_places=2)
-    subscriptions_by_status = serializers.DictField()
-    subscriptions_by_plan = serializers.ListField()
-    recent_organizations = serializers.ListField()
-    growth_trend = serializers.ListField()
-
 
 # =============================================================================
 # ORGANIZATIONS

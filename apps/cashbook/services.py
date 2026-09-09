@@ -253,28 +253,6 @@ def record_change(organization, sale, amount, change_currency, user, exchange_ra
     )
 
 
-def record_sale_income(organization, sale, amount, user, currency=None, exchange_rate=None):
-    """
-    Enregistre une entrée de caisse pour une vente (paiement reçu).
-
-    Conservé pour compatibilité (mono-devise). Les flux de vente passent
-    désormais par ``record_sale_payment_income`` (un mouvement par devise remise).
-    """
-    return _movement(
-        organization,
-        direction='in',
-        movement_type='sale',
-        amount=amount,
-        currency=currency,
-        exchange_rate=exchange_rate,
-        description=f"Vente {sale.reference}",
-        sale=sale,
-        session=getattr(sale, 'session', None),
-        customer=sale.customer,
-        user=user,
-    )
-
-
 def record_sale_cancellation(organization, sale, amount, user, currency=None, exchange_rate=None):
     """
     Enregistre une sortie de caisse pour l'annulation d'une vente.
@@ -291,26 +269,6 @@ def record_sale_cancellation(organization, sale, amount, user, currency=None, ex
         sale=sale,
         session=getattr(sale, 'session', None),
         customer=sale.customer,
-        user=user,
-    )
-
-
-def record_debt_collection(organization, sale, amount, customer, user, currency=None, exchange_rate=None):
-    """
-    Enregistre une entrée de caisse pour un recouvrement de dette client.
-    Appelé quand un paiement est ajouté sur une vente à crédit.
-    """
-    return _movement(
-        organization,
-        direction='in',
-        movement_type='debt_collection',
-        amount=amount,
-        currency=currency,
-        exchange_rate=exchange_rate,
-        description=f"Recouvrement dette - Vente {sale.reference}",
-        sale=sale,
-        session=getattr(sale, 'session', None),
-        customer=customer,
         user=user,
     )
 

@@ -258,6 +258,44 @@ class PaymentMethodSerializer(serializers.ModelSerializer):
 # SALE ITEM SERIALIZERS
 # =============================================================================
 
+#: Statuts de retour qui NE consomment PAS la marchandise rendue.
+#:
+#: Un retour rejeté n'a rien remis en stock ni remboursé : le client peut
+#: rendre l'article pour de bon. Un BROUILLON, lui, consomme - il est
+#: approuvable, et deux brouillons sur les mêmes unités seraient tous deux
+#: appliqués.
+RETURN_STATUSES_QUI_NE_CONSOMMENT_PAS = ('rejected',)
+
+
+def returned_quantity_expression():
+    """
+    Annotation « déjà rendu » d'une ligne de facture.
+
+    Employée par le `Prefetch` du détail de vente ET par la validation d'un
+    nouveau retour : une seule définition, donc l'écran qui propose une borne
+    et le serveur qui la fait respecter ne peuvent pas diverger.
+    """
+    from django.db.models import Q, Sum
+
+    return Sum(
+        'return_items__quantity',
+        filter=~Q(return_items__sale_return__status__in=RETURN_STATUSES_QUI_NE_CONSOMMENT_PAS)
+        & Q(return_items__sale_return__is_deleted=False),
+    )
+
+
+def returned_quantity_for(item):
+    """Repli à la demande, pour une ligne sérialisée hors du préchargement."""
+    from apps.sales.models import SaleItem
+
+    return (
+        SaleItem.objects.filter(pk=item.pk)
+        .annotate(_r=returned_quantity_expression())
+        .values_list('_r', flat=True)
+        .first()
+    ) or Decimal('0')
+
+
 class SaleItemSerializer(serializers.ModelSerializer):
     """Serializer pour les lignes de vente."""
     
@@ -272,6 +310,8 @@ class SaleItemSerializer(serializers.ModelSerializer):
         source='product.packaging_unit.name', read_only=True
     )
     unit_name = serializers.CharField(source='product.unit.name', read_only=True)
+    returned_quantity = serializers.SerializerMethodField()
+    returnable_quantity = serializers.SerializerMethodField()
 
     class Meta:
         model = SaleItem
@@ -282,11 +322,58 @@ class SaleItemSerializer(serializers.ModelSerializer):
             'package_quantity', 'package_unit_price', 'packaging_factor',
             'loose_quantity', 'quantity_display',
             'package_unit_name', 'unit_name',
+            'returned_quantity', 'returnable_quantity',
             'discount_amount', 'discount_percentage',
             'tax_rate', 'tax_amount',
             'subtotal', 'total', 'notes'
         ]
         read_only_fields = ['id', 'subtotal', 'total', 'tax_amount']
+
+    def get_returned_quantity(self, obj):
+        """
+        Ce qui a DÉJÀ été rendu sur cette ligne de facture.
+
+        ┌──────────────────────────────────────────────────────────────────┐
+        │ LA RÈGLE VIT SUR LE SERVEUR, DONC ELLE DOIT S'Y LIRE.            │
+        │                                                                  │
+        │ `SaleReturnCreateSerializer` refuse de rendre deux fois la même   │
+        │ marchandise, mais la fiche ne DISAIT pas le reste : un écran ne   │
+        │ pouvait poser sa borne qu'en recalculant la règle de son côté,    │
+        │ donc en la faisant vivre à deux endroits.                         │
+        │                                                                  │
+        │ ⚠ ANNOTÉ, jamais compté ligne à ligne : voir le `Prefetch` de     │
+        │ `SaleViewSet.get_queryset`. Sans lui, une facture de trente       │
+        │ articles coûterait trente requêtes de plus à chaque ouverture.    │
+        │ Le repli agrège à la demande, pour les chemins qui sérialisent    │
+        │ une ligne hors de ce préchargement.                               │
+        └──────────────────────────────────────────────────────────────────┘
+
+        Un retour REJETÉ ne consomme rien - la marchandise est encore là. Un
+        BROUILLON, si : il est approuvable, et deux brouillons sur les mêmes
+        unités seraient tous deux appliqués.
+        """
+        # ⚠ `hasattr` et NON `is None` : `Sum` rend `None` quand la ligne n'a
+        # aucun retour, ce qui est le cas de LOIN le plus fréquent. Tester la
+        # valeur confondait « non annoté » avec « rien de rendu » et refaisait
+        # une requête par ligne - mesuré à DEUX par article (les deux champs
+        # passent ici), soit vingt-quatre de plus sur une facture de douze.
+        if hasattr(obj, '_returned_quantity'):
+            annote = obj._returned_quantity
+        else:
+            annote = returned_quantity_for(obj)
+        return str(Decimal(annote or 0).quantize(Decimal('0.001')))
+
+    def get_returnable_quantity(self, obj):
+        """
+        Ce qu'il RESTE à rendre : jamais négatif.
+
+        Une donnée ancienne peut porter plus de rendu que de vendu ; un reste
+        négatif s'afficherait tel quel sur un formulaire, et le plafond qu'il
+        pose n'aurait aucun sens.
+        """
+        rendu = Decimal(self.get_returned_quantity(obj))
+        reste = Decimal(obj.quantity or 0) - rendu
+        return str(max(reste, Decimal('0')).quantize(Decimal('0.001')))
 
     def get_quantity_display(self, obj):
         """
@@ -1456,7 +1543,22 @@ class SaleReturnItemSerializer(serializers.ModelSerializer):
             'quantity', 'unit_price', 'total',
             'reason', 'restock'
         ]
-        read_only_fields = ['id']
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ LE PRIX ET LE TOTAL SONT DITS PAR LE SERVEUR, PAS PAR LE CLIENT. │
+        # │                                                                  │
+        # │ `SaleReturnCreateSerializer.create` les relit sur la ligne de    │
+        # │ FACTURE (`original_item.unit_price`) et recalcule le total : ce  │
+        # │ que le client enverrait serait jeté. Les laisser obligatoires    │
+        # │ faisait donc refuser tout retour dont le corps ne portait pas    │
+        # │ deux valeurs que le serveur n'allait pas lire - c'est ce qui     │
+        # │ rendait la création IMPOSSIBLE depuis le back-office, alors que  │
+        # │ le terminal passait pour les envoyer.                            │
+        # │                                                                  │
+        # │ Un montant de remboursement ne se prend pas dans une requête :   │
+        # │ le prix qui fait foi est celui auquel la marchandise a été       │
+        # │ vendue.                                                          │
+        # └──────────────────────────────────────────────────────────────────┘
+        read_only_fields = ['id', 'unit_price', 'total']
 
 
 class SaleReturnListSerializer(serializers.ModelSerializer):
@@ -1515,20 +1617,97 @@ class SaleReturnCreateSerializer(serializers.ModelSerializer):
         model = SaleReturn
         fields = ['original_sale', 'return_type', 'reason', 'items']
 
+    @staticmethod
+    def _nombre(valeur):
+        """« 2 » plutôt que « 2.000 » : le message est lu par un commerçant."""
+        return f"{valeur.normalize():f}" if valeur == valeur.to_integral() else f"{valeur}"
+
+    @staticmethod
+    def _deja_rendu(items):
+        """
+        Quantité déjà rendue par ligne de facture, retours rejetés exclus.
+
+        Une seule requête groupée : une par ligne ferait autant d'allers-retours
+        qu'il y a d'articles dans le panier rendu.
+        """
+        from django.db.models import Sum
+
+        ids = [item['original_item'].id for item in items]
+        # ⚠ L'annotation ne peut PAS s'appeler `total` : `SaleItem` porte déjà
+        # un champ de ce nom, et Django refuse la collision par un `ValueError`
+        # - donc un 500 sur la création de TOUT retour.
+        #
+        # ⚠ La MÊME expression que celle exposée sur la fiche de vente
+        # (`returned_quantity_expression`) : l'écran propose une borne, le
+        # serveur la fait respecter, et deux définitions finiraient par
+        # accepter ici ce que l'autre annonçait comme impossible.
+        lignes = (
+            SaleItem.objects.filter(id__in=ids)
+            .annotate(_deja=returned_quantity_expression())
+            .values_list('id', '_deja')
+        )
+        return {pk: deja or Decimal('0') for pk, deja in lignes}
+
     def validate(self, data):
         items = data.get('items', [])
         if not items:
             raise serializers.ValidationError({
                 'items': "Au moins un article est requis."
             })
-        
-        # Vérifier que les quantités ne dépassent pas les quantités vendues
+
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ LA MÊME MARCHANDISE POUVAIT ÊTRE RENDUE DEUX FOIS.               │
+        # │                                                                  │
+        # │ Le contrôle comparait la quantité rendue à la quantité VENDUE, et │
+        # │ ne regardait pas ce qui avait DÉJÀ été rendu sur cette ligne. Un  │
+        # │ client rendant deux flacons pouvait donc voir le même retour      │
+        # │ enregistré, approuvé, puis recommencé : le stock revenait deux    │
+        # │ fois en rayon et la caisse remboursait deux fois une marchandise  │
+        # │ vendue une seule fois. Rien ne le signalait, et le rapprochement  │
+        # │ ne se ferait qu'à l'inventaire suivant.                           │
+        # │                                                                  │
+        # │ Les retours REJETÉS ne consomment rien - ils n'ont rien remis en  │
+        # │ stock ni remboursé. Les BROUILLONS, si : deux brouillons portant  │
+        # │ les mêmes unités seraient tous deux approuvables, et c'est le     │
+        # │ même défaut pris une décision plus tard.                          │
+        # └──────────────────────────────────────────────────────────────────┘
+        # ⚠ LE CUMUL SE FAIT DANS LA BOUCLE, et pas seulement avant elle.
+        # `_deja_rendu` photographie l'état AVANT la requête : deux lignes du
+        # MÊME envoi désignant la même ligne de facture seraient sinon
+        # comparées toutes deux au même reste, et passeraient toutes deux.
+        # `SaleReturnItem` n'a aucune contrainte d'unicité, donc rien en aval
+        # ne rattraperait le doublon - c'est l'invariant que ce bloc existe
+        # pour tenir, contourné par un corps forgé ou rejoué.
+        deja_rendu = self._deja_rendu(items)
+        reclame_ici = {}
         for item in items:
             original_item = item['original_item']
-            if item['quantity'] > original_item.quantity:
+            rendu = (
+                deja_rendu.get(original_item.id, Decimal('0'))
+                + reclame_ici.get(original_item.id, Decimal('0'))
+            )
+            reste = original_item.quantity - rendu
+            if item['quantity'] > reste:
+                nom = (
+                    original_item.product.name
+                    if original_item.product_id
+                    else original_item.description
+                )
+                if rendu > 0:
+                    raise serializers.ValidationError({
+                        'items': (
+                            f"{nom} : {self._nombre(rendu)} sur "
+                            f"{self._nombre(original_item.quantity)} ont déjà été rendus. "
+                            f"Il en reste {self._nombre(reste)} à rendre."
+                        )
+                    })
                 raise serializers.ValidationError({
-                    'items': f"Quantité de retour supérieure à la quantité vendue pour {original_item.product.name}"
+                    'items': f"Quantité de retour supérieure à la quantité vendue pour {nom}"
                 })
+
+            reclame_ici[original_item.id] = (
+                reclame_ici.get(original_item.id, Decimal('0')) + item['quantity']
+            )
 
         # Vérifier le périmètre entrepôt sur la vente d'origine
         original_sale = data.get('original_sale')

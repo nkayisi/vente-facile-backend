@@ -498,10 +498,43 @@ def build_movements_report(queryset, organization, *, currency='CDF',
             unit_cost = movement.unit_cost if movement.unit_cost and movement.unit_cost > 0 else None
             value = (movement.quantity * unit_cost) if unit_cost is not None else None
 
+            # ┌──────────────────────────────────────────────────────────┐
+            # │ LES DEUX TOTAUX SONT DES MAGNITUDES, ET C'EST MESURÉ.    │
+            # │                                                          │
+            # │ ``quantity`` est signée - une sortie y est négative -     │
+            # │ et ``total_out`` accumulait la valeur BRUTE : la synthèse │
+            # │ écrivait « Sorties (unités) : -901 », un nombre négatif   │
+            # │ sous un libellé qui dit déjà le sens, donc lu deux fois.  │
+            # │                                                          │
+            # │ Pire, cette somme brute était FAUSSE. Deux mouvements de │
+            # │ type ``sale`` portent ici « +1 » avec « 0 → -1 » : des    │
+            # │ lignes anciennes, à la convention de signe inverse. Elles │
+            # │ VENAIENT EN DÉDUCTION des sorties au lieu de s'y ajouter. │
+            # │                                                          │
+            # │ Les trois lectures possibles ont été comparées sur les 44 │
+            # │ mouvements de l'établissement, contre la vérité terrain   │
+            # │ (``quantity_after - quantity_before``) :                  │
+            # │                                                          │
+            # │   type + magnitude   1 564 / 905   ← égal à la vérité     │
+            # │   après - avant      1 564 / 905                          │
+            # │   signe de quantity  1 566 / 903   (les 2 lignes          │
+            # │                                     anciennes comptées    │
+            # │                                     à l'envers)           │
+            # │   type + brut        1 564 / -901  (l'ancien calcul)      │
+            # │                                                          │
+            # │ Le TYPE dit ce que le mouvement est, la MAGNITUDE combien │
+            # │ il a déplacé. Ni le signe seul ni la somme brute ne       │
+            # │ résistent aux lignes dont le signe contredit l'étiquette. │
+            # │                                                          │
+            # │ Un déconditionnement porte zéro et ne pèse alors sur      │
+            # │ aucun des deux, sans cas particulier : ouvrir un carton   │
+            # │ déplace des unités entre canaux, il n'en crée ni n'en     │
+            # │ détruit.                                                  │
+            # └──────────────────────────────────────────────────────────┘
             if incoming:
-                total_in += movement.quantity
+                total_in += abs(movement.quantity)
             else:
-                total_out += movement.quantity
+                total_out += abs(movement.quantity)
             if value is not None:
                 total_value += value
 

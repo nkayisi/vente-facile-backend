@@ -61,11 +61,6 @@ def _get_membership(request):
     return getattr(request, cache_key)
 
 
-def get_request_membership(request):
-    """Alias public de :func:`_get_membership`, pour les appelants hors module."""
-    return _get_membership(request)
-
-
 def has_perm_code(request, perm_code: str) -> bool:
     """
     Helper utilitaire : vérifie si l'utilisateur courant possède une permission
@@ -224,39 +219,6 @@ class HasPermission(permissions.BasePermission):
             return any(p in effective_perms for p in required_perm)
         
         return required_perm in effective_perms
-
-
-class RoleBasedPermission(permissions.BasePermission):
-    """
-    Permission basée sur le rôle de l'utilisateur dans l'organisation.
-    Configurable par ViewSet via l'attribut `role_permissions`.
-    
-    Exemple d'utilisation dans un ViewSet:
-        role_permissions = {
-            'list': ['owner', 'manager', 'cashier'],
-            'create': ['owner', 'manager'],
-            'destroy': ['owner'],
-        }
-    """
-    
-    def has_permission(self, request, view):
-        membership = _get_membership(request)
-        if not membership:
-            return False
-        
-        role_permissions = getattr(view, 'role_permissions', None)
-        if not role_permissions:
-            return True
-        
-        action = getattr(view, 'action', None)
-        if not action:
-            return True
-        
-        allowed_roles = role_permissions.get(action, [])
-        if not allowed_roles:
-            return True
-        
-        return membership.role in allowed_roles
 
 
 def require_permission(*perms):

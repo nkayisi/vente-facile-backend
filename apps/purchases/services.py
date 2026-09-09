@@ -98,6 +98,10 @@ class GoodsReceiptStockService:
             PackagingService.touch(stock)
             stock.save()
 
+            paquets, vrac = PackagingService.split(
+                item.quantity_accepted, loose_accepted, item.packaging_factor
+            )
+
             batch = None
             if item.batch_number or item.expiry_date:
                 batch = FIFOService.add_to_batch(
@@ -123,12 +127,18 @@ class GoodsReceiptStockService:
                 unit_cost=unit_cost,
                 quantity_before=quantity_before,
                 quantity_after=stock.quantity,
+                # ⚠ Le partage se RECONSTITUE, il ne se divise pas.
+                # `loose_share` découpe au facteur du PRODUIT ; diviser par le
+                # facteur FIGÉ sur la ligne donnait un nombre fractionnaire de
+                # contenants dès que le marchand changeait son conditionnement
+                # entre la commande et la réception - et ce nombre partait en
+                # base, dans une colonne que le journal relit toujours.
+                # Voir `inventory.services.receive_transfer`, même remède.
                 input_package_quantity=(
-                    (item.quantity_accepted - loose_accepted) / item.packaging_factor
-                    if item.packaging_factor else Decimal('0.000')
+                    Decimal(paquets) if item.packaging_factor else Decimal('0.000')
                 ),
                 input_loose_quantity=(
-                    loose_accepted if item.packaging_factor else Decimal('0.000')
+                    vrac if item.packaging_factor else Decimal('0.000')
                 ),
                 packaging_factor=item.packaging_factor,
                 reference_type='goods_receipt',
@@ -198,6 +208,10 @@ class GoodsReceiptStockService:
             PackagingService.touch(stock)
             stock.save()
 
+            paquets, vrac = PackagingService.split(
+                item.quantity_accepted, loose_accepted, item.packaging_factor
+            )
+
             StockMovement.objects.create(
                 organization=org,
                 product=item.product,
@@ -208,12 +222,18 @@ class GoodsReceiptStockService:
                 unit_cost=item.unit_cost or Decimal('0.00'),
                 quantity_before=quantity_before,
                 quantity_after=stock.quantity,
+                # ⚠ Le partage se RECONSTITUE, il ne se divise pas.
+                # `loose_share` découpe au facteur du PRODUIT ; diviser par le
+                # facteur FIGÉ sur la ligne donnait un nombre fractionnaire de
+                # contenants dès que le marchand changeait son conditionnement
+                # entre la commande et la réception - et ce nombre partait en
+                # base, dans une colonne que le journal relit toujours.
+                # Voir `inventory.services.receive_transfer`, même remède.
                 input_package_quantity=(
-                    (item.quantity_accepted - loose_accepted) / item.packaging_factor
-                    if item.packaging_factor else Decimal('0.000')
+                    Decimal(paquets) if item.packaging_factor else Decimal('0.000')
                 ),
                 input_loose_quantity=(
-                    loose_accepted if item.packaging_factor else Decimal('0.000')
+                    vrac if item.packaging_factor else Decimal('0.000')
                 ),
                 packaging_factor=item.packaging_factor,
                 reference_type='goods_receipt_cancel',

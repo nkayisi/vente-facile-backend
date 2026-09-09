@@ -68,7 +68,7 @@ class FIFOService:
             queryset = queryset.filter(variant__isnull=True)
         
         if exclude_expired:
-            today = timezone.now().date()
+            today = timezone.localdate()
             queryset = queryset.filter(
                 Q(expiry_date__isnull=True) | Q(expiry_date__gte=today)
             )
@@ -210,7 +210,7 @@ class FIFOService:
             batches = batches.filter(variant__isnull=True)
         
         if exclude_expired:
-            today = timezone.now().date()
+            today = timezone.localdate()
             batches = batches.filter(
                 Q(expiry_date__isnull=True) | Q(expiry_date__gte=today)
             )
@@ -345,7 +345,7 @@ class FIFOService:
         Returns:
             Liste des lots qui vont expirer
         """
-        today = timezone.now().date()
+        today = timezone.localdate()
         expiry_limit = today + timezone.timedelta(days=days_ahead)
         
         queryset = StockBatch.objects.filter(
@@ -373,7 +373,7 @@ class FIFOService:
         Returns:
             Liste des lots expirés
         """
-        today = timezone.now().date()
+        today = timezone.localdate()
         
         queryset = StockBatch.objects.filter(
             organization=organization,
@@ -386,105 +386,6 @@ class FIFOService:
             queryset = queryset.filter(warehouse=warehouse)
         
         return list(queryset.order_by('expiry_date'))
-
-
-class ProfitCalculationService:
-    """
-    Service pour le calcul du profit réel basé sur le coût des lots FIFO.
-    """
-    
-    @staticmethod
-    def calculate_item_profit(
-        selling_price: Decimal,
-        quantity: Decimal,
-        cost_price: Decimal,
-        discount_amount: Decimal = Decimal('0.00')
-    ) -> dict:
-        """
-        Calcule le profit pour un article de vente.
-        
-        Args:
-            selling_price: Prix de vente unitaire
-            quantity: Quantité vendue
-            cost_price: Coût de revient unitaire (du lot FIFO)
-            discount_amount: Montant de la remise
-        
-        Returns:
-            Dict avec revenue, cost, profit, margin_percentage
-        """
-        revenue = (selling_price * quantity - discount_amount).quantize(Decimal('0.01'))
-        cost = (cost_price * quantity).quantize(Decimal('0.01'))
-        profit = (revenue - cost).quantize(Decimal('0.01'))
-        
-        margin_percentage = Decimal('0.00')
-        if revenue > 0:
-            margin_percentage = ((profit / revenue) * 100).quantize(Decimal('0.01'))
-        
-        return {
-            'revenue': revenue,
-            'cost': cost,
-            'profit': profit,
-            'margin_percentage': margin_percentage
-        }
-    
-    @staticmethod
-    def calculate_sale_profit(sale) -> dict:
-        """
-        Calcule le profit total d'une vente basé sur les coûts FIFO des lots.
-        CA HT par ligne après remises (y compris remise globale répartie), aligné sur les rapports.
-
-        Args:
-            sale: Instance de Sale
-
-        Returns:
-            Dict avec total_revenue, total_cost, total_profit, margin_percentage, items_detail
-        """
-        from apps.sales.profit_allocation import allocated_line_ht_revenues_for_sale, effective_unit_cost
-
-        total_revenue = Decimal('0.00')
-        total_cost = Decimal('0.00')
-        items_detail = []
-
-        alloc_by_item_id = {
-            i.id: rev for i, rev in allocated_line_ht_revenues_for_sale(sale)
-        }
-
-        for item in sale.items.all():
-            revenue = alloc_by_item_id.get(item.id, Decimal('0.00')).quantize(Decimal('0.01'))
-            cu = effective_unit_cost(item)
-            cost = (cu * item.quantity).quantize(Decimal('0.01'))
-            profit = (revenue - cost).quantize(Decimal('0.01'))
-            margin_percentage = Decimal('0.00')
-            if revenue > 0:
-                margin_percentage = ((profit / revenue) * 100).quantize(Decimal('0.01'))
-
-            total_revenue += revenue
-            total_cost += cost
-
-            items_detail.append({
-                'product_id': str(item.product_id),
-                'product_name': item.product.name,
-                'quantity': item.quantity,
-                'unit_price': item.unit_price,
-                'cost_price': item.cost_price,
-                'revenue': revenue,
-                'cost': cost,
-                'profit': profit,
-                'margin_percentage': margin_percentage,
-            })
-
-        total_profit = (total_revenue - total_cost).quantize(Decimal('0.01'))
-        margin_sale = Decimal('0.00')
-        if total_revenue > 0:
-            margin_sale = ((total_profit / total_revenue) * 100).quantize(Decimal('0.01'))
-
-        return {
-            'total_revenue': total_revenue,
-            'total_cost': total_cost,
-            'total_profit': total_profit,
-            'margin_percentage': margin_sale,
-            'items_detail': items_detail
-        }
 
 
 # ---------------------------------------------------------------------------
@@ -639,6 +540,31 @@ def receive_transfer(transfer, user, received_items=None):
             if received_qty is None:
                 received_qty = item.quantity_shipped
 
+            # ┌──────────────────────────────────────────────────────────────┐
+            # │ ON NE RÉCEPTIONNE PAS PLUS QUE CE QUI A ÉTÉ EXPÉDIÉ.         │
+            # │                                                              │
+            # │ La source n'a été débitée que de `quantity_shipped`. Créditer│
+            # │ davantage à destination fabrique du stock que personne n'a   │
+            # │ chargé, sous un mouvement qui a l'air parfaitement régulier :│
+            # │ une faute de frappe suffit, et l'écart ne se voit qu'à       │
+            # │ l'inventaire suivant, où il passe pour un surplus inexpliqué.│
+            # │                                                              │
+            # │ Le refus est DÉTERMINISTE : réessayer donnerait le même      │
+            # │ résultat, donc `TransitionRefusee`, que le journal traduit en │
+            # │ verdict `rejected` et non en `retry`.                        │
+            # └──────────────────────────────────────────────────────────────┘
+            nom = item.product.name if item.product_id else str(item.id)
+            if received_qty < 0:
+                raise TransitionRefusee(
+                    f"{nom} : une quantité reçue ne peut pas être négative."
+                )
+            if received_qty > item.quantity_shipped:
+                raise TransitionRefusee(
+                    f"{nom} : {received_qty:f} reçus alors que "
+                    f"{item.quantity_shipped:f} ont été expédiés. "
+                    "On ne réceptionne pas plus que ce qui a été chargé."
+                )
+
             item.quantity_received = received_qty
             item.save()
 
@@ -649,6 +575,27 @@ def receive_transfer(transfer, user, received_items=None):
                 item.product,
                 received_qty,
                 received_loose if received_loose is not None else item.loose_quantity,
+            )
+            # ┌──────────────────────────────────────────────────────────────┐
+            # │ LE PARTAGE SE RECONSTITUE, IL NE SE DIVISE PAS.              │
+            # │                                                              │
+            # │ `input_package_quantity` valait                              │
+            # │ `(received_qty - loose_received) / item.packaging_factor`.   │
+            # │ Or `loose_share` découpe au facteur du PRODUIT et la division│
+            # │ employait celui FIGÉ sur la ligne : tant que les deux        │
+            # │ coïncident le quotient tombe juste, et personne ne le        │
+            # │ remarque. Qu'un marchand change son conditionnement pendant  │
+            # │ que la marchandise est en route, et « 1,667 PAQUET »         │
+            # │ s'enregistrait - définitivement, dans une colonne que le     │
+            # │ journal des mouvements et son export reliront toujours.      │
+            # │                                                              │
+            # │ `split` rend un nombre ENTIER de scellés et reverse le       │
+            # │ reliquat au vrac ; les deux compteurs sont pris du même      │
+            # │ découpage, donc `paquets × facteur + vrac == quantité` reste │
+            # │ vrai quoi qu'il arrive au catalogue entre-temps.             │
+            # └──────────────────────────────────────────────────────────────┘
+            paquets_recus, vrac_recu = PackagingService.split(
+                received_qty, loose_received, item.packaging_factor
             )
 
             # Récupérer le coût moyen de la source
@@ -707,10 +654,12 @@ def receive_transfer(transfer, user, received_items=None):
                 quantity_before=quantity_before,
                 quantity_after=stock.quantity,
                 input_package_quantity=(
-                    (received_qty - loose_received) / item.packaging_factor
-                    if item.packaging_factor else Decimal('0.000')
+                    Decimal(paquets_recus) if item.packaging_factor
+                    else Decimal('0.000')
                 ),
-                input_loose_quantity=loose_received if item.packaging_factor else Decimal('0.000'),
+                input_loose_quantity=(
+                    vrac_recu if item.packaging_factor else Decimal('0.000')
+                ),
                 packaging_factor=item.packaging_factor,
                 reference_type='stock_transfer',
                 reference_id=transfer.id,
@@ -856,13 +805,18 @@ def approve_adjustment(adjustment, user):
             # L'écart se relit en contenants dans l'historique : « il
             # manquait 2 cartons + 1 bouteille » parle au marchand, « -25 »
             # non. Le signe reste porté par `quantity`.
+            # ⚠ Le partage se RECONSTITUE, il ne se divise pas. `loose_share`
+            # découpe au facteur du PRODUIT et la division employait `factor`,
+            # qui préfère celui FIGÉ sur la ligne : les deux pouvaient donc
+            # diverger, et « 1,667 CARTON » partait en base. `split` rend les
+            # deux compteurs d'un même découpage, sous UN seul facteur.
             factor = item.packaging_factor or PackagingService.factor(item.product)
             gap = abs(item.quantity_difference)
-            loose_gap = (
-                PackagingService.loose_share(item.product, gap)
-                if factor else Decimal('0.000')
+            package_gap, loose_gap = (
+                PackagingService.split(gap, Decimal('0.000'), factor)
+                if factor else (0, Decimal('0.000'))
             )
-            package_gap = (gap - loose_gap) / factor if factor else Decimal('0.000')
+            package_gap = Decimal(package_gap)
 
             # Créer le mouvement
             StockMovement.objects.create(

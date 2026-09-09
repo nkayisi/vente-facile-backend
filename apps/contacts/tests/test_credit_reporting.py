@@ -22,8 +22,12 @@ from .test_debt_flows import _DebtBaseTest
 
 class _DueDateBaseTest(_DebtBaseTest):
     def _set_due_date(self, sale_id, days_from_today):
+        # `localdate` et non `now().date()` : le rapport de créances compte
+        # l'ancienneté depuis le jour du MARCHAND. Entre 23h UTC et minuit à
+        # Kinshasa les deux diffèrent d'un jour, et « 40 jours de retard »
+        # devenait 41 pendant cette heure-là, sans autre cause qu'un fuseau.
         sale = Sale.objects.get(pk=sale_id)
-        sale.due_date = timezone.now().date() + timedelta(days=days_from_today)
+        sale.due_date = timezone.localdate() + timedelta(days=days_from_today)
         sale.save(update_fields=['due_date'])
         return sale
 

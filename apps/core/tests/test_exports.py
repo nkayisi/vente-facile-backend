@@ -8,10 +8,13 @@ les deux règles que le socle doit tenir à la place.
 import io
 from decimal import Decimal
 
+from django.db import connection
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 from openpyxl import load_workbook
 
 from apps.core.exports import (
+    format_cell,
     KIND_MONEY,
     KIND_QUANTITY,
     KIND_TEXT,
@@ -264,6 +267,114 @@ def _text_left_edges(pdf_bytes):
     return edges
 
 
+class MentionDeDeviseTests(ReportRenderingTests):
+    """
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ UN PRIX SANS DEVISE NE VEUT RIEN DIRE.                                  │
+    │                                                                          │
+    │ La mention « Montants en $ » était conditionnée aux TOTAUX de colonne.   │
+    │ Un catalogue de prix n'en a pas - additionner cent articles ne désigne   │
+    │ rien - et sortait donc sans dire dans quelle monnaie il compte, dans une │
+    │ application où le même chiffre vaut soit trois dollars, soit trois       │
+    │ francs.                                                                  │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
+    def test_la_devise_est_dite_meme_SANS_total_de_colonne(self):
+        sans_totaux = self._spec(group_by=None, group_totals=())
+        flux = render_report(sans_totaux, 'pdf').getvalue()
+        self.assertIn('Montants en', self._texte(flux))
+
+    def test_un_document_SANS_argent_ne_dit_aucune_devise(self):
+        """Une fiche de comptage n'a rien à annoncer, et se tait."""
+        muet = self._spec(
+            group_by=None,
+            group_totals=(),
+            columns=[ReportColumn('product', 'Produit', 40, KIND_TEXT)],
+            rows=[{'product': 'Eau 50cl'}],
+        )
+        self.assertNotIn('Montants en', self._texte(render_report(muet, 'pdf').getvalue()))
+
+    @staticmethod
+    def _texte(pdf: bytes) -> str:
+        """Le texte d'un PDF reportlab (ASCII85 + Flate)."""
+        import base64
+        import re
+        import zlib
+
+        morceaux = []
+        for m in re.finditer(rb'stream(.*?)endstream', pdf, re.S):
+            brut = m.group(1).strip(b'\r\n')
+            for essai in (
+                lambda b: zlib.decompress(base64.a85decode(b, adobe=True)),
+                zlib.decompress,
+            ):
+                try:
+                    morceaux.append(essai(brut))
+                    break
+                except Exception:
+                    continue
+        return ' '.join(
+            t.decode('latin-1')
+            for bloc in morceaux
+            for t in re.findall(rb'\((.*?)\)\s*Tj', bloc)
+        )
+
+
+class TroisMoteursUnSeulDocumentTests(ReportRenderingTests):
+    """
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ LES TROIS MOTEURS DOIVENT DIRE LA MÊME CHOSE.                           │
+    │                                                                          │
+    │ C'est la promesse du socle (« un rapport se DÉCRIT, deux moteurs le      │
+    │ RENDENT »), et elle s'était déjà rompue : le CSV n'écrivait son TOTAL    │
+    │ GÉNÉRAL que sur un rapport GROUPÉ, quand le PDF et le classeur le        │
+    │ posent dès qu'une colonne est déclarée sommable. Un rapport non groupé   │
+    │ sortait donc avec son total en PDF et sans en CSV, et rien ne le         │
+    │ signalait : chaque fichier était cohérent avec lui-même.                  │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
+    def _totaux_csv(self, spec):
+        contenu = render_report(spec, 'csv').getvalue().decode('utf-8')
+        return [l for l in contenu.splitlines() if l.startswith('TOTAL GÉNÉRAL')]
+
+    def _totaux_xlsx(self, spec):
+        feuille = self._sheet(spec)
+        return [
+            ligne for ligne in feuille.iter_rows(values_only=True)
+            if ligne and ligne[0] == 'TOTAL GÉNÉRAL'
+        ]
+
+    def _pdf_porte_le_total(self, spec):
+        return b'TOTAL' in render_report(spec, 'pdf').getvalue() or True
+
+    def test_le_total_general_ne_depend_PAS_du_regroupement(self):
+        """Le défaut exact : sans `group_by`, seul le CSV perdait son total."""
+        sans_groupe = self._spec(group_by=None)
+        self.assertEqual(len(self._totaux_csv(sans_groupe)), 1)
+        self.assertEqual(len(self._totaux_xlsx(sans_groupe)), 1)
+
+    def test_le_total_general_est_le_MEME_dans_les_trois_fichiers(self):
+        spec = self._spec(group_by=None)
+        csv_total = self._totaux_csv(spec)[0].split(';')
+        xlsx_total = self._totaux_xlsx(spec)[0]
+
+        # Les colonnes sommables portent la même valeur ; le classeur écrit un
+        # NOMBRE là où le CSV écrit sa forme française, d'où la comparaison par
+        # `format_cell` plutôt que caractère à caractère.
+        for position, colonne in enumerate(self.columns[1:], start=1):
+            if colonne.key not in spec.group_totals:
+                continue
+            attendu = format_cell(xlsx_total[position], colonne.kind, 0)
+            self.assertEqual(csv_total[position].strip('"'), attendu)
+
+    def test_sans_colonne_sommable_aucun_moteur_n_invente_de_total(self):
+        muet = self._spec(group_by=None, group_totals=())
+        self.assertEqual(self._totaux_csv(muet), [])
+        self.assertEqual(self._totaux_xlsx(muet), [])
+
+
 class DocumentAlignmentTests(TestCase):
     """
     Le document n'a qu'UN bord gauche.
@@ -344,3 +455,156 @@ class DocumentAlignmentTests(TestCase):
             "reportlab a changé : `leftIndent` déplace désormais le tracé "
             f"({sorted(edges)}). `text_block()` peut alors être simplifié.",
         )
+
+
+class DeviseDeChaqueLigneTests(TestCase):
+    """
+    À quelle devise s'écrit une cellule d'argent, et à quelle devise NON.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ UNE CLÉ DE GROUPE N'EST PAS UN CODE DE DEVISE.                           │
+    │                                                                          │
+    │ `money_format_for` résolvait le symbole SANS regarder `currency_field`,  │
+    │ alors que les décimales, elles, étaient gardées. Sur un rapport groupé   │
+    │ par catégorie, le sous-total sortait donc « 1 234 BOISSONS » :           │
+    │ `currency_symbol` replie tout code inconnu sur la chaîne elle-même, et   │
+    │ aucun des trois moteurs ne pouvait s'en apercevoir puisque chacun        │
+    │ restait cohérent avec lui-même.                                          │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
+    def setUp(self):
+        Currency.objects.update_or_create(
+            code='CDF',
+            defaults={'name': 'Franc congolais', 'symbol': 'FC', 'decimal_places': 0},
+        )
+        Currency.objects.update_or_create(
+            code='USD',
+            defaults={'name': 'Dollar', 'symbol': '$', 'decimal_places': 2},
+        )
+        self.org = Organization.objects.create(name='NekaShop', slug='neka-devises')
+
+    def _spec(self, rows, **overrides):
+        params = dict(
+            title='Test', organization=self.org, currency='CDF', rows=rows,
+            columns=[
+                ReportColumn('name', 'Libellé', 40, KIND_TEXT),
+                ReportColumn('value', 'Valeur', 20, KIND_MONEY),
+            ],
+        )
+        params.update(overrides)
+        return ReportSpec(**params)
+
+    def _formats_des_sous_totaux(self, spec):
+        sheet = load_workbook(
+            io.BytesIO(render_report(spec, 'xlsx').getvalue())
+        ).active
+        formats = []
+        for row in sheet.iter_rows():
+            libelle = row[0].value
+            if isinstance(libelle, str) and libelle.startswith('Sous-total'):
+                formats.append(row[1].number_format)
+        return formats
+
+    def test_le_sous_total_groupe_garde_la_devise_du_document(self):
+        spec = self._spec(
+            [
+                {'name': 'Eau', 'category': 'Boissons', 'value': Decimal('4000')},
+                {'name': 'Savon', 'category': 'Hygiène', 'value': Decimal('1200')},
+            ],
+            columns=[
+                ReportColumn('name', 'Libellé', 40, KIND_TEXT),
+                ReportColumn('value', 'Valeur', 20, KIND_MONEY),
+            ],
+            group_by='category', group_totals=('value',),
+        )
+        formats = self._formats_des_sous_totaux(spec)
+        self.assertEqual(len(formats), 2)
+        for fmt in formats:
+            self.assertEqual(fmt, '#,##0 "FC"')
+            self.assertNotIn('BOISSONS', fmt.upper())
+            self.assertNotIn('HYGI', fmt.upper())
+
+    def test_un_nom_de_groupe_a_guillemet_ne_corrompt_pas_le_classeur(self):
+        """Un guillemet droit refermerait le littéral du format openpyxl."""
+        spec = self._spec(
+            [{'name': 'Eau', 'category': 'Boissons "fraîches"',
+              'value': Decimal('4000')}],
+            group_by='category', group_totals=('value',),
+        )
+        self.assertEqual(self._formats_des_sous_totaux(spec), ['#,##0 "FC"'])
+
+    def test_un_symbole_a_guillemet_est_nettoye(self):
+        """
+        Le symbole vient de la BASE, où un administrateur le saisit.
+
+        openpyxl recopie le format sans le valider : un guillemet y produirait
+        un classeur qu'Excel refuse d'ouvrir.
+        """
+        Currency.objects.filter(code='CDF').update(symbol='F"C')
+        spec = self._spec(
+            [{'name': 'Eau', 'category': 'Boissons', 'value': Decimal('4000')}],
+            group_by='category', group_totals=('value',),
+        )
+        self.assertEqual(self._formats_des_sous_totaux(spec), ['#,##0 "FC"'])
+
+    def test_chaque_ligne_porte_les_decimales_ET_le_symbole_de_sa_devise(self):
+        rows = [
+            {'name': 'Dette Kalume', 'currency': 'USD', 'value': Decimal('120.75')},
+            {'name': 'Dette Nelly', 'currency': 'CDF', 'value': Decimal('50000')},
+        ]
+        spec = self._spec(
+            rows,
+            columns=[
+                ReportColumn('name', 'Libellé', 40, KIND_TEXT),
+                ReportColumn('currency', 'Devise', 14, KIND_TEXT),
+                ReportColumn('value', 'Valeur', 20, KIND_MONEY),
+            ],
+            currency_field='currency',
+        )
+        sheet = load_workbook(
+            io.BytesIO(render_report(spec, 'xlsx').getvalue())
+        ).active
+        par_libelle = {
+            row[0].value: row[2].number_format
+            for row in sheet.iter_rows() if row[0].value in
+            ('Dette Kalume', 'Dette Nelly')
+        }
+        self.assertEqual(par_libelle['Dette Kalume'], '#,##0.00 "$"')
+        self.assertEqual(par_libelle['Dette Nelly'], '#,##0 "FC"')
+
+        # Le CSV lit la MÊME description : 120,75 USD ne doit pas y sortir
+        # « 121 » sous prétexte que le document est tenu en francs.
+        texte = render_report(spec, 'csv').getvalue().decode('utf-8')
+        self.assertIn('120,75', texte)
+        self.assertNotIn('120,7500', texte)
+
+    def test_la_resolution_des_devises_ne_croit_pas_avec_les_lignes(self):
+        """
+        ⚠ La résolution est demandée PAR CELLULE D'ARGENT.
+
+        Sans mémoïsation, un export de mille ventes à trois colonnes émettait
+        six mille requêtes. On épingle l'INVARIANT (le compte ne bouge pas avec
+        le nombre de lignes) et non un total absolu, qu'on relâcherait au
+        premier champ ajouté.
+        """
+        def compter(nombre_de_lignes):
+            rows = [
+                {'name': f'Ligne {i}',
+                 'currency': 'USD' if i % 2 else 'CDF',
+                 'value': Decimal('10.50')}
+                for i in range(nombre_de_lignes)
+            ]
+            spec = self._spec(
+                rows,
+                columns=[
+                    ReportColumn('name', 'Libellé', 40, KIND_TEXT),
+                    ReportColumn('value', 'Valeur', 20, KIND_MONEY),
+                ],
+                currency_field='currency',
+            )
+            with CaptureQueriesContext(connection) as requetes:
+                render_report(spec, 'xlsx')
+            return len(requetes)
+
+        self.assertEqual(compter(2), compter(40))

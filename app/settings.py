@@ -444,11 +444,6 @@ LOGGING = {
             'class': 'logging.StreamHandler',
             'formatter': 'simple',
         },
-        'file': {
-            'class': 'logging.FileHandler',
-            'filename': BASE_DIR / 'logs' / 'django.log',
-            'formatter': 'verbose',
-        },
     },
     'root': {
         'handlers': ['console'],
@@ -460,9 +455,42 @@ LOGGING = {
             'level': config('DJANGO_LOG_LEVEL', default='INFO'),
             'propagate': False,
         },
+        # ┌──────────────────────────────────────────────────────────────┐
+        # │ AUCUN HANDLER DE FICHIER, ET C'EST LA CORRECTION.            │
+        # │                                                              │
+        # │ Il y en avait un, avec rotation, pour empêcher `django.log`  │
+        # │ de remplir le disque du VPS - un disque plein arrête         │
+        # │ PostgreSQL avant d'arrêter Django, et le marchand perd sa    │
+        # │ caisse pour un fichier de journal. Mais gunicorn tourne à    │
+        # │ `--workers 2` (voir `entrypoint.sh`) : DEUX processus        │
+        # │ tenaient le même `RotatingFileHandler`. Quand l'un fait sa   │
+        # │ bascule, l'autre garde sa poignée sur l'inode RENOMMÉ - ses  │
+        # │ lignes n'apparaissent plus jamais dans `django.log`, et      │
+        # │ quand ce fichier est enfin supprimé, l'inode resté ouvert    │
+        # │ continue d'occuper le disque jusqu'au recyclage du worker.   │
+        # │ La rotation réintroduisait donc le remplissage qu'elle       │
+        # │ venait fermer, par l'autre bout.                             │
+        # │                                                              │
+        # │ Deux faits rendent le retrait sans coût : PERSONNE NE LIT ce │
+        # │ fichier - il n'est monté dans aucun des deux                 │
+        # │ `docker-compose.yml`, donc il vit dans la couche jetable du  │
+        # │ conteneur et disparaît à chaque `up --build` ; et la copie   │
+        # │ console est DÉJÀ collectée par le démon Docker, seul         │
+        # │ écrivain capable de faire tourner un fichier sans course.    │
+        # │ La borne haute est posée là-bas (`logging: max-size` /       │
+        # │ `max-file`, cinq fichiers de dix mégaoctets, comme ici).     │
+        # │                                                              │
+        # │ NE PAS remettre un handler de fichier ici sans avoir résolu  │
+        # │ la concurrence entre workers.                                │
+        # └──────────────────────────────────────────────────────────────┘
         'apps': {
-            'handlers': ['console', 'file'],
-            'level': 'DEBUG',
+            'handlers': ['console'],
+            # ⚠ `DEBUG` était codé EN DUR, donc actif en production : chaque
+            # requête y écrivait ses détails. Le niveau suit désormais le mode,
+            # et reste réglable par variable d'environnement.
+            'level': config(
+                'APPS_LOG_LEVEL', default='DEBUG' if DEBUG else 'INFO'
+            ),
             'propagate': False,
         },
     },

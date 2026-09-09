@@ -26,17 +26,6 @@ class SavedReportSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'last_run', 'next_run', 'created_at']
 
 
-class ReportExportSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = ReportExport
-        fields = [
-            'id', 'saved_report', 'template', 'export_format', 'status',
-            'parameters', 'file', 'file_size', 'error_message',
-            'completed_at', 'expires_at', 'created_at'
-        ]
-        read_only_fields = ['id', 'status', 'file', 'file_size', 'error_message', 'completed_at', 'created_at']
-
-
 class DashboardWidgetSerializer(serializers.ModelSerializer):
     class Meta:
         model = DashboardWidget

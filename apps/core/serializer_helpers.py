@@ -62,26 +62,3 @@ def scope_fk_to_org(serializer, *fk_names: str) -> None:
         if hasattr(model, 'is_deleted'):
             filtered = filtered.filter(is_deleted=False)
         field.queryset = filtered
-
-
-def scope_nested_fk_to_org(
-    serializer,
-    nested_field: str,
-    fk_names: Iterable[str],
-) -> None:
-    """Applique ``scope_fk_to_org`` aux items d'un serializer imbriqué (``many=True``).
-
-    Utilisé pour scoper par ex. ``items[*].product`` quand ``SaleCreateSerializer``
-    contient un ``SaleItemCreateSerializer(many=True)``.
-    """
-    nested = serializer.fields.get(nested_field)
-    if nested is None:
-        return
-
-    child = getattr(nested, 'child', None)
-    if child is None:
-        return
-
-    # Le child hérite du context du parent, donc on peut réutiliser le helper
-    # en lui passant l'instance enfant.
-    scope_fk_to_org(child, *fk_names)

@@ -15,6 +15,7 @@ from decimal import Decimal
 from apps.core.api_mixins import (
     TenantViewSetMixin, AuditMixin, WarehouseScopedQuerysetMixin, ExportResponseMixin,
 )
+from rest_framework.exceptions import ValidationError as DRFValidationError
 from apps.core.warehouse_scope import (
     accessible_warehouse_ids,
     assert_warehouse_allowed_for_request,
@@ -370,12 +371,12 @@ class StockViewSet(ExportResponseMixin, WarehouseScopedQuerysetMixin, TenantView
         organization = self.get_organization()
         days = int(request.query_params.get('days', 30))
         
-        expiry_date = timezone.now().date() + timezone.timedelta(days=days)
+        expiry_date = timezone.localdate() + timezone.timedelta(days=days)
         
         batches = StockBatch.objects.filter(
             organization=organization,
             expiry_date__lte=expiry_date,
-            expiry_date__gte=timezone.now().date(),
+            expiry_date__gte=timezone.localdate(),
             quantity__gt=0
         ).select_related('product', 'product__unit', 'warehouse').order_by('expiry_date')
         m = get_membership_for_request(request)
@@ -415,7 +416,7 @@ class StockViewSet(ExportResponseMixin, WarehouseScopedQuerysetMixin, TenantView
             batches = batches.filter(quantity__gt=0)
         
         if not include_expired:
-            today = timezone.now().date()
+            today = timezone.localdate()
             batches = batches.filter(
                 db_models.Q(expiry_date__isnull=True) | db_models.Q(expiry_date__gte=today)
             )
@@ -793,7 +794,9 @@ class StockAdjustmentViewSet(TransitionActionMixin, WarehouseScopedQuerysetMixin
 
 # =============================================================================
 
-class InventorySessionViewSet(TransitionActionMixin, WarehouseScopedQuerysetMixin, TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
+class InventorySessionViewSet(ExportResponseMixin, TransitionActionMixin,
+                              WarehouseScopedQuerysetMixin, TenantViewSetMixin,
+                              AuditMixin, viewsets.ModelViewSet):
     """
     ViewSet pour la gestion des sessions d'inventaire.
     
@@ -808,7 +811,6 @@ class InventorySessionViewSet(TransitionActionMixin, WarehouseScopedQuerysetMixi
     - POST   /inventory-sessions/{id}/validate/      : Valider et appliquer les ajustements
     - POST   /inventory-sessions/{id}/cancel/        : Annuler (déverrouille le stock)
     - GET    /inventory-sessions/{id}/counts/        : Liste des lignes de comptage
-    - GET    /inventory-sessions/{id}/print-data/    : Données pour impression
     """
 
     transition_serializer = InventorySessionDetailSerializer
@@ -834,7 +836,9 @@ class InventorySessionViewSet(TransitionActionMixin, WarehouseScopedQuerysetMixi
         'validate': 'inventory.validate',
         'cancel': 'inventory.cancel',
         'counts': 'inventory.view',
-        'print_data': 'inventory.print',
+        # Les deux documents (fiche et rapport) se lisent avec le même droit
+        # que l'impression : ils ne portent rien que l'écran n'affiche déjà.
+        'export': 'inventory.print',
         # Le VERROU se lit au comptoir, donc par le caissier, qui n'a pas
         # `inventory.view`. Sans cette ligne l'action n'était pas listée, donc
         # refusée (403) à TOUS les rôles : le POS web appelait une route qui
@@ -910,7 +914,13 @@ class InventorySessionViewSet(TransitionActionMixin, WarehouseScopedQuerysetMixi
     def cancel(self, request, pk=None):
         """Annule une session d'inventaire et déverrouille le stock."""
         from .services import cancel_inventory_session
-        return self._transition(cancel_inventory_session)
+        # ⚠ `serialiser=True` comme ses quatre soeurs : le service rend une
+        # `InventorySession`, et sans cet argument l'objet partait tel quel au
+        # rendu JSON. Django répondait 500 - APRÈS que le service ait écrit,
+        # puisque le rendu est la dernière étape : le stock était bel et bien
+        # déverrouillé, et le gérant lisait un échec. C'est le défaut déjà
+        # corrigé sur le chemin du JOURNAL, resté ouvert sur celui de la VUE.
+        return self._transition(cancel_inventory_session, serialiser=True)
 
     @action(detail=True, methods=['get'])
     def counts(self, request, pk=None):
@@ -947,46 +957,48 @@ class InventorySessionViewSet(TransitionActionMixin, WarehouseScopedQuerysetMixi
         serializer = InventoryCountSerializer(qs, many=True)
         return Response(serializer.data)
 
-    @action(detail=True, methods=['get'], url_path='print-data')
-    def print_data(self, request, pk=None):
+    @action(detail=True, methods=['get'], url_path='export')
+    def export(self, request, pk=None):
         """
-        Retourne les données formatées pour l'impression de l'inventaire.
-        Inclut les informations de la session et toutes les lignes de comptage.
+        La fiche de comptage ou le rapport d'écarts, en PDF, classeur ou CSV.
+
+        Les deux documents étaient dessinés dans le navigateur, en jsPDF, à
+        partir du JSON de `print-data/`. Ils portent désormais la marque de tous
+        les autres documents du produit.
         """
+        from apps.inventory.session_documents import (
+            DOCUMENT_BASENAMES,
+            build_inventory_report,
+            build_inventory_sheet,
+        )
+        from apps.settings.services import CurrencyService
+
+        fmt = self.get_export_format(request)
+        document = (request.query_params.get('document') or 'sheet').strip()
+        if document not in DOCUMENT_BASENAMES:
+            raise DRFValidationError({
+                'document': "Document inconnu. Attendu : "
+                            + ', '.join(sorted(DOCUMENT_BASENAMES)) + '.',
+            })
+
         session = self.get_object()
-        
+        organization = self.get_organization()
         counts = session.counts.select_related(
-            'product', 'product__category', 'product__unit', 'variant', 'counted_by'
+            'product', 'product__category', 'product__unit',
+            'product__packaging_unit',
         ).order_by('product__category__name', 'product__name')
-        
-        # Group by category
-        categories_data = {}
-        for count in counts:
-            cat_name = count.product.category.name if count.product.category else 'Sans catégorie'
-            if cat_name not in categories_data:
-                categories_data[cat_name] = []
-            categories_data[cat_name].append(InventoryCountSerializer(count).data)
-        
-        return Response({
-            'session': InventorySessionListSerializer(session).data,
-            'warehouse': {
-                'name': session.warehouse.name,
-                'code': session.warehouse.code,
-                'address': session.warehouse.address,
-            },
-            'categories': categories_data,
-            'summary': {
-                'total_products': session.items_total,
-                'counted_products': session.items_counted,
-                'products_with_difference': session.items_with_difference,
-                'total_expected_quantity': str(session.total_expected_quantity),
-                'total_counted_quantity': str(session.total_counted_quantity),
-                'total_difference_quantity': str(session.total_difference_quantity),
-                'total_difference_value': str(session.total_difference_value),
-            },
-            'printed_at': timezone.now().isoformat(),
-            'printed_by': request.user.full_name or request.user.email,
-        })
+
+        constructeur = (
+            build_inventory_sheet if document == 'sheet' else build_inventory_report
+        )
+        spec = constructeur(
+            session, counts, organization,
+            currency=CurrencyService.primary_code(organization),
+        )
+        return self.render_export(
+            spec, f"{DOCUMENT_BASENAMES[document]}_{session.reference}", fmt
+        )
+
 
     @action(detail=False, methods=['get'], url_path='locked-products')
     def locked_products(self, request):

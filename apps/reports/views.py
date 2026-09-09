@@ -26,7 +26,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 from apps.core.mixins import TenantQuerysetMixin
-from apps.core.api_mixins import ActionPaginationMixin
+from apps.core.api_mixins import ActionPaginationMixin, ExportResponseMixin
 from apps.core.api_permissions import IsTenantMember, HasActiveSubscription, HasPermission
 from apps.core.warehouse_scope import (
     accessible_warehouse_ids,
@@ -41,6 +41,11 @@ from apps.inventory.packaging import PackagingProfile, PackagingService
 from apps.contacts.models import Customer
 from apps.settings.services import CurrencyService
 from apps.cashbook.models import CashMovement, Expense
+
+# Les deux refus du rapport d'activité, partagés par l'action paginée et par
+# l'export : deux surfaces qui refusent le même acte doivent le dire pareil.
+USER_ACTIVITY_REQUIS = "Le paramètre 'user' est requis."
+USER_ACTIVITY_INCONNU = "Utilisateur introuvable dans cette organisation."
 # Agrégations comptables : les montants de caisse/dépenses sont convertis en
 # devise principale (montant × exchange_rate) avant d'être sommés. Le livre de
 # caisse, lui, reste ventilé par devise - voir apps/cashbook/views.py.
@@ -128,7 +133,8 @@ class DashboardViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
         )
 
 
-class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.ViewSet):
+class StatisticsViewSet(ExportResponseMixin, ActionPaginationMixin,
+                        TenantQuerysetMixin, viewsets.ViewSet):
     """
     ViewSet pour les statistiques et rapports en temps réel.
     Fournit des endpoints pour différentes métriques de l'entreprise.
@@ -162,6 +168,10 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         'product_profits': 'reports.view',
         'sales_by_packaging': 'reports.view',
         'user_activity': 'reports.view',
+        # Exporter, c'est LIRE : le fichier ne porte rien que l'écran n'affiche
+        # déjà, et les mêmes `_scope_*` s'appliquent. Sans cette entrée,
+        # `HasPermission` refuse la route à TOUS les rôles, en silence.
+        'export': 'reports.view',
     }
     
     def _accessible_warehouse_ids(self, request):
@@ -291,12 +301,59 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         return qs.filter(warehouse_id__in=wh_ids)
 
     def _parse_date_range(self, request):
-        """Parse les paramètres de période"""
-        period = request.query_params.get('period', 'month')
+        """
+        Bornes de la période demandée.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ LE DÉFAUT ÉTAIT `month`, ET `month` EST CALENDAIRE.                  │
+        │                                                                      │
+        │ Un appel sans paramètre couvrait donc du 1er du mois à aujourd'hui.  │
+        │ Relevé le 2 septembre 2026 sur les vraies données : DEUX JOURS,      │
+        │ zéro vente - la dernière datait du 31 août - pendant que la même     │
+        │ base rendait 18 ventes sur trente jours glissants. Toutes les        │
+        │ rubriques annonçaient « Aucune donnée », et le marchand y lit une    │
+        │ perte de données. Le défaut revenait les premiers jours de CHAQUE    │
+        │ mois, et le terminal, qui n'envoie aucune date, y tombait toujours.  │
+        │                                                                      │
+        │ Le défaut est désormais GLISSANT sur trente jours. Les périodes      │
+        │ calendaires restent offertes et gardent leur sens : le back-office   │
+        │ les nomme « Ce mois », « Cette année », et une fenêtre nommée par un │
+        │ calendrier doit suivre le calendrier. Ce qui était faux, c'était de  │
+        │ l'imposer à qui ne demande rien.                                     │
+        └──────────────────────────────────────────────────────────────────────┘
+
+        Deux familles, et les libellés de l'interface disent laquelle :
+
+        - CALENDAIRES : `today`, `week` (depuis lundi), `month` (depuis le 1er),
+          `quarter`, `year` (depuis le 1er janvier).
+        - GLISSANTES : `last_7_days`, `last_30_days`, `last_12_months`. Seules
+          celles-ci s'emboîtent quel que soit le quantième, ce qui est la règle
+          déjà retenue pour le tableau de bord (`_periode_glissante`).
+
+        Les DATES EXPLICITES (`date_from` / `date_to`) priment sur tout, et
+        c'est ce que le terminal envoie : la fenêtre ne dépend alors plus d'un
+        défaut serveur qu'il ne voit pas.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ « AUJOURD'HUI » EST LE JOUR DU MARCHAND, PAS CELUI DE GREENWICH.     │
+        │                                                                      │
+        │ Les bornes se lisaient en `timezone.now().date()`, donc en UTC,      │
+        │ pendant que le filtre `sale_date__date` résout en `TIME_ZONE`        │
+        │ (Africa/Kinshasa, UTC+1). Entre 23h et minuit UTC, il est déjà le    │
+        │ lendemain à Kinshasa : `end_date` désignait la veille, et TOUTE      │
+        │ vente de la première heure du jour sortait de la fenêtre. Le         │
+        │ marchand qui ouvre après minuit lit « Aucune donnée » sur les huit   │
+        │ onglets, une heure durant, alors qu'il vient d'encaisser.            │
+        │                                                                      │
+        │ D'où `localdate()` ici et partout où ce module date un jour. C'est   │
+        │ la règle déjà posée par `day_bounds()` côté inventaire.              │
+        └──────────────────────────────────────────────────────────────────────┘
+        """
+        period = request.query_params.get('period', 'last_30_days')
         date_from = request.query_params.get('date_from')
         date_to = request.query_params.get('date_to')
         
-        today = timezone.now().date()
+        today = timezone.localdate()
         
         if date_from and date_to:
             from datetime import datetime
@@ -330,8 +387,25 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         elif period == 'year':
             start_date = today.replace(month=1, day=1)
             end_date = today
+        elif period == 'last_7_days':
+            # Sept jours AUJOURD'HUI INCLUS : `- 7` en ferait huit, et la
+            # comparaison à la période précédente porterait sur deux fenêtres
+            # inégales, ce qui inventerait une variation.
+            start_date = today - timedelta(days=6)
+            end_date = today
+        elif period == 'last_12_months':
+            # Douze mois PLEINS, dont le mois en cours : on part du 1er du mois
+            # situé onze mois en arrière. Une fenêtre à cheval rendrait treize
+            # seaux dont deux partiels, avec deux étiquettes « sept. » sur le
+            # même axe. Même règle qu'au tableau de bord.
+            premier = today.replace(day=1)
+            recule = premier.year * 12 + (premier.month - 1) - 11
+            start_date = premier.replace(year=recule // 12, month=recule % 12 + 1)
+            end_date = today
         else:
-            start_date = today - timedelta(days=30)
+            # `last_30_days`, et tout ce qui n'est pas reconnu : trente jours
+            # glissants, aujourd'hui inclus.
+            start_date = today - timedelta(days=29)
             end_date = today
         
         # Période précédente pour comparaison
@@ -341,33 +415,29 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         
         return start_date, end_date, prev_start_date, prev_end_date
 
-    @action(detail=False, methods=['get'])
-    def user_activity(self, request):
-        """Rapport d'activité d'un utilisateur sur une période (avec heures).
-
-        Params : ``user`` (id, requis), ``date_from``/``date_to`` ou ``period``,
-        ``group_by=hour|day`` (défaut ``day``). Réservé à ``reports.view``
-        (owner + gérant) ; les données restent scopées au périmètre du
-        demandeur (un gérant ne voit que l'activité dans ses entrepôts).
+    @staticmethod
+    def _resolve_activity_member(org, target_id):
         """
-        org = self.get_organization()
-        start_date, end_date, _, _ = self._parse_date_range(request)
-        group_by = request.query_params.get('group_by', 'day')
+        L'employé visé par le rapport d'activité, ou `None`.
 
-        target_id = request.query_params.get('user')
+        Rend `None` plutôt que de lever : l'action et l'export refusent tous
+        deux, mais ils doivent le faire avec LEURS codes (400 puis 404) et avec
+        le message porté par `USER_ACTIVITY_REQUIS` / `USER_ACTIVITY_INCONNU`,
+        que les deux chemins partagent pour ne pas dériver.
+        """
         if not target_id:
-            return Response(
-                {'user': "Le paramètre 'user' est requis."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        membership = OrganizationMembership.objects.filter(
+            return None
+        return OrganizationMembership.objects.filter(
             organization=org, user_id=target_id
         ).select_related('user').first()
-        if not membership:
-            return Response(
-                {'user': "Utilisateur introuvable dans cette organisation."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
+
+    def _user_activity_data(self, request, org, membership, start_date, end_date, group_by):
+        """
+        L'activité d'un employé sur la période, déjà quantifiée.
+
+        Le `breakdown` n'a jamais été paginé : cette méthode rend donc la
+        période entière, et l'action comme l'export en tirent le même contenu.
+        """
         target_user = membership.user
 
         money = dict(output_field=DecimalField())
@@ -474,7 +544,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         def sou(montant):
             return (montant or Decimal('0')).quantize(Decimal('0.01'))
 
-        return Response({
+        return {
             'user': {
                 'id': str(target_user.id),
                 'name': f"{target_user.first_name} {target_user.last_name}".strip() or target_user.email,
@@ -503,7 +573,72 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
                 'net': sou(cash_in - cash_out),
             },
             'breakdown': breakdown,
-        })
+        }
+
+    @action(detail=False, methods=['get'], url_path='export')
+    def export(self, request):
+        """
+        Exporte un onglet de « Rapports & Statistiques », en PDF, classeur ou CSV.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ LE PÉRIMÈTRE ENTIER, JAMAIS LA PAGE AFFICHÉE.                        │
+        │                                                                      │
+        │ Les deux surfaces fabriquaient leur document à partir des vingt       │
+        │ lignes chargées, sous un en-tête qui annonçait le total. Ici les      │
+        │ constructeurs de lignes sont appelés SANS pagination.                 │
+        └──────────────────────────────────────────────────────────────────────┘
+
+        Ni `ExportableListMixin` ni `filter_queryset` : ce ViewSet n'a pas de
+        queryset unique, et un onglet croise jusqu'à trois rubriques. Le
+        périmètre vient donc des mêmes `_scope_*` que les actions paginées.
+        """
+        from .exports import EXPORT_BASENAMES, build_tab_spec
+
+        fmt = self.get_export_format(request)
+        tab = (request.query_params.get('tab') or 'overview').strip()
+
+        # Le refus se fait ICI et non dans le constructeur, pour porter le même
+        # littéral et la même FORME que l'action paginée : `ValidationError`
+        # rendrait une liste là où l'action rend une chaîne, et le back-office
+        # branche son message de champ sur cette forme.
+        if tab == 'user-activity' and not request.query_params.get('user'):
+            return Response(
+                {'user': USER_ACTIVITY_REQUIS},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        spec = build_tab_spec(self, request, tab)
+        return self.render_export(spec, EXPORT_BASENAMES.get(tab, 'rapport'), fmt)
+
+    @action(detail=False, methods=['get'])
+    def user_activity(self, request):
+        """Rapport d'activité d'un utilisateur sur une période (avec heures).
+
+        Params : ``user`` (id, requis), ``date_from``/``date_to`` ou ``period``,
+        ``group_by=hour|day`` (défaut ``day``). Réservé à ``reports.view``
+        (owner + gérant) ; les données restent scopées au périmètre du
+        demandeur (un gérant ne voit que l'activité dans ses entrepôts).
+        """
+        org = self.get_organization()
+        start_date, end_date, _, _ = self._parse_date_range(request)
+        group_by = request.query_params.get('group_by', 'day')
+
+        target_id = request.query_params.get('user')
+        if not target_id:
+            return Response(
+                {'user': USER_ACTIVITY_REQUIS},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        membership = self._resolve_activity_member(org, target_id)
+        if not membership:
+            return Response(
+                {'user': USER_ACTIVITY_INCONNU},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        return Response(self._user_activity_data(
+            request, org, membership, start_date, end_date, group_by
+        ))
 
     @action(detail=False, methods=['get'])
     def summary(self, request):
@@ -744,14 +879,16 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             'total_revenue': item['total_revenue'],
         }
 
-    @action(detail=False, methods=['get'])
-    def top_products(self, request):
-        """Top produits les plus vendus avec pagination"""
-        org = self.get_organization()
-        start_date, end_date, _, _ = self._parse_date_range(request)
-        page = int(request.query_params.get('page', 1))
-        page_size = int(request.query_params.get('page_size', 20))
-        
+    def _top_products_values(self, request, org, start_date, end_date):
+        """
+        Ventes agrégées par produit, ordonnées, SANS pagination.
+
+        ⚠ NE PAS RÉÉCRIRE CE `values()` AILLEURS. `PackagingProfile.from_values`
+        y lit `product__selling_mode`, `product__units_per_package` et le nom
+        des deux unités ; une clé oubliée rend `factor=None` en SILENCE, et
+        toutes les quantités retombent en nombres nus (« 72 » au lieu de
+        « 5 casiers + 12 bouteilles »), sans la moindre erreur.
+        """
         items = self._scope_sale_items(
             SaleItem.objects.filter(
                 sale__organization=org,
@@ -786,15 +923,25 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             ),
             total_revenue=primary_sum('total', rate='sale__exchange_rate')
         ).order_by('-quantity_sold')
-        
-        # Pagination
+
+        return data
+
+    @action(detail=False, methods=['get'])
+    def top_products(self, request):
+        """Top produits les plus vendus avec pagination"""
+        org = self.get_organization()
+        start_date, end_date, _, _ = self._parse_date_range(request)
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 20))
+
+        data = self._top_products_values(request, org, start_date, end_date)
         total_count = data.count()
         start_idx = (page - 1) * page_size
-        end_idx = start_idx + page_size
-        paginated_data = data[start_idx:end_idx]
-        
-        result = [self._top_product_row(item) for item in paginated_data]
-        
+        result = [
+            self._top_product_row(item)
+            for item in data[start_idx:start_idx + page_size]
+        ]
+
         serializer = TopProductSerializer(result, many=True)
         return Response({
             'results': serializer.data,
@@ -804,14 +951,8 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             'total_pages': (total_count + page_size - 1) // page_size if page_size > 0 else 0,
         })
     
-    @action(detail=False, methods=['get'])
-    def top_customers(self, request):
-        """Meilleurs clients avec pagination"""
-        org = self.get_organization()
-        start_date, end_date, _, _ = self._parse_date_range(request)
-        page = int(request.query_params.get('page', 1))
-        page_size = int(request.query_params.get('page_size', 20))
-        
+    def _top_customer_rows(self, request, org, start_date, end_date):
+        """Meilleurs clients, ordonnés, sur le PÉRIMÈTRE ENTIER."""
         sales = self._scope_sales(
             Sale.objects.filter(
                 organization=org,
@@ -837,12 +978,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             order_count=Count('id')
         ).order_by('-total_purchases')
         
-        total_count = data.count()
-        start_idx = (page - 1) * page_size
-        end_idx = start_idx + page_size
-        paginated_data = data[start_idx:end_idx]
-        
-        result = [
+        return [
             {
                 'customer_id': item['customer__id'],
                 'customer_name': item['customer__name'],
@@ -850,9 +986,22 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
                 'order_count': item['order_count'],
                 'current_balance': item['customer__current_balance'] or Decimal('0')
             }
-            for item in paginated_data
+            for item in data
         ]
-        
+
+    @action(detail=False, methods=['get'])
+    def top_customers(self, request):
+        """Meilleurs clients avec pagination"""
+        org = self.get_organization()
+        start_date, end_date, _, _ = self._parse_date_range(request)
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 20))
+
+        rows = self._top_customer_rows(request, org, start_date, end_date)
+        total_count = len(rows)
+        start_idx = (page - 1) * page_size
+        result = rows[start_idx:start_idx + page_size]
+
         serializer = TopCustomerSerializer(result, many=True)
         return Response({
             'results': serializer.data,
@@ -879,15 +1028,14 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         serializer = CashbookStatsSerializer(stats)
         return Response(serializer.data)
     
-    @action(detail=False, methods=['get'])
-    def cash_flow(self, request):
-        """Flux de trésorerie par période avec pagination"""
-        org = self.get_organization()
-        start_date, end_date, _, _ = self._parse_date_range(request)
-        group_by = request.query_params.get('group_by', 'day')
-        page = int(request.query_params.get('page', 1))
-        page_size = int(request.query_params.get('page_size', 20))
-        
+    def _cash_flow_rows(self, request, org, start_date, end_date, group_by):
+        """
+        Flux de trésorerie par période, sur le PÉRIMÈTRE ENTIER.
+
+        Extraite de l'action pour que l'export la rejoue sans pagination : un
+        fichier qui ne porterait que les vingt lignes affichées mentirait sur
+        son propre contenu, sous un en-tête qui annonce le total.
+        """
         movements = self._scope_cash_movements(
             CashMovement.objects.filter(
                 organization=org,
@@ -896,14 +1044,14 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             ),
             request,
         )
-        
+
         if group_by == 'week':
             trunc_func = TruncWeek('movement_date')
         elif group_by == 'month':
             trunc_func = TruncMonth('movement_date')
         else:
             trunc_func = TruncDate('movement_date')
-        
+
         # Montants convertis en devise principale : un flux de trésorerie est un
         # chiffre comptable unique, il ne peut pas mélanger USD et CDF bruts.
         data = movements.annotate(
@@ -912,24 +1060,32 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             income=primary_sum('amount', filter=Q(direction='in')),
             expenses=primary_sum('amount', filter=Q(direction='out')),
         ).order_by('period')
-        
-        all_data = list(data)
-        total_count = len(all_data)
-        
-        start_idx = (page - 1) * page_size
-        end_idx = start_idx + page_size
-        paginated_data = all_data[start_idx:end_idx]
-        
-        result = [
+
+        return [
             {
                 'period': item['period'].strftime('%Y-%m-%d') if item['period'] else '',
                 'income': item['income'],
                 'expenses': item['expenses'],
                 'net': item['income'] - item['expenses']
             }
-            for item in paginated_data
+            for item in data
         ]
-        
+
+    @action(detail=False, methods=['get'])
+    def cash_flow(self, request):
+        """Flux de trésorerie par période avec pagination"""
+        org = self.get_organization()
+        start_date, end_date, _, _ = self._parse_date_range(request)
+        group_by = request.query_params.get('group_by', 'day')
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 20))
+
+        rows = self._cash_flow_rows(request, org, start_date, end_date, group_by)
+        total_count = len(rows)
+
+        start_idx = (page - 1) * page_size
+        result = rows[start_idx:start_idx + page_size]
+
         serializer = CashFlowByPeriodSerializer(result, many=True)
         return Response({
             'results': serializer.data,
@@ -948,8 +1104,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         serializer = CustomerStatsSerializer(stats)
         return Response(serializer.data)
 
-    @action(detail=False, methods=['get'])
-    def receivables(self, request):
+    def _receivables_data(self, request, org):
         """
         Balance âgée des créances clients, ventilée par devise.
 
@@ -966,8 +1121,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         """
         from apps.cashbook.services import primary_sum
 
-        org = self.get_organization()
-        today = timezone.now().date()
+        today = timezone.localdate()
 
         open_invoices = self._scope_sales(
             Sale.objects.filter(
@@ -1021,6 +1175,11 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             entry = by_customer.setdefault(key, {
                 'customer_id': str(sale.customer_id),
                 'customer_name': sale.customer.name,
+                # Le téléphone vient du SERVEUR : le terminal le joignait dans
+                # sa base locale et le back-office ne l'avait pas du tout, si
+                # bien que son écran de relance ne portait aucun numéro. On
+                # relance au téléphone, pas par la pensée.
+                'customer_phone': sale.customer.phone or '',
                 'currency': sale.currency,
                 'amount_due': Decimal('0.00'),
                 'invoice_count': 0,
@@ -1045,7 +1204,7 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             by_customer.values(), key=lambda e: e['amount_due'], reverse=True,
         )
 
-        return Response({
+        return {
             'as_of': str(today),
             'buckets': [name for name, _, _ in buckets],
             'by_currency': sorted(by_currency.values(), key=lambda r: r['currency']),
@@ -1056,7 +1215,12 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             'total_primary': total_primary,
             'overdue_primary': overdue_primary,
             'primary_currency': CurrencyService.primary_code(org),
-        })
+        }
+
+    @action(detail=False, methods=['get'])
+    def receivables(self, request):
+        """Balance âgée des créances clients, ventilée par devise."""
+        return Response(self._receivables_data(request, self.get_organization()))
     
     # ========================================================================
     # HELPER METHODS
@@ -1168,11 +1332,11 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         low_stock = decomptes['low_stock']
         
         # Lots expirant bientôt (30 jours)
-        expiring_date = timezone.now().date() + timedelta(days=30)
+        expiring_date = timezone.localdate() + timedelta(days=30)
         batches = StockBatch.objects.filter(
             organization=org,
             expiry_date__lte=expiring_date,
-            expiry_date__gte=timezone.now().date(),
+            expiry_date__gte=timezone.localdate(),
             quantity__gt=0
         )
         if request is not None:
@@ -1277,18 +1441,32 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
     # RAPPORT JOURNALIER DE CAISSE
     # ========================================================================
     
-    @action(detail=False, methods=['get'])
-    def daily_cash_report(self, request):
-        """Rapport journalier de caisse détaillé"""
-        org = self.get_organization()
+    def _parse_report_date(self, request):
+        """
+        La date du rapport journalier, ou aujourd'hui.
+
+        ⚠ `strptime` n'était pas gardé : `?date=oops` remontait en **500**, une
+        panne serveur là où l'appelant s'est trompé. Le refus est déterministe
+        et porte le nom du champ, comme `_parse_date_range` le fait déjà.
+
+        Le corps vit dans `apps.core.report_params` : l'export de caisse avait
+        le même défaut sans le même correctif, et deux gardes recopiées finissent
+        par refuser dans deux termes différents la même faute de saisie.
+        """
+        from apps.core.report_params import parse_day
+
         date_str = request.query_params.get('date')
-        
-        if date_str:
-            from datetime import datetime
-            report_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-        else:
-            report_date = timezone.now().date()
-        
+        if not date_str:
+            return timezone.localdate()
+        return parse_day(date_str)
+
+    def _daily_cash_data(self, request, org, report_date):
+        """
+        Synthèse du jour et mouvements du jour.
+
+        Rend `(report_data, movements)` : les agrégats couvrent DÉJÀ la journée
+        entière, seule la LISTE était paginée par l'action.
+        """
         # Mouvements du jour
         movements = self._scope_cash_movements(
             CashMovement.objects.filter(
@@ -1403,21 +1581,14 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             'expenses_count': expenses_count,
             'net_cash_flow': net_cash_flow,
         }
-        
-        # Liste des mouvements avec pagination
-        page = int(request.query_params.get('page', 1))
-        page_size = int(request.query_params.get('page_size', 20))
-        
-        all_movements = list(movements)
-        total_movements = len(all_movements)
-        
-        start_idx = (page - 1) * page_size
-        end_idx = start_idx + page_size
-        paginated_movements = all_movements[start_idx:end_idx]
-        
-        movements_list = []
-        for m in paginated_movements:
-            movements_list.append({
+
+        return report_data, movements
+
+    @staticmethod
+    def _daily_cash_movement_rows(movements):
+        """Les mouvements en lignes lisibles, sans pagination."""
+        return [
+            {
                 'id': m.id,
                 'time': m.movement_date.time(),
                 'type': m.movement_type,
@@ -1427,8 +1598,26 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
                 'amount': m.amount,
                 'direction': m.direction,
                 'balance_after': m.balance_after,
-            })
-        
+            }
+            for m in movements
+        ]
+
+    @action(detail=False, methods=['get'])
+    def daily_cash_report(self, request):
+        """Rapport journalier de caisse détaillé"""
+        org = self.get_organization()
+        report_date = self._parse_report_date(request)
+        report_data, movements = self._daily_cash_data(request, org, report_date)
+
+        # Liste des mouvements avec pagination
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 20))
+
+        all_rows = self._daily_cash_movement_rows(movements)
+        total_movements = len(all_rows)
+        start_idx = (page - 1) * page_size
+        movements_list = all_rows[start_idx:start_idx + page_size]
+
         return Response({
             'report': DailyCashReportSerializer(report_data).data,
             'movements': {
@@ -1444,12 +1633,8 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
     # BÉNÉFICES ET MARGES
     # ========================================================================
     
-    @action(detail=False, methods=['get'])
-    def profit_margins(self, request):
-        """Calcul des bénéfices et marges globaux"""
-        org = self.get_organization()
-        start_date, end_date, _, _ = self._parse_date_range(request)
-        
+    def _profit_margins_data(self, request, org, start_date, end_date):
+        """Bénéfices et marges globaux. Déjà sur la période entière."""
         # Ventes complétées
         sales = self._scope_sales(
             Sale.objects.filter(
@@ -1533,7 +1718,15 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             'net_profit': net_profit,
             'net_margin_percentage': round(net_margin, 2),
         }
-        
+
+        return data
+
+    @action(detail=False, methods=['get'])
+    def profit_margins(self, request):
+        """Calcul des bénéfices et marges globaux"""
+        org = self.get_organization()
+        start_date, end_date, _, _ = self._parse_date_range(request)
+        data = self._profit_margins_data(request, org, start_date, end_date)
         serializer = ProfitMarginSerializer(data)
         return Response(serializer.data)
     
@@ -1637,14 +1830,8 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             'total_gross_profit': sum((r['gross_profit'] for r in results), Decimal('0')),
         })
 
-    @action(detail=False, methods=['get'])
-    def product_profits(self, request):
-        """Bénéfices par produit avec pagination"""
-        org = self.get_organization()
-        start_date, end_date, _, _ = self._parse_date_range(request)
-        page = int(request.query_params.get('page', 1))
-        page_size = int(request.query_params.get('page_size', 20))
-        
+    def _product_profit_rows(self, request, org, start_date, end_date):
+        """Bénéfices par produit, triés, sur le PÉRIMÈTRE ENTIER."""
         sale_items = self._scope_sale_items(
             SaleItem.objects.filter(
                 sale__organization=org,
@@ -1723,13 +1910,21 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         
         # Trier par profit décroissant
         result.sort(key=lambda x: x['profit'], reverse=True)
-        
-        # Pagination
+        return result
+
+    @action(detail=False, methods=['get'])
+    def product_profits(self, request):
+        """Bénéfices par produit avec pagination"""
+        org = self.get_organization()
+        start_date, end_date, _, _ = self._parse_date_range(request)
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 20))
+
+        result = self._product_profit_rows(request, org, start_date, end_date)
         total_count = len(result)
         start_idx = (page - 1) * page_size
-        end_idx = start_idx + page_size
-        paginated_result = result[start_idx:end_idx]
-        
+        paginated_result = result[start_idx:start_idx + page_size]
+
         serializer = ProductProfitSerializer(paginated_result, many=True)
         return Response({
             'results': serializer.data,
@@ -1743,14 +1938,14 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
     # STOCKS DÉTAILLÉS
     # ========================================================================
     
-    @action(detail=False, methods=['get'])
-    def stock_details(self, request):
-        """Liste détaillée du stock par produit avec pagination"""
-        org = self.get_organization()
-        filter_status = request.query_params.get('status')  # low, out, available
-        page = int(request.query_params.get('page', 1))
-        page_size = int(request.query_params.get('page_size', 20))
-        
+    def _stock_detail_rows(self, request, org, filter_status=None):
+        """
+        Stock détaillé par produit, trié, sur le PÉRIMÈTRE ENTIER.
+
+        ⚠ La variable d'état s'appelle `state` et non `status` : ce module
+        importe `status` de DRF, et le masquer dans une méthode partagée est un
+        piège qui n'apparaît qu'au premier `status.HTTP_*` ajouté plus bas.
+        """
         # `product__unit` et `product__packaging_unit` alimentent l'affichage
         # « 12 cartons + 3 bouteilles » : sans eux, deux requêtes par ligne.
         stocks = self._scope_stocks(
@@ -1774,19 +1969,19 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             
             # Déterminer le statut
             if qty <= 0:
-                status = 'out_of_stock'
+                state = 'out_of_stock'
             elif min_level and qty <= min_level:
-                status = 'low_stock'
+                state = 'low_stock'
             else:
-                status = 'available'
-            
+                state = 'available'
+
             # Filtrer si demandé
             if filter_status:
-                if filter_status == 'low' and status != 'low_stock':
+                if filter_status == 'low' and state != 'low_stock':
                     continue
-                elif filter_status == 'out' and status != 'out_of_stock':
+                elif filter_status == 'out' and state != 'out_of_stock':
                     continue
-                elif filter_status == 'available' and status != 'available':
+                elif filter_status == 'available' and state != 'available':
                     continue
             
             # Le stock d'un produit vendu en gros se lit en contenants : « 147 »
@@ -1819,19 +2014,27 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
                 'min_stock_level': min_level,
                 'cost_price': cost,
                 'stock_value': qty * cost,
-                'status': status,
+                'status': state,
             })
         
         # Trier par statut (ruptures en premier) puis par nom
         status_order = {'out_of_stock': 0, 'low_stock': 1, 'available': 2}
         result.sort(key=lambda x: (status_order.get(x['status'], 3), x['product_name']))
-        
-        # Pagination
+        return result
+
+    @action(detail=False, methods=['get'])
+    def stock_details(self, request):
+        """Liste détaillée du stock par produit avec pagination"""
+        org = self.get_organization()
+        filter_status = request.query_params.get('status')  # low, out, available
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 20))
+
+        result = self._stock_detail_rows(request, org, filter_status)
         total_count = len(result)
         start_idx = (page - 1) * page_size
-        end_idx = start_idx + page_size
-        paginated_result = result[start_idx:end_idx]
-        
+        paginated_result = result[start_idx:start_idx + page_size]
+
         serializer = StockDetailSerializer(paginated_result, many=True)
         return Response({
             'results': serializer.data,
@@ -1841,14 +2044,10 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
             'total_pages': (total_count + page_size - 1) // page_size if page_size > 0 else 0,
         })
     
-    @action(detail=False, methods=['get'])
-    def stock_movements_summary(self, request):
-        """Résumé des mouvements de stock par type"""
-        org = self.get_organization()
-        start_date, end_date, _, _ = self._parse_date_range(request)
-        
+    def _stock_movements_summary_data(self, request, org, start_date, end_date):
+        """Totaux de mouvements par type. Sans pagination : il n'y a qu'une ligne."""
         from apps.inventory.models import StockMovement
-        
+
         movements = self._scope_stock_movements(
             StockMovement.objects.filter(
                 organization=org,
@@ -1892,12 +2091,19 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
                 data['transfers_out'] += qty
             elif m.movement_type in ['purchase', 'initial']:
                 data['total_in'] += qty
-        
+
+        return data
+
+    @action(detail=False, methods=['get'])
+    def stock_movements_summary(self, request):
+        """Résumé des mouvements de stock par type"""
+        org = self.get_organization()
+        start_date, end_date, _, _ = self._parse_date_range(request)
+        data = self._stock_movements_summary_data(request, org, start_date, end_date)
         serializer = StockMovementSummarySerializer(data)
         return Response(serializer.data)
     
-    @action(detail=False, methods=['get'])
-    def product_supplies(self, request):
+    def _product_supplies_map(self, request, org, start_date, end_date):
         """
         Approvisionnements par produit pour une période donnée.
 
@@ -1906,10 +2112,10 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
         champs de saisie figés sur le mouvement, jamais d'une division du total :
         une réception de 5 cartons plus 120 bouteilles ne doit pas se relire
         « 10 cartons ».
+
+        Rendue par identifiant de produit EN CHAÎNE : c'est la clé que l'onglet
+        « Produits » croise, et un UUID ne se compare pas à une chaîne.
         """
-        org = self.get_organization()
-        start_date, end_date, _, _ = self._parse_date_range(request)
-        
         from apps.inventory.models import StockMovement
         
         # Récupérer les mouvements d'entrée (approvisionnements) par produit
@@ -1961,4 +2167,11 @@ class StatisticsViewSet(ActionPaginationMixin, TenantQuerysetMixin, viewsets.Vie
                 'packages': float(packages) if packages is not None else None,
                 'loose': float(loose) if loose is not None else None,
             }
-        return Response(result)
+        return result
+
+    @action(detail=False, methods=['get'])
+    def product_supplies(self, request):
+        """Approvisionnements par produit, pour la période demandée."""
+        org = self.get_organization()
+        start_date, end_date, _, _ = self._parse_date_range(request)
+        return Response(self._product_supplies_map(request, org, start_date, end_date))

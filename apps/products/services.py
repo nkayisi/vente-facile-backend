@@ -1081,35 +1081,21 @@ class ProductExcelService:
     # EXPORT
     # ---------------------------------------------------------------------
 
-    EXPORT_COLUMNS = [
-        {"key": "name", "header": "Nom", "width": 35},
-        {"key": "sku", "header": "Code SKU", "width": 18},
-        {"key": "barcode", "header": "Code-barres", "width": 18},
-        {"key": "category", "header": "Catégorie", "width": 22},
-        {"key": "brand", "header": "Marque", "width": 18},
-        {"key": "unit", "header": "Unité de détail", "width": 15},
-        {"key": "selling_mode", "header": "Mode de vente", "width": 18},
-        {"key": "packaging_unit", "header": "Unité de gros", "width": 14},
-        {"key": "units_per_package", "header": "Unités par conditionnement", "width": 24},
-        {"key": "cost_price", "header": "Prix d'achat (détail)", "width": 18},
-        {"key": "selling_price", "header": "Prix de vente (détail)", "width": 20},
-        {"key": "package_cost_price", "header": "Prix d'achat (conditionnement)", "width": 26},
-        {"key": "wholesale_price", "header": "Prix de vente (conditionnement)", "width": 27},
-        {"key": "tax_rate", "header": "TVA (%)", "width": 10},
-        {"key": "stock_quantity", "header": "Stock (unités)", "width": 14},
-        {"key": "stock_display", "header": "Stock (détaillé)", "width": 26},
-        {"key": "min_stock_level", "header": "Stock min", "width": 10},
-        {"key": "is_active", "header": "Actif", "width": 8},
-    ]
+    # ┌──────────────────────────────────────────────────────────────────────┐
+    # │ LE CATALOGUE NE DESSINE PLUS SON PROPRE DOCUMENT.                    │
+    # │                                                                      │
+    # │ `EXPORT_COLUMNS`, `_export_queryset`, `export_excel` et `export_pdf` │
+    # │ vivaient ici : un `Workbook` openpyxl et un `SimpleDocTemplate`      │
+    # │ reportlab montés à la main, avec leurs styles et leur bandeau, servis │
+    # │ par deux endpoints qui ignoraient les filtres de l'écran.            │
+    # │                                                                      │
+    # │ La description vit dans `apps/products/reports.py` et le rendu dans  │
+    # │ `apps/core/exports.py`, comme tous les autres rapports du produit.   │
+    # │ Ce qui RESTE ici est `_product_export_row`, qui sait lire un produit │
+    # │ et son stock : c'est du vocabulaire de catalogue, pas de mise en     │
+    # │ page, et la description l'appelle.                                    │
+    # └──────────────────────────────────────────────────────────────────────┘
 
-    @classmethod
-    def _export_queryset(cls, organization):
-        return (
-            Product.objects.filter(organization=organization, is_deleted=False)
-            .select_related("category", "brand", "unit", "packaging_unit")
-            .prefetch_related("stocks")
-            .order_by("name")
-        )
 
     @classmethod
     def _product_export_row(cls, product: Product) -> Dict[str, Any]:
@@ -1158,218 +1144,6 @@ class ProductExcelService:
             "min_stock_level": product.min_stock_level or 0,
             "is_active": "Oui" if product.is_active else "Non",
         }
-
-    @classmethod
-    def export_excel(cls, organization) -> io.BytesIO:
-        """Génère un fichier Excel contenant tous les produits de l'organisation."""
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Produits"
-
-        header_font = Font(bold=True, color="FFFFFF", size=11)
-        header_fill = PatternFill(start_color="F97316", end_color="F97316", fill_type="solid")
-        header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        thin_border = Border(
-            left=Side(style="thin"),
-            right=Side(style="thin"),
-            top=Side(style="thin"),
-            bottom=Side(style="thin"),
-        )
-
-        for col_idx, col in enumerate(cls.EXPORT_COLUMNS, start=1):
-            cell = ws.cell(row=1, column=col_idx, value=col["header"])
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.alignment = header_alignment
-            cell.border = thin_border
-            ws.column_dimensions[get_column_letter(col_idx)].width = col["width"]
-
-        queryset = cls._export_queryset(organization)
-        for row_offset, product in enumerate(queryset.iterator(chunk_size=500), start=2):
-            row_data = cls._product_export_row(product)
-            for col_idx, col in enumerate(cls.EXPORT_COLUMNS, start=1):
-                value = row_data[col["key"]]
-                if isinstance(value, Decimal):
-                    value = float(value)
-                cell = ws.cell(row=row_offset, column=col_idx, value=value)
-                cell.border = thin_border
-
-        ws.freeze_panes = "A2"
-
-        buffer = io.BytesIO()
-        wb.save(buffer)
-        buffer.seek(0)
-        return buffer
-
-    @classmethod
-    def export_pdf(cls, organization) -> io.BytesIO:
-        """Génère un PDF (paysage) listant tous les produits de l'organisation."""
-        # Import différé pour éviter le coût quand l'export PDF n'est pas utilisé.
-        from reportlab.lib import colors
-        from reportlab.lib.pagesizes import A4, landscape
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.lib.units import mm
-        from reportlab.platypus import (
-            SimpleDocTemplate,
-            Paragraph,
-            Spacer,
-            Table,
-            TableStyle,
-        )
-
-        buffer = io.BytesIO()
-        doc = SimpleDocTemplate(
-            buffer,
-            pagesize=landscape(A4),
-            leftMargin=10 * mm,
-            rightMargin=10 * mm,
-            topMargin=12 * mm,
-            bottomMargin=12 * mm,
-            title=f"Produits - {organization.name}",
-        )
-
-        styles = getSampleStyleSheet()
-        title_style = ParagraphStyle(
-            "Title",
-            parent=styles["Title"],
-            fontSize=16,
-            textColor=colors.HexColor("#F97316"),
-            spaceAfter=4,
-            alignment=0,
-        )
-        meta_style = ParagraphStyle(
-            "Meta",
-            parent=styles["Normal"],
-            fontSize=9,
-            textColor=colors.HexColor("#6B7280"),
-        )
-        cell_style = ParagraphStyle(
-            "Cell",
-            parent=styles["Normal"],
-            fontSize=8,
-            leading=10,
-        )
-        # Un `Paragraph` porte son propre alignement : les directives `ALIGN`
-        # d'un `TableStyle` ne l'atteignent pas. Les quatre colonnes de prix
-        # étaient donc déclarées à droite et sortaient à gauche, la règle
-        # n'ayant jamais eu d'effet. L'alignement se pose ici, sur le style.
-        cell_right = ParagraphStyle("CellR", parent=cell_style, alignment=2)
-        cell_center = ParagraphStyle("CellC", parent=cell_style, alignment=1)
-
-        # Colonnes qui se rangent à droite : les prix, et le stock - écrit en
-        # mots (« 12 cartons + 3 bouteilles ») mais lu comme une grandeur.
-        RIGHT_COLUMNS = {"cost_price", "selling_price", "package_cost_price",
-                         "wholesale_price", "stock_display"}
-        CENTER_COLUMNS = {"is_active"}
-
-        def column_style(key):
-            if key in RIGHT_COLUMNS:
-                return cell_right
-            if key in CENTER_COLUMNS:
-                return cell_center
-            return cell_style
-
-        # Les prix sont groupés par canal, détail puis gros, comme à l'écran.
-        # La colonne « Unité » disparaît : le stock détaillé porte désormais les
-        # libellés (« 12 cartons + 3 bouteilles »), elle ferait doublon.
-        pdf_columns = [
-            {"key": "name", "header": "Produit", "width": 44},
-            {"key": "sku", "header": "SKU", "width": 24},
-            {"key": "category", "header": "Catégorie", "width": 26},
-            {"key": "brand", "header": "Marque", "width": 22},
-            {"key": "cost_price", "header": "Achat détail", "width": 22},
-            {"key": "selling_price", "header": "Vente détail", "width": 22},
-            {"key": "package_cost_price", "header": "Achat gros", "width": 22},
-            {"key": "wholesale_price", "header": "Vente gros", "width": 22},
-            {"key": "stock_display", "header": "Stock", "width": 36},
-            {"key": "is_active", "header": "Actif", "width": 14},
-        ]
-
-        queryset = cls._export_queryset(organization)
-        total = queryset.count()
-
-        story = [
-            Paragraph(f"Catalogue produits - {organization.name}", title_style),
-            Paragraph(
-                f"Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')} • {total} produit(s)",
-                meta_style,
-            ),
-            Spacer(1, 6 * mm),
-        ]
-
-        # L'en-tête se range comme sa colonne, sinon « Achat détail » collé à
-        # gauche ne coiffe plus visuellement les montants collés à droite.
-        data = [[
-            Paragraph(f"<b>{c['header']}</b>", column_style(c["key"]))
-            for c in pdf_columns
-        ]]
-
-        # Décimales de la devise de l'organisation, et convention francophone :
-        # le `.2f` codé en dur imprimait « 10 198.20 » pour un catalogue en
-        # francs congolais, une devise qui n'a pas de décimale, et posait un
-        # point là où tous les autres documents posent une virgule.
-        from apps.core.exports import currency_decimals, format_number
-        from apps.settings.services import CurrencyService
-
-        decimals = currency_decimals(CurrencyService.primary_code(organization))
-
-        def fmt_money(value):
-            if value in (None, ""):
-                return ""
-            try:
-                return format_number(value, decimals)
-            except (TypeError, ValueError, ArithmeticError):
-                return str(value)
-
-        for product in queryset.iterator(chunk_size=500):
-            row_dict = cls._product_export_row(product)
-            # Un produit vendu au détail seul n'a pas de prix de gros : un tiret
-            # se lit mieux qu'un zéro, qui ferait croire à la gratuité.
-            data.append([
-                Paragraph(str(row_dict["name"] or ""), cell_style),
-                Paragraph(str(row_dict["sku"] or ""), cell_style),
-                Paragraph(str(row_dict["category"] or "-"), cell_style),
-                Paragraph(str(row_dict["brand"] or "-"), cell_style),
-                Paragraph(fmt_money(row_dict["cost_price"]) or "-", cell_right),
-                Paragraph(fmt_money(row_dict["selling_price"]) or "-", cell_right),
-                Paragraph(fmt_money(row_dict["package_cost_price"]) or "-", cell_right),
-                Paragraph(fmt_money(row_dict["wholesale_price"]) or "-", cell_right),
-                Paragraph(str(row_dict["stock_display"] or "-"), cell_right),
-                Paragraph(str(row_dict["is_active"]), cell_center),
-            ])
-
-        if total == 0:
-            data.append([
-                Paragraph("<i>Aucun produit à exporter.</i>", cell_style),
-                *[Paragraph("", cell_style) for _ in pdf_columns[1:]],
-            ])
-
-        col_widths = [c["width"] * mm for c in pdf_columns]
-        table = Table(data, colWidths=col_widths, repeatRows=1)
-        table.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F97316")),
-                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                    # L'alignement est porté par le style de chaque `Paragraph`
-                    # (voir `column_style`) : une règle `ALIGN` posée ici serait
-                    # sans effet, comme elle l'a été jusqu'à présent.
-                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                    ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#E5E7EB")),
-                    ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#D1D5DB")),
-                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#FAFAFA")]),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-                    ("TOPPADDING", (0, 0), (-1, -1), 4),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-                ]
-            )
-        )
-        story.append(table)
-
-        doc.build(story)
-        buffer.seek(0)
-        return buffer
 
     @classmethod
     def check_duplicate(cls, organization, sku: str = None, barcode: str = None, exclude_id=None) -> Dict[str, Any]:

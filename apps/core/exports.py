@@ -18,6 +18,8 @@ Deux règles que ce socle fait respecter et que l'export produits enfreint :
 from __future__ import annotations
 
 import io
+import re
+from math import ceil
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
@@ -25,7 +27,7 @@ from typing import Any, Iterable, Sequence
 
 from django.utils import timezone
 
-# Couleur de marque, alignée sur le frontend (`lib/pdf-utils.ts`).
+# Couleur de marque, alignée sur celle des tickets (`core/src/receipt/tokens.ts`).
 BRAND_HEX = 'F97316'
 HEADER_BG_HEX = 'F97316'
 GROUP_BG_HEX = 'FEF3C7'
@@ -41,6 +43,17 @@ GRID_HEX = 'D1D5DB'
 # reportlab) et le tableau (retrait 3) démarraient à trois abscisses
 # différentes, et l'œil lisait un bord gauche en escalier.
 CELL_PAD_X = 3
+
+# Nombre maximal de relevés par rangée du cartouche de synthèse.
+#
+# Six sur une A4 paysage donne des cases d'environ quarante-cinq millimètres :
+# « Chiffre d'affaires » y tient sur une ligne, et « 2 006 013,72 » aussi. Au
+# delà, les libellés se coupent en deux (« Ruptur / es »), ce qui est le défaut
+# que cette constante existe pour empêcher.
+SUMMARY_MAX_PER_ROW = 6
+
+#: Idem en portrait, où la largeur utile tombe à environ 190 mm.
+SUMMARY_MAX_PER_ROW_PORTRAIT = 4
 
 # Marge intérieure du cadre de reportlab. `SimpleDocTemplate` construit son
 # `Frame` avec les valeurs par défaut, soit 6 points de chaque côté, et le
@@ -101,6 +114,25 @@ class ReportSpec:
     group_by: str | None = None
     group_label: str = ''
     group_totals: Sequence[str] = field(default_factory=tuple)
+    #: Nom du champ de ligne portant le code de devise de CETTE ligne.
+    #:
+    #: ┌──────────────────────────────────────────────────────────────────────┐
+    #: │ UN TABLEAU MULTI-DEVISES NE SE FORMATE PAS À UNE SEULE DEVISE.       │
+    #: │                                                                      │
+    #: │ `currency` porte la devise du document ; ses décimales s'appliquaient │
+    #: │ donc à TOUTES les cellules. Sur une balance âgée d'un établissement   │
+    #: │ tenu en CDF (zéro décimale), une dette de 120,75 USD sortait « 121 ». │
+    #: │ Sur un papier de relance, c'est un montant faux.                      │
+    #: └──────────────────────────────────────────────────────────────────────┘
+    currency_field: str | None = None
+
+    #: Ligne TOTAL GÉNÉRAL en pied de tableau.
+    #:
+    #: À mettre à `False` quand les groupes ne sont PAS commensurables : une
+    #: balance âgée groupée par devise ne se totalise pas, additionner des
+    #: francs et des dollars rendrait un nombre qui n'existe pas. Les
+    #: sous-totaux par groupe, eux, restent justes.
+    grand_total: bool = True
     currency: str = 'CDF'
     landscape_mode: bool = True
     signatures: Sequence[str] = field(default_factory=tuple)
@@ -148,6 +180,80 @@ def currency_symbol(code: str) -> str:
         .values_list('symbol', flat=True)
         .first()
     ) or code
+
+
+def currency_code_for(spec, ligne_ou_code) -> str | None:
+    """
+    Le code de devise que porte une ligne, ou None si le document n'en a qu'une.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ SANS `currency_field`, UNE CLÉ DE GROUPE EST UN LIBELLÉ LIBRE.           │
+    │                                                                          │
+    │ Un rapport groupé par catégorie annonce « BOISSONS », pas « USD ». La    │
+    │ lire comme un code de devise faisait écrire « 1 234,00 BOISSONS » sous   │
+    │ chaque sous-total du classeur, `currency_symbol` repliant tout code      │
+    │ inconnu sur la chaîne elle-même ; et un nom de catégorie portant un      │
+    │ guillemet droit corrompait le fichier, openpyxl recopiant le format tel  │
+    │ quel. Le défaut ne se voyait pas : chaque moteur restait cohérent avec   │
+    │ lui-même.                                                                │
+    │                                                                          │
+    │ Le seul qui sache si une valeur est une devise est `spec` : c'est donc   │
+    │ ici, et nulle part ailleurs, qu'on le lui demande.                       │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+    champ = getattr(spec, 'currency_field', None)
+    if not champ:
+        return None
+    code = (
+        ligne_ou_code if isinstance(ligne_ou_code, str)
+        else (ligne_ou_code or {}).get(champ)
+    )
+    return code or None
+
+
+class DeviseDuDocument:
+    """
+    Décimales et symbole à employer, ligne par ligne, le temps d'UN rendu.
+
+    Sans `currency_field`, c'est la devise du document partout. Avec, c'est
+    celle que porte la ligne : un tableau qui mêle des monnaies doit écrire
+    chacune avec sa précision et son symbole.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ MÉMOÏSÉ LE TEMPS DU RENDU, JAMAIS DU PROCESSUS.                          │
+    │                                                                          │
+    │ `currency_decimals` refuse un cache de module, et il a raison : il       │
+    │ servirait une valeur périmée après modification d'une devise, et         │
+    │ coupleraient les tests entre eux en survivant au rollback de chacun.     │
+    │                                                                          │
+    │ Mais dès qu'un document porte `currency_field`, la résolution est        │
+    │ demandée PAR CELLULE D'ARGENT, deux requêtes à chaque fois : un export   │
+    │ de mille ventes à trois colonnes en émettait six mille. La portée d'un   │
+    │ rendu concilie les deux - la table des devises ne change pas pendant     │
+    │ qu'on écrit un fichier.                                                  │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
+    def __init__(self, spec: ReportSpec):
+        self.spec = spec
+        self._table: dict[str, tuple[int, str]] = {}
+        self.decimales_defaut, self.symbole_defaut = self._meta(spec.currency)
+
+    def _meta(self, code: str) -> tuple[int, str]:
+        code = (code or 'CDF').upper()
+        if code not in self._table:
+            self._table[code] = (currency_decimals(code), currency_symbol(code))
+        return self._table[code]
+
+    def decimales(self, ligne_ou_code=None) -> int:
+        """Décimales de la devise de cette ligne, ou celles du document."""
+        code = currency_code_for(self.spec, ligne_ou_code)
+        return self._meta(code)[0] if code else self.decimales_defaut
+
+    def symbole(self, ligne_ou_code=None) -> str:
+        """Symbole de la devise de cette ligne, ou celui du document."""
+        code = currency_code_for(self.spec, ligne_ou_code)
+        return self._meta(code)[1] if code else self.symbole_defaut
 
 
 def to_decimal(value: Any) -> Decimal | None:
@@ -306,12 +412,22 @@ def render_report_xlsx(spec: ReportSpec) -> io.BytesIO:
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
 
-    decimals = currency_decimals(spec.currency)
-    symbol = currency_symbol(spec.currency)
-    money_format = (
-        f'#,##0 "{symbol}"' if decimals == 0
-        else f'#,##0.{"0" * decimals} "{symbol}"'
-    )
+    devise = DeviseDuDocument(spec)
+
+    def money_format_for(ligne_ou_code=None) -> str:
+        """
+        Le format d'affichage d'un montant, à la devise de SA ligne.
+
+        Un tableau qui mêle des monnaies écrirait sinon toutes ses cellules avec
+        les décimales et le symbole de la principale : une dette de 120,75 USD
+        s'afficherait « 121 FC » dans un établissement tenu en francs.
+        """
+        d = devise.decimales(ligne_ou_code)
+        # ⚠ Le symbole vient de la BASE, où un administrateur le saisit. Un
+        # guillemet droit y refermerait le littéral du format et corromprait le
+        # classeur, openpyxl recopiant la chaîne sans la valider.
+        sym = devise.symbole(ligne_ou_code).replace('"', '')
+        return f'#,##0 "{sym}"' if d == 0 else f'#,##0.{"0" * d} "{sym}"'
 
     workbook = Workbook()
     sheet = workbook.active
@@ -399,13 +515,15 @@ def render_report_xlsx(spec: ReportSpec) -> io.BytesIO:
             elif column.kind == KIND_DATE and isinstance(raw, date):
                 value = raw
             else:
-                value = format_cell(raw, column.kind, decimals) or None
+                value = format_cell(
+                    raw, column.kind, devise.decimales(row)
+                ) or None
 
             cell = sheet.cell(row=row_index, column=position, value=value)
             cell.border = box
             cell.alignment = Alignment(horizontal=column.effective_align)
             if column.kind == KIND_MONEY:
-                cell.number_format = money_format
+                cell.number_format = money_format_for(row)
             elif column.kind == KIND_QUANTITY:
                 cell.number_format = '#,##0.###'
             elif column.kind == KIND_DATE:
@@ -418,7 +536,11 @@ def render_report_xlsx(spec: ReportSpec) -> io.BytesIO:
                 cell.font = bold
         row_index += 1
 
-    def write_totals_row(label: str, totals: dict, fill: PatternFill) -> None:
+    # ⚠ Le paramètre s'appelle `groupe` et non `devise` : `devise` est le
+    # résolveur du document, et une clé de groupe n'est un code de monnaie que
+    # si `currency_field` le dit. Confondre les deux est le défaut d'origine.
+    def write_totals_row(label: str, totals: dict, fill: PatternFill,
+                         groupe=None) -> None:
         nonlocal row_index
         for position, column in enumerate(spec.columns, start=1):
             if position == 1:
@@ -433,7 +555,7 @@ def render_report_xlsx(spec: ReportSpec) -> io.BytesIO:
             cell.border = box
             cell.alignment = Alignment(horizontal=column.effective_align)
             if column.key in totals and column.kind == KIND_MONEY:
-                cell.number_format = money_format
+                cell.number_format = money_format_for(groupe)
             elif column.key in totals and column.kind == KIND_QUANTITY:
                 cell.number_format = '#,##0.###'
         row_index += 1
@@ -446,8 +568,9 @@ def render_report_xlsx(spec: ReportSpec) -> io.BytesIO:
 
     for group_name, row in _grouped(spec):
         if spec.group_by and group_name != current_group:
-            if current_group is not None:
-                write_totals_row(f"Sous-total {current_group}", group_totals, group_fill)
+            if current_group is not None and spec.group_totals:
+                write_totals_row(f"Sous-total {current_group}", group_totals,
+                                 group_fill, current_group)
             current_group = group_name
             group_totals = {}
             write_data_row({spec.columns[0].key: group_name}, group_fill, bold_row=True)
@@ -460,12 +583,13 @@ def render_report_xlsx(spec: ReportSpec) -> io.BytesIO:
         # données arrêterait le filtre bien avant le bas du tableau.
         last_body_row = row_index - 1
 
-    if spec.group_by and current_group is not None:
-        write_totals_row(f"Sous-total {current_group}", group_totals, group_fill)
+    if spec.group_by and current_group is not None and spec.group_totals:
+        write_totals_row(f"Sous-total {current_group}", group_totals,
+                         group_fill, current_group)
 
     if line_count == 0:
         write_banner(spec.empty_message, muted)
-    elif spec.group_totals:
+    elif spec.group_totals and spec.grand_total:
         write_totals_row('TOTAL GÉNÉRAL', grand_totals, total_fill)
 
     # Volet figé : le lecteur garde les en-têtes sous les yeux en faisant défiler
@@ -558,8 +682,8 @@ def render_report_pdf(spec: ReportSpec) -> io.BytesIO:
         Image, KeepTogether, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
     )
 
-    decimals = currency_decimals(spec.currency)
-    symbol = currency_symbol(spec.currency)
+    devise = DeviseDuDocument(spec)
+    symbol = devise.symbole_defaut
     page_size = landscape(A4) if spec.landscape_mode else A4
 
     buffer = io.BytesIO()
@@ -689,9 +813,30 @@ def render_report_pdf(spec: ReportSpec) -> io.BytesIO:
     title_lines: list = [Paragraph(spec.title, title_style)]
     if spec.subtitle:
         title_lines.append(Paragraph(spec.subtitle, meta_style))
+    # ┌──────────────────────────────────────────────────────────────────────┐
+    # │ LA DEVISE SE DIT DÈS QU'IL Y A UN MONTANT.                           │
+    # │                                                                      │
+    # │ La mention était conditionnée aux TOTAUX de colonne : un document     │
+    # │ dont les montants ne se somment pas - un catalogue de prix, où        │
+    # │ additionner cent articles ne désigne rien - sortait donc sans dire    │
+    # │ dans quelle monnaie il compte. Dans une application multi-devise, le  │
+    # │ même chiffre vaut alors soit trois dollars, soit trois francs.        │
+    # │                                                                      │
+    # │ Un document dont AUCUNE colonne ne porte d'argent (une fiche de       │
+    # │ comptage, par exemple) n'a rien à annoncer, et se tait.                │
+    # └──────────────────────────────────────────────────────────────────────┘
+    porte_de_l_argent = any(c.kind == KIND_MONEY for c in spec.columns)
+    # ⚠ Un tableau MULTI-DEVISES ne compte pas dans la devise du document : ses
+    # lignes portent chacune la leur, avec ses décimales. Annoncer « Montants
+    # en $ » y désignerait la mauvaise monnaie sur la moitié des lignes.
+    mention = (
+        ' &nbsp;•&nbsp; Montants dans la devise de chaque ligne'
+        if getattr(spec, 'currency_field', None)
+        else f" &nbsp;•&nbsp; Montants en {symbol}"
+    )
     title_lines.append(Paragraph(
         f"Généré le {timezone.localtime().strftime('%d/%m/%Y à %H:%M')}"
-        + (f" &nbsp;•&nbsp; Montants en {symbol}" if spec.group_totals else ''),
+        + (mention if porte_de_l_argent else ''),
         meta_style,
     ))
     # Sans le rappel des filtres, un tirage « par catégorie » devient
@@ -706,36 +851,74 @@ def render_report_pdf(spec: ReportSpec) -> io.BytesIO:
     story.append(Spacer(1, 3 * mm))
 
     if spec.summary:
-        summary_cells = [
-            [Paragraph(f"<b>{label}</b><br/><font size=9>{value}</font>", cell_style)
-             for label, value in spec.summary]
-        ]
-        # Largeurs proportionnelles au contenu. À largeur égale, « Période /
-        # Tout l'historique » se serrait pendant que « Mouvements / 36 »
-        # gardait les trois quarts de sa case vide : le cartouche perdait son
-        # rythme et se lisait comme une grille mal remplie. Le plancher de 12 %
-        # empêche une case courte de se réduire à un filet.
-        weights = [
-            max(len(label), len(str(value)) + 2) for label, value in spec.summary
-        ]
-        floor = 0.12 / len(spec.summary) * sum(weights) if spec.summary else 0
-        weights = [max(w, floor) for w in weights]
-        total_weight = sum(weights) or 1
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ LE CARTOUCHE EST UNE GRILLE, PLUS UNE SEULE RANGÉE.              │
+        # │                                                                  │
+        # │ Il posait UNE colonne par relevé. Passe encore à quatre ; les     │
+        # │ rapports en portent DIX-HUIT, et chaque case tombait à une        │
+        # │ dizaine de millimètres : « Ventes » sortait « Vent / es »,        │
+        # │ « Ruptures » en « Ruptur / es ». Un cadran illisible ne renseigne │
+        # │ pas, et c'est la première chose que le lecteur regarde.           │
+        # │                                                                  │
+        # │ Les cases sont d'ÉGALE largeur : un cadran se lit en balayant une │
+        # │ colonne, et des largeurs proportionnelles au contenu (ce que      │
+        # │ faisait l'ancien code) cassent ce balayage.                       │
+        # └──────────────────────────────────────────────────────────────────┘
+        releves = [(str(label).strip(), value) for label, value in spec.summary]
+
+        # Autant de rangées PLEINES que possible : à quatorze relevés, trois
+        # rangées de cinq laissent une case vide, quand deux rangées de sept
+        # les serreraient. On répartit, on ne remplit pas.
+        # La densité suit la LARGEUR RÉELLE de la page : six cases tiennent en
+        # paysage (environ 45 mm chacune), quatre en portrait. Un nombre fixe
+        # recouperait « Chiffre d'affaires » dès qu'un rapport passe en
+        # portrait, ce qui est précisément le défaut qu'on referme.
+        par_ligne_max = (
+            SUMMARY_MAX_PER_ROW if usable_width >= 250 * mm else SUMMARY_MAX_PER_ROW_PORTRAIT
+        )
+        rangs = max(1, ceil(len(releves) / par_ligne_max))
+        par_ligne = ceil(len(releves) / rangs)
+
+        # Le libellé AU-DESSUS de la valeur, petit et gris ; la valeur en gras.
+        # C'est ce que rend déjà le document HTML partagé, et c'est ce qui rend
+        # toute la largeur de la case au nombre.
+        summary_cells = []
+        for depart in range(0, len(releves), par_ligne):
+            rangee = [
+                Paragraph(
+                    f'<font size=6.5 color="#{MUTED_HEX}">{label}</font>'
+                    f'<br/><font size=9><b>{value}</b></font>',
+                    cell_style,
+                )
+                for label, value in releves[depart:depart + par_ligne]
+            ]
+            rangee += [''] * (par_ligne - len(rangee))
+            summary_cells.append(rangee)
+
         summary_table = Table(
             summary_cells,
-            colWidths=[usable_width * w / total_weight for w in weights],
+            colWidths=[usable_width / par_ligne] * par_ligne,
         )
         summary_table.hAlign = 'LEFT'
-        summary_table.setStyle(TableStyle([
+        style_synthese = [
             ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor(f'#{GRID_HEX}')),
             ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.HexColor(f'#{GRID_HEX}')),
             ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#FFF7ED')),
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('LEFTPADDING', (0, 0), (-1, -1), CELL_PAD_X),
-            ('RIGHTPADDING', (0, 0), (-1, -1), CELL_PAD_X),
+            ('LEFTPADDING', (0, 0), (-1, -1), CELL_PAD_X + 2),
+            ('RIGHTPADDING', (0, 0), (-1, -1), CELL_PAD_X + 2),
             ('TOPPADDING', (0, 0), (-1, -1), 4),
             ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-        ]))
+        ]
+        # La dernière case s'étend sur le reliquat : une case VIDE au bout d'un
+        # cadran se lit comme une valeur manquante, pas comme une fin de liste.
+        reste = par_ligne * len(summary_cells) - len(releves)
+        if reste:
+            derniere = len(summary_cells) - 1
+            style_synthese.append(
+                ('SPAN', (par_ligne - reste - 1, derniere), (par_ligne - 1, derniere))
+            )
+        summary_table.setStyle(TableStyle(style_synthese))
         story.append(summary_table)
         story.append(Spacer(1, 4 * mm))
 
@@ -754,7 +937,8 @@ def render_report_pdf(spec: ReportSpec) -> io.BytesIO:
                 cells.append(styled(label, column, strong=True))
             elif column.key in totals:
                 cells.append(styled(
-                    format_cell(totals[column.key], column.kind, decimals),
+                    format_cell(totals[column.key], column.kind,
+                                devise.decimales(current_group)),
                     column, strong=True,
                 ))
             else:
@@ -765,7 +949,7 @@ def render_report_pdf(spec: ReportSpec) -> io.BytesIO:
 
     for group_name, row in _grouped(spec):
         if spec.group_by and group_name != current_group:
-            if current_group is not None:
+            if current_group is not None and spec.group_totals:
                 push_totals(f"Sous-total {current_group}", group_totals, f'#{GROUP_BG_HEX}')
             current_group = group_name
             group_totals = {}
@@ -777,16 +961,17 @@ def render_report_pdf(spec: ReportSpec) -> io.BytesIO:
             row_styles.append(('SPAN', (0, len(data) - 1), (-1, len(data) - 1)))
 
         data.append([
-            styled(format_cell(row.get(c.key), c.kind, decimals) or '-', c)
+            styled(format_cell(row.get(c.key), c.kind,
+                                devise.decimales(row)) or '-', c)
             for c in spec.columns
         ])
         _accumulate(grand_totals, row, spec.group_totals)
         _accumulate(group_totals, row, spec.group_totals)
         line_count += 1
 
-    if spec.group_by and current_group is not None:
+    if spec.group_by and current_group is not None and spec.group_totals:
         push_totals(f"Sous-total {current_group}", group_totals, f'#{GROUP_BG_HEX}')
-    if line_count and spec.group_totals:
+    if line_count and spec.group_totals and spec.grand_total:
         push_totals('TOTAL GÉNÉRAL', grand_totals, f'#{TOTAL_BG_HEX}')
 
     if line_count == 0:
@@ -837,19 +1022,159 @@ def render_report_pdf(spec: ReportSpec) -> io.BytesIO:
     return buffer
 
 
+# --------------------------------------------------------------------------
+# Rendu CSV
+# --------------------------------------------------------------------------
+
+#: Séparateur du CSV. **Point-virgule, et pas virgule.**
+#:
+#: Excel choisit son séparateur d'après la locale du poste : en français c'est
+#: le point-virgule, et un fichier à virgules s'y ouvre en UNE seule colonne.
+#: Le marchand conclut que l'export est cassé.
+CSV_SEPARATOR = ';'
+
+#: Marque d'ordre des octets. Sans elle, Excel lit « Créances » en « CrÃ©ances ».
+CSV_BOM = '\ufeff'
+
+_CSV_A_PROTEGER = re.compile(r'["\n\r;,]')
+
+
+def csv_cell(text: Any) -> str:
+    """
+    Échappe une cellule de CSV.
+
+    Le cas des guillemets n'a rien d'exceptionnel ici, c'est le cas GÉNÉRAL :
+    chaque montant porte une virgule décimale française (« 4 282,60 »), et une
+    cellule non protégée décalerait toute la ligne.
+    """
+    value = '' if text is None else str(text)
+    if _CSV_A_PROTEGER.search(value):
+        return '"' + value.replace('"', '""') + '"'
+    return value
+
+
+def render_report_csv(spec: ReportSpec) -> io.BytesIO:
+    """
+    Rend le rapport en CSV.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ MIROIR STRICT DE `core/src/report/csv.ts`.                              │
+    │                                                                          │
+    │ Le paquet partagé produit déjà ce fichier côté client pour les documents │
+    │ hors ligne du terminal. Les deux doivent rendre le MÊME contenu, sinon   │
+    │ un même rapport donne deux fichiers selon d'où on l'a demandé : même     │
+    │ séparateur, même BOM, mêmes fins de ligne, même ordre de sections.       │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    Les cellules passent par le MÊME `format_cell` que le PDF et le classeur :
+    un montant ne peut donc pas s'écrire de trois façons dans les trois fichiers
+    d'un seul et même rapport.
+    """
+    devise = DeviseDuDocument(spec)
+    columns = list(spec.columns)
+    lines: list[str] = []
+
+    def ligne(*cells: Any) -> None:
+        lines.append(CSV_SEPARATOR.join(csv_cell(c) for c in cells))
+
+    # L'identité de l'émetteur, comme le PDF et le classeur la portent. Un
+    # fichier voyage seul : sans elle, on ne peut pas dire de quel
+    # établissement sort ce tableau, ni le produire comme pièce.
+    ligne(spec.organization.name)
+    for line in organization_identity(spec.organization):
+        ligne(line)
+    lines.append('')
+
+    ligne(spec.title)
+    if spec.subtitle:
+        ligne(spec.subtitle)
+
+    if spec.filters_applied:
+        for label, value in spec.filters_applied:
+            ligne(label, value)
+        lines.append('')
+
+    if spec.summary:
+        # Les libellés en retrait (les tranches d'une balance âgée) perdent leur
+        # indentation : une cellule de tableur ne rend pas les espaces de tête,
+        # et les garder ferait croire à une faute de saisie.
+        for label, value in spec.summary:
+            ligne(str(label).strip(), value)
+        lines.append('')
+
+    ligne(*(column.header for column in columns))
+
+    group_totals = list(spec.group_totals)
+    totals: dict = {}
+    grand_totals: dict = {}
+    current_group = None
+    empty = True
+
+    # ⚠ Une ligne de sous-total SANS colonne sommable est une bande VIDE. Sur
+    # une fiche de comptage à remplir au stylo, elle n'ajoute que du bruit
+    # entre deux rayons : les trois moteurs ne l'écrivent donc que si des
+    # colonnes sont déclarées sommables.
+    def ligne_de_totaux(label: str, cumuls: dict, groupe=None) -> None:
+        """Une ligne de total, aux MÊMES colonnes que les deux autres moteurs."""
+        decimales = devise.decimales(groupe)
+        ligne(label, *(
+            format_cell(cumuls.get(c.key), c.kind, decimales)
+            if c.key in group_totals else ''
+            for c in columns[1:]
+        ))
+
+    for group, row in _grouped(spec):
+        empty = False
+        if spec.group_by and group != current_group:
+            if current_group is not None and group_totals:
+                ligne_de_totaux(f"Sous-total {current_group}", totals, current_group)
+            current_group = group
+            totals = {}
+            ligne(f"{spec.group_label or 'Groupe'} : {group}")
+
+        if group_totals:
+            _accumulate(totals, row, group_totals)
+            _accumulate(grand_totals, row, group_totals)
+        ligne(*(
+            format_cell(row.get(c.key), c.kind, devise.decimales(row))
+            for c in columns
+        ))
+
+    if empty:
+        ligne(spec.empty_message)
+    else:
+        if spec.group_by and group_totals and current_group is not None:
+            ligne_de_totaux(f"Sous-total {current_group}", totals, current_group)
+        # ⚠ LE TOTAL GÉNÉRAL NE DÉPEND PAS DU REGROUPEMENT.
+        #
+        # Il était écrit ici sous `spec.group_by`, alors que le PDF et le
+        # classeur le posent dès qu'une colonne est déclarée sommable. Un
+        # rapport non groupé sortait donc AVEC son total en PDF et SANS en CSV :
+        # deux documents d'un même rapport qui ne disent pas la même chose,
+        # exactement ce que ce socle existe pour empêcher. Trouvé par un test.
+        if group_totals and spec.grand_total:
+            ligne_de_totaux('TOTAL GÉNÉRAL', grand_totals)
+
+    # CRLF : c'est ce qu'attend Excel, et c'est ce que produit le paquet partagé.
+    contenu = CSV_BOM + '\r\n'.join(lines) + '\r\n'
+    return io.BytesIO(contenu.encode('utf-8'))
+
+
 RENDERERS = {
     'pdf': render_report_pdf,
     'xlsx': render_report_xlsx,
+    'csv': render_report_csv,
 }
 
 CONTENT_TYPES = {
     'pdf': 'application/pdf',
     'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'csv': 'text/csv; charset=utf-8',
 }
 
 
 def render_report(spec: ReportSpec, fmt: str) -> io.BytesIO:
-    """Rend le rapport dans le format demandé (`pdf` ou `xlsx`)."""
+    """Rend le rapport dans le format demandé (`pdf`, `xlsx` ou `csv`)."""
     try:
         return RENDERERS[fmt](spec)
     except KeyError:

@@ -11,11 +11,14 @@ from django.utils import timezone
 from decimal import Decimal
 from rest_framework.exceptions import ValidationError as DRFValidationError
 
+from apps.core.report_params import period_label
 from apps.core.api_mixins import (
     TenantViewSetMixin,
     AuditMixin,
+    ExportableListMixin,
     WarehouseScopedQuerysetMixin,
     WarehouseAssertCreateMixin,
+    describe_filters,
 )
 from apps.core.warehouse_scope import (
     accessible_warehouse_ids,
@@ -303,6 +306,7 @@ class SaleViewSet(
     WarehouseScopedQuerysetMixin,
     TenantViewSetMixin,
     AuditMixin,
+    ExportableListMixin,
     viewsets.ModelViewSet,
 ):
     """
@@ -356,7 +360,43 @@ class SaleViewSet(
         # n'a jamais été écrit depuis le web, et la pastille DUPLICATA ne
         # pouvait donc pas distinguer une réimpression d'une première sortie.
         'mark_receipt_printed': 'sales.view',
+        # Exporter, c'est LIRE : le fichier ne porte rien de plus que l'écran,
+        # et le queryset y applique le même périmètre entrepôt et la même
+        # portée par créateur.
+        'export': 'sales.view',
     }
+
+    export_basename = 'historique_des_ventes'
+
+    def build_export_spec(self, request, queryset):
+        """Décrit le journal des ventes tel que l'écran le montre.
+
+        Le queryset arrive DÉJÀ filtré et NON paginé (`ExportableListMixin`) :
+        c'est ce qui garantit que le fichier couvre le même périmètre que
+        l'écran qui l'a déclenché, et non ses cinquante premières lignes.
+        """
+        from apps.settings.services import CurrencyService
+
+        from .reports import build_sales_report
+
+        organization = self.get_organization()
+        params = request.query_params
+
+        statuts = dict(Sale.Status.choices)
+        filtres = describe_filters(params, {
+            'status': ('Statut', lambda v: statuts.get(v, v), 'Tous'),
+            'search': ('Recherche', lambda v: v, '-'),
+        })
+        periode = period_label(params)
+        if periode:
+            filtres.insert(0, ('Période', periode))
+
+        return build_sales_report(
+            queryset,
+            organization,
+            currency=CurrencyService.primary_code(organization),
+            filters_applied=filtres,
+        )
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -394,16 +434,43 @@ class SaleViewSet(
         queryset = super().get_queryset()
 
         # Optimisation des requêtes par action :
-        # - liste : compteur d'items via annotation `_items_count` (un seul COUNT
-        #   agrégé au lieu d'une requête par ligne), sans précharger items/paiements
-        #   que la liste ne sérialise pas.
+        # - liste ET export : compteur d'items via annotation `_items_count` (un
+        #   seul COUNT agrégé au lieu d'une requête par ligne), sans précharger
+        #   items/paiements qu'aucun des deux ne sérialise.
         # - détail : préchargement complet des relations lues par SaleDetailSerializer
         #   (items → product/variant, payments → payment_method/received_by).
-        if self.action == 'list':
+        #
+        # ⚠ `export` DOIT rejoindre la branche légère. `build_sales_report` ne
+        # lit que `customer`, `sold_by` et un nombre d'articles ; la branche
+        # détail lui faisait descendre tout le catalogue vendu (produit, unité,
+        # unité de conditionnement, variante) et tous les règlements, sur un
+        # périmètre volontairement NON PAGINÉ - et `iterator(chunk_size=500)`
+        # refaisait ce préchargement à chaque tranche.
+        if self.action in ('list', 'export'):
             queryset = queryset.annotate(_items_count=Count('items'))
         else:
+            from django.db.models import Prefetch
+
+            from .serializers import returned_quantity_expression
+
             queryset = queryset.select_related('register', 'warehouse', 'session').prefetch_related(
-                'items__product', 'items__variant',
+                # ⚠ `__unit` et `__packaging_unit` sont OBLIGATOIRES :
+                # `SaleItemSerializer` lit `product.unit.name` et
+                # `product.packaging_unit.name` pour écrire « 3 casiers +
+                # 7 bouteilles ». S'arrêter à `items__product` laisse DEUX
+                # requêtes par produit distinct sur chaque détail de vente.
+                #
+                # `_returned_quantity` est ANNOTÉ sur la même passe : la fiche
+                # dit ce qu'il reste à rendre, et le compter ligne à ligne
+                # coûterait une requête par article à chaque ouverture.
+                Prefetch(
+                    'items',
+                    queryset=SaleItem.objects.annotate(
+                        _returned_quantity=returned_quantity_expression()
+                    ),
+                ),
+                'items__product', 'items__product__unit',
+                'items__product__packaging_unit', 'items__variant',
                 'payments__payment_method', 'payments__received_by',
             )
 
@@ -429,7 +496,7 @@ class SaleViewSet(
             queryset = queryset.filter(
                 status__in=[Sale.Status.PENDING, Sale.Status.PARTIALLY_PAID],
                 amount_due__gt=0,
-                due_date__lt=timezone.now().date(),
+                due_date__lt=timezone.localdate(),
             )
 
         return queryset
@@ -530,7 +597,7 @@ class SaleViewSet(
     def today(self, request):
         """Retourne les ventes du jour avec pagination."""
         organization = self.get_organization()
-        today = timezone.now().date()
+        today = timezone.localdate()
         
         sales = Sale.objects.filter(
             organization=organization,
@@ -563,7 +630,7 @@ class SaleViewSet(
         
         # Paramètres de période
         period = request.query_params.get('period', 'today')
-        today = timezone.now().date()
+        today = timezone.localdate()
         
         if period == 'today':
             date_filter = {'sale_date__date': today}
@@ -646,12 +713,20 @@ class SaleReturnViewSet(
     queryset = SaleReturn.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission, TenantObjectPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['status', 'return_type']
+    # `original_sale` : une fiche de vente doit pouvoir lister SES retours.
+    # Sans ce filtre, il faudrait tirer toute la table et trier côté client.
+    filterset_fields = ['status', 'return_type', 'original_sale']
     search_fields = ['reference', 'original_sale__reference']
     ordering = ['-return_date']
     
     select_related_fields = ['original_sale', 'created_by', 'approved_by']
-    prefetch_related_fields = ['items', 'items__original_item__product']
+    # Même raison que sur `SaleViewSet` : la lecture en contenants passe par
+    # les deux unités du produit.
+    prefetch_related_fields = [
+        'items', 'items__original_item__product',
+        'items__original_item__product__unit',
+        'items__original_item__product__packaging_unit',
+    ]
 
     warehouse_scope_field = 'original_sale__warehouse_id'
     warehouse_scope_include_null = True
@@ -728,7 +803,10 @@ class QuotationViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     ordering = ['-created_at']
     
     select_related_fields = ['customer', 'created_by', 'converted_sale']
-    prefetch_related_fields = ['items', 'items__product']
+    prefetch_related_fields = [
+        'items', 'items__product',
+        'items__product__unit', 'items__product__packaging_unit',
+    ]
     
     action_permissions = {
         'list': 'sales.view',

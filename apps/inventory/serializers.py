@@ -123,8 +123,53 @@ class StockLocationSerializer(serializers.ModelSerializer):
 # LECTURE DES ÉCARTS DE COMPTAGE
 # =============================================================================
 
+def _expected_split(product, expected_base, expected_loose, factor=None):
+    """
+    Partage ATTENDU d'une ligne de comptage : ``(scellés, vrac)``.
+
+    ``None`` quand aucun conditionnement ne s'applique - l'appelant retombe
+    alors sur le total en unité de détail nommée.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ UN SEUL CHEMIN, PARCE QU'UNE LIGNE NE PEUT PAS SE CONTREDIRE.           │
+    │                                                                          │
+    │ L'écart passait par ``split`` et la fiche imprimée divisait de son côté :│
+    │ « 7.9166666666666666666666666667 CASIERS » en colonne « Stock système »  │
+    │ au-dessus d'un écart, lui, correct. ``split`` garantit un nombre ENTIER  │
+    │ de scellés et reverse le reliquat au vrac - un contenant entamé ne se    │
+    │ rescelle pas.                                                            │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ LE FACTEUR EST CELUI SOUS LEQUEL ON A COMPTÉ.                           │
+    │                                                                          │
+    │ ``counted_package_quantity`` est LU : c'est le nombre de contenants que  │
+    │ le magasinier a écrit, sous le conditionnement en vigueur ce jour-là -   │
+    │ ``packaging_factor`` est d'ailleurs REPOSÉ à chaque comptage. L'attendu, │
+    │ lui, se reconstitue. Le reconstituer au facteur d'AUJOURD'HUI puis       │
+    │ soustraire l'autre revient à retrancher des casiers de douze à des       │
+    │ casiers de vingt-quatre, et le nombre qui en sort ne désigne rien :      │
+    │ mesuré, un rayon parfaitement juste s'annonçait « +4 CASIERS ».          │
+    │                                                                          │
+    │ C'est la règle que ``format_movement_quantity`` tient déjà : « le lire   │
+    │ au conditionnement d'aujourd'hui réécrirait un passé qui l'ignorait ».   │
+    │                                                                          │
+    │ Sans facteur figé (lignes anciennes, produit devenu conditionné depuis), │
+    │ on retombe sur celui du produit : c'est tout ce qu'on a, et le refuser   │
+    │ ferait perdre la ventilation là où elle marchait.                        │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+    from apps.inventory.packaging import PackagingService
+
+    factor = factor or PackagingService.factor(product)
+    if not factor or factor < 2:
+        return None
+    return PackagingService.split(expected_base, expected_loose or 0, factor)
+
+
 def _difference_display(product, *, expected_base, expected_loose,
-                        counted_packages, counted_loose, base_delta):
+                        counted_packages, counted_loose, base_delta,
+                        factor=None):
     """
     Écart d'un comptage, ventilé par canal quand les deux parts sont connues.
 
@@ -139,8 +184,8 @@ def _difference_display(product, *, expected_base, expected_loose,
     """
     from apps.inventory.packaging import PackagingService
 
-    factor = PackagingService.factor(product)
-    if factor is None:
+    partage = _expected_split(product, expected_base, expected_loose, factor)
+    if partage is None:
         return PackagingService.format_difference(product, base_delta)
 
     counted_packages = counted_packages or 0
@@ -148,9 +193,7 @@ def _difference_display(product, *, expected_base, expected_loose,
     if not counted_packages and not counted_loose:
         return PackagingService.format_difference(product, base_delta)
 
-    expected_packages, expected_loose_split = PackagingService.split(
-        expected_base, expected_loose or 0, factor
-    )
+    expected_packages, expected_loose_split = partage
     return PackagingService.format_difference(
         product,
         base_delta,
@@ -421,7 +464,7 @@ class StockBatchSerializer(serializers.ModelSerializer):
     def get_days_until_expiry(self, obj):
         if obj.expiry_date:
             from django.utils import timezone
-            delta = obj.expiry_date - timezone.now().date()
+            delta = obj.expiry_date - timezone.localdate()
             return delta.days
         return None
 
@@ -735,14 +778,40 @@ class StockMovementCreateSerializer(serializers.ModelSerializer):
 
         request = self.context.get('request')
         view = self.context.get('view')
-        organization = (
+        user = getattr(request, 'user', None)
+
+        # L'ORGANISATION SE LIT D'ABORD DANS LE CONTEXTE, ET C'EST OBLIGATOIRE.
+        #
+        # Le journal de synchronisation rejoue cet acte SANS `view` : il n'a
+        # qu'une requête. En ne résolvant que par la vue, `organization` valait
+        # `None` sur ce chemin. `OperationContext` porte l'organisation ; le
+        # gestionnaire la pose ici.
+        organization = self.context.get('organization') or (
             view.get_organization()
             if view is not None and hasattr(view, 'get_organization')
             else None
         )
-        if request and organization and not PermissionService.has_permission(
-            request.user, organization, 'products.edit'
-        ):
+
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ UN CONTRÔLE DE DROIT QUI IGNORE SUR QUOI IL PORTE REFUSE.        │
+        # │                                                                  │
+        # │ Il était écrit `if request and organization and not ...` : sans  │
+        # │ organisation, le contrôle SAUTAIT au lieu de fermer. C'est ce    │
+        # │ qui laissait un caissier retarifer le catalogue depuis son       │
+        # │ terminal quand le back-office le lui refusait - le journal       │
+        # │ construit ce serializer sans `view`.                             │
+        # │                                                                  │
+        # │ Le refus reste une ERREUR DE CHAMP, jamais un 403 : créer le     │
+        # │ mouvement reste autorisé, et il suffit de décocher la case.      │
+        # └──────────────────────────────────────────────────────────────────┘
+        if organization is None or user is None:
+            raise serializers.ValidationError({
+                'update_product_prices': (
+                    "Le report des prix sur la fiche produit n'a pas pu être "
+                    "vérifié. Décochez la case pour enregistrer le mouvement."
+                )
+            })
+        if not PermissionService.has_permission(user, organization, 'products.edit'):
             raise serializers.ValidationError({
                 'update_product_prices': (
                     "Vous n'avez pas la permission de modifier les prix de la "
@@ -1058,6 +1127,8 @@ class StockAdjustmentItemSerializer(serializers.ModelSerializer):
             counted_packages=obj.counted_package_quantity,
             counted_loose=obj.counted_loose_quantity,
             base_delta=obj.quantity_difference,
+            # Le facteur FIGÉ sur la ligne : c'est sous lui qu'on a compté.
+            factor=obj.packaging_factor,
         )
 
     def validate(self, data):
@@ -1304,6 +1375,8 @@ class InventoryCountSerializer(serializers.ModelSerializer):
             counted_packages=obj.counted_package_quantity,
             counted_loose=obj.counted_loose_quantity,
             base_delta=obj.quantity_difference,
+            # Le facteur FIGÉ sur la ligne : c'est sous lui qu'on a compté.
+            factor=obj.packaging_factor,
         )
 
 

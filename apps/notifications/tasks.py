@@ -135,11 +135,11 @@ def check_expiring_products():
     from apps.notifications.models import Alert
     
     warning_days = settings.VENTE_FACILE.get('EXPIRY_WARNING_DAYS', 30)
-    warning_date = timezone.now().date() + timedelta(days=warning_days)
+    warning_date = timezone.localdate() + timedelta(days=warning_days)
     
     expiring_batches = StockBatch.objects.filter(
         expiry_date__lte=warning_date,
-        expiry_date__gte=timezone.now().date(),
+        expiry_date__gte=timezone.localdate(),
         quantity__gt=0
     ).select_related('product', 'product__unit', 'organization')
     
@@ -153,7 +153,7 @@ def check_expiring_products():
         ).exists()
         
         if not existing_alert:
-            days_until_expiry = (batch.expiry_date - timezone.now().date()).days
+            days_until_expiry = (batch.expiry_date - timezone.localdate()).days
             
             Alert.objects.create(
                 organization=batch.organization,
@@ -196,7 +196,7 @@ def check_customer_payment_due():
     from apps.notifications.models import Alert
     from apps.sales.models import Sale
 
-    today = timezone.now().date()
+    today = timezone.localdate()
     warning_days = settings.VENTE_FACILE.get('PAYMENT_DUE_WARNING_DAYS', 3)
     warning_date = today + timedelta(days=warning_days)
 
@@ -395,46 +395,6 @@ def check_subscription_expiry():
 
 
 @shared_task
-def send_daily_sales_report():
-    """Send daily sales summary to organization admins."""
-    from apps.organizations.models import Organization
-    from apps.sales.models import Sale
-    from apps.notifications.models import Notification
-    from django.db.models import Sum, Count
-    
-    yesterday = timezone.now().date() - timedelta(days=1)
-    
-    organizations = Organization.objects.filter(is_active=True)
-    
-    for org in organizations:
-        sales = Sale.objects.filter(
-            organization=org,
-            status='completed',
-            sale_date__date=yesterday
-        ).aggregate(
-            total=Sum('total'),
-            count=Count('id')
-        )
-        
-        if sales['count'] and sales['count'] > 0:
-            admins = org.memberships.filter(
-                role__in=['owner', 'admin', 'manager'],
-                is_active=True
-            ).select_related('user')
-            
-            for membership in admins:
-                Notification.objects.create(
-                    organization=org,
-                    user=membership.user,
-                    notification_type=Notification.NotificationType.INFO,
-                    title=f"Résumé des ventes - {yesterday}",
-                    message=f"Nombre de ventes: {sales['count']}, Total: {sales['total'] or 0} CDF",
-                    action_url='/reports/sales',
-                    action_label='Voir détails'
-                )
-
-
-@shared_task
 def cleanup_old_notifications():
     """Delete notifications older than 30 days."""
     from apps.notifications.models import Notification
@@ -447,42 +407,3 @@ def cleanup_old_notifications():
     ).delete()
     
     return f"Deleted {deleted_count} old notifications"
-
-
-@shared_task
-def send_email_notification(notification_id):
-    """Send email for a notification."""
-    from django.core.mail import send_mail
-    from django.conf import settings
-    from apps.notifications.models import Notification, EmailLog
-    
-    try:
-        notification = Notification.objects.select_related('user').get(id=notification_id)
-        
-        email_log = EmailLog.objects.create(
-            organization=notification.organization,
-            to_email=notification.user.email,
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            subject=notification.title,
-            body=notification.message,
-            status=EmailLog.Status.PENDING
-        )
-        
-        send_mail(
-            subject=notification.title,
-            message=notification.message,
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            recipient_list=[notification.user.email],
-            fail_silently=False
-        )
-        
-        email_log.status = EmailLog.Status.SENT
-        email_log.sent_at = timezone.now()
-        email_log.save()
-        
-    except Exception as e:
-        if 'email_log' in locals():
-            email_log.status = EmailLog.Status.FAILED
-            email_log.error_message = str(e)
-            email_log.save()
-        raise

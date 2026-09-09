@@ -3,6 +3,7 @@ Mixins DRF pour les ViewSets multi-tenant.
 """
 from django.http import Http404, HttpResponse
 from django.utils import timezone
+from rest_framework.decorators import action
 from rest_framework import status
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
@@ -274,47 +275,6 @@ class AuditMixin:
         return serializer.save(**extra_kwargs)
 
 
-class SearchMixin:
-    """
-    Mixin pour la recherche avancée.
-    """
-    search_fields = []
-    
-    def get_queryset(self):
-        queryset = super().get_queryset()
-        
-        search = self.request.query_params.get('search', None)
-        if search and self.search_fields:
-            from django.db.models import Q
-            query = Q()
-            for field in self.search_fields:
-                query |= Q(**{f'{field}__icontains': search})
-            queryset = queryset.filter(query)
-        
-        return queryset
-
-
-class FilterMixin:
-    """
-    Mixin pour le filtrage par paramètres URL.
-    """
-    filter_fields = {}
-    
-    def get_queryset(self):
-        queryset = super().get_queryset()
-        
-        for param, field in self.filter_fields.items():
-            value = self.request.query_params.get(param, None)
-            if value is not None:
-                if value.lower() == 'true':
-                    value = True
-                elif value.lower() == 'false':
-                    value = False
-                queryset = queryset.filter(**{field: value})
-        
-        return queryset
-
-
 class ActionPaginationMixin:
     """
     Mixin pour paginer les résultats des actions personnalisées (@action).
@@ -385,7 +345,11 @@ class ExportResponseMixin:
     """
 
     #: Formats acceptés par les actions d'export du ViewSet.
-    export_formats = ('pdf', 'xlsx')
+    #:
+    #: `csv` s'ajoute au PDF et au classeur : c'est le format que le marchand
+    #: ouvre le plus vite, et le socle le rend depuis la même `ReportSpec`, donc
+    #: aucune rubrique n'a une ligne à écrire pour en profiter.
+    export_formats = ('pdf', 'xlsx', 'csv')
 
     #: Nom du paramètre de requête portant le format demandé.
     #:
@@ -439,3 +403,80 @@ class ExportResponseMixin:
 
         buffer = render_report(spec, fmt)
         return self.export_file_response(buffer, basename, fmt)
+
+
+class ExportableListMixin(ExportResponseMixin):
+    """
+    Donne à un ViewSet une action ``GET .../export/`` sans plomberie à écrire.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ « NE PAS CHAQUE FOIS RÉÉCRIRE LES LOGIQUES D'EXPORTATION ».              │
+    │                                                                          │
+    │ `ExportResponseMixin` portait déjà le format et la réponse ; la SÉQUENCE │
+    │ - lire le format, filtrer le queryset, décrire le rapport, le rendre -   │
+    │ restait recopiée dans chaque action, et c'est là que les écarts          │
+    │ naissent. Un ViewSet n'a plus qu'à déclarer son constructeur de          │
+    │ description et le nom de son fichier.                                    │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ L'EXPORT PORTE LE PÉRIMÈTRE FILTRÉ, JAMAIS LA PAGE AFFICHÉE.            │
+    │                                                                          │
+    │ D'où `self.filter_queryset(self.get_queryset())` et surtout PAS de       │
+    │ pagination : un export qui ne couvrirait que les cinquante lignes à      │
+    │ l'écran est le défaut que le back-office a dû corriger sur ses niveaux   │
+    │ de stock. `get_queryset` porte en outre le périmètre entrepôt et la      │
+    │ portée par créateur : les court-circuiter ouvrirait la lecture.          │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
+    #: Radical du nom de fichier servi. `ExportResponseMixin` y ajoute la date.
+    export_basename = 'rapport'
+
+    def build_export_spec(self, request, queryset):
+        """Décrit le rapport. À implémenter par le ViewSet.
+
+        Rend une ``ReportSpec`` : les deux moteurs (PDF et classeur) la rendent
+        tous les deux, si bien que les deux fichiers d'un même export ne
+        peuvent pas diverger.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} déclare `ExportableListMixin` sans "
+            "implémenter `build_export_spec`."
+        )
+
+    @action(detail=False, methods=['get'], url_path='export')
+    def export(self, request, *args, **kwargs):
+        """Exporte le périmètre filtré, en PDF ou en classeur."""
+        fmt = self.get_export_format(request)
+        queryset = self.filter_queryset(self.get_queryset())
+        spec = self.build_export_spec(request, queryset)
+        return self.render_export(spec, self.export_basename, fmt)
+
+
+def describe_filters(params, libelles):
+    """
+    Traduit des paramètres de requête en lignes « Filtre : valeur » lisibles.
+
+    ``libelles`` associe un nom de paramètre à ``(intitulé, résolveur, défaut)``
+    - la docstring annonçait un COUPLE alors que le code déballe un TRIPLET, et
+    le premier appelant venu y a perdu un aller-retour. Le résolveur transforme
+    la valeur brute en texte ; le défaut est ce qui s'écrit en l'ABSENCE de
+    filtre, plutôt que de faire disparaître la ligne : un lecteur doit pouvoir
+    distinguer « pas de filtre » de « filtre oublié dans l'en-tête ».
+
+    Un identifiant invalide est rendu « inconnu » et n'interrompt rien : le
+    queryset l'a déjà écarté, et faire échouer un export pour un libellé
+    manquant serait disproportionné.
+    """
+    lignes = []
+    for cle, (intitule, resolveur, defaut) in libelles.items():
+        brut = params.get(cle)
+        if not brut:
+            lignes.append((intitule, defaut))
+            continue
+        try:
+            lignes.append((intitule, resolveur(brut) or 'inconnu'))
+        except Exception:
+            lignes.append((intitule, 'inconnu'))
+    return lignes

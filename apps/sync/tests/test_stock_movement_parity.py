@@ -196,3 +196,111 @@ class MouvementParityTests(_MouvementBaseTest):
             'rejected',
         )
         self.assertEqual(StockMovement.objects.count(), 0)
+
+
+class ReportDesPrixParLeJournalTests(_MouvementBaseTest):
+    """
+    Le report des prix sur la fiche produit exige `products.edit`, DES DEUX CÔTÉS.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ LE CONTRÔLE ÉTAIT SAUTÉ SUR LE CHEMIN DU TERMINAL.                       │
+    │                                                                          │
+    │ `_validate_product_prices` résolvait l'organisation par                  │
+    │ `self.context['view'].get_organization()`. Le gestionnaire de            │
+    │ synchronisation construit le serializer avec le seul `request` : il n'y  │
+    │ a pas de `view`, `organization` valait `None`, et tout le `if` tombait.  │
+    │                                                                          │
+    │ Latent tant que le terminal n'envoyait pas le drapeau. Le jour où son    │
+    │ formulaire gagne la case, n'importe quel caissier réécrit les prix du    │
+    │ catalogue depuis son téléphone, en silence, quand le back-office le lui  │
+    │ refuse.                                                                  │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    Le rôle est celui qui MORD : un magasinier porte `products.edit`, un
+    caissier ne porte pas `stock_movements.create`. Le cas réel est donc le
+    caissier à qui le marchand a accordé la saisie de stock par
+    `extra_permissions`, et à qui il n'a pas accordé la retarification.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # `cashier_a` vient de `make_org_with_users`, avec l'entrepôt principal
+        # déjà assigné.
+        self.adhesion_caissier = OrganizationMembership.objects.get(
+            user=self.cashier_a, organization=self.org,
+        )
+        self.adhesion_caissier.extra_permissions = ['stock_movements.create']
+        self.adhesion_caissier.save(update_fields=['extra_permissions'])
+        self.client.force_authenticate(user=self.cashier_a)
+
+    def _prix_du_produit(self):
+        self.produit.refresh_from_db()
+        return (self.produit.cost_price, self.produit.selling_price)
+
+    def test_le_caissier_ne_retarifie_pas_le_catalogue_par_le_journal(self):
+        avant = self._prix_du_produit()
+
+        op = '66666666-6666-4666-8666-666666666666'
+        verdict = self._verdict(
+            self._journal(
+                self._payload_terminal(
+                    op,
+                    unit_cost='1500',
+                    update_product_prices=True,
+                    selling_price='9999',
+                ),
+                op,
+            ),
+            'rejected',
+        )
+        self.assertIn('update_product_prices', str(verdict.get('errors')))
+        self.assertEqual(
+            self._prix_du_produit(), avant,
+            'Les prix du catalogue ont bougé sur un droit que le caissier n\'a pas.',
+        )
+
+    def test_le_back_office_refuse_le_meme_geste(self):
+        """La parité est le sujet : les deux surfaces doivent refuser."""
+        avant = self._prix_du_produit()
+
+        vue = self.client.post(
+            '/api/v1/stock-movements/',
+            {
+                'product': str(self.produit.id),
+                'warehouse': str(self.warehouse.id),
+                'movement_type': 'purchase', 'quantity': '10', 'unit_cost': '1500',
+                'update_product_prices': True, 'selling_price': '9999',
+            },
+            format='json', **self._headers(),
+        )
+        self.assertEqual(vue.status_code, status.HTTP_400_BAD_REQUEST, vue.data)
+        self.assertIn('update_product_prices', vue.data)
+        self.assertEqual(self._prix_du_produit(), avant)
+
+    def test_avec_le_droit_le_report_passe_par_le_journal(self):
+        """
+        Le refus ne doit pas se transformer en interdiction générale.
+
+        Sans ce contre-test, poser le contrôle trop haut (un `blocked` sur
+        l'opération entière, ou un refus inconditionnel) passerait inaperçu.
+        """
+        self.adhesion_caissier.extra_permissions = [
+            'stock_movements.create', 'products.edit',
+        ]
+        self.adhesion_caissier.save(update_fields=['extra_permissions'])
+
+        op = '77777777-7777-4777-8777-777777777777'
+        self._verdict(
+            self._journal(
+                self._payload_terminal(
+                    op,
+                    unit_cost='1500',
+                    update_product_prices=True,
+                    selling_price='9999',
+                ),
+                op,
+            ),
+            'applied',
+        )
+        self.produit.refresh_from_db()
+        self.assertEqual(self.produit.selling_price, Decimal('9999.00'))

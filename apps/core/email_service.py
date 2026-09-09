@@ -115,32 +115,3 @@ def send_quotation_email(quotation, recipient_email: Optional[str] = None) -> bo
         f"Cordialement,\n{org.name}"
     )
     return _send(subject, recipient_email, text_body)
-
-
-def send_receipt_email(sale, recipient_email: Optional[str] = None) -> bool:
-    """
-    Envoie un reçu de vente au client.
-
-    Si ``recipient_email`` n'est pas fourni, utilise ``sale.customer.email``.
-    """
-    if not recipient_email and getattr(sale, 'customer', None):
-        recipient_email = getattr(sale.customer, 'email', None)
-    if not recipient_email:
-        logger.info("Vente %s : pas d'email client, reçu non envoyé", sale.reference)
-        return False
-
-    org = sale.organization
-    total = sale.total
-    currency = getattr(sale, 'currency', 'CDF')
-    date_str = timezone.localtime(sale.sale_date).strftime('%d/%m/%Y %H:%M') if sale.sale_date else 'N/A'
-
-    subject = f"Reçu {sale.reference} - {org.name}"
-    text_body = (
-        f"Bonjour,\n\n"
-        f"Merci pour votre achat chez {org.name} le {date_str}.\n\n"
-        f"Référence : {sale.reference}\n"
-        f"Total : {total} {currency}\n"
-        f"Payé : {sale.amount_paid} {currency}\n\n"
-        f"À bientôt,\n{org.name}"
-    )
-    return _send(subject, recipient_email, text_body)

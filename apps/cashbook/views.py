@@ -14,8 +14,17 @@ from django_filters.rest_framework import DjangoFilterBackend
 from apps.core.api_mixins import (
     TenantViewSetMixin,
     AuditMixin,
+    ExportResponseMixin,
     WarehouseAssertCreateMixin,
 )
+from apps.core.report_params import (
+    format_day,
+    month_label,
+    parse_day,
+    parse_month,
+    parse_year,
+)
+from rest_framework.exceptions import ValidationError as DRFValidationError
 from apps.core.warehouse_scope import (
     accessible_warehouse_ids,
     get_membership_for_request,
@@ -347,7 +356,7 @@ class ExpenseViewSet(
             expense.payment_reference = payment_reference
 
         expense.status = 'paid'
-        expense.paid_date = timezone.now().date()
+        expense.paid_date = timezone.localdate()
         expense.save()
         return Response(ExpenseDetailSerializer(expense).data)
 
@@ -475,7 +484,8 @@ class ExpenseViewSet(
 # CASH MOVEMENT VIEWSET
 # =============================================================================
 
-class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
+class CashMovementViewSet(ExportResponseMixin, TenantViewSetMixin,
+                          viewsets.ModelViewSet):
     """
     ViewSet pour les mouvements de caisse.
     
@@ -505,6 +515,9 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     action_permissions = {
         'list': 'cashbook.view',
         'retrieve': 'cashbook.view',
+        # Exporter, c'est LIRE. Sans cette ligne, `HasPermission` refuse la
+        # route à TOUS les rôles, en silence.
+        'export_report': 'cashbook.view',
         'create': 'cashbook.create_movement',
         'update': 'cashbook.create_movement',
         'partial_update': 'cashbook.create_movement',
@@ -684,7 +697,7 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         balances = self._last_balance_by_currency(scoped_qs)
 
         # Totaux du jour par devise.
-        today = timezone.now().date()
+        today = timezone.localdate()
         today_totals = {
             r['currency']: r
             for r in self._totals_by_currency(scoped_qs.filter(movement_date__date=today))
@@ -772,11 +785,161 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             'by_day': list(by_day),
         })
 
+    # ------------------------------------------------------------------
+    # Constructeurs partagés par les rapports et par leur EXPORT
+    # ------------------------------------------------------------------
+    #
+    # Les quatre rapports (journalier, mensuel, annuel, personnalisé) ne
+    # diffèrent que par leur fenêtre et leur pas de temps. Ce qui suit est
+    # appelé par les actions paginées ET par `export_report`, pour que le
+    # fichier ne puisse pas dire autre chose que l'écran.
+
+    @staticmethod
+    def _movements_by_day(movements):
+        """Totaux par jour, ventilés par devise."""
+        return movements.annotate(
+            day=TruncDate('movement_date')
+        ).values('day', 'currency').annotate(
+            total_in=Sum('amount', filter=Q(direction='in'), default=Decimal('0.00')),
+            total_out=Sum('amount', filter=Q(direction='out'), default=Decimal('0.00')),
+            count=Count('id'),
+        ).order_by('day', 'currency')
+
+    @staticmethod
+    def _movements_by_month(movements):
+        """Totaux par mois, ventilés par devise."""
+        return movements.annotate(
+            month=TruncMonth('movement_date')
+        ).values('month', 'currency').annotate(
+            total_in=Sum('amount', filter=Q(direction='in'), default=Decimal('0.00')),
+            total_out=Sum('amount', filter=Q(direction='out'), default=Decimal('0.00')),
+            count=Count('id'),
+        ).order_by('month', 'currency')
+
+    def _report_window(self, request, scope):
+        """
+        La fenêtre d'un rapport de caisse, et ce qu'elle recouvre.
+
+        Rend `(libelle, base_qs, movements, borne)` : `base_qs` sert à calculer
+        le solde d'ouverture (il porte TOUT l'historique), `movements` la
+        période, et `borne` la date à laquelle l'ouverture est relevée.
+        """
+        import datetime
+
+        organization = self.get_organization()
+        base_qs = self._scope_cash_movements_to_membership(
+            CashMovement.objects.filter(organization=organization, is_cancelled=False)
+        )
+        p = request.query_params
+
+        aujourdhui = timezone.localdate()
+
+        if scope == 'daily':
+            jour = parse_day(p['date']) if p.get('date') else aujourdhui
+            return (
+                f"Journée du {format_day(jour.isoformat())}",
+                base_qs,
+                base_qs.filter(movement_date__date=jour).select_related(
+                    'payment_method', 'sale', 'expense', 'customer', 'supplier',
+                    'created_by',
+                ).order_by('movement_date'),
+                jour,
+            )
+
+        if scope == 'monthly':
+            annee = parse_year(p.get('year'), aujourdhui.year)
+            mois = parse_month(p.get('month'), aujourdhui.month)
+            premier = datetime.date(annee, mois, 1)
+            return (
+                month_label(f"{annee:04d}-{mois:02d}"),
+                base_qs,
+                base_qs.filter(
+                    movement_date__year=annee, movement_date__month=mois
+                ),
+                premier,
+            )
+
+        if scope == 'annual':
+            annee = parse_year(p.get('year'), aujourdhui.year)
+            return (
+                f"Année {annee}",
+                base_qs,
+                base_qs.filter(movement_date__year=annee),
+                datetime.date(annee, 1, 1),
+            )
+
+        debut, fin = p.get('date_from'), p.get('date_to')
+        if not debut or not fin:
+            raise DRFValidationError(
+                {'detail': "Les paramètres date_from et date_to sont requis."}
+            )
+        debut = parse_day(debut, champ='date_from')
+        fin = parse_day(fin, champ='date_to')
+        return (
+            f"Du {format_day(debut.isoformat())} au {format_day(fin.isoformat())}",
+            base_qs,
+            base_qs.filter(
+                movement_date__date__gte=debut, movement_date__date__lte=fin
+            ),
+            debut,
+        )
+
+    @action(detail=False, methods=['get'], url_path='export-report')
+    def export_report(self, request):
+        """
+        Les quatre rapports de caisse, en PDF, classeur ou CSV.
+
+        ┌──────────────────────────────────────────────────────────────────┐
+        │ LE JOURNALIER PORTE LA JOURNÉE ENTIÈRE.                          │
+        │                                                                  │
+        │ Le document dessiné dans le navigateur ne mettait dans son        │
+        │ tableau que `movements.results`, c'est-à-dire les vingt lignes    │
+        │ paginées à l'écran, sous une synthèse qui annonçait tout le jour. │
+        │ Ici la liste n'est pas paginée.                                   │
+        └──────────────────────────────────────────────────────────────────┘
+        """
+        from apps.cashbook.reports import (
+            SCOPE_BASENAMES,
+            build_daily_cash_report,
+            build_period_cash_report,
+        )
+
+        fmt = self.get_export_format(request)
+        scope = (request.query_params.get('scope') or 'daily').strip()
+        if scope not in SCOPE_BASENAMES:
+            raise DRFValidationError({
+                'scope': "Portée inconnue. Attendu : "
+                         + ', '.join(sorted(SCOPE_BASENAMES)) + '.',
+            })
+
+        organization = self.get_organization()
+        libelle, base_qs, movements, borne = self._report_window(request, scope)
+        by_currency = self._report_by_currency(base_qs, movements, borne)
+        primary = self._primary_currency()
+
+        if scope == 'daily':
+            spec = build_daily_cash_report(
+                organization, libelle=libelle, movements=movements,
+                by_currency=by_currency, currency=primary,
+            )
+        else:
+            par_mois = scope == 'annual'
+            buckets = (
+                self._movements_by_month(movements) if par_mois
+                else self._movements_by_day(movements)
+            )
+            spec = build_period_cash_report(
+                organization, scope=scope, libelle=libelle, buckets=buckets,
+                by_currency=by_currency, currency=primary, par_mois=par_mois,
+            )
+
+        return self.render_export(spec, SCOPE_BASENAMES[scope], fmt)
+
     @action(detail=False, methods=['get'], url_path='daily-report')
     def daily_report(self, request):
         """Rapport journalier détaillé."""
         organization = self.get_organization()
-        date_str = request.query_params.get('date', timezone.now().date().isoformat())
+        date_str = request.query_params.get('date', timezone.localdate().isoformat())
 
         base_qs = self._scope_cash_movements_to_membership(
             CashMovement.objects.filter(organization=organization, is_cancelled=False)
@@ -859,14 +1022,7 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         # Ouverture / totaux / clôture PAR DEVISE.
         by_currency = self._report_by_currency(base_qs, movements, first_day)
 
-        # Par jour (ventilé par devise).
-        by_day = movements.annotate(
-            day=TruncDate('movement_date')
-        ).values('day', 'currency').annotate(
-            total_in=Sum('amount', filter=Q(direction='in'), default=Decimal('0.00')),
-            total_out=Sum('amount', filter=Q(direction='out'), default=Decimal('0.00')),
-            count=Count('id'),
-        ).order_by('day', 'currency')
+        by_day = self._movements_by_day(movements)
 
         # Par type (ventilé par devise)
         by_type = movements.values(
@@ -930,14 +1086,7 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         # Ouverture / totaux / clôture PAR DEVISE.
         by_currency = self._report_by_currency(base_qs, movements, first_day)
 
-        # Par mois (ventilé par devise)
-        by_month = movements.annotate(
-            month=TruncMonth('movement_date')
-        ).values('month', 'currency').annotate(
-            total_in=Sum('amount', filter=Q(direction='in'), default=Decimal('0.00')),
-            total_out=Sum('amount', filter=Q(direction='out'), default=Decimal('0.00')),
-            count=Count('id'),
-        ).order_by('month', 'currency')
+        by_month = self._movements_by_month(movements)
 
         # Par type (ventilé par devise)
         by_type = movements.values(
@@ -1004,14 +1153,7 @@ class CashMovementViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         # Ouverture / totaux / clôture PAR DEVISE.
         by_currency = self._report_by_currency(base_qs, movements, date_from)
 
-        # Par jour (ventilé par devise)
-        by_day = movements.annotate(
-            day=TruncDate('movement_date')
-        ).values('day', 'currency').annotate(
-            total_in=Sum('amount', filter=Q(direction='in'), default=Decimal('0.00')),
-            total_out=Sum('amount', filter=Q(direction='out'), default=Decimal('0.00')),
-            count=Count('id'),
-        ).order_by('day', 'currency')
+        by_day = self._movements_by_day(movements)
 
         # Par type (ventilé par devise)
         by_type = movements.values(

@@ -15,7 +15,12 @@ from django.db.models import Sum, Count, Q, F, Exists, OuterRef, DecimalField
 from django.db.models.functions import Coalesce
 from django.http import HttpResponse
 
-from apps.core.api_mixins import TenantViewSetMixin, BulkActionMixin, AuditMixin
+from apps.core.api_mixins import (
+    AuditMixin,
+    BulkActionMixin,
+    ExportableListMixin,
+    TenantViewSetMixin,
+)
 from apps.core.warehouse_scope import (
     accessible_warehouse_ids,
     assert_warehouse_allowed_for_request,
@@ -311,7 +316,8 @@ class UnitViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
 # PRODUCT VIEWSET
 # =============================================================================
 
-class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.ModelViewSet):
+class ProductViewSet(ExportableListMixin, TenantViewSetMixin, AuditMixin,
+                     BulkActionMixin, viewsets.ModelViewSet):
     """
     ViewSet pour la gestion des produits.
 
@@ -337,8 +343,9 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
     - GET /products/{id}/stock/ : Stock du produit
     - GET /products/low-stock/ : Produits en stock bas
     - GET /products/search-barcode/ : Recherche par code-barres
+    - GET /products/export/ : Catalogue en PDF, classeur ou CSV
     """
-    
+
     queryset = Product.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
@@ -350,6 +357,55 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
     select_related_fields = ['category', 'brand', 'unit', 'packaging_unit']
     prefetch_related_fields = ['stocks__warehouse', 'stocks__location', 'images', 'variants']
     bulk_update_fields = ['is_active', 'is_featured', 'category', 'brand']
+    export_basename = 'catalogue_produits'
+
+    def build_export_spec(self, request, queryset):
+        """
+        Décrit le catalogue, sur le PÉRIMÈTRE FILTRÉ.
+
+        ┌──────────────────────────────────────────────────────────────────┐
+        │ L'EXPORT SUIT L'ÉCRAN, ET IL NE LE FAISAIT PAS.                  │
+        │                                                                  │
+        │ L'ancien export sortait TOUT l'établissement quels que soient les │
+        │ filtres posés : on filtrait sur une catégorie, on exportait, et   │
+        │ on recevait le catalogue entier. `ExportableListMixin` passe ici  │
+        │ le queryset déjà filtré, donc le fichier dit ce que l'écran       │
+        │ montrait quand on l'a demandé.                                    │
+        └──────────────────────────────────────────────────────────────────┘
+        """
+        from apps.core.api_mixins import describe_filters
+        from apps.products.reports import build_product_catalog_report
+        from apps.settings.services import CurrencyService
+
+        organization = self.get_organization()
+        params = request.query_params
+
+        def nom_de(modele, valeur):
+            objet = modele.objects.filter(
+                organization=organization, id=valeur
+            ).first()
+            return objet.name if objet else valeur
+
+        # Le troisième membre est ce qui s'écrit EN L'ABSENCE de filtre : une
+        # ligne qui disparaîtrait empêcherait de distinguer « pas de filtre »
+        # d'« filtre oublié dans l'en-tête ».
+        filtres = describe_filters(params, {
+            'category': ('Catégorie', lambda v: nom_de(Category, v), 'Toutes'),
+            'brand': ('Marque', lambda v: nom_de(Brand, v), 'Toutes'),
+            'is_active': (
+                'Statut',
+                lambda v: 'Actifs' if v.lower() == 'true' else 'Inactifs',
+                'Tous',
+            ),
+            'search': ('Recherche', str, '-'),
+        })
+
+        return build_product_catalog_report(
+            queryset,
+            organization,
+            currency=CurrencyService.primary_code(organization),
+            filters_applied=filtres,
+        )
     
     action_permissions = {
         'list': 'products.view',
@@ -365,8 +421,9 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
         'search_barcode': 'products.view',
         'import_template': 'products.view',
         'import_products': 'products.create',
-        'export_excel': 'products.view',
-        'export_pdf': 'products.view',
+        # Exporter, c'est LIRE. Sans cette ligne, `HasPermission` refuse la
+        # route à TOUS les rôles, en silence.
+        'export': 'products.view',
         'check_duplicate': 'products.view',
     }
 
@@ -640,35 +697,6 @@ class ProductViewSet(TenantViewSetMixin, AuditMixin, BulkActionMixin, viewsets.M
             return Response(result, status=status.HTTP_200_OK)
         else:
             return Response(result, status=status.HTTP_400_BAD_REQUEST)
-
-    @action(detail=False, methods=['get'], url_path='export/excel')
-    def export_excel(self, request):
-        """Exporte tous les produits de l'organisation au format Excel."""
-        organization = self.get_organization()
-        buffer = ProductExcelService.export_excel(organization)
-
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        response = HttpResponse(
-            buffer.getvalue(),
-            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        )
-        response['Content-Disposition'] = (
-            f'attachment; filename="produits_export_{timestamp}.xlsx"'
-        )
-        return response
-
-    @action(detail=False, methods=['get'], url_path='export/pdf')
-    def export_pdf(self, request):
-        """Exporte tous les produits de l'organisation au format PDF."""
-        organization = self.get_organization()
-        buffer = ProductExcelService.export_pdf(organization)
-
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
-        response['Content-Disposition'] = (
-            f'attachment; filename="produits_export_{timestamp}.pdf"'
-        )
-        return response
 
     @action(detail=False, methods=['post'], url_path='check-duplicate')
     def check_duplicate(self, request):

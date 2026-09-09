@@ -388,8 +388,13 @@ def stock_movement_create(ctx, payload):
     from apps.inventory.stock_movements import create_stock_movement
 
     local_id = payload.pop('id', None)
+    # L'ORGANISATION VOYAGE DANS LE CONTEXTE, et ce n'est pas décoratif : sans
+    # elle, `_validate_product_prices` ne trouve rien à quoi opposer
+    # `products.edit` (il n'y a pas de `view` ici) et laisse passer un report de
+    # prix qu'un caissier n'a pas le droit de demander.
     serializer = StockMovementCreateSerializer(
-        data=payload, context={'request': ctx.request}
+        data=payload,
+        context={'request': ctx.request, 'organization': ctx.organization},
     )
     serializer.is_valid(raise_exception=True)
     # Le périmètre entrepôt est vérifié DANS le service, comme pour la vue :
@@ -852,10 +857,23 @@ def inventory_session_validate(ctx, payload):
 
 @handler('inventory_session.cancel', permission='inventory.cancel')
 def inventory_session_cancel(ctx, payload):
+    """
+    Annule la session et DÉVERROUILLE son stock.
+
+    ⚠ Elle passait `serialiser=False`, si bien qu'`authoritative` recevait le
+    retour brut du service - et `cancel_inventory_session` rend l'objet
+    `InventorySession`, pas un dictionnaire. Le rendu de la réponse levait
+    alors « Object of type InventorySession is not JSON serializable », que
+    `_classify` range en `unexpected`, donc en `retry` : l'opération repartait
+    à chaque synchronisation, POUR TOUJOURS, et une session lancée depuis un
+    terminal ne pouvait plus y être annulée - alors qu'elle VERROUILLE le stock
+    de ses produits, donc bloque la vente.
+
+    `serialiser=False` n'est juste que pour `count`, dont le service rend bien
+    un dictionnaire.
+    """
     from apps.inventory.services import cancel_inventory_session
-    return _transition_inventaire(
-        ctx, payload, cancel_inventory_session, serialiser=False,
-    )
+    return _transition_inventaire(ctx, payload, cancel_inventory_session)
 
 
 # --------------------------------------------------------------- catalogue

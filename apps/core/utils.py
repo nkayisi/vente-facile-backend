@@ -7,13 +7,6 @@ from decimal import Decimal, ROUND_HALF_UP
 from django.utils import timezone
 
 
-def generate_reference(prefix='REF', length=8):
-    """Generate a unique reference code."""
-    timestamp = timezone.now().strftime('%Y%m%d%H%M%S')
-    random_part = secrets.token_hex(4).upper()
-    return f"{prefix}-{timestamp}-{random_part}"[:length + len(prefix) + 1]
-
-
 def generate_token(length=32):
     """Generate a secure random token."""
     return secrets.token_urlsafe(length)
@@ -27,27 +20,6 @@ def round_decimal(value, places=2):
         Decimal(10) ** -places,
         rounding=ROUND_HALF_UP
     )
-
-
-def calculate_percentage(part, whole):
-    """Calculate percentage."""
-    if whole == 0:
-        return Decimal('0.00')
-    return round_decimal((Decimal(str(part)) / Decimal(str(whole))) * 100)
-
-
-def calculate_margin(cost, selling):
-    """Calculate profit margin percentage."""
-    if cost == 0:
-        return Decimal('100.00') if selling > 0 else Decimal('0.00')
-    return round_decimal(((selling - cost) / cost) * 100)
-
-
-def calculate_markup(cost, selling):
-    """Calculate markup percentage."""
-    if selling == 0:
-        return Decimal('0.00')
-    return round_decimal(((selling - cost) / selling) * 100)
 
 
 class ReferenceGenerator:

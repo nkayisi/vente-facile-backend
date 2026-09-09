@@ -70,23 +70,6 @@ class IsTenantOwner(permissions.BasePermission):
         ).exists()
 
 
-class HasObjectPermission(permissions.BasePermission):
-    """
-    Object-level permission check using django-guardian.
-    Checks if user has specific permission on the object.
-    """
-    
-    def __init__(self, perm_name=None):
-        self.perm_name = perm_name
-
-    def has_object_permission(self, request, view, obj):
-        if not request.user.is_authenticated:
-            return False
-        
-        perm = self.perm_name or f'{view.action}_{obj._meta.model_name}'
-        return perm in get_perms(request.user, obj)
-
-
 class TenantObjectPermission(permissions.BasePermission):
     """
     Combined tenant membership and object permission check.

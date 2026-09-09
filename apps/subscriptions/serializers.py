@@ -79,19 +79,6 @@ class SubscriptionSerializer(serializers.ModelSerializer):
         ]
 
 
-class SubscriptionStatusSerializer(serializers.Serializer):
-    """Serializer pour la réponse du statut d'abonnement."""
-    has_subscription = serializers.BooleanField()
-    is_active = serializers.BooleanField()
-    is_blocked = serializers.BooleanField()
-    status = serializers.CharField()
-    message = serializers.CharField(allow_null=True)
-    days_remaining = serializers.IntegerField(required=False)
-    days_remaining_grace = serializers.IntegerField(required=False)
-    subscription = SubscriptionSerializer(allow_null=True)
-    plan = PlanSerializer(required=False, allow_null=True)
-
-
 class ActivateSubscriptionSerializer(serializers.Serializer):
     """Serializer pour l'activation d'un abonnement par paiement."""
     plan_id = serializers.UUIDField()

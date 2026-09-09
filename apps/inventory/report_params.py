@@ -7,62 +7,28 @@ mouvement) ne disent rien à qui lit le document une fois imprimé, il faut donc
 les résoudre en libellés. Ce module concentre cette résolution pour que les trois
 actions d'export ne la réécrivent pas chacune.
 """
-from datetime import datetime
-
-MONTH_NAMES = [
-    'janvier', 'février', 'mars', 'avril', 'mai', 'juin',
-    'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre',
-]
+# Les aides GÉNÉRIQUES vivent dans `apps/core/report_params` : une période se
+# libelle pareil sur un rapport de ventes et sur un journal de stock. Elles y
+# étaient réexportées ici le temps que les appelants migrent ; ils l'ont tous
+# fait (ventes, caisse, rapports), et la réexportation n'avait plus de
+# consommateur. On n'importe donc plus que ce que ce module emploie lui-même.
+from apps.core.report_params import period_label
 
 STATUS_LABELS = {
     'out': 'En rupture',
     'low': 'Stock bas',
     'available': 'Disponible',
     'reserved': 'Avec réservation',
+    # Les deux états exclusifs du terminal. Sans leur libellé, l'en-tête du
+    # document afficherait le code nu, qui ne renseigne personne.
+    'low_only': 'Stock bas',
+    'healthy': 'En stock',
 }
 
 SOURCE_LABELS = {
     'all': 'Toutes les entrées',
     'receipts': 'Réceptions fournisseur uniquement',
 }
-
-
-def _format_day(value):
-    """Rend une date ISO au format francophone, ou la valeur brute si illisible."""
-    try:
-        return datetime.strptime(value, '%Y-%m-%d').strftime('%d/%m/%Y')
-    except (TypeError, ValueError):
-        return value
-
-
-def month_label(value):
-    """« 2026-08 » devient « août 2026 »."""
-    try:
-        year, month = (int(part) for part in str(value).split('-')[:2])
-        return f"{MONTH_NAMES[month - 1]} {year}"
-    except (TypeError, ValueError, IndexError):
-        return str(value)
-
-
-def period_label(params):
-    """
-    Libellé de la période couverte, dans l'ordre de priorité des paramètres.
-
-    Un rapport sans période affichée laisse le lecteur deviner s'il regarde le
-    mois, l'année, ou tout l'historique : la mention est obligatoire.
-    """
-    if params.get('month'):
-        return month_label(params['month'])
-
-    date_from = params.get('date_from')
-    date_to = params.get('date_to')
-    if date_from and date_to:
-        return f"du {_format_day(date_from)} au {_format_day(date_to)}"
-    if date_from:
-        return f"à partir du {_format_day(date_from)}"
-    if date_to:
-        return f"jusqu'au {_format_day(date_to)}"
-    return 'Tout l\'historique'
 
 
 def _warehouse_label(organization, warehouse_id):

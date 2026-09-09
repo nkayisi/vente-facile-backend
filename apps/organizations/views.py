@@ -218,7 +218,7 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         from apps.sales.models import Sale
         from django.db.models import Sum, Count
         
-        today = timezone.now().date()
+        today = timezone.localdate()
         month_start = today.replace(day=1)
         
         stats = {
@@ -278,7 +278,7 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         if cached_payload is not None:
             return Response(cached_payload)
 
-        today = timezone.now().date()
+        today = timezone.localdate()
 
         # Les quatre périodes sont GLISSANTES et donc emboîtées : voir
         # `_periode_glissante`, qui porte la règle et le motif.

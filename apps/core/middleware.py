@@ -4,16 +4,6 @@ from django.utils.deprecation import MiddlewareMixin
 _thread_locals = threading.local()
 
 
-def get_current_organization():
-    """Get the current organization from thread local storage."""
-    return getattr(_thread_locals, 'organization', None)
-
-
-def get_current_user():
-    """Get the current user from thread local storage."""
-    return getattr(_thread_locals, 'user', None)
-
-
 class TenantMiddleware(MiddlewareMixin):
     """
     Middleware that sets the current organization in thread local storage.

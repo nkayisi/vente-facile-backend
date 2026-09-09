@@ -88,6 +88,9 @@ class StockFilter(django_filters.FilterSet):
             ('low', 'Stock bas'),
             ('available', 'Disponible'),
             ('reserved', 'Avec réservation'),
+            # Les deux états EXCLUSIFS du terminal : voir `filter_status`.
+            ('low_only', 'Stock bas'),
+            ('healthy', 'En stock'),
         ],
     )
 
@@ -128,6 +131,33 @@ class StockFilter(django_filters.FilterSet):
             return queryset.filter(quantity__gt=0)
         if value == 'reserved':
             return queryset.filter(reserved_quantity__gt=0)
+
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ `low` ET `available` SE RECOUVRENT. LES ÉTATS DU TERMINAL, NON.  │
+        # │                                                                  │
+        # │ `low` contient les ruptures, `available` contient les stocks     │
+        # │ bas : ce sont deux ALERTES, et c'est ce que le back-office veut  │
+        # │ de son bouton « Stock bas ». L'écran `/rayon` du terminal, lui,  │
+        # │ range chaque rayon dans une case et une seule.                   │
+        # │                                                                  │
+        # │ Traduire son « bas » par `low` produirait donc un DOCUMENT PLUS  │
+        # │ LARGE QUE L'ÉCRAN qui l'a déclenché - le défaut que tous les     │
+        # │ exports de ce dépôt ont dû corriger. D'où ces deux états.        │
+        # │                                                                  │
+        # │ `low` et `available` NE BOUGENT PAS : le web les emploie.        │
+        # └──────────────────────────────────────────────────────────────────┘
+        #
+        # Un seuil à zéro ne déclenche RIEN : un produit sans point de
+        # réapprovisionnement n'est jamais « bas », il est simplement suivi.
+        sous_le_seuil = Q(
+            quantity__lte=F('product__reorder_point'),
+            product__reorder_point__gt=0,
+            product__track_inventory=True,
+        )
+        if value == 'low_only':
+            return queryset.filter(Q(quantity__gt=0) & sous_le_seuil)
+        if value == 'healthy':
+            return queryset.filter(quantity__gt=0).exclude(sous_le_seuil)
         return queryset
 
 
