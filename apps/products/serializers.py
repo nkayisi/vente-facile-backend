@@ -34,7 +34,7 @@ class CategoryListSerializer(serializers.ModelSerializer):
 class CategoryDetailSerializer(serializers.ModelSerializer):
     """Serializer complet pour le détail d'une catégorie."""
     
-    parent_name = serializers.CharField(source='parent.name', read_only=True)
+    parent_name = serializers.CharField(source='parent.name', read_only=True, default=None)
     ancestors = serializers.SerializerMethodField()
     
     class Meta:
@@ -217,7 +217,7 @@ class BrandSerializer(serializers.ModelSerializer):
 class UnitSerializer(serializers.ModelSerializer):
     """Serializer pour les unités de mesure."""
     
-    base_unit_name = serializers.CharField(source='base_unit.name', read_only=True)
+    base_unit_name = serializers.CharField(source='base_unit.name', read_only=True, default=None)
     
     class Meta:
         model = Unit
@@ -330,21 +330,36 @@ class ProductPriceSerializer(serializers.ModelSerializer):
 # PRODUCT SERIALIZERS
 # =============================================================================
 
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ UN NOM DE MARQUE ABSENT DISPARAISSAIT DE LA RÉPONSE, AU LIEU D'ÊTRE NUL. │
+# │                                                                          │
+# │ `CharField(source='brand.name')` sur un produit SANS marque lève une     │
+# │ `AttributeError` que DRF traduit en `SkipField` : la CLÉ ELLE-MÊME ne    │
+# │ figure plus dans le JSON. Le contrat annoncé aux clients devenait donc   │
+# │ « parfois là, parfois pas », alors que les types du back-office et du    │
+# │ terminal la déclarent présente. Une lecture aussi banale que             │
+# │ `p.unit_symbol.trim()` plante sur un produit sans unité, et seulement    │
+# │ sur celui-là - la classe de défaut la plus coûteuse à reproduire.        │
+# │                                                                          │
+# │ `default=None` rend la clé à `null`, qui se lit « pas de marque » et non │
+# │ « champ inconnu ». Il vaut pour TOUTE source pointillée traversant une   │
+# │ clé étrangère facultative.                                               │
+# └──────────────────────────────────────────────────────────────────────────┘
 class ProductListSerializer(serializers.ModelSerializer):
     """
     Serializer léger pour les listes de produits.
     Optimisé pour les performances (pas de nested serializers lourds).
     """
     
-    category_name = serializers.CharField(source='category.name', read_only=True)
-    brand_name = serializers.CharField(source='brand.name', read_only=True)
-    unit_symbol = serializers.CharField(source='unit.symbol', read_only=True)
-    unit_name = serializers.CharField(source='unit.name', read_only=True)
+    category_name = serializers.CharField(source='category.name', read_only=True, default=None)
+    brand_name = serializers.CharField(source='brand.name', read_only=True, default=None)
+    unit_symbol = serializers.CharField(source='unit.symbol', read_only=True, default=None)
+    unit_name = serializers.CharField(source='unit.name', read_only=True, default=None)
     packaging_unit_name = serializers.CharField(
-        source='packaging_unit.name', read_only=True
+        source='packaging_unit.name', read_only=True, default=None
     )
     packaging_unit_symbol = serializers.CharField(
-        source='packaging_unit.symbol', read_only=True
+        source='packaging_unit.symbol', read_only=True, default=None
     )
     stock_quantity = serializers.SerializerMethodField()
     stock_location = serializers.SerializerMethodField()
@@ -469,15 +484,15 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     Inclut les relations nested.
     """
     
-    category_name = serializers.CharField(source='category.name', read_only=True)
-    brand_name = serializers.CharField(source='brand.name', read_only=True)
-    unit_name = serializers.CharField(source='unit.name', read_only=True)
-    unit_symbol = serializers.CharField(source='unit.symbol', read_only=True)
+    category_name = serializers.CharField(source='category.name', read_only=True, default=None)
+    brand_name = serializers.CharField(source='brand.name', read_only=True, default=None)
+    unit_name = serializers.CharField(source='unit.name', read_only=True, default=None)
+    unit_symbol = serializers.CharField(source='unit.symbol', read_only=True, default=None)
     packaging_unit_name = serializers.CharField(
-        source='packaging_unit.name', read_only=True
+        source='packaging_unit.name', read_only=True, default=None
     )
     packaging_unit_symbol = serializers.CharField(
-        source='packaging_unit.symbol', read_only=True
+        source='packaging_unit.symbol', read_only=True, default=None
     )
     packaging_summary = serializers.SerializerMethodField()
 

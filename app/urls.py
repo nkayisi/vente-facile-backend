@@ -61,5 +61,35 @@ urlpatterns = [
 ]
 
 if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
     urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
+
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ LES PHOTOS DE PRODUITS N'ÉTAIENT SERVIES QU'EN DÉVELOPPEMENT.            │
+# │                                                                          │
+# │ `static()` ne branche sa route que sous `DEBUG`, et WhiteNoise ne sert   │
+# │ que les fichiers STATIQUES. En production, toute photo répondait donc    │
+# │ 404 : la fiche affichait son repli « colis », et le marchand concluait   │
+# │ que sa photo n'avait pas été enregistrée.                                │
+# │                                                                          │
+# │ Servie par Django, une photo occupe un fil de Gunicorn (2 workers × 4    │
+# │ threads) le temps de son transfert : c'est le compromis assumé d'un      │
+# │ déploiement sur disque local, et c'est pourquoi le stockage objet reste  │
+# │ le chemin recommandé - dès qu'`AWS_STORAGE_BUCKET_NAME` est posé, les    │
+# │ URL pointent ailleurs et cette route n'est plus empruntée.               │
+# │                                                                          │
+# │ WHITENOISE EST LE MAUVAIS OUTIL ICI, et c'est ce qui a été essayé en     │
+# │ premier : il indexe les fichiers AU DÉMARRAGE. Une photo envoyée après   │
+# │ aurait répondu 404 jusqu'au prochain redémarrage - une panne             │
+# │ intermittente, donc invisible en recette et impossible à reproduire.     │
+# └──────────────────────────────────────────────────────────────────────────┘
+if not getattr(settings, 'USE_S3_MEDIA', False):
+    from django.views.static import serve as _serve_media
+    from django.urls import re_path as _re_path
+
+    urlpatterns += [
+        _re_path(
+            r'^media/(?P<path>.*)$',
+            _serve_media,
+            {'document_root': settings.MEDIA_ROOT},
+        ),
+    ]

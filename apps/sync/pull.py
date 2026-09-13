@@ -44,7 +44,9 @@ from decimal import Decimal
 from uuid import UUID
 
 from django.apps import apps
-from django.db.models import Q
+from django.conf import settings
+from django.core.files.storage import default_storage
+from django.db.models import FileField, Q
 from django.utils import timezone
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema
@@ -89,8 +91,14 @@ def decode_cursor(cursor):
 #: Marqueur : toutes les colonnes concrètes du modèle.
 ALL = ('*',)
 
-#: Ne voyagent jamais. `organization` est implicite (le client n'en connaît
-#: qu'une), et les fichiers ne se transportent pas dans une charge JSON.
+#: Ne voyagent jamais. `organization` est implicite : le client n'en connaît
+#: qu'une.
+#:
+#: Les colonnes de FICHIER, elles, voyagent - mais jamais leur contenu : c'est
+#: leur URL publique qui descend, résolue par `_url_absolue`. Le commentaire
+#: d'origine affirmait ici que « les fichiers ne se transportent pas dans une
+#: charge JSON », ce qui était vrai des octets et faux de la référence, et
+#: laissait croire qu'il n'y avait rien à résoudre.
 NEVER_SENT = {'organization', 'password'}
 
 
@@ -191,6 +199,78 @@ def _rows(queryset, fields):
     ]
 
 
+def _champs_fichier(model):
+    """
+    Les colonnes de ce modele qui portent un fichier.
+
+    Memoise sur la classe : le registre est fige au demarrage, et resoudre la
+    liste a chaque page couterait une introspection par ligne tiree.
+    """
+    cache = _CHAMPS_FICHIER_CACHE.get(model)
+    if cache is None:
+        cache = tuple(
+            f.attname
+            for f in model._meta.concrete_fields
+            if isinstance(f, FileField)
+        )
+        _CHAMPS_FICHIER_CACHE[model] = cache
+    return cache
+
+
+_CHAMPS_FICHIER_CACHE = {}
+
+
+def _url_absolue(nom):
+    """
+    L'URL publique d'un fichier range, depuis sa cle de stockage.
+
+    +--------------------------------------------------------------------------+
+    | LE TIRAGE ENVOYAIT UNE CLE DE STOCKAGE, PAS UNE URL.                     |
+    |                                                                          |
+    | `queryset.values()` rend la COLONNE BRUTE d'un `FileField` -             |
+    | « products/abc.jpg » - sans jamais construire de `FieldFile`. Ni         |
+    | `MEDIA_URL`, ni hote, ni signature : la valeur ne designe rien pour un   |
+    | client. Le terminal la traitait pourtant comme une URL finie et la       |
+    | passait telle quelle a son composant d'image, qui echouait en silence et |
+    | retombait sur son icone de repli. Les photos d'articles n'ont donc       |
+    | JAMAIS paru sur mobile, sans qu'aucune erreur ne le signale.             |
+    |                                                                          |
+    | La resolution appartient au SERVEUR, et a lui seul : c'est lui qui sait  |
+    | si `django-storages` est actif (l'URL est alors absolue et porte le      |
+    | domaine du seau) ou si les fichiers sont servis localement sous          |
+    | `/media/` (l'URL est alors relative, et il faut la prefixer). Un client  |
+    | qui devinerait ce prefixe se tromperait le jour d'une bascule vers S3.   |
+    +--------------------------------------------------------------------------+
+    """
+    if not nom:
+        return nom
+    try:
+        url = default_storage.url(nom)
+    except Exception:
+        # Un nom de fichier abime ne doit pas arreter le tirage de toute une
+        # table, sur tous les terminaux a la fois. On rend la valeur telle
+        # quelle : l'image manquera, la synchronisation passera.
+        return nom
+    if url.startswith(('http://', 'https://', '//')):
+        return url
+    base = (getattr(settings, 'PUBLIC_BACKEND_URL', '') or '').rstrip('/')
+    return f'{base}{url}' if base else url
+
+
+def _resoudre_fichiers(rows, model):
+    """Reecrit sur place les colonnes de fichier en URL publique."""
+    champs = _champs_fichier(model)
+    if not champs:
+        return rows
+    for row in rows:
+        for champ in champs:
+            if champ in row:
+                row[champ] = _url_absolue(row[champ])
+    return rows
+
+
+
+
 # --------------------------------------------------------------------- lecture
 
 
@@ -259,7 +339,9 @@ def _attach_children(table, rows):
         model = child.get_model()
         grouped = {pid: [] for pid in parent_ids}
         queryset = model.objects.filter(**{f'{child.parent_field}__in': parent_ids})
-        for item in _rows(queryset, resolve_fields(model, child.fields)):
+        for item in _resoudre_fichiers(
+            _rows(queryset, resolve_fields(model, child.fields)), model
+        ):
             parent = item.get(f'{child.parent_field}_id')
             if parent in grouped:
                 grouped[parent].append(item)
@@ -302,10 +384,13 @@ def read_page(table, organization, membership, cursor, limit):
     )
 
     exposed = set(fields)
-    rows = [
-        {key: _coerce(val) for key, val in row.items() if key in exposed}
-        for row in page
-    ]
+    rows = _resoudre_fichiers(
+        [
+            {key: _coerce(val) for key, val in row.items() if key in exposed}
+            for row in page
+        ],
+        model,
+    )
 
     _attach_children(table, rows)
     return rows, next_cursor, has_more

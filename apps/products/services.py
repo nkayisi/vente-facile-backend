@@ -513,8 +513,28 @@ class ProductExcelService:
         brands_map = cls._build_brands_map(organization)
         units_map = cls._build_units_map(organization)
         
-        # Charger les SKU et codes-barres existants pour détecter les doublons
-        existing_skus = set(Product.objects.filter(organization=organization, is_deleted=False).values_list('sku', flat=True))
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ UN SKU DÉJÀ PRIS NE DIT PAS ENCORE SI LE PRODUIT EST LE MÊME.    │
+        # │                                                                  │
+        # │ On retient donc, avec chaque SKU, de QUEL produit il est le code.│
+        # │ Deux situations que l'ancien code confondait :                   │
+        # │                                                                  │
+        # │  • même SKU, même produit : le marchand réimporte son fichier.   │
+        # │    On ne crée rien - un second exemplaire du même article       │
+        # │    fausserait son stock et le ferait apparaître deux fois au     │
+        # │    comptoir.                                                     │
+        # │                                                                  │
+        # │  • même SKU, produit DIFFÉRENT : le code a été réemployé, par    │
+        # │    inadvertance ou faute de mieux. Le produit est réel et doit   │
+        # │    entrer au catalogue ; c'est son CODE qui est en conflit, pas  │
+        # │    lui. On lui en attribue un dérivé, et on le DIT.              │
+        # └──────────────────────────────────────────────────────────────────┘
+        sku_identities = {
+            row['sku']: cls._normalize_key(row['name'])
+            for row in Product.objects.filter(
+                organization=organization, is_deleted=False
+            ).values('sku', 'name')
+        }
         existing_barcodes = set(Product.objects.filter(organization=organization, is_deleted=False, barcode__isnull=False).exclude(barcode='').values_list('barcode', flat=True))
         # Slugs déjà attribués dans CE fichier : sans eux, deux produits de même
         # nom recevraient le même slug, la contrainte d'unicité sauterait à la
@@ -529,7 +549,12 @@ class ProductExcelService:
             "created": 0,
             "updated": 0,
             "skipped": 0,
-            "errors": []
+            "errors": [],
+            # Produits créés sous un code dérivé. Ce n'est ni une erreur ni un
+            # succès muet : le fichier du marchand dit « COCA-33 » et la base
+            # dira « COCA-33-2 ». Le taire lui ferait chercher un article qu'il
+            # ne retrouverait ni à la recherche, ni à la douchette.
+            "renamed": [],
         }
         
         products_to_create = []
@@ -560,14 +585,35 @@ class ProductExcelService:
             # seul connaît le mode de vente : en gros seul, c'est le prix du
             # conditionnement qui prend le relais.
 
-            # Vérifier les doublons SKU
-            if sku and sku in existing_skus:
-                errors.append(f"SKU '{sku}' existe déjà")
-            
-            # Vérifier les doublons code-barres
+            # LE CODE-BARRES EST CONTRÔLÉ EN PREMIER, ET IL NE SE DÉRIVE JAMAIS.
+            # Il identifie un article dans le monde entier : deux produits ne
+            # peuvent pas le partager, et en inventer un ferait imprimer une
+            # étiquette qui ne scanne rien. Un conflit de code-barres reste donc
+            # un refus, là où un conflit de SKU se répare.
             barcode = str(row_data.get("barcode") or "").strip()
             if barcode and barcode in existing_barcodes:
                 errors.append(f"Code-barres '{barcode}' existe déjà")
+
+            # Conflit de SKU : le produit est-il le même, ou seulement son code ?
+            sku_attribue = sku
+            sku_dorigine = None
+            if sku and not errors and sku in sku_identities:
+                if sku_identities[sku] == cls._normalize_key(name):
+                    # Même code, même nom : c'est le même article.
+                    #
+                    # `_normalize_key` replie la casse et les espaces, PAS les
+                    # accents - c'est l'arbitrage déjà rendu dans ce fichier
+                    # (voir `_normalize_label`) : « Café » et « Cafe » sont deux
+                    # libellés légitimement distincts. Conséquence assumée ici :
+                    # « Café 33cl » face à « Cafe 33cl » passe pour un autre
+                    # produit, donc il est CRÉÉ sous un code dérivé et le
+                    # rapport le dit. L'erreur inverse - le confondre et ne rien
+                    # créer - ferait disparaître un article sans que le marchand
+                    # ait de quoi le retrouver.
+                    errors.append(f"SKU '{sku}' existe déjà")
+                else:
+                    sku_dorigine = sku
+                    sku_attribue = cls._allocate_unique_sku(sku, sku_identities)
             
             if errors:
                 results["errors"].append({
@@ -589,6 +635,10 @@ class ProductExcelService:
                 )
                 product_data["organization"] = organization
                 product_data["created_by"] = user
+                # `_parse_row_data` recopie le SKU du fichier ; c'est ici qu'il
+                # cède la place au code dérivé quand le sien était déjà pris par
+                # un AUTRE produit.
+                product_data["sku"] = sku_attribue
                 product_data["slug"] = slugify(name)
                 
                 # Assurer l'unicité du slug, en base comme dans ce fichier
@@ -600,9 +650,20 @@ class ProductExcelService:
                 allocated_slugs.add(product_data["slug"])
 
                 products_to_create.append(product_data)
-                existing_skus.add(sku)  # Ajouter pour éviter les doublons dans le même fichier
+                # Le SKU RETENU rejoint la table d'identités, sans quoi deux
+                # lignes du même fichier recevraient le même code dérivé et la
+                # contrainte d'unicité ferait tomber tout le lot à la création.
+                sku_identities[sku_attribue] = cls._normalize_key(name)
                 if barcode:
                     existing_barcodes.add(barcode)
+
+                if sku_dorigine:
+                    results["renamed"].append({
+                        "row": row_num,
+                        "name": name,
+                        "requested_sku": sku_dorigine,
+                        "assigned_sku": sku_attribue,
+                    })
 
             except ProductRowError as e:
                 results["errors"].append({
@@ -715,6 +776,35 @@ class ProductExcelService:
         return as_messages(detail)
 
     @classmethod
+    def _allocate_unique_sku(cls, base: str, taken) -> str:
+        """
+        Code dérivé d'un SKU déjà pris par un AUTRE produit : « COCA-33-2 ».
+
+        Le suffixe est numérique et lisible : le marchand doit reconnaître son
+        code d'origine d'un coup d'œil, pour rapprocher la ligne de son fichier
+        de la fiche créée. Un identifiant fabriqué de toutes pièces romprait ce
+        lien, et c'est précisément ce que le rapport d'import lui demande de
+        vérifier.
+
+        ⚠ La base est tronquée AVANT le suffixe, jamais après : un code coupé à
+        `max_length` emporterait le « -2 » et rendrait deux articles
+        indiscernables, ce que la contrainte d'unicité refuserait ensuite pour
+        tout le lot.
+        """
+        limite = Product._meta.get_field('sku').max_length
+        i = 2
+        while i < 10000:
+            suffixe = f"-{i}"
+            candidat = base[: limite - len(suffixe)] + suffixe
+            if candidat not in taken:
+                return candidat
+            i += 1
+        # Repli : dix mille homonymes tiennent du fichier corrompu, mais rendre
+        # un code déjà pris ferait tomber la création de TOUT le lot.
+        digest = hashlib.sha256(f"{base}|{len(taken)}|sku".encode()).hexdigest()[:8].upper()
+        return (base[: limite - 9] + "-" + digest)
+
+    @classmethod
     def _allocate_unique_category_slug(cls, organization, parent: Optional[Category], display_name: str) -> str:
         """Slug unique pour une catégorie au sein du même parent (contrainte org + parent + slug)."""
         base = slugify(display_name) or "categorie"
@@ -744,12 +834,23 @@ class ProductExcelService:
         Évite les collisions du type « 3 premières lettres » identiques entre unités différentes.
         """
         clean = (display_name or "").strip()
-        root = slugify(clean)[:8] or "u"
-        root = root.upper()
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ « PLAQUETTE » DEVENAIT « PLAQUETT », SANS COLLISION À RÉSOUDRE.  │
+        # │                                                                  │
+        # │ La racine était tronquée à 8 signes pour réserver la place d'un  │
+        # │ suffixe, sur une colonne qui en accepte 10 - et le suffixe ne    │
+        # │ sert que dans le cas RARE de deux unités homonymes. Tout nom de  │
+        # │ 9 ou 10 lettres sortait donc amputé, et ce symbole est ce que le │
+        # │ marchand lit dans chaque colonne de stock et sur chaque ticket.  │
+        # │                                                                  │
+        # │ On prend la place entière d'abord ; on ne raccourcit que quand   │
+        # │ un suffixe devient nécessaire.                                   │
+        # └──────────────────────────────────────────────────────────────────┘
+        root = (slugify(clean) or "u").upper()
         i = 0
         while i < 10000:
             suffix = "" if i == 0 else str(i)
-            candidate = (root + suffix)[:10]
+            candidate = root[: 10 - len(suffix)] + suffix
             if not Unit.objects.filter(organization=organization, symbol=candidate).exists():
                 return candidate
             i += 1

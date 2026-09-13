@@ -161,14 +161,48 @@ elif DB_ENGINE == 'django.db.backends.sqlite3':
 
 
 
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ LES PHOTOS DE PRODUITS N'ÉTAIENT SERVIES QU'EN DÉVELOPPEMENT.            │
+# │                                                                          │
+# │ `static(MEDIA_URL, ...)` n'est branché que sous `DEBUG` (voir            │
+# │ `app/urls.py`), et WhiteNoise ne sert que les fichiers STATIQUES. En     │
+# │ production, toute photo de produit répondait donc 404 : la fiche         │
+# │ affichait son repli « colis » et le marchand concluait que sa photo      │
+# │ n'avait pas été enregistrée, alors qu'elle était bien en base et sur le  │
+# │ disque.                                                                  │
+# │                                                                          │
+# │ Deux chemins, et le second n'est pas un luxe : le stockage objet quand   │
+# │ il est configuré, le disque local sinon. Une plateforme qui n'a que le   │
+# │ premier oblige à un compte S3 pour afficher une photo ; une qui n'a que  │
+# │ le second perd ses photos au prochain déploiement du conteneur.          │
+# └──────────────────────────────────────────────────────────────────────────┘
+AWS_STORAGE_BUCKET_NAME = os.getenv('AWS_STORAGE_BUCKET_NAME', '')
+USE_S3_MEDIA = bool(AWS_STORAGE_BUCKET_NAME)
+
 STORAGES = {
     "default": {
-        "BACKEND": "django.core.files.storage.FileSystemStorage",
+        "BACKEND": (
+            "storages.backends.s3.S3Storage"
+            if USE_S3_MEDIA
+            else "django.core.files.storage.FileSystemStorage"
+        ),
     },
     "staticfiles": {
         "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
     },
 }
+
+if USE_S3_MEDIA:
+    AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID', '')
+    AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY', '')
+    AWS_S3_REGION_NAME = os.getenv('AWS_S3_REGION_NAME', '')
+    # Endpoint explicite : ce projet vise des hébergeurs africains, où l'on
+    # trouve plus souvent du S3 compatible (Scaleway, Wasabi, MinIO) qu'AWS.
+    AWS_S3_ENDPOINT_URL = os.getenv('AWS_S3_ENDPOINT_URL') or None
+    AWS_S3_CUSTOM_DOMAIN = os.getenv('AWS_S3_CUSTOM_DOMAIN') or None
+    AWS_QUERYSTRING_AUTH = False
+    AWS_S3_FILE_OVERWRITE = False
+    AWS_DEFAULT_ACL = None
 # =============================================================================
 # CUSTOM USER MODEL
 # =============================================================================

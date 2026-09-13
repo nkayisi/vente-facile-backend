@@ -261,21 +261,175 @@ class PriceValidationTests(_ImportSetup):
 class ImportGuardTests(_ImportSetup):
     """Comportements existants, verrouillés maintenant qu'on touche au fichier."""
 
-    def test_sku_duplique_est_ignore(self):
-        Product.objects.create(
-            organization=self.org, name='Savon', slug='savon', sku='SAV-01',
-            cost_price=Decimal('400'), selling_price=Decimal('800'),
-        )
-        result = self._import([self._row(
-            name='Savon bis', sku='SAV-01', selling_price=900
-        )])
-
-        self.assertEqual(result["created"], 0)
-        self.assertEqual(result["skipped"], 1)
-        self.assertIn("existe déjà", " ".join(self._errors(result)))
-
     def test_sku_manquant_est_ignore(self):
         result = self._import([self._row(name='Savon', selling_price=800)])
 
         self.assertEqual(result["created"], 0)
         self.assertIn("Code SKU requis", self._errors(result))
+
+
+class ConflitDeSkuTests(_ImportSetup):
+    """
+    Un SKU déjà pris ne dit pas encore si le produit est le même.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ CE QUI A CHANGÉ, ET POURQUOI L'ANCIEN TEST A ÉTÉ CORRIGÉ.                │
+    │                                                                          │
+    │ `test_sku_duplique_est_ignore` affirmait que « Savon » et « Savon bis »  │
+    │ partageant le code SAV-01 devaient tous deux être ignorés. C'était le    │
+    │ comportement, ce n'était pas la règle voulue : le second est un article  │
+    │ RÉEL que le marchand a saisi, et c'est son CODE qui est en conflit, pas  │
+    │ lui. Le refuser le faisait disparaître de son catalogue.                 │
+    │                                                                          │
+    │ La règle est désormais : on compare l'IDENTITÉ avant de trancher. Même   │
+    │ nom, on ne crée rien ; nom différent, on crée sous un code dérivé et on  │
+    │ le dit.                                                                  │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.existant = Product.objects.create(
+            organization=self.org, name='Savon', slug='savon', sku='SAV-01',
+            cost_price=Decimal('400'), selling_price=Decimal('800'),
+        )
+
+    def _skus(self):
+        return set(
+            Product.objects.filter(organization=self.org, is_deleted=False)
+            .values_list('sku', flat=True)
+        )
+
+    def test_meme_sku_et_meme_nom_ne_cree_rien(self):
+        """Le marchand réimporte son fichier : un second exemplaire du même
+        article fausserait son stock et le montrerait deux fois au comptoir."""
+        result = self._import([self._row(
+            name='Savon', sku='SAV-01', selling_price=900
+        )])
+
+        self.assertEqual(result["created"], 0)
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(result["renamed"], [])
+        self.assertIn("existe déjà", " ".join(self._errors(result)))
+        self.assertEqual(
+            Product.objects.filter(organization=self.org, is_deleted=False).count(), 1
+        )
+
+    def test_la_casse_et_les_espaces_ne_font_pas_un_autre_produit(self):
+        """« savon » retapé avec deux espaces reste le même article : le
+        comparer brut créerait un doublon à chaque réimport."""
+        result = self._import([self._row(
+            name='  savon  ', sku='SAV-01', selling_price=900
+        )])
+
+        self.assertEqual(result["created"], 0)
+        self.assertEqual(result["renamed"], [])
+
+    def test_meme_sku_et_nom_different_est_cree_sous_un_code_derive(self):
+        result = self._import([self._row(
+            name='Savon bis', sku='SAV-01', selling_price=900
+        )])
+
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(result["skipped"], 0)
+        self.assertEqual(self._skus(), {'SAV-01', 'SAV-01-2'})
+
+        cree = Product.objects.get(organization=self.org, name='Savon bis')
+        self.assertEqual(cree.sku, 'SAV-01-2')
+        # Le produit d'origine n'est pas touché : on répare le code du NOUVEAU.
+        self.existant.refresh_from_db()
+        self.assertEqual(self.existant.sku, 'SAV-01')
+        self.assertEqual(self.existant.selling_price, Decimal('800'))
+
+    def test_le_renommage_est_ANNONCE_ligne_par_ligne(self):
+        """
+        Le fichier du marchand dit « SAV-01 », la base dira « SAV-01-2 ».
+        Le taire lui ferait chercher un article qu'il ne retrouverait ni à la
+        recherche, ni à la douchette.
+        """
+        result = self._import([self._row(
+            name='Savon bis', sku='SAV-01', selling_price=900
+        )])
+
+        self.assertEqual(len(result["renamed"]), 1)
+        avis = result["renamed"][0]
+        self.assertEqual(avis["row"], 3)
+        self.assertEqual(avis["name"], 'Savon bis')
+        self.assertEqual(avis["requested_sku"], 'SAV-01')
+        self.assertEqual(avis["assigned_sku"], 'SAV-01-2')
+
+    def test_deux_lignes_du_meme_fichier_recoivent_deux_codes_distincts(self):
+        """
+        Sans mémoire des codes attribués DANS le fichier, les deux lignes
+        recevraient « SAV-01-2 » et la contrainte d'unicité ferait tomber le
+        lot ENTIER à la création - y compris les lignes saines.
+        """
+        result = self._import([
+            self._row(name='Savon bis', sku='SAV-01', selling_price=900),
+            self._row(name='Savon ter', sku='SAV-01', selling_price=950),
+            self._row(name='Éponge', sku='EPO-01', selling_price=300),
+        ])
+
+        self.assertEqual(result["created"], 3)
+        self.assertEqual(result["skipped"], 0)
+        self.assertEqual(
+            self._skus(), {'SAV-01', 'SAV-01-2', 'SAV-01-3', 'EPO-01'}
+        )
+
+    def test_un_code_barres_deja_pris_reste_un_REFUS(self):
+        """
+        Un code-barres identifie un article dans le monde entier : deux
+        produits ne peuvent pas le partager, et en inventer un ferait imprimer
+        une étiquette qui ne scanne rien. Le conflit de code-barres l'emporte
+        donc sur la réparation du SKU.
+        """
+        self.existant.barcode = '5449000000996'
+        self.existant.save(update_fields=['barcode'])
+
+        result = self._import([self._row(
+            name='Savon bis', sku='SAV-01', barcode='5449000000996',
+            selling_price=900,
+        )])
+
+        self.assertEqual(result["created"], 0)
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(result["renamed"], [])
+        self.assertIn("Code-barres", " ".join(self._errors(result)))
+        self.assertEqual(self._skus(), {'SAV-01'})
+
+    def test_le_suffixe_survit_a_la_borne_de_longueur(self):
+        """
+        La base est tronquée AVANT le suffixe, jamais après : un code coupé à
+        `max_length` emporterait le « -2 » et rendrait deux articles
+        indiscernables, ce que la contrainte d'unicité refuserait pour tout
+        le lot.
+        """
+        limite = Product._meta.get_field('sku').max_length
+        long_sku = 'Z' * limite
+        Product.objects.create(
+            organization=self.org, name='Long', slug='long', sku=long_sku,
+            cost_price=Decimal('1'), selling_price=Decimal('2'),
+        )
+
+        result = self._import([self._row(
+            name='Long bis', sku=long_sku, selling_price=900
+        )])
+
+        self.assertEqual(result["created"], 1)
+        attribue = result["renamed"][0]["assigned_sku"]
+        self.assertLessEqual(len(attribue), limite)
+        self.assertTrue(attribue.endswith('-2'))
+        self.assertTrue(Product.objects.filter(
+            organization=self.org, sku=attribue
+        ).exists())
+
+    def test_un_sku_libre_ne_declenche_aucun_renommage(self):
+        result = self._import([self._row(
+            name='Éponge', sku='EPO-01', selling_price=300
+        )])
+
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(result["renamed"], [])
+        self.assertEqual(
+            Product.objects.get(organization=self.org, name='Éponge').sku, 'EPO-01'
+        )
