@@ -55,7 +55,10 @@ class ContratDesPermissionsTests(APITestCase):
         C'est ce croisement qui rend la parité structurelle : changer la
         permission d'un côté fait échouer le test en nommant l'autre.
         """
-        from apps.cashbook.views import CashMovementViewSet, ExpenseViewSet
+        from apps.cashbook.views import (
+            CashMovementViewSet, ExpenseCategoryViewSet, ExpenseViewSet,
+            IncomeCategoryViewSet,
+        )
         from apps.contacts.views import CustomerViewSet
         from apps.inventory.views import (
             InventorySessionViewSet, StockAdjustmentViewSet, StockMovementViewSet,
@@ -103,8 +106,27 @@ class ContratDesPermissionsTests(APITestCase):
             'category.create': (CategoryViewSet, 'create'),
             'brand.create': (BrandViewSet, 'create'),
             'unit.create': (UnitViewSet, 'create'),
+            # `partial_update` et non `update` : les deux portent le même code
+            # aujourd'hui, mais l'acte est de forme PATCH (`partial=True`) et le
+            # contrat doit dire lequel il rejoue.
+            'category.update': (CategoryViewSet, 'partial_update'),
+            'brand.update': (BrandViewSet, 'partial_update'),
+            'unit.update': (UnitViewSet, 'partial_update'),
             'expense.create': (ExpenseViewSet, 'create'),
+            'expense.submit': (ExpenseViewSet, 'submit'),
+            'expense.approve': (ExpenseViewSet, 'approve'),
+            'expense.reject': (ExpenseViewSet, 'reject'),
+            'expense.pay': (ExpenseViewSet, 'pay'),
+            'expense.cancel': (ExpenseViewSet, 'cancel'),
             'cash_movement.create': (CashMovementViewSet, 'create'),
+            'cash_movement.cancel': (CashMovementViewSet, 'cancel'),
+            'income_category.create': (IncomeCategoryViewSet, 'create'),
+            'expense_category.create': (ExpenseCategoryViewSet, 'create'),
+            # `partial_update`, comme le back-office : les deux vues y
+            # retiennent leur `…CreateSerializer`, et c'est ce que le journal
+            # rejoue. Voir `test_cashbook_category_update.py`.
+            'income_category.update': (IncomeCategoryViewSet, 'partial_update'),
+            'expense_category.update': (ExpenseCategoryViewSet, 'partial_update'),
         }
         self.assertEqual(
             sorted(contrat), sorted(HANDLERS),

@@ -245,6 +245,26 @@ def _classify(exc):
         return SyncOperation.Verdict.REJECTED, {
             'code': 'refus_metier', 'detail': str(exc),
         }
+    if isinstance(exc, (ImportError, AttributeError, NameError)):
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ UN DÉFAUT DE CODE NE SE RÉPARE PAS EN RÉESSAYANT.               │
+        # │                                                                  │
+        # │ Un symbole qui n'existe pas au premier essai n'existera pas au   │
+        # │ millième. Ces trois-là tombaient dans le repli `unexpected`,     │
+        # │ donc en `retry` : l'opération repartait à CHAQUE                 │
+        # │ synchronisation, indéfiniment, pour un acte qui ne passera       │
+        # │ jamais - en batterie et en données, sur le terminal d'un         │
+        # │ marchand. C'est arrivé : deux handlers de caisse importaient un  │
+        # │ serializer au nom inexistant.                                     │
+        # │                                                                  │
+        # │ ⚠ CE CLASSEMENT NE CORRIGE RIEN, il abrège. Le garde-fou qui     │
+        # │ ferme réellement la porte est `test_handler_imports.py`, qui     │
+        # │ résout statiquement chaque import différé des handlers. Les deux │
+        # │ vont ensemble : sans le test, on enterre le défaut plus vite.    │
+        # └──────────────────────────────────────────────────────────────────┘
+        return SyncOperation.Verdict.REJECTED, {
+            'code': 'handler_defect', 'detail': str(exc),
+        }
     if isinstance(exc, (OperationalError, DatabaseError)):
         return SyncOperation.Verdict.RETRY, {'code': 'database', 'detail': str(exc)}
     return SyncOperation.Verdict.RETRY, {'code': 'unexpected', 'detail': str(exc)}

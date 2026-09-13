@@ -404,13 +404,37 @@ def _taux_du_client(serializer):
     return serializer.validated_data.get('exchange_rate')
 
 
-def create_expense(serializer, *, organization, user, request=None, **extra):
+def create_expense(serializer, *, organization, user, request=None,
+                   reference=None, **extra):
     """
     Enregistre une dépense saisie à la main. Appelé par la vue ET par le journal.
 
     ``request`` sert au seul contrôle de périmètre entrepôt ; il est facultatif
     parce qu'une dépense peut n'être rattachée à aucun entrepôt
     (``warehouse_write_required = False`` sur la vue).
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ ``reference`` : LE NUMÉRO DU TERMINAL, ET LE SERVEUR LE REPREND.         │
+    │                                                                          │
+    │ Une dépense se règle au comptoir, souvent avant que le réseau ne         │
+    │ revienne, et le bénéficiaire repart avec sa pièce justificative - qui    │
+    │ porte une ligne de signature. Un numéro provisoire remplacé ensuite      │
+    │ par celui du serveur rendrait ce papier muet : il ne désignerait plus    │
+    │ rien. C'est exactement le défaut corrigé sur ``sale.add_payment`` au     │
+    │ lot 6, où le règlement encaissé hors ligne sortait sous un numéro que    │
+    │ le serveur remplaçait.                                                   │
+    │                                                                          │
+    │ ⚠ Il ne passe PAS par ``**extra`` : ``reference`` est déjà un argument   │
+    │ nommé de ``serializer.save()`` juste en dessous, et un doublon lèverait  │
+    │ ``TypeError: got multiple values for keyword argument``.                 │
+    │                                                                          │
+    │ ⚠ ``reference`` reste ``read_only`` sur le serializer : elle ne peut     │
+    │ donc arriver que par ici, jamais d'un client REST. C'est voulu.          │
+    │                                                                          │
+    │ La collision reste impossible en silence : ``Expense`` porte une         │
+    │ contrainte d'unicité sur (organisation, référence), donc un              │
+    │ ``IntegrityError``, donc un verdict ``rejected``.                        │
+    └──────────────────────────────────────────────────────────────────────────┘
     """
     from apps.core.warehouse_scope import assert_warehouse_allowed_for_request
 
@@ -425,7 +449,7 @@ def create_expense(serializer, *, organization, user, request=None, **extra):
     )
     return serializer.save(
         organization=organization,
-        reference=ReferenceGenerator.generate_expense_reference(organization),
+        reference=reference or ReferenceGenerator.generate_expense_reference(organization),
         currency=devise,
         exchange_rate=taux,
         created_by=user,
@@ -465,3 +489,203 @@ def create_manual_cash_movement(serializer, *, organization, user, **extra):
         created_by=user,
         **extra,
     )
+
+
+# =============================================================================
+# TRANSITIONS D'UNE DÉPENSE, ET ANNULATION D'UN MOUVEMENT
+# =============================================================================
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ LE CORPS DESCEND ICI PARCE QUE DEUX SURFACES LE REJOUENT.               │
+# │                                                                          │
+# │ Ces six gestes vivaient dans `ExpenseViewSet` et `CashMovementViewSet`,  │
+# │ donc hors d'atteinte du journal : un terminal ne pouvait ni approuver    │
+# │ une dépense ni annuler un mouvement, et les y rejouer aurait demandé de  │
+# │ les réécrire. C'est très exactement ainsi que la dette client avait      │
+# │ divergé avant le lot 6. « La parité n'est pas surveillée, elle est       │
+# │ structurelle » (§5.5) : elle ne l'est que si le corps est partagé.       │
+# └──────────────────────────────────────────────────────────────────────────┘
+
+
+class TransitionRefusee(Exception):
+    """
+    Refus métier déterministe : à ne JAMAIS réessayer.
+
+    `_classify` le traduit en verdict `rejected`. Réessayer une approbation
+    déjà faite créerait un SECOND mouvement de caisse, et le tiroir sortirait
+    deux fois la même dépense.
+    """
+
+
+def create_cash_movement_for_expense(expense, *, user=None, session=None):
+    """
+    La sortie de caisse d'une dépense approuvée ou payée.
+
+    ⚠ La SESSION est résolue par l'appelant et passée ici, jamais devinée : au
+    back-office c'est celle du caissier au comptoir (`request.user`), et depuis
+    le journal celle de l'utilisateur du terminal. La deviner depuis
+    `expense.created_by` rattacherait la sortie à la caisse de l'auteur de la
+    dépense, qui peut être un gérant sans tiroir.
+
+    La sortie hérite de la DEVISE de la dépense : `_movement` calcule
+    `balance_after` par devise, et convertir ici ferait sortir du tiroir des
+    billets qui n'y étaient pas.
+    """
+    return _movement(
+        expense.organization,
+        direction='out',
+        movement_type='expense',
+        amount=expense.amount,
+        currency=expense.currency,
+        exchange_rate=expense.exchange_rate,
+        description=f"Dépense: {expense.description}",
+        payment_method=expense.payment_method,
+        expense=expense,
+        session=session,
+        user=user or expense.created_by,
+    )
+
+
+def _session_pour(organization, user):
+    return get_open_session_for_user(organization, user) if user else None
+
+
+def submit_expense(expense, user=None):
+    """Passe une dépense en attente d'approbation. Ne bouge PAS le tiroir."""
+    if expense.status != 'draft':
+        raise TransitionRefusee(
+            "Seules les dépenses en brouillon peuvent être soumises."
+        )
+    expense.status = 'pending'
+    expense.save(update_fields=['status', 'updated_at'])
+    return expense
+
+
+def approve_expense(expense, user):
+    """
+    Approuve une dépense ET fait sortir l'argent du tiroir.
+
+    L'approbation est le moment où la dépense devient une sortie réelle : c'est
+    `stats` du serveur qui le dit, en ne comptant que `approved` et `paid`.
+    """
+    if expense.status != 'pending':
+        raise TransitionRefusee(
+            "Seules les dépenses en attente peuvent être approuvées."
+        )
+    expense.status = 'approved'
+    expense.approved_by = user
+    expense.save(update_fields=['status', 'approved_by', 'updated_at'])
+    create_cash_movement_for_expense(
+        expense, user=user, session=_session_pour(expense.organization, user)
+    )
+    return expense
+
+
+def reject_expense(expense, reason='', user=None):
+    """
+    Rejette une dépense. Le motif REJOINT les notes, il ne les écrase pas.
+
+    Écraser `notes` ferait disparaître ce que l'auteur avait écrit sur sa
+    propre dépense - c'est le défaut qu'`annuler une vente` a dû corriger sur
+    `sale.notes`.
+    """
+    if expense.status != 'pending':
+        raise TransitionRefusee(
+            "Seules les dépenses en attente peuvent être rejetées."
+        )
+    expense.status = 'rejected'
+    if reason:
+        expense.notes = f"{expense.notes}\n--- Rejet ---\n{reason}".strip()
+    expense.save(update_fields=['status', 'notes', 'updated_at'])
+    return expense
+
+
+def pay_expense(expense, user, payment_method_id=None, payment_reference=''):
+    """
+    Marque une dépense payée, en l'approuvant au passage si besoin.
+
+    C'est le raccourci des petites dépenses : un caissier qui sort deux mille
+    francs pour du carburant n'ouvre pas un circuit d'approbation.
+
+    ⚠ Le mouvement de caisse n'est créé QUE s'il n'en existe pas déjà un de
+    vivant. Sans ce contrôle, payer une dépense déjà approuvée ferait sortir
+    l'argent une seconde fois.
+    """
+    if expense.status in ('paid', 'cancelled'):
+        raise TransitionRefusee(
+            "Cette dépense ne peut pas être marquée comme payée."
+        )
+
+    champs = ['status', 'paid_date', 'updated_at']
+    if expense.status in ('draft', 'pending'):
+        expense.approved_by = user
+        champs.append('approved_by')
+        if not expense.cash_movements.filter(is_cancelled=False).exists():
+            create_cash_movement_for_expense(
+                expense, user=user, session=_session_pour(expense.organization, user)
+            )
+
+    if payment_method_id:
+        from apps.sales.models import PaymentMethod
+        # Un moyen de paiement introuvable est IGNORÉ, comme au back-office :
+        # il ne doit pas empêcher d'enregistrer une sortie d'argent réelle.
+        methode = PaymentMethod.objects.filter(
+            id=payment_method_id, organization=expense.organization
+        ).first()
+        if methode is not None:
+            expense.payment_method = methode
+            champs.append('payment_method')
+    if payment_reference:
+        expense.payment_reference = payment_reference
+        champs.append('payment_reference')
+
+    expense.status = 'paid'
+    expense.paid_date = timezone.localdate()
+    expense.save(update_fields=champs)
+    return expense
+
+
+def cancel_expense(expense, user, reason=''):
+    """
+    Annule une dépense et CONTREPASSE sa sortie de caisse.
+
+    Sans l'annulation du mouvement, le tiroir garde une sortie qui n'a plus
+    lieu d'être et le caissier trouve le soir un manquant que rien n'explique.
+    C'est le défaut exact relevé sur l'annulation d'une vente au lot 3.
+    """
+    if expense.status == 'cancelled':
+        raise TransitionRefusee("Cette dépense est déjà annulée.")
+
+    for movement in expense.cash_movements.filter(is_cancelled=False):
+        cancel_cash_movement(movement, user, reason)
+
+    expense.status = 'cancelled'
+    expense.save(update_fields=['status', 'updated_at'])
+    return expense
+
+
+def cancel_cash_movement(movement, user, reason=''):
+    """
+    Annule un mouvement de tiroir.
+
+    ⚠ On MARQUE, on ne supprime pas : un mouvement de caisse est une écriture
+    comptable, elle se contrepasse et ne se rature pas. `is_cancelled` sort la
+    ligne des soldes et des listes, et la laisse dans les rapports de caisse,
+    où l'on vient justement chercher ce qui a été rectifié.
+
+    ⚠ `balance_after` des mouvements SUIVANTS n'est PAS recalculé, et c'est le
+    comportement du back-office depuis toujours : cette colonne est l'état du
+    tiroir tel qu'il était à cet instant, pas un solde courant. La réécrire
+    changerait l'histoire d'un tiroir déjà compté.
+    """
+    if movement.is_cancelled:
+        raise TransitionRefusee("Ce mouvement est déjà annulé.")
+
+    movement.is_cancelled = True
+    movement.cancelled_at = timezone.now()
+    movement.cancelled_by = user
+    movement.cancel_reason = reason
+    movement.save(update_fields=[
+        'is_cancelled', 'cancelled_at', 'cancelled_by', 'cancel_reason', 'updated_at',
+    ])
+    return movement

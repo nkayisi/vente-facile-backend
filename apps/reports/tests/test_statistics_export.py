@@ -508,8 +508,26 @@ class ColonnesExplicitesTests(_BaseExport):
         # figerait les décimales du dollar dans un gabarit tenu en CDF, qui n'en
         # a aucune. On prouve la STRUCTURE, pas la mise en forme.
         attendu = [csv_cell(montant(v)) for v in (500, 200, 300)]
-        ligne = next(l for l in contenu.splitlines() if l.startswith('0') and ';' in l)
-        self.assertEqual(ligne.split(';')[1:], attendu)
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ LA LIGNE SE RECONNAÎT À SA FORME DE DATE, PAS À UN ZÉRO DE TÊTE. │
+        # │                                                                  │
+        # │ Le test cherchait `startswith('0')` : `format_day` rend           │
+        # │ « JJ/MM/AAAA », donc le quantième ne commence par un zéro que du  │
+        # │ 1er au 9 du mois. Du 10 au 31, `next()` ne trouvait rien et le    │
+        # │ test échouait en `StopIteration` - un échec qui ne nomme même pas │
+        # │ ce qui manque. Il passait donc neuf jours sur trente, et rien ne  │
+        # │ le signalait le reste du temps puisqu'il était vert au moment où  │
+        # │ on l'écrivait.                                                    │
+        # └──────────────────────────────────────────────────────────────────┘
+        lignes = [
+            l for l in contenu.splitlines()
+            if re.match(r'^\d{2}/\d{2}/\d{4};', l)
+        ]
+        self.assertEqual(
+            len(lignes), 1,
+            f"Une seule journée attendue dans le flux, trouvé : {lignes}",
+        )
+        self.assertEqual(lignes[0].split(';')[1:], attendu)
 
     def test_le_flux_porte_un_TOTAL(self):
         """Sommable : c'est tout l'intérêt d'une colonne plutôt qu'une phrase."""

@@ -233,3 +233,142 @@ class MouvementCaisseParityTests(_CaisseBaseTest):
         # entrepôt. Sans elle, il est invisible aux magasiniers.
         self.assertEqual(par_le_journal.session_id, self.session.id)
         self.assertEqual(par_le_journal.created_by_id, self.cashier_a.id)
+
+
+class CategorieDepuisLeComptoirTests(_CaisseBaseTest):
+    """
+    Les deux actes de catégorie, et l'opération qui BOUCLAIT.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ CE TEST EST LE SEUL QUI PROUVE QUE LE DÉFAUT EST REFERMÉ.               │
+    │                                                                          │
+    │ Les handlers importaient `IncomeCategorySerializer` et                   │
+    │ `ExpenseCategorySerializer` : deux noms qui n'existent pas. À            │
+    │ l'exécution, `ImportError` - que `_classify` rangeait en `retry`.        │
+    │ L'opération repartait à CHAQUE synchronisation, indéfiniment, sur le     │
+    │ terminal d'un marchand. Aucun test n'entrait dans ces corps, et la       │
+    │ suite était verte.                                                       │
+    │                                                                          │
+    │ Le contrôle qui compte n'est donc pas « la catégorie existe », c'est     │
+    │ « le verdict est `applied` et surtout PAS `retry` ».                     │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ⚠ Le caissier n'a PAS `cashbook.manage_categories` : c'est le gérant qui
+    crée une catégorie, sur les deux surfaces.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.client.force_authenticate(user=self.manager)
+
+    def test_une_categorie_de_depense_est_APPLIQUEE_et_jamais_reessayee(self):
+        from apps.cashbook.models import ExpenseCategory
+
+        op = '33333333-3333-4333-8333-333333333333'
+        reponse = self._journal('expense_category.create', {
+            'id': op, 'name': 'Carburant', 'description': 'Gasoil et essence',
+            'color': '#10B981', 'is_active': True,
+        }, op)
+        verdict = self._verdict(reponse)
+
+        categorie = ExpenseCategory.objects.get(id=op)
+        self.assertEqual(categorie.name, 'Carburant')
+        self.assertEqual(categorie.description, 'Gasoil et essence')
+        self.assertEqual(categorie.color, '#10B981')
+        self.assertEqual(categorie.organization, self.org)
+        # La réponse passe par le serializer de DÉTAIL : sans `id`, le terminal
+        # ne saurait pas rattacher la catégorie qu'il vient de créer.
+        self.assertIn('id', verdict['authoritative'])
+
+    def test_un_type_d_entree_est_APPLIQUE_et_jamais_reessaye(self):
+        from apps.cashbook.models import IncomeCategory
+
+        op = '44444444-4444-4444-8444-444444444444'
+        reponse = self._journal('income_category.create', {
+            'id': op, 'name': 'Subvention', 'is_active': True,
+        }, op)
+        self._verdict(reponse)
+        self.assertEqual(IncomeCategory.objects.get(id=op).name, 'Subvention')
+
+    def test_un_nom_deja_pris_est_REFUSE_avec_un_message_de_champ(self):
+        """Et non un `IntegrityError` brut, illisible en quarantaine."""
+        op = '55555555-5555-4555-8555-555555555555'
+        reponse = self._journal('expense_category.create', {
+            'id': op, 'name': 'transport',  # `Transport` existe déjà
+        }, op)
+        verdict = self._verdict(reponse, attendu='rejected')
+        self.assertIn('name', str(verdict.get('errors')))
+
+    def test_un_caissier_est_BLOQUE_et_son_opération_est_conservee(self):
+        """
+        `manage_categories` n'est pas dans ses droits. Bloqué n'est pas refusé :
+        l'opération repartira seule le jour où le gérant accorde le droit.
+        """
+        self.client.force_authenticate(user=self.cashier_a)
+        op = '66666666-6666-4666-8666-666666666666'
+        reponse = self._journal('expense_category.create', {
+            'id': op, 'name': 'Fournitures',
+        }, op)
+        self._verdict(reponse, attendu='blocked')
+
+
+class NumeroDAppareilTests(_CaisseBaseTest):
+    """
+    Le numéro imprimé au comptoir est celui que le serveur enregistre.
+
+    Une dépense se règle souvent avant que le réseau ne revienne, et le
+    bénéficiaire repart avec sa pièce justificative - qui porte une ligne de
+    signature. Un numéro remplacé ensuite par celui du serveur rendrait ce
+    papier muet. C'est le défaut corrigé sur `sale.add_payment` au lot 6.
+    """
+
+    def test_la_reference_du_terminal_est_reprise_VERBATIM(self):
+        op = '77777777-7777-4777-8777-777777777777'
+        numero = 'DEP-20260910-K7QM-0042'
+        reponse = self._journal('expense.create', {
+            'id': op, 'reference': numero,
+            'category': str(self.categorie.id),
+            'description': 'Carburant', 'amount': '30.00', 'currency': 'USD',
+            'expense_date': '2026-09-10',
+        }, op)
+        self._verdict(reponse)
+        self.assertEqual(Expense.objects.get(id=op).reference, numero)
+
+    def test_sans_reference_le_serveur_alloue_la_sienne(self):
+        """C'est le chemin d'une dépense saisie au back-office."""
+        op = '88888888-8888-4888-8888-888888888888'
+        reponse = self._journal('expense.create', {
+            'id': op,
+            'category': str(self.categorie.id),
+            'description': 'Loyer', 'amount': '100.00', 'currency': 'USD',
+            'expense_date': '2026-09-10',
+        }, op)
+        self._verdict(reponse)
+        self.assertRegex(Expense.objects.get(id=op).reference, r'^DEP-\d{8}-\d{4}$')
+
+
+class DefautDeCodeTests(_CaisseBaseTest):
+    """
+    Un symbole qui n'existe pas ne se répare pas en réessayant.
+
+    Sans ce classement, un `ImportError` tombait dans le repli `unexpected`,
+    donc en `retry` : l'opération repartait à chaque synchronisation, en
+    batterie et en données, pour un acte qui ne passera jamais.
+    """
+
+    def test_un_ImportError_de_handler_rend_REJECTED_jamais_RETRY(self):
+        from apps.sync.operations import _classify
+        from apps.sync.models import SyncOperation
+
+        verdict, corps = _classify(ImportError("cannot import name 'Fantome'"))
+        self.assertEqual(verdict, SyncOperation.Verdict.REJECTED)
+        self.assertEqual(corps['code'], 'handler_defect')
+
+    def test_une_panne_de_base_reste_RETRY(self):
+        """La frontière ne bouge pas : un aléa technique se réessaie."""
+        from django.db import OperationalError
+        from apps.sync.operations import _classify
+        from apps.sync.models import SyncOperation
+
+        verdict, _ = _classify(OperationalError('deadlock detected'))
+        self.assertEqual(verdict, SyncOperation.Verdict.RETRY)

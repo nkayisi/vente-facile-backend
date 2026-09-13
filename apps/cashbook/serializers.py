@@ -26,12 +26,76 @@ class IncomeCategoryListSerializer(serializers.ModelSerializer):
 
 
 class IncomeCategoryCreateSerializer(serializers.ModelSerializer):
+    """
+    Création et modification d'une catégorie de recette.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ `id` EST EXPOSÉ, ET C'EST UNE RÉPARATION.                               │
+    │                                                                          │
+    │ DRF répond à un POST avec le serializer d'ÉCRITURE. Sans `id`, la        │
+    │ réponse ne portait aucun identifiant : la création en ligne d'un type    │
+    │ d'entrée au back-office (`cashbook/page.tsx`) lisait `result.data.id`,   │
+    │ recevait `undefined`, et ne resélectionnait donc RIEN. Comme             │
+    │ `handleCreate` ne valide que le montant et la description, l'entrée      │
+    │ partait sans `income_category`, sous un libellé pourtant étoilé.         │
+    │                                                                          │
+    │ `UUIDModel.id` est `editable=False` : DRF le rend en lecture seule, il   │
+    │ n'ouvre aucune écriture.                                                 │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
     class Meta:
         model = IncomeCategory
         fields = [
-            'name', 'code', 'description', 'color', 'icon', 'is_active',
+            'id', 'name', 'code', 'description', 'color', 'icon', 'is_active',
         ]
+        read_only_fields = ['id']
 
+    def validate(self, data):
+        """
+        Un nom déjà pris rend 400, jamais 500.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ DRF SAUTE LA CONTRAINTE D'UNICITÉ QUAND UN DE SES CHAMPS MANQUE.    │
+        │                                                                      │
+        │ `UniqueConstraint(organization, name)` existe en base, mais          │
+        │ `organization` est injectée par `TenantViewSetMixin.perform_create`  │
+        │ et n'est pas un champ du serializer. `get_unique_together_validators`│
+        │ écarte alors la contrainte en silence, et un doublon lève un         │
+        │ `IntegrityError` NON RATTRAPÉ : HTTP 500 au back-office, et sur le   │
+        │ journal un verdict `rejected` dont le détail est le texte brut de    │
+        │ PostgreSQL. Deux fins indignes d'un écran.                            │
+        │                                                                      │
+        │ ⚠ La contrainte RESTE : ce contrôle ferme la course commune, pas la  │
+        │ concurrence. Un `IntegrityError` résiduel continue de rendre          │
+        │ `rejected`, ce qui est la bonne fin pour deux terminaux qui créent   │
+        │ le même nom à la même seconde.                                        │
+        └──────────────────────────────────────────────────────────────────────┘
+
+        `__iexact`, comme les catégories de PRODUITS, et comme le terminal qui
+        oppose déjà `toLowerCase` avant l'envoi. C'est volontairement plus
+        strict que la contrainte, sensible à la casse : trois surfaces disent
+        alors la même chose.
+        """
+        # L'en-tête de tenant, comme `products/serializers.py` : c'est le seul
+        # porteur commun aux deux chemins, la vue comme le journal (qui
+        # construit le serializer avec `context={'request': ctx.request}`).
+        request = self.context.get('request')
+        organisation_id = (
+            request.headers.get('X-Organization-ID') if request is not None else None
+        ) or getattr(getattr(self.instance, 'organization', None), 'id', None)
+        nom = data.get('name', getattr(self.instance, 'name', None))
+        if nom and organisation_id:
+            doublons = IncomeCategory.objects.filter(
+                organization_id=organisation_id, name__iexact=nom,
+            )
+            if self.instance is not None:
+                doublons = doublons.exclude(pk=self.instance.pk)
+            if doublons.exists():
+                raise serializers.ValidationError({
+                    'name': "Il existe déjà une catégorie avec ce même nom."
+                })
+        return data
 
 class IncomeCategoryDetailSerializer(serializers.ModelSerializer):
     movement_count = serializers.SerializerMethodField()
@@ -72,13 +136,77 @@ class ExpenseCategoryListSerializer(serializers.ModelSerializer):
 
 
 class ExpenseCategoryCreateSerializer(serializers.ModelSerializer):
+    """
+    Création et modification d'une catégorie de dépense.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ `id` EST EXPOSÉ, ET C'EST UNE RÉPARATION.                               │
+    │                                                                          │
+    │ DRF répond à un POST avec le serializer d'ÉCRITURE. Sans `id`, la        │
+    │ réponse ne portait aucun identifiant : la création en ligne d'un type    │
+    │ d'entrée au back-office (`cashbook/page.tsx`) lisait `result.data.id`,   │
+    │ recevait `undefined`, et ne resélectionnait donc RIEN. Comme             │
+    │ `handleCreate` ne valide que le montant et la description, l'entrée      │
+    │ partait sans `income_category`, sous un libellé pourtant étoilé.         │
+    │                                                                          │
+    │ `UUIDModel.id` est `editable=False` : DRF le rend en lecture seule, il   │
+    │ n'ouvre aucune écriture.                                                 │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
     class Meta:
         model = ExpenseCategory
         fields = [
-            'name', 'code', 'description', 'color', 'icon',
+            'id', 'name', 'code', 'description', 'color', 'icon',
             'is_active', 'budget_monthly',
         ]
+        read_only_fields = ['id']
 
+    def validate(self, data):
+        """
+        Un nom déjà pris rend 400, jamais 500.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ DRF SAUTE LA CONTRAINTE D'UNICITÉ QUAND UN DE SES CHAMPS MANQUE.    │
+        │                                                                      │
+        │ `UniqueConstraint(organization, name)` existe en base, mais          │
+        │ `organization` est injectée par `TenantViewSetMixin.perform_create`  │
+        │ et n'est pas un champ du serializer. `get_unique_together_validators`│
+        │ écarte alors la contrainte en silence, et un doublon lève un         │
+        │ `IntegrityError` NON RATTRAPÉ : HTTP 500 au back-office, et sur le   │
+        │ journal un verdict `rejected` dont le détail est le texte brut de    │
+        │ PostgreSQL. Deux fins indignes d'un écran.                            │
+        │                                                                      │
+        │ ⚠ La contrainte RESTE : ce contrôle ferme la course commune, pas la  │
+        │ concurrence. Un `IntegrityError` résiduel continue de rendre          │
+        │ `rejected`, ce qui est la bonne fin pour deux terminaux qui créent   │
+        │ le même nom à la même seconde.                                        │
+        └──────────────────────────────────────────────────────────────────────┘
+
+        `__iexact`, comme les catégories de PRODUITS, et comme le terminal qui
+        oppose déjà `toLowerCase` avant l'envoi. C'est volontairement plus
+        strict que la contrainte, sensible à la casse : trois surfaces disent
+        alors la même chose.
+        """
+        # L'en-tête de tenant, comme `products/serializers.py` : c'est le seul
+        # porteur commun aux deux chemins, la vue comme le journal (qui
+        # construit le serializer avec `context={'request': ctx.request}`).
+        request = self.context.get('request')
+        organisation_id = (
+            request.headers.get('X-Organization-ID') if request is not None else None
+        ) or getattr(getattr(self.instance, 'organization', None), 'id', None)
+        nom = data.get('name', getattr(self.instance, 'name', None))
+        if nom and organisation_id:
+            doublons = ExpenseCategory.objects.filter(
+                organization_id=organisation_id, name__iexact=nom,
+            )
+            if self.instance is not None:
+                doublons = doublons.exclude(pk=self.instance.pk)
+            if doublons.exists():
+                raise serializers.ValidationError({
+                    'name': "Il existe déjà une catégorie avec ce même nom."
+                })
+        return data
 
 class ExpenseCategoryDetailSerializer(serializers.ModelSerializer):
     expense_count = serializers.SerializerMethodField()

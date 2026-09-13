@@ -33,9 +33,27 @@ class ReferenceGenerator:
         today = timezone.now()
         prefix = f"VT-{today.strftime('%Y%m%d')}"
         
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ ON NE COMPTE QUE LES RÉFÉRENCES DE LA SÉRIE DU SERVEUR.          │
+        # │                                                                  │
+        # │ Un terminal alloue son propre numéro avant d'imprimer, et il     │
+        # │ porte un code d'appareil : `VT-20260910-K7QM-0042`. Or le tri   │
+        # │ est ALPHABÉTIQUE et « K » passe au-dessus de « 0 », si bien que  │
+        # │ cette référence-là devenait le dernier rang connu, et            │
+        # │ `split('-')[-1]` en tirait 42. La série du serveur sautait donc  │
+        # │ à 0043 alors qu'elle en était à 0004.                            │
+        # │                                                                  │
+        # │ Ce n'est pas une collision - les deux séries ne se croisent pas  │
+        # │ - c'est un TROU, et une série trouée porte le RCCM et le NIF.    │
+        # │ Le motif ne retient que les rangs à quatre chiffres collés au    │
+        # │ préfixe du jour, c'est-à-dire la seule forme que produit cette   │
+        # │ fonction.                                                        │
+        # └──────────────────────────────────────────────────────────────────┘
         last = Sale.objects.filter(
             organization=organization,
-            reference__startswith=prefix
+            reference__startswith=prefix,
+        ).filter(
+            reference__regex=r'^' + prefix + r'-[0-9]{4}$'
         ).order_by('-reference').first()
         
         if last:
@@ -209,9 +227,27 @@ class ReferenceGenerator:
         today = timezone.now()
         prefix = f"DEP-{today.strftime('%Y%m%d')}"
         
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ ON NE COMPTE QUE LES RÉFÉRENCES DE LA SÉRIE DU SERVEUR.          │
+        # │                                                                  │
+        # │ Un terminal alloue son propre numéro avant d'imprimer, et il     │
+        # │ porte un code d'appareil : `DEP-20260910-K7QM-0042`. Or le tri   │
+        # │ est ALPHABÉTIQUE et « K » passe au-dessus de « 0 », si bien que  │
+        # │ cette référence-là devenait le dernier rang connu, et            │
+        # │ `split('-')[-1]` en tirait 42. La série du serveur sautait donc  │
+        # │ à 0043 alors qu'elle en était à 0004.                            │
+        # │                                                                  │
+        # │ Ce n'est pas une collision - les deux séries ne se croisent pas  │
+        # │ - c'est un TROU, et une série trouée porte le RCCM et le NIF.    │
+        # │ Le motif ne retient que les rangs à quatre chiffres collés au    │
+        # │ préfixe du jour, c'est-à-dire la seule forme que produit cette   │
+        # │ fonction.                                                        │
+        # └──────────────────────────────────────────────────────────────────┘
         last = Expense.objects.filter(
             organization=organization,
-            reference__startswith=prefix
+            reference__startswith=prefix,
+        ).filter(
+            reference__regex=r'^' + prefix + r'-[0-9]{4}$'
         ).order_by('-reference').first()
         
         if last:

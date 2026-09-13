@@ -243,11 +243,47 @@ class ExpenseViewSet(
 
         return queryset
 
+    def create(self, request, *args, **kwargs):
+        """
+        Créer une dépense et rendre le DÉTAIL complet (avec `id` et `reference`).
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ SANS CET OVERRIDE, LE REÇU DE DÉPENSE SORTAIT SANS NUMÉRO.          │
+        │                                                                      │
+        │ DRF répond à un POST avec le serializer d'ÉCRITURE, et               │
+        │ `ExpenseCreateSerializer` ne déclare ni `id`, ni `reference`, ni     │
+        │ `category_name`, ni `payment_method_name`. Or le back-office bâtit   │
+        │ son ticket thermique avec ces quatre-là : les quatre valaient        │
+        │ `undefined`, le papier sortait sans numéro ni catégorie, et le       │
+        │ fichier s'appelait `depense-undefined.pdf`. `createExpense` annonce  │
+        │ pourtant `Promise<ApiResponse<Expense>>` - axios rend `any`, et      │
+        │ TypeScript n'avait rien à dire.                                       │
+        │                                                                      │
+        │ Le chemin du JOURNAL rendait déjà `ExpenseDetailSerializer` : les    │
+        │ deux surfaces reçoivent désormais le même corps, ce qui est la       │
+        │ définition même de la parité de §5.5.                                 │
+        └──────────────────────────────────────────────────────────────────────┘
+
+        Calqué sur `SaleViewSet.create`.
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        expense = self.perform_create(serializer)
+        expense.refresh_from_db()
+        return Response(
+            ExpenseDetailSerializer(expense).data, status=status.HTTP_201_CREATED,
+        )
+
     def perform_create(self, serializer):
-        """Le corps vit dans `services.create_expense`, que le journal appelle aussi."""
+        """
+        Le corps vit dans `services.create_expense`, que le journal appelle aussi.
+
+        Il REND l'instance : `create()` en a besoin pour répondre par la fiche
+        détaillée, et le contrat de DRF ne l'interdit pas.
+        """
         from .services import create_expense
 
-        create_expense(
+        return create_expense(
             serializer,
             organization=self.get_organization(),
             user=self.request.user,
@@ -275,53 +311,47 @@ class ExpenseViewSet(
         )
         serializer.save(currency=currency, exchange_rate=exchange_rate)
 
+    # ┌──────────────────────────────────────────────────────────────────────┐
+    # │ LES CINQ TRANSITIONS VIVENT DANS `cashbook.services`.               │
+    # │                                                                      │
+    # │ Elles étaient écrites ici, donc hors d'atteinte du journal : un      │
+    # │ terminal ne pouvait ni approuver ni payer une dépense, et les y      │
+    # │ rejouer aurait demandé de les réécrire. Le CONTRAT DE RÉPONSE ne     │
+    # │ bouge pas - `{'detail': ...}` en 400, la fiche détaillée en 200 - le │
+    # │ back-office y branchant déjà ses messages.                           │
+    # └──────────────────────────────────────────────────────────────────────┘
+
+    def _transition(self, fonction, *args, **kwargs):
+        from .services import TransitionRefusee
+        expense = self.get_object()
+        try:
+            fonction(expense, *args, **kwargs)
+        except TransitionRefusee as exc:
+            return Response(
+                {'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST
+            )
+        expense.refresh_from_db()
+        return Response(ExpenseDetailSerializer(expense).data)
+
     @action(detail=True, methods=['post'])
     def submit(self, request, pk=None):
         """Soumettre une dépense pour approbation."""
-        expense = self.get_object()
-        if expense.status != 'draft':
-            return Response(
-                {'detail': "Seules les dépenses en brouillon peuvent être soumises."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        expense.status = 'pending'
-        expense.save(update_fields=['status', 'updated_at'])
-        return Response(ExpenseDetailSerializer(expense).data)
+        from .services import submit_expense
+        return self._transition(submit_expense, request.user)
 
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
         """Approuver une dépense et créer le mouvement de caisse."""
-        expense = self.get_object()
-        if expense.status != 'pending':
-            return Response(
-                {'detail': "Seules les dépenses en attente peuvent être approuvées."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        expense.status = 'approved'
-        expense.approved_by = request.user
-        expense.save(update_fields=['status', 'approved_by', 'updated_at'])
-
-        # Créer le mouvement de caisse
-        self._create_cash_movement_for_expense(expense)
-
-        return Response(ExpenseDetailSerializer(expense).data)
+        from .services import approve_expense
+        return self._transition(approve_expense, request.user)
 
     @action(detail=True, methods=['post'])
     def reject(self, request, pk=None):
         """Rejeter une dépense."""
-        expense = self.get_object()
-        if expense.status != 'pending':
-            return Response(
-                {'detail': "Seules les dépenses en attente peuvent être rejetées."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        reason = request.data.get('reason', '')
-        expense.status = 'rejected'
-        expense.notes = f"{expense.notes}\n--- Rejet ---\n{reason}".strip() if reason else expense.notes
-        expense.save(update_fields=['status', 'notes', 'updated_at'])
-        return Response(ExpenseDetailSerializer(expense).data)
+        from .services import reject_expense
+        return self._transition(
+            reject_expense, request.data.get('reason', ''), request.user
+        )
 
     @action(detail=True, methods=['post'])
     def pay(self, request, pk=None):
@@ -329,60 +359,21 @@ class ExpenseViewSet(
         Marquer une dépense comme payée.
         Si la dépense est en brouillon ou en attente, elle est automatiquement approuvée.
         """
-        expense = self.get_object()
-        if expense.status in ['paid', 'cancelled']:
-            return Response(
-                {'detail': "Cette dépense ne peut pas être marquée comme payée."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Paiement direct (shortcut pour petites dépenses)
-        if expense.status in ['draft', 'pending']:
-            expense.approved_by = request.user
-            # Créer le mouvement de caisse si pas encore fait
-            if not expense.cash_movements.filter(is_cancelled=False).exists():
-                self._create_cash_movement_for_expense(expense)
-
-        payment_method_id = request.data.get('payment_method')
-        payment_reference = request.data.get('payment_reference', '')
-
-        if payment_method_id:
-            from apps.sales.models import PaymentMethod
-            try:
-                expense.payment_method = PaymentMethod.objects.get(id=payment_method_id)
-            except PaymentMethod.DoesNotExist:
-                pass
-        if payment_reference:
-            expense.payment_reference = payment_reference
-
-        expense.status = 'paid'
-        expense.paid_date = timezone.localdate()
-        expense.save()
-        return Response(ExpenseDetailSerializer(expense).data)
+        from .services import pay_expense
+        return self._transition(
+            pay_expense,
+            request.user,
+            payment_method_id=request.data.get('payment_method'),
+            payment_reference=request.data.get('payment_reference', ''),
+        )
 
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
         """Annuler une dépense et son mouvement de caisse."""
-        expense = self.get_object()
-        if expense.status == 'cancelled':
-            return Response(
-                {'detail': "Cette dépense est déjà annulée."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        reason = request.data.get('reason', '')
-
-        # Annuler les mouvements de caisse liés
-        for movement in expense.cash_movements.filter(is_cancelled=False):
-            movement.is_cancelled = True
-            movement.cancelled_at = timezone.now()
-            movement.cancelled_by = request.user
-            movement.cancel_reason = reason
-            movement.save()
-
-        expense.status = 'cancelled'
-        expense.save(update_fields=['status', 'updated_at'])
-        return Response(ExpenseDetailSerializer(expense).data)
+        from .services import cancel_expense
+        return self._transition(
+            cancel_expense, request.user, request.data.get('reason', '')
+        )
 
     @action(detail=False, methods=['get'])
     def stats(self, request):
@@ -453,31 +444,6 @@ class ExpenseViewSet(
             'by_category': list(by_category),
             'by_month': list(by_month),
         })
-
-    def _create_cash_movement_for_expense(self, expense):
-        """Crée un mouvement de caisse pour une dépense approuvée (multi-devise)."""
-        from .services import get_open_session_for_user, _movement
-        organization = expense.organization
-
-        # Rattache la sortie de caisse à la session ouverte de l'utilisateur
-        # qui paie (caissier au comptoir) pour le calcul de la caisse nette.
-        session = get_open_session_for_user(organization, self.request.user)
-
-        # La sortie de caisse hérite de la devise de la dépense ; `_movement`
-        # calcule `balance_after` par devise.
-        _movement(
-            organization,
-            direction='out',
-            movement_type='expense',
-            amount=expense.amount,
-            currency=expense.currency,
-            exchange_rate=expense.exchange_rate,
-            description=f"Dépense: {expense.description}",
-            payment_method=expense.payment_method,
-            expense=expense,
-            session=session,
-            user=expense.created_by,
-        )
 
 
 # =============================================================================
@@ -666,21 +632,13 @@ class CashMovementViewSet(ExportResponseMixin, TenantViewSetMixin,
 
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
-        """Annuler un mouvement de caisse."""
+        """Annuler un mouvement de caisse. Le corps vit dans `services`."""
+        from .services import TransitionRefusee, cancel_cash_movement
         movement = self.get_object()
-        if movement.is_cancelled:
-            return Response(
-                {'detail': "Ce mouvement est déjà annulé."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        reason = request.data.get('reason', '')
-        movement.is_cancelled = True
-        movement.cancelled_at = timezone.now()
-        movement.cancelled_by = request.user
-        movement.cancel_reason = reason
-        movement.save()
-
+        try:
+            cancel_cash_movement(movement, request.user, request.data.get('reason', ''))
+        except TransitionRefusee as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(CashMovementDetailSerializer(movement).data)
 
     @action(detail=False, methods=['get'])

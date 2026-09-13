@@ -920,6 +920,54 @@ def _referentiel_create(ctx, payload, modele, serializer_classe, cle):
     }
 
 
+def _referentiel_update(ctx, payload, modele, serializer_classe, cle, quoi, lecture=None):
+    """
+    Modification d'un référentiel, par le serializer du back-office.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ `id` DÉSIGNE LA CIBLE, NON UNE CLÉ À ATTRIBUER.                         │
+    │                                                                          │
+    │ C'est toute la différence avec `_referentiel_create`, qui passe `id` à   │
+    │ `save()` pour que la clé posée au comptoir devienne celle du serveur.    │
+    │ Ici la fiche existe déjà : `id` sert à la RETROUVER.                     │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    `partial=True` n'est pas un confort : sans lui, `CategoryDetailSerializer`
+    exigerait `name` ET `slug` à chaque envoi, et basculer `is_active` seul
+    serait refusé pour deux champs qu'on ne modifiait pas.
+
+    `_objet_de_lorg` rend un refus DÉTERMINISTE (`not_found`) pour une fiche
+    absente, d'une autre organisation, ou supprimée en douceur - les managers de
+    `Category` et `Brand` étant des `TenantSoftDeleteManager`, qui filtrent
+    `is_deleted=False`. Ce chemin est emprunté pour de vrai : une unité
+    supprimée dans le back-office SURVIT sur chaque terminal (`Unit` n'a pas de
+    suppression douce, donc aucune pierre tombale ne descend), et le terminal
+    enverra des `unit.update` sur des unités fantômes.
+
+    `lecture` sépare le serializer d'ÉCRITURE de celui de LECTURE, quand le
+    back-office en emploie deux (les catégories de caisse écrivent par
+    `…CreateSerializer` et rendent par `…DetailSerializer`). Absent, on rend
+    avec celui qui a écrit - c'est le cas des référentiels de produits.
+    """
+    identifiant = payload.pop('id', None)
+    if not identifiant:
+        raise OperationRejected(
+            "L'identifiant de la fiche à modifier est absent.",
+            code='missing_fields',
+            details={'id': ['Ce champ est requis.']},
+        )
+    objet = _objet_de_lorg(modele, ctx, identifiant, quoi)
+    serializer = serializer_classe(
+        objet, data=payload, partial=True, context={'request': ctx.request},
+    )
+    serializer.is_valid(raise_exception=True)
+    objet = serializer.save()
+    return {
+        'server_ids': {cle: str(objet.id)},
+        'authoritative': (lecture or serializer_classe)(objet).data,
+    }
+
+
 @handler('category.create', permission='categories.create')
 def category_create(ctx, payload):
     from apps.products.models import Category
@@ -943,6 +991,44 @@ def unit_create(ctx, payload):
     return _referentiel_create(ctx, payload, Unit, UnitSerializer, 'unit')
 
 
+@handler('category.update', permission='categories.edit')
+def category_update(ctx, payload):
+    """
+    ⚠ `CategoryDetailSerializer`, JAMAIS `CategoryCreateSerializer`.
+
+    Le second vérifie l'unicité du nom SANS exclure la fiche modifiée
+    (`serializers.py`, aucun `exclude(pk=self.instance.pk)`) : une catégorie s'y
+    refuserait ELLE-MÊME à chaque enregistrement qui porte son propre nom,
+    c'est-à-dire toujours. Refus déterministe et inconditionnel, découvert hors
+    ligne. C'est aussi le serializer que `CategoryViewSet.get_serializer_class`
+    retient pour `partial_update`.
+    """
+    from apps.products.models import Category
+    from apps.products.serializers import CategoryDetailSerializer
+    return _referentiel_update(
+        ctx, payload, Category, CategoryDetailSerializer, 'category',
+        'Cette catégorie',
+    )
+
+
+@handler('brand.update', permission='products.edit')
+def brand_update(ctx, payload):
+    from apps.products.models import Brand
+    from apps.products.serializers import BrandSerializer
+    return _referentiel_update(
+        ctx, payload, Brand, BrandSerializer, 'brand', 'Cette marque',
+    )
+
+
+@handler('unit.update', permission='products.edit')
+def unit_update(ctx, payload):
+    from apps.products.models import Unit
+    from apps.products.serializers import UnitSerializer
+    return _referentiel_update(
+        ctx, payload, Unit, UnitSerializer, 'unit', 'Cette unité',
+    )
+
+
 # ------------------------------------------------------------------- livre de caisse
 
 
@@ -961,6 +1047,11 @@ def expense_create(ctx, payload):
     from apps.cashbook.services import create_expense
 
     local_id = payload.pop('id', None)
+    # Le numéro imprimé au comptoir, retiré du corps comme l'identifiant :
+    # `reference` est `read_only` sur le serializer, elle ne passe que par le
+    # service. Absente, le serveur alloue la sienne - c'est le chemin d'une
+    # dépense saisie au back-office.
+    reference = payload.pop('reference', None)
     serializer = ExpenseCreateSerializer(data=payload, context={'request': ctx.request})
     serializer.is_valid(raise_exception=True)
     expense = create_expense(
@@ -968,6 +1059,7 @@ def expense_create(ctx, payload):
         organization=ctx.organization,
         user=ctx.user,
         request=ctx.request,
+        reference=reference,
         **({'id': local_id} if local_id else {}),
     )
     return {
@@ -1002,3 +1094,215 @@ def cash_movement_create(ctx, payload):
         'server_ids': {'cash_movement': str(movement.id)},
         'authoritative': CashMovementDetailSerializer(movement).data,
     }
+
+
+# ----------------------------------------------- transitions du livre de caisse
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ LES SIX GESTES PASSENT PAR LES SERVICES DU BACK-OFFICE.                  │
+# │                                                                          │
+# │ Ils vivaient dans les vues, donc le journal n'y avait pas accès : un      │
+# │ terminal savait CRÉER une dépense et un mouvement, jamais les faire      │
+# │ avancer ni les annuler. Un refus y est déterministe - une dépense déjà   │
+# │ payée le restera - donc verdict `rejected`, jamais `retry` : réessayer   │
+# │ une approbation créerait un SECOND mouvement de caisse et le tiroir      │
+# │ sortirait deux fois la même dépense.                                     │
+# └──────────────────────────────────────────────────────────────────────────┘
+
+
+def _refus_si_impossible_cashbook(fonction, *args, **kwargs):
+    """Traduit un refus de transition de caisse en refus d'opération."""
+    from apps.cashbook.services import TransitionRefusee
+    try:
+        return fonction(*args, **kwargs)
+    except TransitionRefusee as exc:
+        raise OperationRejected(str(exc), code='transition_refused')
+
+
+def _transition_depense(ctx, payload, fonction, *args, **kwargs):
+    from apps.cashbook.models import Expense
+    from apps.cashbook.serializers import ExpenseDetailSerializer
+
+    _require(payload, 'expense')
+    depense = _objet_de_lorg(Expense, ctx, payload['expense'], 'Cette dépense')
+    _refus_si_impossible_cashbook(fonction, depense, *args, **kwargs)
+    depense.refresh_from_db()
+    return {
+        'server_ids': {'expense': str(depense.id)},
+        'authoritative': ExpenseDetailSerializer(depense).data,
+    }
+
+
+@handler('expense.submit', permission='cashbook.create_expense')
+def expense_submit(ctx, payload):
+    """Soumettre sa propre dépense : c'est l'auteur qui le fait, d'où `.create_expense`."""
+    from apps.cashbook.services import submit_expense
+    return _transition_depense(ctx, payload, submit_expense, ctx.user)
+
+
+@handler('expense.approve', permission='cashbook.approve_expense')
+def expense_approve(ctx, payload):
+    from apps.cashbook.services import approve_expense
+    return _transition_depense(ctx, payload, approve_expense, ctx.user)
+
+
+@handler('expense.reject', permission='cashbook.approve_expense')
+def expense_reject(ctx, payload):
+    from apps.cashbook.services import reject_expense
+    return _transition_depense(
+        ctx, payload, reject_expense, payload.get('reason', ''), ctx.user
+    )
+
+
+@handler('expense.pay', permission='cashbook.approve_expense')
+def expense_pay(ctx, payload):
+    from apps.cashbook.services import pay_expense
+    return _transition_depense(
+        ctx, payload, pay_expense, ctx.user,
+        payment_method_id=payload.get('payment_method'),
+        payment_reference=payload.get('payment_reference', ''),
+    )
+
+
+@handler('expense.cancel', permission='cashbook.approve_expense')
+def expense_cancel(ctx, payload):
+    from apps.cashbook.services import cancel_expense
+    return _transition_depense(
+        ctx, payload, cancel_expense, ctx.user, payload.get('reason', '')
+    )
+
+
+@handler('cash_movement.cancel', permission='cashbook.cancel_movement')
+def cash_movement_cancel(ctx, payload):
+    """
+    Annule un mouvement de tiroir. On MARQUE, on ne supprime pas : une écriture
+    comptable se contrepasse et ne se rature pas.
+    """
+    from apps.cashbook.models import CashMovement
+    from apps.cashbook.serializers import CashMovementDetailSerializer
+    from apps.cashbook.services import cancel_cash_movement
+
+    _require(payload, 'movement')
+    mouvement = _objet_de_lorg(
+        CashMovement, ctx, payload['movement'], 'Ce mouvement de caisse',
+    )
+    _refus_si_impossible_cashbook(
+        cancel_cash_movement, mouvement, ctx.user, payload.get('reason', ''),
+    )
+    mouvement.refresh_from_db()
+    return {
+        'server_ids': {'cash_movement': str(mouvement.id)},
+        'authoritative': CashMovementDetailSerializer(mouvement).data,
+    }
+
+
+def _categorie_de_caisse(ctx, payload, ecriture, lecture):
+    """
+    Une catégorie de recette ou de dépense, par les serializers du back-office.
+
+    ⚠ DEUX serializers, et il en faut deux : le back-office écrit par
+    `…CreateSerializer` et rend par `…DetailSerializer`. Un seul nom pour les
+    deux rôles est exactement l'erreur qui a fait boucler cet acte (voir
+    `test_handler_imports.py`).
+
+    ⚠ Aucun `slug` n'est fabriqué ici, contrairement aux catégories de
+    produits : `IncomeCategory` et `ExpenseCategory` n'en portent pas. Le
+    `code` est facultatif côté serveur, et le laisser vide est ce que fait le
+    back-office quand le marchand ne le renseigne pas.
+    """
+    local_id = payload.pop('id', None)
+    serializer = ecriture(data=payload, context={'request': ctx.request})
+    serializer.is_valid(raise_exception=True)
+    categorie = _sauver_avec_audit(ctx, serializer, local_id)
+    return categorie, lecture(categorie).data
+
+
+@handler('income_category.create', permission='cashbook.manage_categories')
+def income_category_create(ctx, payload):
+    from apps.cashbook.serializers import (
+        IncomeCategoryCreateSerializer, IncomeCategoryDetailSerializer,
+    )
+    categorie, rendu = _categorie_de_caisse(
+        ctx, payload, IncomeCategoryCreateSerializer, IncomeCategoryDetailSerializer,
+    )
+    return {
+        'server_ids': {'income_category': str(categorie.id)},
+        'authoritative': rendu,
+    }
+
+
+@handler('expense_category.create', permission='cashbook.manage_categories')
+def expense_category_create(ctx, payload):
+    from apps.cashbook.serializers import (
+        ExpenseCategoryCreateSerializer, ExpenseCategoryDetailSerializer,
+    )
+    categorie, rendu = _categorie_de_caisse(
+        ctx, payload, ExpenseCategoryCreateSerializer, ExpenseCategoryDetailSerializer,
+    )
+    return {
+        'server_ids': {'expense_category': str(categorie.id)},
+        'authoritative': rendu,
+    }
+
+
+def _categorie_de_caisse_update(ctx, payload, modele, ecriture, lecture, cle, quoi):
+    """
+    Renommer une catégorie de caisse, changer sa couleur, ou la désactiver.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ LE SERIALIZER EST LE `Create`, ET C'EST L'INVERSE DES PRODUITS.         │
+    │                                                                          │
+    │ `category.update` impose `CategoryDetailSerializer` parce que le         │
+    │ `CategoryCreateSerializer` des PRODUITS vérifie l'unicité du nom SANS    │
+    │ exclure la fiche modifiée : une catégorie s'y refuserait elle-même à     │
+    │ chaque enregistrement portant son propre nom.                            │
+    │                                                                          │
+    │ Ici c'est le contraire, et recopier ce motif « par symétrie » serait le  │
+    │ défaut. `IncomeCategoryCreateSerializer.validate` porte déjà son         │
+    │ `exclude(pk=self.instance.pk)`, et c'est LUI que                          │
+    │ `IncomeCategoryViewSet.get_serializer_class` retient pour                │
+    │ `partial_update`. Passer au `…DetailSerializer`, qui n'a AUCUN           │
+    │ `validate()`, sauterait le contrôle d'unicité : un nom déjà pris lèverait│
+    │ un `IntegrityError` non rattrapé, donc un verdict `rejected` dont le     │
+    │ détail est le texte brut de PostgreSQL. Deux tests l'épinglent, dans les │
+    │ deux sens.                                                               │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ⚠ PAS DE SUPPRESSION, et ce n'est pas un renoncement. `ExpenseCategory` est
+    `PROTECT`-référencée par `Expense` (supprimer une catégorie utilisée lève
+    `ProtectedError`), `IncomeCategory` est `SET_NULL` (la suppression réussit
+    et orpheline l'historique en silence), et surtout AUCUNE des deux tables
+    n'émet de pierre tombale au tirage : une suppression côté serveur
+    n'atteindrait jamais un terminal, où la catégorie resterait listée et
+    proposée à la saisie, pour toujours. `is_active` est le levier juste - il
+    retire la rubrique des formulaires sans toucher à l'historique.
+    """
+    return _referentiel_update(
+        ctx, payload, modele, ecriture, cle, quoi, lecture=lecture,
+    )
+
+
+@handler('income_category.update', permission='cashbook.manage_categories')
+def income_category_update(ctx, payload):
+    from apps.cashbook.models import IncomeCategory
+    from apps.cashbook.serializers import (
+        IncomeCategoryCreateSerializer, IncomeCategoryDetailSerializer,
+    )
+    return _categorie_de_caisse_update(
+        ctx, payload, IncomeCategory,
+        IncomeCategoryCreateSerializer, IncomeCategoryDetailSerializer,
+        'income_category', "Ce type d'entrée",
+    )
+
+
+@handler('expense_category.update', permission='cashbook.manage_categories')
+def expense_category_update(ctx, payload):
+    from apps.cashbook.models import ExpenseCategory
+    from apps.cashbook.serializers import (
+        ExpenseCategoryCreateSerializer, ExpenseCategoryDetailSerializer,
+    )
+    return _categorie_de_caisse_update(
+        ctx, payload, ExpenseCategory,
+        ExpenseCategoryCreateSerializer, ExpenseCategoryDetailSerializer,
+        'expense_category', "Cette catégorie de dépense",
+    )
