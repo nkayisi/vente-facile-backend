@@ -21,10 +21,20 @@ from rest_framework.views import exception_handler as drf_exception_handler
 from rest_framework.response import Response
 from rest_framework import status
 
+from apps.core.exceptions import AbonnementRequis
+
 logger = logging.getLogger("apps.api")
 
 
 def api_exception_handler(exc, context):
+    # ⚠ AVANT la délégation, et c'est obligatoire : DRF fait traverser tout
+    # détail dictionnaire par `_get_error_details`, qui convertit en CHAÎNES
+    # les booléens et les nombres. `is_blocked: True` sortirait `"True"`, et un
+    # client qui le compare à `true` lirait un corps qui a l'air juste. Le
+    # corps de ce refus est donc rendu brut, tel que l'exception l'a composé.
+    if isinstance(exc, AbonnementRequis):
+        return Response(exc.payload, status=exc.status_code)
+
     response = drf_exception_handler(exc, context)
 
     if response is not None:

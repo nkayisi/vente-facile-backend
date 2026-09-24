@@ -376,10 +376,16 @@ class SubscriptionGateTests(_OperationsBaseTest):
     def _expirer_abonnement(self):
         from django.utils import timezone
         from apps.subscriptions.models import Subscription
+        from apps.subscriptions.services import SubscriptionService
         Subscription.objects.filter(organization=self.org).update(
             status=Subscription.Status.EXPIRED,
             current_period_end=timezone.now() - __import__('datetime').timedelta(days=1),
         )
+        # ⚠ `queryset.update()` ne déclenche aucun signal, donc le cache de
+        # blocage (~60 s) n'est PAS invalidé. Sans cette purge, un test qui a
+        # déjà fait une requête pour cette organisation verrait le verdict
+        # d'avant l'expiration, et passerait pour la mauvaise raison.
+        SubscriptionService.invalidate_org_cache(self.org.id)
 
     def test_pull_still_works_with_an_expired_subscription(self):
         self._expirer_abonnement()
@@ -393,11 +399,17 @@ class SubscriptionGateTests(_OperationsBaseTest):
         resp = self._send([
             self._op('sale.create', self._cart(), 'ffff6666-0000-4000-8000-000000000001')
         ])
-        # 403, comme partout ailleurs sur la plateforme : c'est ce que rend
-        # `HasActiveSubscription`, et `SaleViewSet` répond la même chose. Un 402
-        # serait plus parlant, mais s'en écarter ici ferait de cet endpoint le
-        # seul à répondre autrement.
-        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        # 402, comme partout ailleurs sur la plateforme : c'est ce que rend
+        # `HasActiveSubscription` depuis qu'elle lève `SubscriptionRequired`.
+        # Cet endpoint répondait 403 avec les autres, et le motif écrit ici
+        # était de ne pas être « le seul à répondre autrement » ; le changement
+        # étant uniforme, ce motif a disparu.
+        #
+        # Le code compte autant que le statut : c'est lui qui permet au terminal
+        # de ranger le lot en `blocked` - conservé, non réessayé - au lieu de le
+        # remettre en attente à chaque cycle pendant des semaines.
+        self.assertEqual(resp.status_code, status.HTTP_402_PAYMENT_REQUIRED)
+        self.assertEqual(resp.data['code'], 'subscription_required')
         self.assertIn('abonnement', str(resp.data).lower())
         self.assertEqual(Sale.objects.count(), 0)
 

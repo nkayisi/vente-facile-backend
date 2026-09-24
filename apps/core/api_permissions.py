@@ -128,25 +128,65 @@ class IsTenantManager(permissions.BasePermission):
 
 class HasActiveSubscription(permissions.BasePermission):
     """
-    Vérifie que l'organisation a un abonnement actif.
-    Bloque les opérations d'écriture si l'abonnement est inactif.
+    Ferme l'écriture quand l'abonnement ne la couvre plus.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ UN SEUL VERDICT POUR TOUTE LA PLATEFORME.                                │
+    │                                                                          │
+    │ Cette classe s'appuyait sur `get_active_subscription()`, dont la liste   │
+    │ `[TRIAL, ACTIVE]` EXCLUT `PAST_DUE` - c'est-à-dire la période de grâce.  │
+    │ Pendant ces jours-là, `/subscriptions/status/` annonçait « non bloqué,   │
+    │ il vous reste N jours » et le bandeau du back-office le répétait,        │
+    │ pendant que le moindre enregistrement était refusé. La grâce ne valait   │
+    │ donc rien, et c'est l'écran qui mentait.                                 │
+    │                                                                          │
+    │ Le verdict vient désormais de `get_cached_block_state`, la MÊME source   │
+    │ que l'endpoint de statut. Deux surfaces ne peuvent plus dire deux        │
+    │ choses différentes du même abonnement.                                   │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ⚠ **Le cache n'est pas un confort, il est obligatoire.**
+    `get_subscription_status` ÉCRIT en base (il bascule `PAST_DUE`/`EXPIRED`) :
+    l'appeler directement ferait un `UPDATE` à chaque requête d'écriture.
+    `get_cached_block_state` est écrit pour ce chemin chaud, caché ~60 s, et
+    invalidé par les signaux de `Subscription` et `SubscriptionPayment`.
+
+    ⚠ **`get_active_subscription()` n'est PAS modifiée** : sa liste décrit
+    « un abonnement en cours », ce qui reste juste pour ses autres appelants
+    (quotas). Elle n'a simplement jamais décrit le DROIT D'ÉCRIRE.
     """
+
     message = "Votre abonnement est inactif. Veuillez le renouveler."
 
     def has_permission(self, request, view):
-        from django.conf import settings
-        if settings.DEBUG:
-            return True
-            
+        # Lire ses propres données ne se monnaie pas : un marchand impayé doit
+        # pouvoir sortir son historique. C'est l'écriture qui se ferme. Ce
+        # contrôle passe AVANT le garde de développement : la lecture ne doit
+        # pas dépendre d'un réglage d'environnement.
         if request.method in permissions.SAFE_METHODS:
             return True
-        
+
+        # ⚠ En développement, la porte est ouverte - sinon il faudrait un
+        # abonnement valide pour coder. `SUBSCRIPTION_ENFORCE_IN_DEBUG` permet
+        # de la refermer sans toucher à `DEBUG`, qui emporterait aussi les
+        # pages d'erreur et le rechargement : c'est le seul moyen de vérifier
+        # le 402 de bout en bout sur un poste de développement.
+        from django.conf import settings
+        if settings.DEBUG and not getattr(
+            settings, 'SUBSCRIPTION_ENFORCE_IN_DEBUG', False
+        ):
+            return True
+
         membership = _get_membership(request)
         if not membership:
             return False
-        
-        subscription = membership.organization.get_active_subscription()
-        return subscription is not None and subscription.is_active
+
+        from apps.subscriptions.services import SubscriptionService
+        etat = SubscriptionService.get_cached_block_state(membership.organization)
+        if etat['is_blocked']:
+            from apps.core.exceptions import AbonnementRequis
+            raise AbonnementRequis(etat)
+        return True
 
 
 class TenantObjectPermission(permissions.BasePermission):

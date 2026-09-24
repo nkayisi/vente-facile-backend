@@ -145,6 +145,64 @@ def resolve_device(raw_token):
     )
 
 
+def subscription_payload(organization, membership):
+    """
+    L'abonnement, tel qu'un TERMINAL doit le comprendre.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ IL DESCEND PAR ICI PARCE QU'IL NE PEUT PAS DESCENDRE AILLEURS.           │
+    │                                                                          │
+    │ `/subscriptions/status/` exige la permission `subscription.view`, qui    │
+    │ n'est accordée qu'au PROPRIÉTAIRE. Or un terminal est tenu par un        │
+    │ caissier : une porte d'abonnement adossée à cet endpoint ne se           │
+    │ fermerait jamais pour la population même qu'il faut retenir. Ce chemin   │
+    │ de réveil, lui, sert tous les rôles, et il répond même quand             │
+    │ l'organisation est bloquée (`AllowAny`, jeton d'appareil) - sans quoi    │
+    │ un marchand qui vient de payer ne l'apprendrait jamais.                  │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    **`access_until` est la pièce maîtresse.** C'est la date jusqu'à laquelle le
+    serveur laisserait écrire, grâce comprise. Le terminal n'a rien d'autre à
+    comprendre : hors ligne, il la compare à son horloge et tranche seul. Sans
+    elle, un mode avion offrirait des mois gratuits, puisque le dernier verdict
+    connu resterait « non bloqué » indéfiniment.
+
+    ⚠ **On passe par `get_subscription_status` et non par le cache allégé** :
+    celui-ci ne porte ni `current_period_end` ni `grace_end`, donc pas de quoi
+    calculer `access_until`. C'est un chemin FROID - une fois par réveil de
+    session - et non le chemin chaud des requêtes d'écriture.
+    """
+    from datetime import timedelta
+
+    from apps.subscriptions.models import GlobalConfig
+    from apps.subscriptions.services import SubscriptionService
+
+    etat = SubscriptionService.get_subscription_status(organization)
+    subscription = etat.get('subscription')
+
+    access_until = None
+    if subscription is not None and subscription.current_period_end:
+        access_until = subscription.current_period_end + timedelta(
+            days=GlobalConfig.get().grace_period_days
+        )
+
+    return {
+        'is_blocked': etat['is_blocked'],
+        'status': etat['status'],
+        'message': etat.get('message'),
+        'access_until': access_until,
+        'days_remaining': etat.get('days_remaining'),
+        # Le plan EN COURS, pour que le terminal propose de le prolonger plutôt
+        # qu'un autre : on renouvelle bien plus souvent qu'on ne change d'offre.
+        'plan_id': str(subscription.plan_id) if subscription else None,
+        'plan_name': subscription.plan.name if subscription else None,
+        # Régler l'abonnement est réservé au propriétaire (`moko_initiate` est
+        # `IsTenantOwner`). Le dire ici évite d'offrir à un caissier un bouton
+        # que le serveur refusera une fois son numéro saisi.
+        'can_manage': bool(membership and membership.role == 'owner'),
+    }
+
+
 def build_session_payload(user, organization, device=None):
     """
     Tout ce qu'il faut pour travailler hors ligne, en une seule réponse.
@@ -211,6 +269,7 @@ def build_session_payload(user, organization, device=None):
         'loyalty_program': (
             LoyaltyProgramSerializer(loyalty).data if loyalty else None
         ),
+        'subscription': subscription_payload(organization, membership),
         'device': (
             {
                 'id': str(device.id),

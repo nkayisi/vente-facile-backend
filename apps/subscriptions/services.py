@@ -58,13 +58,16 @@ class SubscriptionService:
         Retourne le statut détaillé de l'abonnement d'une organisation.
         Utilisé par le middleware et l'API /subscription/status.
         """
+        # `select_related('plan')` RETIRE une requête plutôt que d'en ajouter :
+        # les appelants lisent presque tous le plan (nom, tarif, palier) juste
+        # après, et la charge de session en a désormais besoin.
         subscription = organization.subscriptions.filter(
             status__in=[
                 Subscription.Status.TRIAL,
                 Subscription.Status.ACTIVE,
                 Subscription.Status.PAST_DUE,
             ]
-        ).order_by('-created_at').first()
+        ).select_related('plan').order_by('-created_at').first()
 
         now = timezone.now()
         config = GlobalConfig.get()
@@ -412,6 +415,49 @@ class SubscriptionService:
 
         period_end = sub.current_period_end
         if period_end and now < period_end:
+            # ┌──────────────────────────────────────────────────────────────┐
+            # │ UN ESSAI N'EST PAS UNE PÉRIODE PAYÉE.                       │
+            # │                                                              │
+            # │ La règle « seul un palier strictement supérieur » existe     │
+            # │ pour empêcher un marchand de changer d'offre au milieu d'un  │
+            # │ mois qu'il a déjà réglé. Appliquée à un ESSAI, elle          │
+            # │ interdisait de souscrire quoi que ce soit : le plan d'essai  │
+            # │ et le premier plan payant partagent le palier 1, donc aucun  │
+            # │ plan n'était « strictement supérieur ».                      │
+            # │                                                              │
+            # │ Conséquence mesurée : personne ne pouvait convertir son      │
+            # │ essai avant son terme. Il fallait attendre l'expiration,     │
+            # │ se faire bloquer, et payer seulement là - alors que le       │
+            # │ bandeau du back-office promet « Passer au payant » pendant   │
+            # │ tout l'essai, et que le terminal ferme désormais sa porte à  │
+            # │ l'échéance.                                                  │
+            # └──────────────────────────────────────────────────────────────┘
+            if sub.is_trial:
+                if mode == SubscriptionService.CHECKOUT_MODE_EXTEND:
+                    return {
+                        'allowed': False,
+                        'reason_code': 'SUBSCRIPTION_TRIAL_NOT_EXTENDABLE',
+                        'message': (
+                            "Un essai ne se prolonge pas. Choisissez un plan payant "
+                            "pour continuer après son terme."
+                        ),
+                        'checkout_mode': mode,
+                    }
+                # ⚠ Le plan visé doit être PAYANT : sans ce contrôle, on
+                # autoriserait à relancer un essai gratuit par-dessus un essai
+                # en cours, indéfiniment.
+                if target_plan.price_monthly > 0 or target_plan.price_yearly > 0:
+                    return {
+                        'allowed': True, 'reason_code': None,
+                        'message': None, 'checkout_mode': mode,
+                    }
+                return {
+                    'allowed': False,
+                    'reason_code': 'SUBSCRIPTION_TRIAL_ALREADY_RUNNING',
+                    'message': "Un essai est déjà en cours.",
+                    'checkout_mode': mode,
+                }
+
             if target_plan.id == sub.plan.id:
                 if mode == SubscriptionService.CHECKOUT_MODE_EXTEND:
                     return {'allowed': True, 'reason_code': None, 'message': None, 'checkout_mode': mode}

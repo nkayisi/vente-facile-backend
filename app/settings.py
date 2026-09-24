@@ -392,6 +392,17 @@ CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
 
 REDIS_URL = config('REDIS_URL', default='redis://127.0.0.1:6379/1')
 TOKEN_CACHE_TTL = config('TOKEN_CACHE_TTL', default=3600, cast=int)
+
+# Refermer la porte d'abonnement en développement.
+#
+# `HasActiveSubscription` s'ouvre sous `DEBUG` : sans cela il faudrait un
+# abonnement valide pour coder. Mais le refus 402 est alors invérifiable en
+# local, et c'est lui qui fait ranger les opérations du terminal en `blocked`
+# plutôt qu'en attente indéfinie. Poser cette variable referme la porte SANS
+# toucher à `DEBUG`, qui emporterait les pages d'erreur et le rechargement.
+SUBSCRIPTION_ENFORCE_IN_DEBUG = config(
+    'SUBSCRIPTION_ENFORCE_IN_DEBUG', default=False, cast=bool
+)
 PENDING_META_TTL_SECONDS = config(
     'PENDING_META_TTL_SECONDS',
     default=172800,
