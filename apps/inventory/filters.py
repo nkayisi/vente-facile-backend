@@ -16,7 +16,9 @@ import django_filters
 from django.db.models import F, Q
 from django.utils import timezone
 
-from .models import Stock, StockMovement
+from .models import (
+    InventorySession, Stock, StockAdjustment, StockMovement, StockTransfer,
+)
 
 #: Types de mouvement qui font ENTRER de la marchandise.
 #: Repris de ``models.STOCK_IN_MOVEMENT_TYPES`` pour rester une seule vérité.
@@ -179,12 +181,18 @@ class StockMovementFilter(django_filters.FilterSet):
     month = django_filters.CharFilter(method='filter_month')
     search = django_filters.CharFilter(method='filter_search')
     created_by = django_filters.UUIDFilter(field_name='created_by_id')
+    #: Alias canonique de `created_by`. Un seul nom de paramètre sur toute
+    #: l'application - `user` - évite une table de correspondance par écran,
+    #: donc un écran qui en manquera. `created_by` reste : le back-office
+    #: l'emploie déjà.
+    user = django_filters.UUIDFilter(field_name='created_by_id')
 
     class Meta:
         model = StockMovement
         fields = [
             'warehouse', 'product', 'variant', 'category', 'movement_type',
             'reference_type', 'direction', 'date_from', 'date_to', 'month',
+            'created_by', 'user',
         ]
 
     def filter_movement_type(self, queryset, name, value):
@@ -242,3 +250,56 @@ class StockMovementFilter(django_filters.FilterSet):
             | Q(product__sku__icontains=value)
             | Q(notes__icontains=value)
         )
+
+
+class StockTransferFilter(django_filters.FilterSet):
+    """
+    Filtres de la liste des transferts.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ SÉMANTIQUE **OU**, JAMAIS ET.                                           │
+    │                                                                          │
+    │ Un transfert relie DEUX entrepôts. Le borner sur la seule source         │
+    │ cacherait au magasinier de destination exactement ce qu'il doit          │
+    │ réceptionner - c'est déjà le raisonnement du manifeste de tirage, où     │
+    │ `stock_transfers` n'est volontairement pas borné par `warehouse_path`.   │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
+    warehouse = django_filters.UUIDFilter(method='filter_warehouse')
+    user = django_filters.UUIDFilter(field_name='requested_by_id')
+
+    class Meta:
+        model = StockTransfer
+        fields = ['status', 'source_warehouse', 'destination_warehouse']
+
+    def filter_warehouse(self, queryset, name, value):
+        return queryset.filter(
+            Q(source_warehouse_id=value) | Q(destination_warehouse_id=value)
+        )
+
+
+class StockAdjustmentFilter(django_filters.FilterSet):
+    """Filtres de la liste des ajustements."""
+
+    user = django_filters.UUIDFilter(field_name='created_by_id')
+
+    class Meta:
+        model = StockAdjustment
+        fields = ['status', 'adjustment_type', 'warehouse']
+
+
+class InventorySessionFilter(django_filters.FilterSet):
+    """
+    Filtres de la liste des sessions d'inventaire.
+
+    `user` vise le CRÉATEUR de la session. Une feuille de comptage porte bien un
+    `counted_by` par ligne, mais filtrer une session sur qui a compté l'une de
+    ses lignes rendrait une liste qu'aucun total n'explique.
+    """
+
+    user = django_filters.UUIDFilter(field_name='created_by_id')
+
+    class Meta:
+        model = InventorySession
+        fields = ['status', 'scope_type', 'warehouse']

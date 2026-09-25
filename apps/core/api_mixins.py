@@ -22,8 +22,65 @@ class TenantViewSetMixin:
     - Attribue automatiquement l'organization lors de la création
     - Attribue les permissions guardian lors de la création
     - Gère le soft delete si le modèle le supporte
+    - REFUSE un `warehouse`/`user` hors périmètre, au lieu de rendre vide
     """
-    
+
+    def filter_queryset(self, queryset):
+        """
+        Le point UNIQUE où un identifiant hors périmètre est refusé.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ LA DOCTRINE ÉTAIT ÉCRITE, ET ONZE `FilterSet` NE LA SUIVAIENT PAS.  │
+        │                                                                      │
+        │ `warehouse_scope` la pose noir sur blanc : « UN IDENTIFIANT HORS     │
+        │ PÉRIMÈTRE LÈVE, IL NE REND JAMAIS UN ENSEMBLE VIDE. Rendre zéro      │
+        │ ligne ferait lire "ce caissier n'a rien vendu" là où la vérité est   │
+        │ "vous n'avez pas le droit de le regarder". » Seuls les rapports et   │
+        │ le tableau de bord l'appliquaient ; les listes rendaient vide, et le │
+        │ marchand ne pouvait pas distinguer les deux.                         │
+        │                                                                      │
+        │ ⚠ ICI, ET NON DANS UN `FilterSet` DE BASE : celui-ci ne couvrirait   │
+        │ que les onze qui en héritent, et laisserait dehors les              │
+        │ `filterset_fields` déclarés à la main (achats, emplacements,        │
+        │ activité). Ici, chaque vue tenant est couverte - et les exports      │
+        │ avec elle, `ExportableListMixin.export` appelant `filter_queryset`.  │
+        └──────────────────────────────────────────────────────────────────────┘
+        """
+        from apps.core.warehouse_scope import (
+            assert_user_allowed_for_membership,
+            assert_warehouse_allowed_for_membership,
+            get_membership_for_request,
+        )
+
+        membership = get_membership_for_request(self.request)
+        # ⚠ Un périmètre qu'on ne sait pas résoudre n'est pas « aucun
+        # périmètre » : on ne valide alors rien, et la vue applique sa propre
+        # borne. Lever ici refuserait des appels que `IsTenantMember` a déjà
+        # laissés passer.
+        if membership is not None:
+            params = self.request.query_params
+            entrepot = params.get('warehouse')
+            if entrepot and self._filtre_declare('warehouse'):
+                assert_warehouse_allowed_for_membership(membership, entrepot)
+            utilisateur = params.get('user')
+            if utilisateur and self._filtre_declare('user'):
+                assert_user_allowed_for_membership(membership, utilisateur)
+
+        return super().filter_queryset(queryset)
+
+    def _filtre_declare(self, cle):
+        """
+        La vue déclare-t-elle ce filtre ?
+
+        ⚠ Sans ce contrôle, un `?user=` posé sur une vue qui n'en fait rien
+        serait refusé alors qu'il est simplement ignoré : l'appelant
+        chercherait un défaut de droit là où il n'y a qu'un paramètre de trop.
+        """
+        filterset = getattr(self, 'filterset_class', None)
+        if filterset is not None and cle in getattr(filterset, 'base_filters', {}):
+            return True
+        return cle in (getattr(self, 'filterset_fields', None) or ())
+
     def get_organization(self):
         """
         Récupère l'organisation depuis le header X-Organization-ID.

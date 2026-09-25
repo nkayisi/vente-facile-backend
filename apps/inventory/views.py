@@ -33,7 +33,10 @@ from .models import (
     StockTransfer, StockTransferItem, StockAdjustment, StockAdjustmentItem,
     InventorySession, InventoryCount, STOCK_IN_MOVEMENT_TYPES
 )
-from .filters import StockFilter, StockMovementFilter
+from .filters import (
+    InventorySessionFilter, StockAdjustmentFilter, StockFilter,
+    StockMovementFilter, StockTransferFilter,
+)
 from .report_params import build_export_context
 from .serializers import (
     WarehouseListSerializer, WarehouseDetailSerializer, WarehouseCreateSerializer,
@@ -651,7 +654,7 @@ class StockTransferViewSet(TransitionActionMixin, TenantViewSetMixin, AuditMixin
     queryset = StockTransfer.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission, TenantObjectPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['status', 'source_warehouse', 'destination_warehouse']
+    filterset_class = StockTransferFilter
     search_fields = ['reference']
     ordering = ['-requested_at']
     
@@ -739,7 +742,7 @@ class StockAdjustmentViewSet(TransitionActionMixin, WarehouseScopedQuerysetMixin
     queryset = StockAdjustment.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission, TenantObjectPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['status', 'adjustment_type', 'warehouse']
+    filterset_class = StockAdjustmentFilter
     search_fields = ['reference', 'reason']
     ordering = ['-created_at']
     
@@ -818,7 +821,7 @@ class InventorySessionViewSet(ExportResponseMixin, TransitionActionMixin,
     queryset = InventorySession.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission, TenantObjectPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['status', 'scope_type', 'warehouse']
+    filterset_class = InventorySessionFilter
     search_fields = ['reference', 'name']
     ordering = ['-created_at']
     

@@ -19,6 +19,7 @@ terminal resté trois semaines dans le noir, et il doit tenir en une requête,
 parce que la connexion qui vient de revenir peut repartir.
 """
 from django.db import IntegrityError, transaction
+from django.db.models import Prefetch
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema
 from rest_framework import serializers, status, viewsets
@@ -203,6 +204,113 @@ def subscription_payload(organization, membership):
     }
 
 
+#: Plafond du roster descendu dans la session.
+#:
+#: Une liste non bornée dans une réponse servie à CHAQUE réveil, sur une 2G
+#: congolaise, est la façon dont un démarrage à froid devient un délai d'attente.
+#: Au-delà, `truncated` le dit : une organisation de cinq cents comptes n'utilise
+#: pas un sélecteur déroulant, elle a besoin d'une recherche serveur.
+MAX_MEMBRES_EQUIPE = 200
+
+
+def build_team_payload(organization, membership):
+    """
+    L'équipe, telle qu'un filtre « Utilisateur » a besoin de la connaître.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ UN SEUL CONSTRUCTEUR, DEUX PORTES.                                      │
+    │                                                                          │
+    │ La session (terminal) et `GET /memberships/team/` (back-office) rendent  │
+    │ EXACTEMENT ce payload. Deux constructions finiraient par proposer deux   │
+    │ listes d'utilisateurs pour le même entrepôt, et le marchand n'aurait     │
+    │ aucun moyen de savoir laquelle croire.                                   │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ `visible` EST EXPLICITE, JAMAIS DÉDUIT D'UNE LISTE VIDE.                │
+    │                                                                          │
+    │ C'est ce qui permet au client de distinguer « roster inconnu » (un       │
+    │ instantané mis en cache avant ce lot n'a pas la clé) de « roster vide ». │
+    │ Lire l'un pour l'autre afficherait « aucun collègue » à un propriétaire  │
+    │ qui en a cinquante : `null` ne se lit jamais comme zéro.                 │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    La borne est le RÔLE, pas `users.view` : cette permission n'est accordée
+    qu'au propriétaire et au gérant, or la règle donne le filtre utilisateur au
+    MAGASINIER aussi. Un caissier, lui, n'en a aucun usage - ses deux filtres
+    sont verrouillés sur lui-même - et son terminal est le plus exposé du parc.
+
+    ⚠ Ni email, ni téléphone : un sélecteur a besoin d'un NOM, et ce payload
+    part à chaque réveil. Les identifiants d'entrepôt voyagent nus, leurs noms
+    descendant déjà par la table `warehouses` du tirage.
+    """
+    from apps.core.warehouse_scope import membership_targets_q
+    from apps.inventory.models import Warehouse
+    from apps.organizations.models import OrganizationMembership
+
+    if membership is None or membership.role == OrganizationMembership.Role.CASHIER:
+        return {'visible': False, 'truncated': False, 'members': []}
+
+    # DEUX requêtes, constantes quel que soit l'effectif. Un
+    # `assigned_warehouses` par membre en coûterait 1+N, soit cinquante et une
+    # pour cinquante employés, à chaque réveil de chaque terminal.
+    lignes = (
+        OrganizationMembership.objects
+        .filter(organization=organization, is_active=True)
+        .select_related('user')
+        .prefetch_related(Prefetch(
+            'assigned_warehouses',
+            queryset=Warehouse.objects.filter(is_deleted=False).only('id'),
+        ))
+    )
+
+    # ┌──────────────────────────────────────────────────────────────────────────┐
+    # │ ON NE PROPOSE QUE CE QUE LA VALIDATION ACCEPTERA.                       │
+    # │                                                                          │
+    # │ Le roster rendait TOUS les membres actifs, sans aucune intersection      │
+    # │ avec le périmètre du demandeur : un gérant en choisissait un hors de     │
+    # │ ses dépôts, et `assert_user_allowed_for_membership` rendait 400 sur un   │
+    # │ nom que l'application venait de lui proposer. Le prédicat est donc       │
+    # │ le MÊME des deux côtés, et il vit dans `warehouse_scope`.                │
+    # │                                                                          │
+    # │ ⚠ LA BORNE EST EN SQL, ET AVANT LE PLAFOND. Filtrer en Python après la   │
+    # │ tranche ferait disparaître les collègues d'un gérant dès que            │
+    # │ l'organisation dépasse deux cents comptes - un défaut qui ne se voit     │
+    # │ qu'à cette taille-là.                                                    │
+    # │                                                                          │
+    # │ ⚠ `.distinct()` : le prédicat traverse un M2M, et un membre affecté à    │
+    # │ deux de mes dépôts sortirait en double, donc compterait deux fois        │
+    # │ contre le plafond.                                                       │
+    # └──────────────────────────────────────────────────────────────────────────┘
+    cibles = membership_targets_q(membership)
+    if cibles is not None:
+        lignes = lignes.filter(cibles).distinct()
+
+    lignes = list(
+        lignes
+        .order_by('user__first_name', 'user__last_name', 'user__email')
+        [: MAX_MEMBRES_EQUIPE + 1]
+    )
+    truncated = len(lignes) > MAX_MEMBRES_EQUIPE
+    lignes = lignes[:MAX_MEMBRES_EQUIPE]
+
+    return {
+        'visible': True,
+        'truncated': truncated,
+        'members': [
+            {
+                'user_id': str(m.user_id),
+                # Un nom vide rendrait une ligne muette dans le sélecteur ;
+                # l'email est le seul repli qui identifie encore quelqu'un.
+                'name': (m.user.full_name or '').strip() or m.user.email,
+                'role': m.role,
+                'warehouses': [str(w.id) for w in m.assigned_warehouses.all()],
+            }
+            for m in lignes
+        ],
+    }
+
+
 def build_session_payload(user, organization, device=None):
     """
     Tout ce qu'il faut pour travailler hors ligne, en une seule réponse.
@@ -229,8 +337,10 @@ def build_session_payload(user, organization, device=None):
         permissions = PermissionService.get_effective_permissions(membership)
         warehouses = [
             {'id': str(w.id), 'name': w.name}
-            for w in membership.assigned_warehouses.all()
+            for w in membership.assigned_warehouses.filter(is_deleted=False)
         ]
+
+    team = build_team_payload(organization, membership)
 
     currencies = OrganizationCurrency.objects.filter(
         organization=organization, is_active=True
@@ -262,6 +372,9 @@ def build_session_payload(user, organization, device=None):
             'permissions': permissions,
             'assigned_warehouses': warehouses,
         },
+        # Sœur de `membership`, et non dedans : `membership` décrit le PORTEUR,
+        # `team` décrit l'organisation.
+        'team': team,
         'settings': (
             OrganizationSettingsSerializer(settings_row).data if settings_row else None
         ),

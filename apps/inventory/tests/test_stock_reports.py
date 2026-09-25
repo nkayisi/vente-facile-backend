@@ -486,13 +486,14 @@ class ExportEndpointTests(_StockReportSetup):
         membership.assigned_warehouses.set([self.warehouse])
 
         self.client.force_authenticate(user=keeper)
+        # ⚠ REFUSÉ, et non rendu vide : zéro ligne se lirait « ce dépôt est
+        # vide » là où la vérité est « vous n'y avez pas accès ». C'est la
+        # doctrine de `warehouse_scope`, que les listes ne suivaient pas.
         spec_resp = self.client.get(
             '/api/v1/stocks/?warehouse=' + str(other.id), **self._headers,
         )
-        results = (
-            spec_resp.data['results'] if 'results' in spec_resp.data else spec_resp.data
-        )
-        self.assertEqual(len(results), 0, "l'entrepôt non assigné doit rester invisible")
+        self.assertEqual(spec_resp.status_code, 400, spec_resp.data)
+        self.assertIn('warehouse', spec_resp.data)
 
         resp = self.client.get(
             '/api/v1/stocks/export/?export_format=pdf', **self._headers,

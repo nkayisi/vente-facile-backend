@@ -46,6 +46,37 @@ def _premier_du_mois_recule(jour, mois):
     return date(rang // 12, rang % 12 + 1, 1)
 
 
+def _cle_de_perimetre(membership, entrepot_voulu, utilisateur_voulu):
+    """
+    L'empreinte du périmètre EFFECTIF, pour la clé de cache du tableau de bord.
+
+    Elle se bâtit sur ce qui borne réellement la lecture - le rôle, croisé avec
+    le filtre volontaire - jamais sur les paramètres bruts de la requête :
+    `?warehouse=` vide et l'absence de paramètre donneraient sinon deux clés
+    pour une seule réponse, et un paramètre que le code ignore forkerait le
+    cache sans forker les données.
+
+    Condensée, parce qu'une clé de cache a une longueur bornée (250 caractères
+    chez memcached) et que vingt entrepôts à 36 caractères la dépassent.
+    """
+    from hashlib import blake2s
+
+    from apps.core.warehouse_scope import accessible_warehouse_ids
+
+    role = membership.role if membership else 'anonyme'
+    ids = accessible_warehouse_ids(membership) if membership else []
+    # `None` (aucune restriction) et `[]` (aucun accès) sont deux situations
+    # opposées : les écrire pareil ferait servir la réponse du propriétaire à
+    # un membre qui n'a droit à rien.
+    portee = 'tous' if ids is None else ','.join(sorted(str(i) for i in ids))
+    # Le caissier est borné par son identité, jamais par ses entrepôts : sans
+    # elle dans la clé, deux caissiers du même dépôt partageraient un total.
+    qui = str(membership.user_id) if membership else ''
+
+    brut = f"{role}|{portee}|{qui}|{entrepot_voulu or ''}|{utilisateur_voulu or ''}"
+    return blake2s(brut.encode('utf-8'), digest_size=8).hexdigest()
+
+
 def _periode_glissante(period, today):
     """
     Bornes du tableau de bord : ``(début, début précédent, fin précédente)``.
@@ -266,14 +297,95 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         from apps.inventory.models import Stock
         from apps.cashbook.services import primary_sum
         from apps.settings.services import CurrencyService
+        from apps.core.warehouse_scope import (
+            assert_user_allowed_for_membership,
+            assert_warehouse_allowed_for_membership,
+            filter_queryset_by_warehouse_ids,
+            membership_for_organization,
+            restrict_visibility_for_membership,
+        )
 
         organization = self.get_object()
         period = request.query_params.get('period', 'month')  # day, week, month, year
 
-        # Cache court (60s) du payload dashboard par (org, période) : le dashboard
-        # est rafraîchi souvent et ces agrégations sont lourdes. Une péremption de
-        # 60s est acceptable pour des statistiques.
-        cache_key = f"vf:dash:{organization.id}:{period}"
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ LE MEMBERSHIP SE RÉSOUT PAR L'URL, PAS PAR L'EN-TÊTE.           │
+        # │                                                                  │
+        # │ `getDashboardStats` du back-office ne pose que `Authorization` : │
+        # │ sans `X-Organization-ID`, `_get_membership` rend `None`, et      │
+        # │ `restrict_visibility_for_membership(qs, None, ...)` rend le      │
+        # │ queryset INTACT. Brancher le helper habituel laisserait donc ce  │
+        # │ tableau de bord ouvert à tous, tout en faisant passer un test    │
+        # │ qui, lui, envoie l'en-tête.                                      │
+        # └──────────────────────────────────────────────────────────────────┘
+        membership = membership_for_organization(request, organization)
+        if membership is None:
+            # `get_queryset` borne déjà aux organisations du demandeur, donc le
+            # cas est théorique. Raison de plus pour qu'il échoue BRUYAMMENT :
+            # un périmètre qu'on ne sait pas résoudre n'est pas « aucun
+            # périmètre », c'est un refus.
+            return Response(
+                {'detail': "Vous n'êtes pas membre de cette organisation."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        entrepot_voulu = request.query_params.get('warehouse') or None
+        utilisateur_voulu = request.query_params.get('user') or None
+        # Refuser, jamais ignorer : un entrepôt hors périmètre retiré en silence
+        # rendrait un écran qui affiche « Entrepôt B » au-dessus des chiffres de A.
+        if entrepot_voulu:
+            assert_warehouse_allowed_for_membership(membership, entrepot_voulu)
+        assert_user_allowed_for_membership(membership, utilisateur_voulu)
+
+        def borner_ventes(queryset):
+            """Périmètre du rôle, puis filtre volontaire. Dans cet ordre."""
+            queryset = restrict_visibility_for_membership(
+                queryset,
+                membership,
+                warehouse_field='warehouse_id',
+                creator_field='sold_by',
+                # Même tolérance que `SaleViewSet` pour les ventes anciennes sans
+                # entrepôt, donc mêmes chiffres des deux côtés.
+                include_null_warehouse=True,
+            )
+            # ⚠ Le filtre VOLONTAIRE n'hérite pas du `| isnull` ci-dessus : sinon
+            # les mêmes ventes sans entrepôt entreraient dans le total de CHAQUE
+            # dépôt, et la somme des dépôts dépasserait le total.
+            if entrepot_voulu:
+                queryset = queryset.filter(warehouse_id=entrepot_voulu)
+            if utilisateur_voulu:
+                queryset = queryset.filter(sold_by_id=utilisateur_voulu)
+            return queryset
+
+        def borner_stocks(queryset):
+            """Le stock n'a pas d'auteur : l'utilisateur voulu y est IGNORÉ.
+
+            Rendre `.none()` ferait lire « aucun stock » parce qu'un filtre
+            d'un autre écran a traîné, ce qui se lit comme une perte de données.
+            """
+            queryset = filter_queryset_by_warehouse_ids(queryset, membership)
+            if entrepot_voulu:
+                queryset = queryset.filter(warehouse_id=entrepot_voulu)
+            return queryset
+
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ LE PÉRIMÈTRE ENTRE DANS LA CLÉ DE CACHE, SINON LE CORRECTIF EST │
+        # │ PIRE QUE LE MAL.                                                 │
+        # │                                                                  │
+        # │ Le payload est partagé 60 s. Sans cette clé, un caissier lirait  │
+        # │ le total du propriétaire SOUS L'ÉTIQUETTE « vos ventes » - une   │
+        # │ fuite plus trompeuse que celle qu'on vient de fermer.            │
+        # │                                                                  │
+        # │ La clé se bâtit sur le périmètre EFFECTIF, jamais sur les        │
+        # │ paramètres bruts : `?warehouse=` vide et l'absence de paramètre   │
+        # │ donneraient sinon deux clés pour une seule réponse. Et elle se   │
+        # │ condense : vingt entrepôts à 36 caractères dépassent la limite   │
+        # │ de 250 caractères d'une clé memcached.                           │
+        # └──────────────────────────────────────────────────────────────────┘
+        cache_key = (
+            f"vf:dash:{organization.id}:{period}:"
+            f"{_cle_de_perimetre(membership, entrepot_voulu, utilisateur_voulu)}"
+        )
         cached_payload = cache.get(cache_key)
         if cached_payload is not None:
             return Response(cached_payload)
@@ -289,13 +401,13 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         primary_currency = CurrencyService.primary_code(organization)
         
         # Ventes période actuelle
-        current_sales = Sale.objects.filter(
+        current_sales = borner_ventes(Sale.objects.filter(
             organization=organization,
             status='completed',
             is_deleted=False,
             sale_date__date__gte=current_start,
             sale_date__date__lte=today
-        )
+        ))
         
         # ┌──────────────────────────────────────────────────────────────────┐
         # │ LE TABLEAU DE BORD EST UN ÉCRAN EN DEVISE PRINCIPALE.            │
@@ -342,13 +454,13 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         )
         
         # Ventes période précédente
-        previous_sales = Sale.objects.filter(
+        previous_sales = borner_ventes(Sale.objects.filter(
             organization=organization,
             status='completed',
             is_deleted=False,
             sale_date__date__gte=previous_start,
             sale_date__date__lte=previous_end
-        )
+        ))
         
         # Même séparation pour la période précédente : sans elle, la VARIATION
         # comparerait un total gonflé à un autre, avec des facteurs de jointure
@@ -499,12 +611,12 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         ).order_by('-primary_total')
         
         # Stock bas
-        low_stock_count = Stock.objects.filter(
+        low_stock_count = borner_stocks(Stock.objects.filter(
             organization=organization,
             quantity__lte=F('product__reorder_point'),
             product__track_inventory=True,
             product__is_deleted=False
-        ).count()
+        )).count()
         
         # Valeur totale du stock - agrégée en base (une seule requête) au lieu de
         # charger tous les stocks en mémoire et sommer en Python. La règle de
@@ -512,10 +624,10 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         # recopiée ici, et `reports/summary` en appliquait une troisième,
         # différente. Un même stock s'affichait donc à deux valeurs.
         stock_value = Stock.total_value_for(
-            Stock.objects.filter(
+            borner_stocks(Stock.objects.filter(
                 organization=organization,
                 product__is_deleted=False,
-            )
+            ))
         )
 
         payload = {
@@ -623,7 +735,39 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         'destroy': 'users.deactivate',
         'manage_permissions': 'users.edit',
         'reset_password': 'users.edit',
+        # Ouvert à TOUT membre : c'est le rôle, et non une permission, qui
+        # décide de ce que `build_team_payload` rend. Voir `team()` plus bas.
+        'team': '*',
     }
+
+    @action(detail=False, methods=['get'])
+    def team(self, request):
+        """
+        `GET /api/v1/memberships/team/`
+
+        L'équipe pour un filtre « Utilisateur », côté back-office.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ POURQUOI PAS `GET /memberships/` TOUT COURT.                        │
+        │                                                                      │
+        │ La liste exige `users.view`, accordé au seul propriétaire et au      │
+        │ gérant. Or la règle donne le filtre utilisateur au MAGASINIER aussi, │
+        │ qui y recevrait donc 403 au chargement de chaque page. Ouvrir la     │
+        │ liste complète pour autant lui livrerait emails, permissions         │
+        │ effectives et dernière connexion, dont il n'a aucun usage.           │
+        │                                                                      │
+        │ Cette action rend EXACTEMENT le payload de la session, par le même   │
+        │ constructeur : deux surfaces, un seul corps.                         │
+        └──────────────────────────────────────────────────────────────────────┘
+
+        Un caissier reçoit `{'visible': False, 'members': []}` : ses deux
+        filtres sont verrouillés sur lui-même, la liste ne lui servirait à rien.
+        """
+        from apps.users.devices import build_team_payload
+
+        organization = self.get_organization()
+        membership = _get_membership(request)
+        return Response(build_team_payload(organization, membership))
 
     def get_serializer_class(self):
         if self.action == 'create':

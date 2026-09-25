@@ -1,3 +1,5 @@
+from uuid import UUID
+
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -30,6 +32,9 @@ from apps.core.api_mixins import ActionPaginationMixin, ExportResponseMixin
 from apps.core.api_permissions import IsTenantMember, HasActiveSubscription, HasPermission
 from apps.core.warehouse_scope import (
     accessible_warehouse_ids,
+    assert_user_allowed_for_request,
+    filter_cash_movement_queryset,
+    assert_warehouse_allowed_for_request,
     get_membership_for_request,
 )
 from apps.organizations.models import OrganizationMembership
@@ -203,26 +208,89 @@ class StatisticsViewSet(ExportResponseMixin, ActionPaginationMixin,
             return qs.filter(**{creator_field: request.user})
         return qs
 
+    def _perimetre_voulu(self, request):
+        """
+        Le filtre VOLONTAIRE de la requête, déjà opposé au périmètre du rôle.
+
+        Rend `(warehouse_id|None, user_id|None)`.
+
+        ┌──────────────────────────────────────────────────────────────────┐
+        │ ON REFUSE, ON N'IGNORE JAMAIS.                                   │
+        │                                                                  │
+        │ Retirer en silence un entrepôt hors périmètre rendrait un écran  │
+        │ qui affiche « Entrepôt B » au-dessus des chiffres de A, et le    │
+        │ marchand n'aurait aucun moyen de s'en apercevoir. `ValidationError`│
+        │ rend 400, et la forme `{'user': "..."}` est celle que            │
+        │ `user_activity` emploie déjà : les deux clients savent la rendre. │
+        └──────────────────────────────────────────────────────────────────┘
+
+        Mémoïsé sur la requête : `summary` appelle six `_scope_*`, et valider
+        six fois lèverait six fois - ou, pire, cesserait de lever le jour où un
+        appelant avalerait la première exception.
+        """
+        cache = getattr(request, '_reports_perimetre_voulu', None)
+        if cache is None:
+            wid = request.query_params.get('warehouse') or None
+            uid = request.query_params.get('user') or None
+            if wid:
+                assert_warehouse_allowed_for_request(request, wid)
+            if uid:
+                assert_user_allowed_for_request(request, uid)
+            cache = (wid, uid)
+            request._reports_perimetre_voulu = cache
+        return cache
+
+    def _vouloir(self, qs, request, *, warehouse_field, user_field):
+        """
+        Superpose le filtre volontaire au périmètre du rôle, jamais l'inverse.
+
+        ⚠ LE VOLONTAIRE N'HÉRITE PAS DU `| warehouse__isnull=True` que portent
+        les `_scope_*`. Cette tolérance est délibérée pour le RÔLE (ventes
+        anciennes sans entrepôt, dépenses d'établissement) ; l'étendre au
+        filtre ferait entrer les mêmes lignes dans le total de CHAQUE entrepôt,
+        et la somme des dépôts dépasserait le total.
+
+        `user_field` à `None` : cette rubrique n'a pas d'auteur (un stock est un
+        état, pas un acte). On IGNORE alors l'utilisateur voulu plutôt que de
+        rendre `.none()` : un onglet qui affiche zéro parce qu'un filtre d'un
+        autre onglet a traîné se lit comme une perte de données.
+        """
+        wid, uid = self._perimetre_voulu(request)
+        if wid:
+            qs = qs.filter(**{warehouse_field: wid})
+        if uid and user_field:
+            qs = qs.filter(**{user_field: uid})
+        return qs
+
     def _scope_sales(self, qs, request):
         """Applique le filtre warehouse aux ventes (+ créateur si caissier)."""
         qs = self._apply_creator_scope(qs, request, 'sold_by')
         wh_ids = self._accessible_warehouse_ids(request)
         if wh_ids is None:
-            return qs
-        if not wh_ids:
-            return qs.filter(warehouse__isnull=True)
-        return qs.filter(Q(warehouse_id__in=wh_ids) | Q(warehouse__isnull=True))
+            pass
+        elif not wh_ids:
+            qs = qs.filter(warehouse__isnull=True)
+        else:
+            qs = qs.filter(Q(warehouse_id__in=wh_ids) | Q(warehouse__isnull=True))
+        return self._vouloir(
+            qs, request, warehouse_field='warehouse_id', user_field='sold_by_id'
+        )
 
     def _scope_sale_items(self, qs, request):
         """Applique le filtre warehouse aux items de vente via ``sale``."""
         qs = self._apply_creator_scope(qs, request, 'sale__sold_by')
         wh_ids = self._accessible_warehouse_ids(request)
         if wh_ids is None:
-            return qs
-        if not wh_ids:
-            return qs.filter(sale__warehouse__isnull=True)
-        return qs.filter(
-            Q(sale__warehouse_id__in=wh_ids) | Q(sale__warehouse__isnull=True)
+            pass
+        elif not wh_ids:
+            qs = qs.filter(sale__warehouse__isnull=True)
+        else:
+            qs = qs.filter(
+                Q(sale__warehouse_id__in=wh_ids) | Q(sale__warehouse__isnull=True)
+            )
+        return self._vouloir(
+            qs, request,
+            warehouse_field='sale__warehouse_id', user_field='sale__sold_by_id',
         )
 
     def _scope_payments(self, qs, request):
@@ -230,75 +298,108 @@ class StatisticsViewSet(ExportResponseMixin, ActionPaginationMixin,
         qs = self._apply_creator_scope(qs, request, 'sale__sold_by')
         wh_ids = self._accessible_warehouse_ids(request)
         if wh_ids is None:
-            return qs
-        if not wh_ids:
-            return qs.filter(sale__warehouse__isnull=True)
-        return qs.filter(
-            Q(sale__warehouse_id__in=wh_ids) | Q(sale__warehouse__isnull=True)
+            pass
+        elif not wh_ids:
+            qs = qs.filter(sale__warehouse__isnull=True)
+        else:
+            qs = qs.filter(
+                Q(sale__warehouse_id__in=wh_ids) | Q(sale__warehouse__isnull=True)
+            )
+        return self._vouloir(
+            qs, request,
+            warehouse_field='sale__warehouse_id', user_field='sale__sold_by_id',
         )
 
     def _scope_cash_movements(self, qs, request):
-        """Applique le filtre warehouse aux mouvements de caisse.
-
-        Tolère les mouvements sans vente/dépense liée (apports, retraits) afin
-        de ne pas masquer les opérations générales aux non-owner. Pour un
-        caissier, restreint aux mouvements qu'il a créés.
         """
-        if self._is_cashier(request):
-            return qs.filter(created_by=request.user)
-        wh_ids = self._accessible_warehouse_ids(request)
-        if wh_ids is None:
-            return qs
-        if not wh_ids:
-            return qs.filter(sale__isnull=True, expense__isnull=True)
-        return qs.filter(
-            Q(sale__warehouse_id__in=wh_ids)
-            | Q(expense__warehouse_id__in=wh_ids)
-            | Q(session__register__warehouse_id__in=wh_ids)
-            | Q(sale__isnull=True, expense__isnull=True)
-            | Q(sale__warehouse__isnull=True, expense__isnull=True)
-            | Q(sale__isnull=True, expense__warehouse__isnull=True)
-        )
+        Le périmètre d'un mouvement de caisse, par le helper PARTAGÉ.
+
+        ┌──────────────────────────────────────────────────────────────────┐
+        │ CE CORPS TOLÉRAIT CE QUE LE LIVRE DE CAISSE REFUSE.              │
+        │                                                                  │
+        │ Il portait trois clauses `isnull` de plus que                     │
+        │ `CashMovementViewSet`, si bien que le même gérant lisait un solde │
+        │ ici et un AUTRE là - deux écrans voisins du même back-office.     │
+        │                                                                  │
+        │ Le strict l'emporte : un apport sans tiroir est une opération     │
+        │ d'établissement, comme un loyer, et elle reste au propriétaire.   │
+        │ C'est la règle que `ExpenseViewSet` applique déjà aux dépenses    │
+        │ sans entrepôt.                                                    │
+        └──────────────────────────────────────────────────────────────────┘
+        """
+        qs = filter_cash_movement_queryset(qs, get_membership_for_request(request))
+        # Le filtre VOLONTAIRE, lui, reste sans clause `isnull` : un apport sans
+        # pièce apparaîtrait sinon sous chaque dépôt, et la somme des dépôts
+        # dépasserait le total du tiroir.
+        wid, uid = self._perimetre_voulu(request)
+        if wid:
+            qs = qs.filter(
+                Q(sale__warehouse_id=wid)
+                | Q(expense__warehouse_id=wid)
+                | Q(session__register__warehouse_id=wid)
+            )
+        if uid:
+            qs = qs.filter(created_by_id=uid)
+        return qs
 
     def _scope_expenses(self, qs, request):
         """Applique le filtre warehouse aux dépenses (+ créateur si caissier)."""
         if self._is_cashier(request):
-            return qs.filter(created_by=request.user)
-        wh_ids = self._accessible_warehouse_ids(request)
-        if wh_ids is None:
-            return qs
-        if not wh_ids:
-            return qs.filter(warehouse__isnull=True)
-        return qs.filter(
-            Q(warehouse_id__in=wh_ids) | Q(warehouse__isnull=True)
+            qs = qs.filter(created_by=request.user)
+        else:
+            wh_ids = self._accessible_warehouse_ids(request)
+            if wh_ids is None:
+                pass
+            elif not wh_ids:
+                qs = qs.filter(warehouse__isnull=True)
+            else:
+                qs = qs.filter(
+                    Q(warehouse_id__in=wh_ids) | Q(warehouse__isnull=True)
+                )
+        return self._vouloir(
+            qs, request, warehouse_field='warehouse_id', user_field='created_by_id'
         )
 
     def _scope_stocks(self, qs, request):
         """Applique le filtre warehouse aux stocks (warehouse strict)."""
         wh_ids = self._accessible_warehouse_ids(request)
         if wh_ids is None:
-            return qs
-        if not wh_ids:
+            pass
+        elif not wh_ids:
             return qs.none()
-        return qs.filter(warehouse_id__in=wh_ids)
+        else:
+            qs = qs.filter(warehouse_id__in=wh_ids)
+        # `user_field=None` : un stock est un ÉTAT, pas un acte. L'utilisateur
+        # voulu y est ignoré, jamais traduit en `.none()`.
+        return self._vouloir(
+            qs, request, warehouse_field='warehouse_id', user_field=None
+        )
 
     def _scope_stock_batches(self, qs, request):
         """Applique le filtre warehouse aux lots de stock (warehouse strict)."""
         wh_ids = self._accessible_warehouse_ids(request)
         if wh_ids is None:
-            return qs
-        if not wh_ids:
+            pass
+        elif not wh_ids:
             return qs.none()
-        return qs.filter(warehouse_id__in=wh_ids)
+        else:
+            qs = qs.filter(warehouse_id__in=wh_ids)
+        return self._vouloir(
+            qs, request, warehouse_field='warehouse_id', user_field=None
+        )
 
     def _scope_stock_movements(self, qs, request):
         """Applique le filtre warehouse aux mouvements de stock."""
         wh_ids = self._accessible_warehouse_ids(request)
         if wh_ids is None:
-            return qs
-        if not wh_ids:
+            pass
+        elif not wh_ids:
             return qs.none()
-        return qs.filter(warehouse_id__in=wh_ids)
+        else:
+            qs = qs.filter(warehouse_id__in=wh_ids)
+        return self._vouloir(
+            qs, request, warehouse_field='warehouse_id', user_field='created_by_id'
+        )
 
     def _parse_date_range(self, request):
         """
@@ -424,11 +525,44 @@ class StatisticsViewSet(ExportResponseMixin, ActionPaginationMixin,
         deux, mais ils doivent le faire avec LEURS codes (400 puis 404) et avec
         le message porté par `USER_ACTIVITY_REQUIS` / `USER_ACTIVITY_INCONNU`,
         que les deux chemins partagent pour ne pas dériver.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ `is_active` N'EST PAS UN DÉTAIL : SANS LUI, L'IDENTITÉ FUIT.         │
+        │                                                                      │
+        │ La composition protège les CHIFFRES - `_scope_sales` et ses sœurs    │
+        │ bornent au périmètre du demandeur - mais pas le bloc `user` de la    │
+        │ réponse, qui porte le nom, l'E-MAIL et le rôle de la cible.          │
+        │                                                                      │
+        │ Et rien ne rattrapait : `assert_user_allowed_for_membership` cherche │
+        │ la cible en `is_active=True`, ne la trouvait pas, et prenait sa      │
+        │ branche PERMISSIVE (« un membre introuvable n'est pas notre          │
+        │ affaire »). Un gérant du dépôt A visait donc un employé DÉSACTIVÉ du │
+        │ dépôt B et recevait 200 avec son adresse.                            │
+        │                                                                      │
+        │ ⚠ Le commentaire qui justifie cette branche permissive (« un         │
+        │ magasinier reçoit déjà la liste complète de l'équipe par sa          │
+        │ session ») n'est plus vrai depuis que `build_team_payload` est borné.│
+        │ Le roster est désormais plus STRICT que la validation, et c'est le   │
+        │ seul sens que le croisement à deux sens ne couvrait pas.             │
+        │                                                                      │
+        │ On s'aligne donc sur le roster : un membre désactivé n'est ni        │
+        │ proposé, ni visable. `USER_ACTIVITY_INCONNU` est la bonne réponse -  │
+        │ pour ce demandeur, il n'existe pas.                                  │
+        └──────────────────────────────────────────────────────────────────────┘
+
+        ⚠ L'identifiant est LU avant d'atteindre l'ORM. `?user=oops` faisait
+        lever `django.core.exceptions.ValidationError` à `.filter()`, que DRF
+        ne sait pas traduire : 500. La garde de `warehouse_scope` existe, mais
+        elle est en aval - cette méthode la devance.
         """
         if not target_id:
             return None
+        try:
+            uid = target_id if isinstance(target_id, UUID) else UUID(str(target_id))
+        except (TypeError, ValueError):
+            return None
         return OrganizationMembership.objects.filter(
-            organization=org, user_id=target_id
+            organization=org, user_id=uid, is_active=True
         ).select_related('user').first()
 
     def _user_activity_data(self, request, org, membership, start_date, end_date, group_by):

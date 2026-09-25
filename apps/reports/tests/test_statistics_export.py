@@ -77,6 +77,34 @@ class _BaseExport(APITestCase):
             is_taxable=False, track_inventory=True, is_active=True,
         )
 
+    def _mouvement(self, reference, montant, devise='CDF', sens='in', type_='other_in'):
+        """
+        Un mouvement de caisse RATTACHÉ à la session du comptoir.
+
+        ⚠ Ces fixtures créaient des mouvements sans vente, sans dépense et sans
+        session, tout en s'authentifiant en GÉRANT. Elles ne passaient que
+        grâce à une tolérance que `reports/_scope_cash_movements` était seul à
+        porter : le Livre de caisse, lui, ne les a jamais montrés à un gérant.
+        Les rattacher, c'est faire décrire à la fixture ce qu'un gérant voit
+        réellement - et c'est ce qui rend l'assertion significative.
+        """
+        from apps.sales.models import RegisterSession
+
+        session = getattr(self, '_session_caisse', None)
+        if session is None:
+            session = RegisterSession.objects.create(
+                organization=self.org, register=self.register,
+                opened_by=self.manager, status='open',
+                opening_balance=Decimal('0'),
+            )
+            self._session_caisse = session
+        return CashMovement.objects.create(
+            organization=self.org, movement_type=type_, direction=sens,
+            amount=Decimal(montant), currency=devise, reference=reference,
+            movement_date=timezone.now(), created_by=self.manager,
+            session=session,
+        )
+
     def _vente(self, reference, produit, quantite=1, prix='1000.00', entrepot=None):
         montant = Decimal(prix) * quantite
         vente = Sale.objects.create(
@@ -398,11 +426,7 @@ class SyntheseTests(_BaseExport):
         # `balance_by_currency` se lit sur les MOUVEMENTS : il faut donc deux
         # devises réellement mouvementées, pas seulement deux devises déclarées.
         for code, montant in (('CDF', '5000'), ('USD', '10.00')):
-            CashMovement.objects.create(
-                organization=self.org, movement_type='other_in', direction='in',
-                amount=Decimal(montant), currency=code, reference=f'MVT-{code}',
-                movement_date=timezone.now(), created_by=self.manager,
-            )
+            self._mouvement(f'MVT-{code}', montant, devise=code)
         contenu = self._csv('overview')
         self.assertIn('Caisse USD', contenu)
 
@@ -487,16 +511,8 @@ class ColonnesExplicitesTests(_BaseExport):
     """
 
     def test_le_flux_a_UNE_COLONNE_PAR_GRANDEUR(self):
-        CashMovement.objects.create(
-            organization=self.org, movement_type='other_in', direction='in',
-            amount=Decimal('500.00'), currency='CDF', reference='MVT-IN',
-            movement_date=timezone.now(), created_by=self.manager,
-        )
-        CashMovement.objects.create(
-            organization=self.org, movement_type='other_out', direction='out',
-            amount=Decimal('200.00'), currency='CDF', reference='MVT-OUT',
-            movement_date=timezone.now(), created_by=self.manager,
-        )
+        self._mouvement('MVT-IN', '500.00')
+        self._mouvement('MVT-OUT', '200.00', sens='out', type_='other_out')
 
         contenu = self._csv('overview')
         self.assertIn('Période;Entrées;Sorties;Net', contenu)
@@ -531,12 +547,8 @@ class ColonnesExplicitesTests(_BaseExport):
 
     def test_le_flux_porte_un_TOTAL(self):
         """Sommable : c'est tout l'intérêt d'une colonne plutôt qu'une phrase."""
-        for valeur, sens, ref in (('500.00', 'in', 'A'), ('300.00', 'in', 'B')):
-            CashMovement.objects.create(
-                organization=self.org, movement_type='other_in', direction=sens,
-                amount=Decimal(valeur), currency='CDF', reference=f'MVT-{ref}',
-                movement_date=timezone.now(), created_by=self.manager,
-            )
+        for valeur, ref in (('500.00', 'A'), ('300.00', 'B')):
+            self._mouvement(f'MVT-{ref}', valeur)
         self.assertIn(f"TOTAL GÉNÉRAL;{csv_cell(montant(800))}", self._csv('overview'))
 
     def test_la_dette_d_un_client_a_SA_colonne(self):

@@ -11,7 +11,7 @@ from django.utils import timezone
 from decimal import Decimal
 from rest_framework.exceptions import ValidationError as DRFValidationError
 
-from apps.core.report_params import period_label
+from apps.core.report_params import perimeter_filters, period_label
 from apps.core.api_mixins import (
     TenantViewSetMixin,
     AuditMixin,
@@ -31,6 +31,9 @@ from apps.core.api_permissions import (
     DENY,
     IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission,
     has_perm_code, is_manager_or_above,
+)
+from .filters import (
+    QuotationFilter, RegisterSessionFilter, SaleFilter, SaleReturnFilter,
 )
 from .models import (
     Register, RegisterSession, Sale, SaleItem, PaymentMethod, Payment,
@@ -118,7 +121,7 @@ class RegisterSessionViewSet(
     queryset = RegisterSession.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
-    filterset_fields = ['status', 'register', 'opened_by']
+    filterset_class = RegisterSessionFilter
     ordering = ['-opened_at']
     
     select_related_fields = ['register', 'opened_by', 'closed_by']
@@ -325,7 +328,7 @@ class SaleViewSet(
     queryset = Sale.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission, TenantObjectPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['status', 'sale_type', 'customer', 'register', 'is_pos']
+    filterset_class = SaleFilter
     search_fields = ['reference', 'customer__name']
     ordering_fields = ['sale_date', 'total', 'reference', 'due_date', 'amount_due']
     ordering = ['-sale_date']
@@ -387,6 +390,9 @@ class SaleViewSet(
             'status': ('Statut', lambda v: statuts.get(v, v), 'Tous'),
             'search': ('Recherche', lambda v: v, '-'),
         })
+        # Le PÉRIMÈTRE, et il n'est jamais tu : `SaleFilter` accepte
+        # `warehouse` et `user`, donc le fichier était filtré sans le dire.
+        filtres.extend(perimeter_filters(params, organization))
         periode = period_label(params)
         if periode:
             filtres.insert(0, ('Période', periode))
@@ -715,7 +721,7 @@ class SaleReturnViewSet(
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     # `original_sale` : une fiche de vente doit pouvoir lister SES retours.
     # Sans ce filtre, il faudrait tirer toute la table et trier côté client.
-    filterset_fields = ['status', 'return_type', 'original_sale']
+    filterset_class = SaleReturnFilter
     search_fields = ['reference', 'original_sale__reference']
     ordering = ['-return_date']
     
@@ -798,7 +804,7 @@ class QuotationViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     queryset = Quotation.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission, TenantObjectPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['status', 'customer']
+    filterset_class = QuotationFilter
     search_fields = ['reference', 'customer__name']
     ordering = ['-created_at']
     
@@ -818,6 +824,28 @@ class QuotationViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         'convert': 'sales.create',
         'send': 'sales.create',
     }
+
+    def get_queryset(self):
+        """
+        Un devis n'a pas d'entrepôt : le périmètre y passe par son AUTEUR.
+
+        ┌──────────────────────────────────────────────────────────────────┐
+        │ CE VIEWSET N'AVAIT AUCUN PÉRIMÈTRE DE RÔLE.                     │
+        │                                                                  │
+        │ Ni mixin d'entrepôt, ni borne sur le créateur : un caissier      │
+        │ lisait les devis de toute l'organisation, quand le même caissier  │
+        │ ne voit que ses propres VENTES. Deux écrans voisins disaient deux │
+        │ choses du même périmètre.                                        │
+        │                                                                  │
+        │ `Quotation` ne porte pas de `warehouse` (ni au serveur, ni en     │
+        │ base locale), donc le seul axe disponible est `created_by`, et    │
+        │ c'est `sales.view_all` qui l'ouvre - la même clé que les ventes.  │
+        └──────────────────────────────────────────────────────────────────┘
+        """
+        queryset = super().get_queryset()
+        if not has_perm_code(self.request, 'sales.view_all'):
+            queryset = queryset.filter(created_by=self.request.user)
+        return queryset
 
     def get_serializer_class(self):
         if self.action == 'list':

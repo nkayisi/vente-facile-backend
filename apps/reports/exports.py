@@ -40,7 +40,7 @@ from apps.core.exports import (
     format_number,
     format_quantity,
 )
-from apps.core.report_params import format_day
+from apps.core.report_params import format_day, perimeter_filters
 from apps.settings.services import CurrencyService
 
 ZERO = Decimal('0')
@@ -275,6 +275,11 @@ def build_tab_context(viewset, request, *, avec_releves: bool = True) -> TabCont
         ('Période', ctx.period_label),
         ('Du', format_day(start_date.strftime('%Y-%m-%d'))),
         ('Au', format_day(end_date.strftime('%Y-%m-%d'))),
+        # L'entrepôt et l'utilisateur SONT appliqués - les `_scope_*` viennent
+        # de le faire - et n'étaient écrits nulle part. Un onglet filtré sur un
+        # dépôt sortait sous un en-tête identique à celui de l'établissement
+        # entier, et rien ne permettait de les distinguer une fois imprimés.
+        *perimeter_filters(request.query_params, org),
     ]
     ctx.summary = build_global_summary(viewset, request, ctx) if avec_releves else []
     return ctx

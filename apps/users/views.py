@@ -179,6 +179,22 @@ class UserViewSet(viewsets.ModelViewSet):
                 for r in manageable_roles
             ],
             'all_permissions': PermissionService.get_all_permissions(),
+            # Le PÉRIMÈTRE ENTREPÔT du demandeur, pendant web de
+            # `membership.assigned_warehouses` de la session du terminal.
+            #
+            # Le back-office n'avait AUCUNE notion d'entrepôt côté client :
+            # `usePermissions()` n'expose que des permissions, et
+            # `OrganizationContext` que l'organisation. Sans ces deux lignes, un
+            # filtre « Entrepôt » ne saurait pas s'il doit se fermer, et un
+            # caissier verrait un sélecteur qui ne lui propose qu'un choix.
+            #
+            # ⚠ Vide pour un PROPRIÉTAIRE, et c'est ce qui le rend « partout » :
+            # `accessible_warehouse_ids` rend `None` pour lui. Le client doit
+            # lire `role` avec, jamais la longueur de cette liste seule.
+            'assigned_warehouses': [
+                {'id': str(w.id), 'name': w.name}
+                for w in membership.assigned_warehouses.filter(is_deleted=False)
+            ],
         })
 
     @action(detail=False, methods=['post'], url_path='me/change-password')

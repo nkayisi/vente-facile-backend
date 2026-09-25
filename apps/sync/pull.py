@@ -39,6 +39,7 @@ appel finit par être oubliée.
 import base64
 import json
 from dataclasses import dataclass, field
+from hashlib import blake2s
 from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
@@ -56,6 +57,14 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.core.api_permissions import IsTenantMember, _get_membership
+from apps.core.warehouse_scope import (
+    accessible_warehouse_ids,
+    filter_cash_movement_queryset,
+    filter_queryset_by_related_warehouse,
+    filter_queryset_by_warehouse_ids,
+    filter_stock_transfer_queryset,
+    restrict_visibility_for_membership,
+)
 
 # Plafond par page. Ce n'est plus une troncature : au-delà, `has_more` invite le
 # client à redemander. Il n'y a plus de perte possible.
@@ -142,6 +151,19 @@ class PullTable:
     #: Chemin de l'entrepôt, pour borner au périmètre du membre. `''` si la
     #: table EST l'entrepôt.
     warehouse_path: str = None
+    #: Les lignes SANS entrepôt restent visibles. Miroir de
+    #: `warehouse_scope_include_null` du viewset correspondant : les ventes
+    #: anciennes sans dépôt sont visibles au web, elles doivent l'être ici.
+    warehouse_include_null: bool = False
+    #: Champ de l'auteur, quand la visibilité de la table en dépend. Miroir de
+    #: `restrict_visibility_for_membership` : un CAISSIER est alors borné par
+    #: créateur, sans aucun entrepôt - c'est la règle des dépenses.
+    creator_field: str = None
+    #: Règle de périmètre nommée, pour les deux tables qui n'en ont pas de
+    #: simple : `'transfer'` (source OU destination) et `'cash_movement'`
+    #: (vente, dépense, ou session). Les deux corps vivent dans
+    #: `apps.core.warehouse_scope`, partagés avec les vues.
+    scope: str = None
     #: Enfants remplacés en bloc avec leur parent. Réservé aux tables sans
     #: suppression douce, dont aucune suppression ne se propagerait autrement.
     children: tuple = field(default_factory=tuple)
@@ -149,6 +171,16 @@ class PullTable:
     def get_model(self):
         app_label, model_name = self.model.split('.')
         return apps.get_model(app_label, model_name)
+
+    @property
+    def est_bornee(self) -> bool:
+        """Le périmètre de cette table dépend-il des affectations du membre ?
+
+        C'est ce qui décide si son jeton de périmètre doit bouger quand un
+        magasinier reçoit un second dépôt. Une table d'organisation - le
+        catalogue, les clients - n'a pas à être re-tirée pour cela.
+        """
+        return self.warehouse_path is not None or self.scope is not None
 
 
 @dataclass(frozen=True)
@@ -285,27 +317,113 @@ def _scope_to_org(queryset, table, organization):
 
 def _scope_to_warehouses(queryset, table, membership):
     """
-    Borne la lecture au périmètre d'entrepôt du membre.
+    Borne la lecture au périmètre du membre, PAR LES MÊMES HELPERS QUE LES VUES.
 
-    Un caissier qui tire le stock de toute l'entreprise, c'est à la fois un
-    problème de volume et de confidentialité. Un `owner` n'a pas de périmètre :
-    il voit tout, comme sur le web.
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ CE CORPS ÉTAIT UNE TROISIÈME ÉCRITURE DU PÉRIMÈTRE, ET IL DIVERGEAIT.   │
+    │                                                                          │
+    │ Trois écarts, tous silencieux, tous mesurés :                            │
+    │                                                                          │
+    │ 1. Il lisait `assigned_warehouses` SANS `is_deleted=False` : un membre   │
+    │    dont le seul dépôt est supprimé se retrouvait borné à un dépôt mort,  │
+    │    donc à zéro ligne, là où le web lui rendait `.none()` par un autre    │
+    │    chemin. Deux vides, deux causes, aucune lisible.                      │
+    │ 2. Il ignorait la tolérance NULL : une vente ancienne sans entrepôt      │
+    │    était visible au back-office et INTROUVABLE sur le terminal qui       │
+    │    l'avait peut-être encaissée.                                          │
+    │ 3. Il n'avait aucune branche de rôle : `expenses` et `cash_movements`    │
+    │    descendaient EN ENTIER, y compris les opérations d'établissement      │
+    │    qu'aucune surface ne montre à un rôle borné.                          │
+    │                                                                          │
+    │ ⚠ « Aucun entrepôt assigné » rend désormais `.none()`, comme les douze   │
+    │ sites du web. Le commentaire qui vivait ici (« le web fait le même       │
+    │ choix ») était FAUX : le tirage était le seul des trois à ne pas borner, │
+    │ et un membre mal configuré détenait toute l'organisation dans un SQLite  │
+    │ non chiffré. L'écran du terminal, lui, disait déjà « Aucun entrepôt ne   │
+    │ vous est assigné ».                                                      │
+    └──────────────────────────────────────────────────────────────────────────┘
     """
-    if table.warehouse_path is None or membership is None:
-        return queryset
-    if membership.role == 'owner':
+    if membership is None:
         return queryset
 
-    ids = list(membership.assigned_warehouses.values_list('id', flat=True))
-    if not ids:
-        # Aucun entrepôt assigné : on ne borne pas. Le web fait le même choix,
-        # et borner ici viderait l'écran d'un membre mal configuré au lieu de
-        # signaler la configuration.
+    if table.scope == 'transfer':
+        return filter_stock_transfer_queryset(queryset, membership)
+    if table.scope == 'cash_movement':
+        return filter_cash_movement_queryset(queryset, membership)
+    if table.warehouse_path is None:
         return queryset
 
+    if table.creator_field:
+        return restrict_visibility_for_membership(
+            queryset,
+            membership,
+            warehouse_field=table.warehouse_path,
+            creator_field=table.creator_field,
+            include_null_warehouse=table.warehouse_include_null,
+        )
     if table.warehouse_path == '':
-        return queryset.filter(id__in=ids)
-    return queryset.filter(**{f'{table.warehouse_path}__in': ids})
+        # La table EST l'entrepôt : on borne sur son propre identifiant.
+        return filter_queryset_by_warehouse_ids(queryset, membership, 'id')
+    return filter_queryset_by_related_warehouse(
+        queryset,
+        membership,
+        table.warehouse_path,
+        include_null=table.warehouse_include_null,
+    )
+
+
+#: Révision de la RÈGLE de périmètre du tirage.
+#:
+#: À incrémenter dès que `_scope_to_warehouses` change ce qu'une table laisse
+#: passer, même sans toucher à son `warehouse_path` : ajouter une tolérance
+#: NULL, une branche de rôle, ou resserrer le cas « aucun entrepôt assigné »
+#: modifie le périmètre sans modifier sa description. Sans ce numéro, le jeton
+#: ne bougerait pas et les terminaux garderaient une base tirée sous l'ancienne
+#: règle, définitivement.
+SCOPE_RULE_VERSION = 2
+
+#: Le jeton d'une table que rien ne borne. Constant par choix : y mêler le rôle
+#: ou les entrepôts ferait re-tirer `products` et `customers` le jour où un
+#: magasinier reçoit un second dépôt, pour un périmètre qui n'a pas bougé.
+SCOPE_TOKEN_ORG = 'org'
+
+
+def scope_token(table, membership):
+    """
+    L'empreinte du périmètre sous lequel CE membre lit CETTE table.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ LE CURSEUR NE DIT PAS SOUS QUEL PÉRIMÈTRE IL A ÉTÉ OBTENU.              │
+    │                                                                          │
+    │ Et c'est une perte de données silencieuse. Le périmètre est appliqué     │
+    │ AVANT le curseur (`read_page`) : quand il s'élargit - un magasinier      │
+    │ reçoit un second dépôt, `assign_default_warehouse` rattache un membre -  │
+    │ les lignes devenues éligibles portent un `updated_at` ANTÉRIEUR au point │
+    │ de reprise. `_after_cursor` les écarte, et elles ne descendront JAMAIS.  │
+    │                                                                          │
+    │ Pire, la sonde `pull/changed/` applique exactement la même séquence :    │
+    │ elle répond « rien de neuf », et le terminal affiche « Complet, à        │
+    │ l'instant » sur une table amputée. La fraîcheur ment sans le savoir.     │
+    │                                                                          │
+    │ Le client range ce jeton à côté du curseur. À la moindre différence, il  │
+    │ EFFACE la table et la retire en entier - voir la réserve sur             │
+    │ l'effacement dans `sync/pull.ts`.                                        │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+    if not table.est_bornee or membership is None:
+        return SCOPE_TOKEN_ORG
+
+    # `None` (propriétaire : aucune restriction) et `[]` (aucun accès) sont deux
+    # situations OPPOSÉES : les écrire pareil donnerait le même jeton, donc
+    # aucune reprise, au moment exact où le périmètre bascule de l'un à l'autre.
+    ids = accessible_warehouse_ids(membership)
+    portee = 'tous' if ids is None else ','.join(sorted(str(i) for i in ids))
+    brut = (
+        f'{SCOPE_RULE_VERSION}|{membership.role}|{portee}'
+        f'|{table.warehouse_path}|{table.warehouse_include_null}'
+        f'|{table.creator_field}|{table.scope}'
+    )
+    return blake2s(brut.encode('utf-8'), digest_size=8).hexdigest()
 
 
 def _after_cursor(queryset, cursor, column='updated_at'):
@@ -537,9 +655,15 @@ PULL_TABLES = (
 
     # -- caisse et ventes
     PullTable('registers', 'sales.Register', soft_delete=True, warehouse_path='warehouse_id'),
-    PullTable('register_sessions', 'sales.RegisterSession'),
+    # `RegisterSessionViewSet` borne par `register__warehouse_id` : sans cette
+    # ligne, tout terminal détenait les sessions de caisse de l'organisation.
+    PullTable('register_sessions', 'sales.RegisterSession',
+              warehouse_path='register__warehouse_id'),
+    # ⚠ `warehouse_include_null` : `SaleViewSet` le porte, donc une vente
+    # ancienne sans entrepôt est visible au back-office. Sans lui ici, elle
+    # était introuvable sur le terminal qui l'avait peut-être encaissée.
     PullTable('sales', 'sales.Sale', soft_delete=True, warehouse_path='warehouse_id',
-              children=SALE_CHILDREN),
+              warehouse_include_null=True, children=SALE_CHILDREN),
     PullTable('stock_movements', 'inventory.StockMovement', warehouse_path='warehouse_id'),
 
     # -- retours et devis
@@ -557,6 +681,8 @@ PULL_TABLES = (
     # propriétaire ne touchent jamais cette ligne.
     PullTable('sale_returns', 'sales.SaleReturn', soft_delete=True,
               warehouse_path='original_sale__warehouse_id',
+              # Miroir de `SaleReturnViewSet`, qui tolère le NULL lui aussi.
+              warehouse_include_null=True,
               children=RETURN_CHILDREN),
     PullTable('quotations', 'sales.Quotation', soft_delete=True,
               children=QUOTATION_CHILDREN),
@@ -567,8 +693,12 @@ PULL_TABLES = (
     # entrepôts, et le borner sur l'un des deux cacherait au magasinier de
     # destination les transferts qu'on lui expédie - c'est-à-dire précisément
     # ceux qu'il doit réceptionner. Le périmètre est celui de l'organisation.
+    # ⚠ Le OU, jamais une borne sur l'un des deux dépôts : c'est la règle
+    # écrite ci-dessus. Mais « ne pas borner du tout » n'en était pas la
+    # traduction - le terminal détenait les transferts de toute
+    # l'organisation, là où `StockTransferViewSet` borne en OU.
     PullTable('stock_transfers', 'inventory.StockTransfer', soft_delete=True,
-              children=TRANSFER_CHILDREN),
+              scope='transfer', children=TRANSFER_CHILDREN),
     PullTable('stock_adjustments', 'inventory.StockAdjustment', soft_delete=True,
               warehouse_path='warehouse_id', children=ADJUSTMENT_CHILDREN),
     PullTable('inventory_sessions', 'inventory.InventorySession', soft_delete=True,
@@ -577,8 +707,12 @@ PULL_TABLES = (
     # -- livre de caisse
     PullTable('income_categories', 'cashbook.IncomeCategory'),
     PullTable('expense_categories', 'cashbook.ExpenseCategory'),
-    PullTable('expenses', 'cashbook.Expense'),
-    PullTable('cash_movements', 'cashbook.CashMovement'),
+    # Les deux tables que le tirage descendait EN ENTIER, opérations
+    # d'établissement comprises. `creator_field` porte la branche caissier
+    # de `restrict_visibility_for_membership`, exactement comme la vue.
+    PullTable('expenses', 'cashbook.Expense',
+              warehouse_path='warehouse_id', creator_field='created_by'),
+    PullTable('cash_movements', 'cashbook.CashMovement', scope='cash_movement'),
 )
 
 PULL_TABLES_BY_NAME = {table.name: table for table in PULL_TABLES}
@@ -902,9 +1036,11 @@ class SyncManifestView(APIView):
         # l'écran d'attente ne saurait afficher qu'une roue, et une roue ne dit
         # pas si l'on en a pour dix secondes ou pour dix minutes.
         with_counts = request.query_params.get('counts') in ('1', 'true', 'yes')
+        # Le jeton de périmètre dépend du MEMBRE : il ne peut pas vivre dans
+        # `describe_table`, que `dump_pull_manifest` rend aussi, sans session.
+        membership = _get_membership(request)
         counts = {}
         if with_counts:
-            membership = _get_membership(request)
             organization = membership.organization
             for t in PULL_TABLES:
                 model = t.get_model()
@@ -918,6 +1054,12 @@ class SyncManifestView(APIView):
             'schema_version': PULL_SCHEMA_VERSION,
             'default_page_size': DEFAULT_PAGE_SIZE,
             'tables': [
-                describe_table(t, counts.get(t.name)) for t in PULL_TABLES
+                # `scope_token` porte le PÉRIMÈTRE, `schema_version` la FORME du
+                # contrat. Les confondre ferait re-tirer tout le parc au moindre
+                # ajout de colonne, et ne rattraperait pas un changement
+                # d'affectation, qui ne touche aucune colonne.
+                {**describe_table(t, counts.get(t.name)),
+                 'scope_token': scope_token(t, membership)}
+                for t in PULL_TABLES
             ],
         })

@@ -27,11 +27,13 @@ from apps.core.report_params import (
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from apps.core.warehouse_scope import (
     accessible_warehouse_ids,
+    filter_cash_movement_queryset,
     get_membership_for_request,
     restrict_visibility_for_request,
 )
 from apps.core.api_permissions import IsTenantMember, HasPermission
 
+from .filters import CashMovementFilter, ExpenseFilter
 from .models import IncomeCategory, ExpenseCategory, Expense, CashMovement
 from .serializers import (
     IncomeCategoryListSerializer, IncomeCategoryCreateSerializer,
@@ -179,17 +181,28 @@ class ExpenseViewSet(
     queryset = Expense.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['status', 'category', 'is_recurring', 'warehouse', 'currency']
+    filterset_class = ExpenseFilter
     search_fields = ['reference', 'description', 'beneficiary', 'notes']
     ordering_fields = ['expense_date', 'amount', 'created_at']
     ordering = ['-expense_date']
 
     select_related_fields = ['category', 'warehouse', 'payment_method', 'created_by', 'approved_by']
 
-    # Le champ ``warehouse`` est nullable (les dépenses globales restent
-    # tolérées), mais filtrées par le périmètre membre quand renseigné.
-    warehouse_scope_field = 'warehouse_id'
-    warehouse_scope_include_null = True
+    # ┌──────────────────────────────────────────────────────────────────────┐
+    # │ DEUX ATTRIBUTS MORTS VIVAIENT ICI, ET ILS DISAIENT LE CONTRAIRE DU   │
+    # │ COMPORTEMENT.                                                        │
+    # │                                                                      │
+    # │ `warehouse_scope_field` et `warehouse_scope_include_null = True` sont │
+    # │ lus par `WarehouseScopedQuerysetMixin`, dont cette vue N'HÉRITE PAS.  │
+    # │ Ils n'ont donc jamais rien fait, et ils annonçaient l'inverse de la   │
+    # │ règle réelle : `get_queryset` appelle                                 │
+    # │ `restrict_visibility_for_request` SANS `include_null_warehouse`, donc │
+    # │ les dépenses d'établissement (loyer, salaires) restent au             │
+    # │ propriétaire. Le fichier se contredisait à deux endroits.             │
+    # │                                                                      │
+    # │ Les deux attributs d'ÉCRITURE, eux, sont bien lus par                 │
+    # │ `WarehouseAssertCreateMixin` : une dépense peut naître sans dépôt.    │
+    # └──────────────────────────────────────────────────────────────────────┘
     warehouse_write_required = False
     warehouse_write_allow_none = True
 
@@ -377,29 +390,30 @@ class ExpenseViewSet(
 
     @action(detail=False, methods=['get'])
     def stats(self, request):
-        """Statistiques des dépenses."""
+        """
+        Statistiques des dépenses, sur EXACTEMENT le périmètre de la liste.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ CETTE ACTION AGRÉGEAIT CE QUE LA LISTE REFUSE.                       │
+        │                                                                      │
+        │ Elle réimplémentait une TROISIÈME variante du périmètre -            │
+        │ `Q(warehouse_id__in=…) | Q(warehouse__isnull=True)` - là où          │
+        │ `get_queryset` applique `restrict_visibility_for_request` avec sa    │
+        │ portée par CRÉATEUR. Deux conséquences, toutes deux silencieuses :   │
+        │                                                                      │
+        │ - un CAISSIER a `cashbook.view`, et cette action lui est ouverte :   │
+        │   il y lisait les dépenses de tous ses collègues du même dépôt,      │
+        │   agrégées, alors que `GET /expenses/` les lui refuse une à une ;    │
+        │ - les dépenses d'établissement (sans entrepôt) y étaient TOLÉRÉES    │
+        │   pour un gérant, quand la liste les réserve au propriétaire.        │
+        │                                                                      │
+        │ Le correctif n'ajoute pas un filtre, il SUPPRIME la copie :          │
+        │ `get_queryset` porte déjà l'organisation, le rôle et les bornes de   │
+        │ date. Il ne reste ici que le statut, qui est propre à la statistique.│
+        └──────────────────────────────────────────────────────────────────────┘
+        """
         organization = self.get_organization()
-        queryset = Expense.objects.filter(
-            organization=organization,
-            status__in=['approved', 'paid']
-        )
-
-        # Restreindre au périmètre du membre (None pour owner = pas de filtre)
-        membership = get_membership_for_request(request)
-        if membership:
-            allowed_ids = accessible_warehouse_ids(membership)
-            if allowed_ids is not None:
-                queryset = queryset.filter(
-                    Q(warehouse_id__in=allowed_ids) | Q(warehouse__isnull=True)
-                )
-
-        # Filtres de date
-        date_from = request.query_params.get('date_from')
-        date_to = request.query_params.get('date_to')
-        if date_from:
-            queryset = queryset.filter(expense_date__gte=date_from)
-        if date_to:
-            queryset = queryset.filter(expense_date__lte=date_to)
+        queryset = self.get_queryset().filter(status__in=['approved', 'paid'])
 
         from .services import primary_sum
         primary = organization.currency or 'CDF'
@@ -468,7 +482,7 @@ class CashMovementViewSet(ExportResponseMixin, TenantViewSetMixin,
     queryset = CashMovement.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['direction', 'movement_type', 'is_cancelled', 'currency']
+    filterset_class = CashMovementFilter
     search_fields = ['reference', 'description', 'notes']
     ordering_fields = ['movement_date', 'amount', 'created_at']
     ordering = ['-movement_date']
@@ -507,32 +521,14 @@ class CashMovementViewSet(ExportResponseMixin, TenantViewSetMixin,
         return CashMovementDetailSerializer
 
     def _scope_cash_movements_to_membership(self, queryset):
-        """Restreint un queryset CashMovement selon le rôle du membre courant.
+        """Le périmètre d'un mouvement de caisse, par le helper PARTAGÉ.
 
-        - owner : tous les mouvements ;
-        - caissier : uniquement ceux qu'il a créés (``created_by``), partout ;
-        - gérant / magasinier : mouvements rattachés à leurs entrepôts, via la
-          vente liée, la dépense liée, ou la session de caisse (entrées/sorties
-          manuelles saisies en caisse).
+        Le corps vivait ici, et `reports/_scope_cash_movements` en tenait une
+        seconde version, plus tolérante : deux soldes pour le même tiroir. Il
+        vit désormais dans `apps.core.warehouse_scope`, que les deux appellent.
         """
-        from apps.organizations.models import OrganizationMembership
-
-        membership = get_membership_for_request(self.request)
-        if not membership:
-            return queryset
-        role = membership.role
-        if role == OrganizationMembership.Role.OWNER:
-            return queryset
-        if role == OrganizationMembership.Role.CASHIER:
-            return queryset.filter(created_by=membership.user)
-        allowed_ids = accessible_warehouse_ids(membership)
-        if not allowed_ids:
-            # Aucun entrepôt assigné => aucun mouvement visible.
-            return queryset.none()
-        return queryset.filter(
-            Q(sale__warehouse_id__in=allowed_ids)
-            | Q(expense__warehouse_id__in=allowed_ids)
-            | Q(session__register__warehouse_id__in=allowed_ids)
+        return filter_cash_movement_queryset(
+            queryset, get_membership_for_request(self.request)
         )
 
     # ------------------------------------------------------------------
@@ -781,6 +777,23 @@ class CashMovementViewSet(ExportResponseMixin, TenantViewSetMixin,
         Rend `(libelle, base_qs, movements, borne)` : `base_qs` sert à calculer
         le solde d'ouverture (il porte TOUT l'historique), `movements` la
         période, et `borne` la date à laquelle l'ouverture est relevée.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ ⚠ ICI, `filter_queryset` N'EST JAMAIS APPELÉ.                       │
+        │                                                                      │
+        │ Seul le périmètre du RÔLE s'applique                                 │
+        │ (`_scope_cash_movements_to_membership`). Tout `?warehouse=` ou       │
+        │ `?user=` envoyé sur ces quatre rapports serait donc IGNORÉ, en       │
+        │ silence - et l'en-tête du document n'en dit rien non plus.           │
+        │                                                                      │
+        │ Ce n'est pas un défaut aujourd'hui : aucune des deux surfaces ne les │
+        │ envoie (`app/dashboard/cashbook/reports` n'a pas de                  │
+        │ `PerimeterFilters`, `caisse/rapports.tsx` pas de `usePerimetre`).    │
+        │ C'est un PIÈGE : le jour où l'une des deux reçoit le composant, le   │
+        │ filtre sera mort-né et le document plus large que l'écran qui l'a    │
+        │ déclenché. Poser un filtre ici, c'est d'abord le faire mordre -      │
+        │ puis écrire les deux lignes de `perimeter_filters` dans l'en-tête.   │
+        └──────────────────────────────────────────────────────────────────────┘
         """
         import datetime
 

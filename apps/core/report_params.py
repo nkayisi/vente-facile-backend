@@ -120,3 +120,78 @@ def parse_month(value, defaut: int, *, champ='month') -> int:
     if value in (None, ''):
         return defaut
     return _entier_borne(value, champ, 1, 12, "Mois attendu entre 1 et 12.")
+
+
+# --------------------------------------------------------------------------
+# Le PÉRIMÈTRE d'un document
+# --------------------------------------------------------------------------
+
+# ┌──────────────────────────────────────────────────────────────────────────────┐
+# │ UN DOCUMENT FILTRÉ QUI NE LE DIT PAS EST INDISCERNABLE D'UN DOCUMENT COMPLET.│
+# │                                                                              │
+# │ Trois constructeurs appliquaient `warehouse` et `user` sans jamais les       │
+# │ écrire en tête : l'export des ventes, les huit onglets de rapports et le     │
+# │ rapport de caisse. Un papier voyage sans sa barre de filtres, et son lecteur │
+# │ n'a aucun moyen de savoir qu'il ne tient qu'un dépôt sur trois.              │
+# │                                                                              │
+# │ Ces deux résolveurs sont GÉNÉRIQUES, et leur place est ici : « Entrepôt »    │
+# │ n'est pas plus un vocabulaire de stock que « Période » ne l'était - c'est    │
+# │ le motif exact pour lequel `period_label` a quitté `apps/inventory`.         │
+# └──────────────────────────────────────────────────────────────────────────────┘
+
+
+def warehouse_label(organization, warehouse_id):
+    """Le nom d'un entrepôt, ou ``None``. Un UUID ne renseigne aucun lecteur."""
+    from apps.inventory.models import Warehouse
+
+    return (
+        Warehouse.objects.filter(organization=organization, id=warehouse_id)
+        .values_list('name', flat=True)
+        .first()
+    )
+
+
+def user_label(organization, user_id):
+    """Le nom d'un membre, avec son e-mail en repli.
+
+    Un nom vide rendrait une ligne d'en-tête muette ; l'e-mail est le seul
+    repli qui identifie encore quelqu'un. Même règle que `build_team_payload`.
+    """
+    from apps.organizations.models import OrganizationMembership
+
+    membre = (
+        OrganizationMembership.objects
+        .filter(organization=organization, user_id=user_id)
+        .select_related('user')
+        .first()
+    )
+    if membre is None:
+        return None
+    return (membre.user.full_name or '').strip() or membre.user.email
+
+
+def perimeter_filters(params, organization):
+    """Les deux lignes de périmètre d'un document, toujours écrites.
+
+    Le défaut ('Tous') s'écrit même en l'ABSENCE de filtre : un lecteur doit
+    pouvoir distinguer « pas de filtre » de « filtre oublié dans l'en-tête ».
+    C'est la règle de `describe_filters`, et elle vaut ici pour la même raison.
+
+    ⚠ Un identifiant illisible rend « inconnu » et n'interrompt rien : le
+    queryset l'a déjà écarté, et faire échouer un export pour un libellé
+    manquant serait disproportionné.
+    """
+    lignes = []
+    for cle, intitule, resolveur in (
+        ('warehouse', 'Entrepôt', warehouse_label),
+        ('user', 'Utilisateur', user_label),
+    ):
+        brut = params.get(cle)
+        if not brut:
+            lignes.append((intitule, 'Tous'))
+            continue
+        try:
+            lignes.append((intitule, resolveur(organization, brut) or 'inconnu'))
+        except Exception:
+            lignes.append((intitule, 'inconnu'))
+    return lignes
