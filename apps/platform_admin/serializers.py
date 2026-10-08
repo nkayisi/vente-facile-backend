@@ -5,7 +5,9 @@ from rest_framework import serializers
 from apps.organizations.models import Organization, OrganizationMembership
 from apps.users.models import User
 from apps.settings.models import Currency
-from apps.subscriptions.models import Plan, PlanFeature, Subscription, SubscriptionPayment
+from apps.subscriptions.models import (
+    GlobalConfig, Plan, PlanFeature, Subscription, SubscriptionPayment,
+)
 
 
 # =============================================================================
@@ -249,3 +251,48 @@ class AdminCreateSubscriptionSerializer(serializers.Serializer):
             return Plan.objects.get(id=value, is_active=True)
         except Plan.DoesNotExist:
             raise serializers.ValidationError("Plan introuvable ou inactif.")
+
+
+# =============================================================================
+# PORTE DE MISE A JOUR MOBILE
+# =============================================================================
+
+class AdminAppReleaseSerializer(serializers.ModelSerializer):
+    """
+    Les huit réglages de la porte de mise à jour du terminal.
+
+    ⚠ **LA VALIDATION EST CELLE DU MODÈLE, jamais une seconde écriture.**
+    `GlobalConfig.clean()` porte les trois règles (forme du semver, seuil qui ne
+    dépasse pas la version du magasin, seuil qui mène quelque part) et l'admin
+    Django les oppose déjà. Les redire ici les ferait diverger, et c'est ce
+    formulaire-là qui peut bloquer un parc entier.
+    """
+
+    class Meta:
+        model = GlobalConfig
+        fields = [
+            'android_minimum_version', 'android_current_version',
+            'android_store_url', 'android_update_message',
+            'ios_minimum_version', 'ios_current_version',
+            'ios_store_url', 'ios_update_message',
+        ]
+
+    def validate(self, attrs):
+        """
+        On valide l'instance TELLE QU'ELLE SERA, pas les seuls champs reçus : un
+        PATCH qui ne touche qu'au seuil doit être confronté à la version du
+        magasin déjà enregistrée, sinon la règle qui protège le parc saute dès
+        qu'on modifie un champ à la fois.
+
+        ⚠ **CETTE MÉTHODE ÉCRIT SUR L'INSTANCE, et c'est un piège de SONDE.** Sans
+        conséquence en production - `attrs` est exactement le `validated_data` que
+        `update()` reposera, et l'instance vient d'un `get()` par requête - mais un
+        script qui réutiliserait le même objet pour deux mesures verrait la seconde
+        fausse. Payé une fois en mesurant l'effacement de la plateforme iOS :
+        instancier à neuf pour chaque essai.
+        """
+        instance = self.instance or GlobalConfig.get()
+        for champ, valeur in attrs.items():
+            setattr(instance, champ, valeur)
+        instance.clean()
+        return attrs

@@ -24,10 +24,13 @@ from .serializers import (
     AdminSubscriptionListSerializer,
     AdminActivateSubscriptionSerializer,
     AdminCreateSubscriptionSerializer,
+    AdminAppReleaseSerializer,
 )
 from apps.organizations.models import Organization
 from apps.users.models import User
-from apps.subscriptions.models import Plan, Subscription, SubscriptionPayment
+from apps.subscriptions.models import (
+    GlobalConfig, Plan, Subscription, SubscriptionPayment,
+)
 
 
 # =============================================================================
@@ -379,3 +382,40 @@ class AdminSubscriptionViewSet(viewsets.ModelViewSet):
         return Response({
             'message': 'Abonnement annulé.',
         })
+
+
+# =============================================================================
+# PORTE DE MISE A JOUR MOBILE
+# =============================================================================
+
+class AdminAppReleaseView(APIView):
+    """
+    La porte de mise à jour du terminal mobile.
+    GET / PATCH /api/v1/platform-admin/app-release/
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ CE FORMULAIRE PEUT BLOQUER TOUT LE PARC, ET LE DÉBLOQUER.                │
+    │                                                                          │
+    │ Poser un seuil au-dessus de ce que le magasin sert rend chaque terminal  │
+    │ inutilisable sans qu'aucun ne puisse s'y conformer. Vider le champ est   │
+    │ la seule réparation, et elle agit au réveil suivant parce que            │
+    │ `GlobalConfig.save()` purge le cache des réglages.                       │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    Un singleton, donc ni liste ni création : `GET` lit, `PATCH` corrige. Un
+    `PUT` exigerait les huit champs et ferait effacer une plateforme en voulant
+    régler l'autre.
+    """
+
+    permission_classes = [IsAuthenticated, IsPlatformAdmin]
+    http_method_names = ['get', 'patch', 'options', 'head']
+
+    def get(self, request):
+        return Response(AdminAppReleaseSerializer(GlobalConfig.get()).data)
+
+    def patch(self, request):
+        config = GlobalConfig.get()
+        serializer = AdminAppReleaseSerializer(config, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)

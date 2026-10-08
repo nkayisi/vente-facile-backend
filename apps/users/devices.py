@@ -184,7 +184,7 @@ def subscription_payload(organization, membership):
     access_until = None
     if subscription is not None and subscription.current_period_end:
         access_until = subscription.current_period_end + timedelta(
-            days=GlobalConfig.get().grace_period_days
+            days=GlobalConfig.reglages()['grace_period_days']
         )
 
     return {
@@ -203,6 +203,53 @@ def subscription_payload(organization, membership):
         'can_manage': bool(membership and membership.role == 'owner'),
     }
 
+
+
+def app_update_payload(device):
+    """
+    La porte de mise à jour, telle qu'un TERMINAL doit la comprendre.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ ON DESCEND UN SEUIL, JAMAIS UN VERDICT.                                  │
+    │                                                                          │
+    │ Le serveur ne peut pas trancher : `Device.app_version` est figée au jour │
+    │ de l'ENRÔLEMENT et n'est jamais rafraîchie, donc elle ment. Et surtout,  │
+    │ un terminal sur lequel on vient de poser un APK à la main, hors ligne,   │
+    │ resterait bloqué par un verdict serveur périmé sans aucun moyen de le    │
+    │ lever. La comparaison appartient à celui qui connaît sa propre version.  │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ ET SURTOUT PAS UN REFUS HTTP.                                            │
+    │                                                                          │
+    │ Un 426 atteindrait `/auth/devices/session/`, c'est-à-dire le SEUL chemin │
+    │ par lequel un terminal peut apprendre qu'un seuil a été ABAISSÉ : la     │
+    │ sortie d'urgence serait inopérante sur les terminaux mêmes qu'elle doit  │
+    │ libérer. Il ferait en outre tomber la poussée du journal en             │
+    │ `kind: "request"` côté client, donc en QUARANTAINE, sur des ventes       │
+    │ parfaitement valides. C'est l'accident que `AbonnementRequis` (402) a    │
+    │ été écrit pour éviter ; on ne le rouvre pas par une autre porte.         │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    **La plateforme est résolue ICI**, depuis `Device.platform`, qui est écrit à
+    l'enrôlement et ne change jamais. Descendre les deux plateformes doublerait
+    la charge sur une 2G et ouvrirait un défaut qu'aucune relecture n'attrape :
+    un binaire iOS qui lirait le seuil Android.
+
+    ⚠ Sans appareil (chemin de test seulement), on n'exige RIEN : on ne sait pas
+    quelle plateforme viser, et une exigence devinée bloque au hasard.
+    """
+    from apps.subscriptions.models import GlobalConfig
+
+    vide = {
+        'minimum_version': None,
+        'current_version': None,
+        'store_urls': [],
+        'message': None,
+    }
+    if device is None:
+        return vide
+    return GlobalConfig.reglages().get(device.platform, vide)
 
 #: Plafond du roster descendu dans la session.
 #:
@@ -317,6 +364,16 @@ def build_session_payload(user, organization, device=None):
 
     Ce n'est pas une commodité : la connexion qui vient de revenir peut repartir
     avant le deuxième appel. Ce qui manquerait ici manquerait pour la journée.
+
+    ⚠ **UN SECOND APPELANT MOBILE JETTE CETTE CHARGE, ET C'EST VOULU.**
+    `src/api/client.ts::openSessionWithDevice` frappe le même endpoint pour
+    réescalader des jetons morts, et ne lit que `{access, refresh}`. Ni
+    `subscription` ni `app_update` ne l'atteignent donc par ce chemin. Ne pas
+    « réparer » : lui faire écrire l'instantané contournerait
+    `appliquerVerdictBase`, donc le filet qui empêche la base d'un compte de
+    recouvrir celle d'un autre. Le chemin qui compte est `refreshSnapshot()`,
+    appelé à la fin de chaque cycle de synchronisation, lequel a cinq
+    déclencheurs automatiques : l'écart se referme au cycle suivant.
     """
     from apps.organizations.serializers import OrganizationDetailSerializer
     from apps.settings.models import LoyaltyProgram, OrganizationCurrency, OrganizationSettings
@@ -383,6 +440,11 @@ def build_session_payload(user, organization, device=None):
             LoyaltyProgramSerializer(loyalty).data if loyalty else None
         ),
         'subscription': subscription_payload(organization, membership),
+        # Sœur de `subscription`, et pour la même raison : c'est le seul
+        # canal qui serve TOUS les rôles, qui réponde à une organisation
+        # bloquée, et dont la réponse soit mise en cache pour un démarrage
+        # à froid sans réseau.
+        'app_update': app_update_payload(device),
         'device': (
             {
                 'id': str(device.id),

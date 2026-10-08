@@ -1,8 +1,26 @@
+from django.core.cache import cache
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.conf import settings
 from django.utils import timezone
 from decimal import Decimal
 from apps.core.models import TimeStampedModel, UUIDModel
+from apps.core.versions import (
+    SEMVER,
+    comparer_versions,
+    segments_version,
+    urls_magasin,
+)
+
+#: Les réglages de plateforme, mis en cache. Lus à CHAQUE réveil de CHAQUE
+#: terminal : sans cache, chacun paierait un `get_or_create` pour quatre entiers
+#: et huit chaînes qui ne changent que quelques fois par an.
+CLE_REGLAGES = "vf:global_config:v1"
+
+#: Filet, pas mécanisme : `GlobalConfig.save()` purge la clé, donc une correction
+#: agit au réveil suivant. Ce délai ne couvre qu'une écriture hors du modèle
+#: (SQL direct), qui n'existe nulle part aujourd'hui.
+TTL_REGLAGES = 300
 
 
 class Plan(TimeStampedModel, UUIDModel):
@@ -469,8 +487,56 @@ class SubscriptionPayment(TimeStampedModel, UUIDModel):
 class GlobalConfig(models.Model):
     """
     Configuration globale du système (singleton).
-    Gérée uniquement via l'admin Django.
+
+    Deux familles de réglages y cohabitent : la durée d'essai et la grâce
+    d'abonnement, et la PORTE DE MISE À JOUR du terminal mobile. Elles n'ont
+    rien à voir l'une avec l'autre, mais elles partagent ce qui compte ici : ce
+    sont des décisions de PLATEFORME, pas d'organisation, et elles doivent
+    pouvoir changer sans redéploiement.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ LES SEUILS DE VERSION NAISSENT VIDES, ET C'EST LA RÈGLE LA PLUS          │
+    │ IMPORTANTE DE CE MODÈLE.                                                 │
+    │                                                                          │
+    │ Une valeur par défaut, fût-elle « 1.0.0 », bloquerait TOUT LE PARC à     │
+    │ l'instant de la migration, avant même que quiconque ait ouvert l'admin.  │
+    │ La chaîne vide veut dire « aucune exigence », et c'est aussi la SORTIE   │
+    │ D'URGENCE : vider le champ rouvre la porte au réveil suivant.            │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ⚠ **Un seuil n'agit que sur les binaires qui portent le mécanisme.** Les
+    versions antérieures l'ignorent, quoi qu'on publie : on livre d'abord la
+    version qui sait se bloquer, on attend qu'elle soit diffusée, et seulement
+    ensuite on pose un seuil.
     """
+
+    _AIDE_MIN = (
+        "Version minimale exigée, en trois segments (1.3.0). Laissez VIDE pour "
+        "n'exiger aucune mise à jour. Ne posez un seuil qu'APRÈS que cette "
+        "version soit réellement disponible dans le magasin : en dessous, le "
+        "terminal est inutilisable. Vider ce champ rouvre la porte au réveil "
+        "suivant."
+    )
+    _AIDE_COURANTE = (
+        "Version servie aujourd'hui par le magasin, en trois segments. "
+        "OBLIGATOIRE dès qu'un seuil est posé : c'est elle, et elle seule, qui "
+        "interdit d'exiger une version qu'aucun terminal ne pourrait installer. "
+        "Elle est aussi NOMMÉE sur l'écran de blocage, pour que le marchand "
+        "sache quoi réclamer."
+    )
+    _AIDE_URL = (
+        "Adresse de la fiche de l'application. Une fiche Play "
+        "(play.google.com/store/apps/details?id=...) ouvre directement "
+        "l'application du magasin. Toute autre adresse est servie telle quelle : "
+        "revendeur, galerie tierce, ou lien d'APK direct pour les terminaux de "
+        "comptoir sans magasin."
+    )
+    _AIDE_MESSAGE = (
+        "Ce que le marchand lit sur l'écran de blocage, à la place du texte par "
+        "défaut. C'est la SEULE issue d'un terminal sans magasin : « Appelez le "
+        "0XX pour recevoir la nouvelle version »."
+    )
+
     trial_days = models.PositiveIntegerField(
         default=15,
         help_text="Nombre de jours de la période d'essai pour les nouveaux comptes"
@@ -479,7 +545,38 @@ class GlobalConfig(models.Model):
         default=3,
         help_text="Nombre de jours de grâce après expiration avant blocage total"
     )
-    
+
+    android_minimum_version = models.CharField(
+        max_length=40, blank=True, default='', help_text=_AIDE_MIN
+    )
+    android_current_version = models.CharField(
+        max_length=40, blank=True, default='', help_text=_AIDE_COURANTE
+    )
+    android_store_url = models.URLField(
+        max_length=300, blank=True, default='', help_text=_AIDE_URL
+    )
+    android_update_message = models.TextField(
+        blank=True, default='', help_text=_AIDE_MESSAGE
+    )
+
+    ios_minimum_version = models.CharField(
+        max_length=40, blank=True, default='', help_text=_AIDE_MIN
+    )
+    ios_current_version = models.CharField(
+        max_length=40, blank=True, default='', help_text=_AIDE_COURANTE
+    )
+    ios_store_url = models.URLField(
+        max_length=300, blank=True, default='',
+        help_text=(
+            "Adresse de la fiche App Store. LAISSEZ VIDE tant que l'application "
+            "n'y est pas publiée : iOS n'autorise aucune installation manuelle, "
+            "donc un terminal iOS bloqué sans lien n'a littéralement aucune issue."
+        ),
+    )
+    ios_update_message = models.TextField(
+        blank=True, default='', help_text=_AIDE_MESSAGE
+    )
+
     class Meta:
         db_table = 'global_config'
         verbose_name = 'Configuration globale'
@@ -488,13 +585,152 @@ class GlobalConfig(models.Model):
     def __str__(self):
         return "Configuration globale"
 
+    def clean(self):
+        """
+        Les trois règles qu'un formulaire doit opposer AVANT qu'un terminal ne les
+        découvre. Partagées par l'admin Django et par l'API d'administration : les
+        écrire deux fois, c'est les faire diverger.
+        """
+        super().clean()
+        erreurs = {}
+        for plateforme in ('android', 'ios'):
+            erreurs.update(self._valider_porte(plateforme))
+        if erreurs:
+            raise ValidationError(erreurs)
+
+    def _valider_porte(self, plateforme):
+        minimum = (getattr(self, f'{plateforme}_minimum_version') or '').strip()
+        courante = (getattr(self, f'{plateforme}_current_version') or '').strip()
+        url = (getattr(self, f'{plateforme}_store_url') or '').strip()
+        message = (getattr(self, f'{plateforme}_update_message') or '').strip()
+
+        erreurs = {}
+        for champ, valeur in (
+            (f'{plateforme}_minimum_version', minimum),
+            (f'{plateforme}_current_version', courante),
+        ):
+            if not valeur:
+                continue
+            # ⚠ LES DEUX CONTRÔLES, ET IL FAUT LES DEUX. `SEMVER` accepte vingt
+            # chiffres par segment ; `segments_version` refuse au-delà de
+            # `MAX_SEGMENT`, où le MIROIR JavaScript perdrait la précision. Sans
+            # ce second contrôle, `comparer_versions` rendait `None`, la garde
+            # anti-brique ne disait rien, et le seuil descendait sur des
+            # terminaux qui le rejettent pour la même raison : la porte
+            # paraissait armée et était INERTE.
+            if not SEMVER.match(valeur) or segments_version(valeur) is None:
+                erreurs[champ] = (
+                    "Trois segments numériques attendus, par exemple 1.3.0."
+                )
+
+        # Une forme fautive rend les deux règles suivantes ininterprétables :
+        # les annoncer en plus ferait chercher trois défauts là où il y en a un.
+        if erreurs or not minimum:
+            return erreurs
+
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ LA VERSION DU MAGASIN EST OBLIGATOIRE DÈS QU'UN SEUIL EST POSÉ.  │
+        # │                                                                  │
+        # │ C'est elle, et elle seule, qui rend la garde anti-brique          │
+        # │ opérante. Tant qu'elle était facultative, l'ordre naturel - poser │
+        # │ le seuil d'abord, la nommer ensuite - sautait la garde            │
+        # │ ENTIÈREMENT, et une faute de frappe (`1.30.0` pour `1.3.0`)       │
+        # │ bloquait tout le parc sans qu'aucun terminal ne puisse s'y        │
+        # │ conformer. Un champ dont l'absence désarme la seule protection du │
+        # │ parc n'est pas un champ facultatif.                               │
+        # └──────────────────────────────────────────────────────────────────┘
+        if not courante:
+            erreurs[f'{plateforme}_current_version'] = (
+                "Nommez la version servie aujourd'hui par le magasin : c'est "
+                "elle qui interdit de poser un seuil qu'aucun terminal ne peut "
+                "atteindre."
+            )
+            # Sans elle, la règle suivante n'a rien à comparer. La tenter
+            # ajouterait un second message pour un seul défaut.
+            return erreurs
+
+        # ⚠ LA RÈGLE QUI EMPÊCHE DE BRIQUER LE PARC. Un seuil au-dessus de ce
+        # que le magasin sert bloque tout le monde sans qu'aucun terminal ne
+        # puisse s'y conformer, et la seule réparation est de revenir ici.
+        #
+        # ⚠ On exige « seuil ≤ magasin », on ne refuse pas seulement le « > ».
+        # Les deux numéros sont désormais lisibles, donc `None` n'est plus
+        # atteignable - mais une garde qui traite l'illisible comme un accord
+        # est celle qui revient le jour où une borne bouge.
+        if comparer_versions(minimum, courante) not in (-1, 0):
+            erreurs[f'{plateforme}_minimum_version'] = (
+                "Ce seuil dépasse la version disponible dans le magasin "
+                f"({courante}) : aucun terminal ne pourrait s'y conformer."
+            )
+
+        # Un mur sans rien dessus est le seul défaut irréparable DEPUIS le
+        # terminal : le marchand lit « mettez à jour » et n'a nulle part où aller.
+        if not url and not message:
+            erreurs[f'{plateforme}_store_url'] = (
+                "Un seuil exige une adresse de mise à jour ou, à défaut, un "
+                "message qui dise au marchand comment obtenir la nouvelle version."
+            )
+
+        return erreurs
+
     def save(self, *args, **kwargs):
         # Singleton: force l'id à 1
         self.pk = 1
         super().save(*args, **kwargs)
+        # ⚠ LA PURGE SUIT L'ÉCRITURE, JAMAIS L'INVERSE : purger d'abord
+        # laisserait une lecture concurrente remettre l'ANCIENNE valeur en cache,
+        # et la sortie d'urgence attendrait alors la fin du TTL.
+        cache.delete(CLE_REGLAGES)
 
     @classmethod
     def get(cls):
         """Retourne l'instance unique de configuration, la crée si besoin."""
         obj, _ = cls.objects.get_or_create(pk=1)
         return obj
+
+    @classmethod
+    def reglages(cls):
+        """
+        Les réglages de plateforme, en DICT PLAT et caché.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ JAMAIS L'INSTANCE, TOUJOURS DES PRIMITIFS.                           │
+        │                                                                      │
+        │ Un modèle Django se sérialise mal en travers d'un déploiement qui    │
+        │ ajoute une colonne : le cache rendrait un objet à qui il manque un   │
+        │ attribut, et l'erreur tomberait sur le chemin de RÉVEIL d'un         │
+        │ terminal. C'est la règle déjà posée par `get_cached_block_state`.    │
+        └──────────────────────────────────────────────────────────────────────┘
+
+        Le cache n'est pas un confort : ce chemin est parcouru à chaque réveil de
+        chaque terminal, et `get()` est un `get_or_create`. `save()` le purge,
+        donc une correction faite en administration agit au réveil SUIVANT.
+        """
+        caches = cache.get(CLE_REGLAGES)
+        if caches is not None:
+            return caches
+
+        obj = cls.get()
+        valeurs = {
+            'trial_days': obj.trial_days,
+            'grace_period_days': obj.grace_period_days,
+            'android': obj._porte('android'),
+            'ios': obj._porte('ios'),
+        }
+        cache.set(CLE_REGLAGES, valeurs, timeout=TTL_REGLAGES)
+        return valeurs
+
+    def _porte(self, plateforme):
+        """La porte de mise à jour d'une plateforme, prête à descendre sur le fil."""
+        minimum = (getattr(self, f'{plateforme}_minimum_version') or '').strip()
+        courante = (getattr(self, f'{plateforme}_current_version') or '').strip()
+        message = (getattr(self, f'{plateforme}_update_message') or '').strip()
+        url = (getattr(self, f'{plateforme}_store_url') or '').strip()
+        return {
+            # `None` et non la chaîne vide : côté terminal, « absent » et « vide »
+            # doivent se lire de la même façon, et `null` ne se confond avec rien.
+            'minimum_version': minimum or None,
+            'current_version': courante or None,
+            'store_urls': urls_magasin(plateforme, url),
+            'message': message or None,
+        }

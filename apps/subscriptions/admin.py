@@ -14,7 +14,44 @@ from .services import SubscriptionService
 
 @admin.register(GlobalConfig)
 class GlobalConfigAdmin(admin.ModelAdmin):
-    list_display = ['__str__', 'trial_days', 'grace_period_days']
+    """
+    Le singleton de plateforme. Deux sujets sans rapport y cohabitent, d'où les
+    groupes : huit champs de version à plat, sous deux compteurs de jours, ne se
+    relisent pas - et c'est précisément ici qu'on vient en urgence rouvrir une
+    porte posée trop haut.
+    """
+
+    list_display = [
+        '__str__', 'trial_days', 'grace_period_days',
+        'android_minimum_version', 'ios_minimum_version',
+    ]
+
+    fieldsets = (
+        ('Abonnements', {'fields': ('trial_days', 'grace_period_days')}),
+        ('Mise à jour obligatoire - Android', {
+            'fields': (
+                'android_minimum_version', 'android_current_version',
+                'android_store_url', 'android_update_message',
+            ),
+            'description': (
+                "Un terminal dont la version est INFÉRIEURE au seuil devient "
+                "inutilisable jusqu'à la mise à jour. Laissez vide pour n'exiger "
+                "rien. Les versions antérieures au mécanisme ignorent ce réglage : "
+                "publiez d'abord, posez le seuil ensuite."
+            ),
+        }),
+        ('Mise à jour obligatoire - iOS', {
+            'fields': (
+                'ios_minimum_version', 'ios_current_version',
+                'ios_store_url', 'ios_update_message',
+            ),
+            'description': (
+                "iOS n'autorise aucune installation manuelle : ne posez un seuil "
+                "qu'une fois l'application publiée sur l'App Store et son adresse "
+                "renseignée, sans quoi un terminal bloqué n'a aucune issue."
+            ),
+        }),
+    )
 
     def has_add_permission(self, request):
         # Singleton : interdire la création si un objet existe déjà

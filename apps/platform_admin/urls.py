@@ -11,6 +11,7 @@ from .views import (
     AdminUserViewSet,
     AdminPlanViewSet,
     AdminSubscriptionViewSet,
+    AdminAppReleaseView,
 )
 
 router = DefaultRouter()
@@ -23,5 +24,6 @@ app_name = 'platform_admin'
 
 urlpatterns = [
     path('dashboard/', AdminDashboardView.as_view(), name='admin-dashboard'),
+    path('app-release/', AdminAppReleaseView.as_view(), name='admin-app-release'),
     path('', include(router.urls)),
 ]

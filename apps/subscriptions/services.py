@@ -70,7 +70,9 @@ class SubscriptionService:
         ).select_related('plan').order_by('-created_at').first()
 
         now = timezone.now()
-        config = GlobalConfig.get()
+        # Les réglages plutôt que l'instance : ce chemin est parcouru à chaque
+        # réveil de chaque terminal, et `get()` est un `get_or_create`.
+        reglages = GlobalConfig.reglages()
 
         if not subscription:
             return {
@@ -84,7 +86,7 @@ class SubscriptionService:
 
         # Vérifier l'expiration
         if subscription.current_period_end and subscription.current_period_end < now:
-            grace_end = subscription.current_period_end + timedelta(days=config.grace_period_days)
+            grace_end = subscription.current_period_end + timedelta(days=reglages['grace_period_days'])
 
             if now > grace_end:
                 # Période de grâce dépassée -> bloquer
