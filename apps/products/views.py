@@ -24,6 +24,7 @@ from apps.core.api_mixins import (
 from apps.core.warehouse_scope import (
     accessible_warehouse_ids,
     assert_warehouse_allowed_for_request,
+    filter_products_by_warehouse_ids,
     filter_queryset_by_warehouse_ids,
     get_membership_for_request,
 )
@@ -74,12 +75,15 @@ def _annotate_product_total_stock(queryset, wh_ids):
 
 
 def _filter_products_by_membership_warehouses(queryset, wh_ids):
-    """Produits visibles dans le périmètre entrepôt (hors owner)."""
-    if wh_ids is None:
-        return queryset
-    return queryset.filter(
-        Q(track_inventory=False) | Q(stocks__warehouse_id__in=wh_ids)
-    ).distinct()
+    """
+    Produits visibles dans le périmètre entrepôt (hors owner).
+
+    Le corps a DÉMÉNAGÉ dans `apps/core/warehouse_scope.py` : la règle était
+    privée à ce module, si bien que le terminal ne pouvait pas la miroiter - le
+    back-office bornait son catalogue par entrepôt depuis toujours, et le
+    terminal montrait tout. C'est T5 du retour de test.
+    """
+    return filter_products_by_warehouse_ids(queryset, wh_ids)
 
 
 # =============================================================================

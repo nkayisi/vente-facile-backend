@@ -187,6 +187,79 @@ def filter_stock_transfer_queryset(
     )
 
 
+def filter_product_queryset(
+    queryset: QuerySet, membership: Optional[OrganizationMembership]
+) -> QuerySet:
+    """
+    Le périmètre d'un ARTICLE : il se dérive de ses lignes de stock.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ LA RÈGLE VIVAIT DANS `products/views.py`, DONC LE TERMINAL NE POUVAIT   │
+    │ PAS LA MIROITER.                                                         │
+    │                                                                          │
+    │ `ProductViewSet` la portait sous le nom `_filter_products_by_membership_ │
+    │ warehouses`, privée à son module : le back-office bornait donc son       │
+    │ catalogue par entrepôt depuis toujours, et le terminal montrait tout. Un │
+    │ marchand qui compare les deux surfaces y lit une incohérence, et c'est   │
+    │ T5 du retour de test.                                                    │
+    │                                                                          │
+    │ Elle est ici pour la même raison que ses deux voisines : une règle de    │
+    │ périmètre écrite à deux endroits finit par donner deux périmètres.       │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ⚠ UN ARTICLE NON SUIVI RESTE VISIBLE DE TOUS, et ce n'est pas une
+    tolérance : un service, une prestation, un emballage interne n'a de ligne
+    de stock dans AUCUN entrepôt. L'écarter le rendrait invendable partout.
+
+    ⚠ `distinct()` EST OBLIGATOIRE. La condition traverse une relation inverse
+    (un article porte une ligne de stock PAR entrepôt) : sans elle, un article
+    stocké dans deux dépôts accessibles sort DEUX FOIS. Le filtre indirect
+    ordinaire (`filter_queryset_by_related_warehouse`) n'en a pas besoin, ses
+    chemins étant tous des clés étrangères directes.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ ⚠ NE PAS S'EN SERVIR POUR BORNER `products` AU TIRAGE. MESURÉ.          │
+    │                                                                          │
+    │ Le tirage pagine sur un curseur `(updated_at, id)`, et le périmètre      │
+    │ s'applique AVANT lui. Or `Stock.save()` ne touche PAS                     │
+    │ `product.updated_at`, et aucun signal ne le fait : un article            │
+    │ nouvellement stocké dans mon dépôt deviendrait éligible avec un          │
+    │ horodatage ANTÉRIEUR au point de reprise, donc il ne descendrait JAMAIS. │
+    │ Un magasinier recevrait une marchandise qui n'apparaîtrait pas sur son   │
+    │ terminal, et la sonde `pull/changed/` répondrait « rien de neuf ».       │
+    │                                                                          │
+    │ Et même avec cette écriture en plus, narrower le tirage ne SUFFIRAIT     │
+    │ pas : un article qui SORT du périmètre n'émet aucune pierre tombale -    │
+    │ il n'est pas supprimé - et resterait en base locale indéfiniment. Le     │
+    │ filtre de LECTURE est donc nécessaire de toute façon, et il est          │
+    │ suffisant : toutes les lignes sont là, on choisit ce qu'on montre.       │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+    return filter_products_by_warehouse_ids(
+        queryset, accessible_warehouse_ids(membership)
+    )
+
+
+def filter_products_by_warehouse_ids(queryset: QuerySet, ids) -> QuerySet:
+    """
+    La règle elle-même, sur des identifiants DÉJÀ résolus.
+
+    Deux formes, et il faut les deux : `ProductViewSet` resserre encore le
+    périmètre du rôle avec son paramètre `?warehouse=`, donc il tient déjà sa
+    liste ; le reste du dépôt part d'une appartenance, comme les deux filtres
+    voisins. Un seul corps, deux portes.
+
+    `None` vaut « aucune restriction » (le propriétaire) ; `[]` vaut « aucun
+    accès », et ne laisse alors passer que les articles non suivis - exactement
+    ce que le back-office rend à un membre sans affectation.
+    """
+    if ids is None:
+        return queryset
+    return queryset.filter(
+        Q(track_inventory=False) | Q(stocks__warehouse_id__in=ids)
+    ).distinct()
+
+
 def filter_cash_movement_queryset(
     queryset: QuerySet, membership: Optional[OrganizationMembership]
 ) -> QuerySet:
