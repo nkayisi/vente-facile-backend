@@ -173,6 +173,10 @@ class StatisticsViewSet(ExportResponseMixin, ActionPaginationMixin,
         'product_profits': 'reports.view',
         'sales_by_packaging': 'reports.view',
         'user_activity': 'reports.view',
+        # Ma propre journée : le caissier n'a pas `reports.view`, et c'est
+        # voulu. `dashboard.view` que les quatre rôles portent, l'endpoint
+        # n'acceptant aucune cible autre que le demandeur.
+        'my_activity': 'dashboard.view',
         # Exporter, c'est LIRE : le fichier ne porte rien que l'écran n'affiche
         # déjà, et les mêmes `_scope_*` s'appliquent. Sans cette entrée,
         # `HasPermission` refuse la route à TOUS les rôles, en silence.
@@ -769,6 +773,71 @@ class StatisticsViewSet(ExportResponseMixin, ActionPaginationMixin,
                 {'user': USER_ACTIVITY_INCONNU},
                 status=status.HTTP_404_NOT_FOUND,
             )
+
+        return Response(self._user_activity_data(
+            request, org, membership, start_date, end_date, group_by
+        ))
+
+    @action(detail=False, methods=['get'], url_path='my-activity')
+    def my_activity(self, request):
+        """Ma propre activité sur la période : ce que J'AI vendu, encaissé, dépensé.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ UNE ACTION À PART, ET SURTOUT PAS `user_activity` ASSOUPLIE.         │
+        │                                                                      │
+        │ Les huit onglets de Rapports sont gardés par `reports.view`, accordé │
+        │ au seul propriétaire et au gérant : un caissier qui ouvre la rubrique │
+        │ reçoit 403. Il n'avait donc AUCUNE lecture de sa propre journée, ce   │
+        │ qui est la contrepartie du cloisonnement - on ne lui retire pas la    │
+        │ lecture de son périmètre en lui retirant celle des autres.            │
+        │                                                                      │
+        │ Relâcher `user_activity` quand la cible est le demandeur aurait mêlé  │
+        │ deux droits dans une seule action : son refus 404 et son message de   │
+        │ champ sont un contrat publié, que les deux clients retraduisent. Une  │
+        │ action distincte ne touche à rien, et elle N'ACCEPTE AUCUN `user` -   │
+        │ le périmètre n'est donc pas une règle à tenir, c'est la forme de      │
+        │ l'endpoint.                                                          │
+        └──────────────────────────────────────────────────────────────────────┘
+
+        Params : ``date_from``/``date_to`` ou ``period``, ``group_by=hour|day``
+        (défaut ``day``). Gardée par ``dashboard.view``, que les quatre rôles
+        portent. Le corps est celui de ``user_activity`` : deux lectures de la
+        même journée ne doivent pas pouvoir donner deux chiffres.
+        """
+        org = self.get_organization()
+        start_date, end_date, _, _ = self._parse_date_range(request)
+        group_by = request.query_params.get('group_by', 'day')
+
+        membership = get_membership_for_request(request)
+        if membership is None:
+            # `IsTenantMember` l'a déjà exigée ; si elle manque ici, c'est que
+            # l'en-tête d'organisation n'a pas été posé. On le DIT plutôt que de
+            # lever une erreur de programmation.
+            return Response(
+                {'detail': "L'en-tête X-Organization-ID est requis."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ LE FILTRE VOLONTAIRE EST NEUTRALISÉ, ET C'EST CE QUI REND LA     │
+        # │ PROMESSE STRUCTURELLE.                                           │
+        # │                                                                  │
+        # │ Sans cela, le contrat serait incohérent : un `?user=` portant SON │
+        # │ propre identifiant passerait la validation et n'aurait aucun      │
+        # │ effet, pendant que celui d'un collègue ferait lever 400. Le même  │
+        # │ paramètre serait donc tantôt toléré tantôt refusé, sur un endpoint │
+        # │ dont la docstring dit n'accepter aucune cible.                    │
+        # │                                                                  │
+        # │ Et ce dépôt a déjà payé un paramètre qui voyage là où il n'a rien │
+        # │ à faire : `?user=` partait sur les quatre appels de l'onglet      │
+        # │ Ventes, où personne ne le lit - « un paramètre qui voyage là où   │
+        # │ il n'a rien à faire finit par être lu ».                          │
+        # │                                                                  │
+        # │ On pré-pose le MÉMO de `_perimetre_voulu` plutôt que d'ajouter un │
+        # │ mécanisme : le périmètre du RÔLE, lui, reste entier - il est      │
+        # │ appliqué avant `_vouloir` dans chaque `_scope_*`.                 │
+        # └──────────────────────────────────────────────────────────────────┘
+        request._reports_perimetre_voulu = (None, None)
 
         return Response(self._user_activity_data(
             request, org, membership, start_date, end_date, group_by

@@ -37,6 +37,7 @@ CHEMINS_PUBLIES = {
     'daily_cash_report',
     'export',
     'product_profits',
+    'my-activity',
     'product_supplies',
     'profit_margins',
     'receivables',
@@ -65,6 +66,9 @@ CHEMINS_DU_TERMINAL = {
     'product_profits',
     'user_activity',
     'receivables',
+    # « Ma journée » : la seule lecture de rapport ouverte à un caissier, qui
+    # n'a pas `reports.view`. Tiret VOULU, l'action déclarant un `url_path`.
+    'my-activity',
 }
 
 
