@@ -14,6 +14,8 @@ Ce qui garantit qu'un membre borné a toujours au moins un entrepôt.
 │ et le signal l'appellent tous deux.                                          │
 └──────────────────────────────────────────────────────────────────────────────┘
 """
+from django.db import transaction
+
 from apps.inventory.models import Warehouse
 
 
@@ -66,3 +68,173 @@ def assurer_entrepot_du_membre(membership) -> bool:
     # synchronisation. Sans ce mécanisme, les lignes du dépôt nouvellement
     # accessible seraient derrière son curseur, donc perdues pour toujours.
     return True
+
+
+# ==============================================================================
+# REMISE À ZÉRO D'UN ESSAI
+# ==============================================================================
+
+#: Ce qu'une remise à zéro EFFACE, dans l'ordre des dépendances.
+#:
+#: ┌────────────────────────────────────────────────────────────────────────────┐
+#: │ UNE LISTE EXPLICITE, JAMAIS UNE CASCADE.                                  │
+#: │                                                                            │
+#: │ S'en remettre aux `on_delete` demanderait de les avoir tous relus, et une  │
+#: │ seule relation en `PROTECT` ferait échouer l'opération à mi-chemin - sur   │
+#: │ un geste destructeur, à l'intérieur d'une transaction qu'on vient          │
+#: │ d'ouvrir. Une liste se relit, se teste, et son ordre est une preuve.       │
+#: │                                                                            │
+#: │ L'ordre va de l'ENFANT vers le PARENT : supprimer une vente avant ses     │
+#: │ lignes marcherait par cascade, mais l'écrire ainsi rend l'intention        │
+#: │ illisible et masquerait une relation `PROTECT` ajoutée plus tard.          │
+#: └────────────────────────────────────────────────────────────────────────────┘
+EFFACES_PAR_LA_REMISE_A_ZERO = [
+    # --- La trace de synchronisation, en premier : elle référence tout le reste.
+    ('sync', 'SyncOperation'),
+    ('users', 'UserActivity'),
+    ('notifications', 'Notification'),
+    ('notifications', 'Alert'),
+    ('notifications', 'EmailLog'),
+
+    # --- Les ventes et leur suite.
+    ('sales', 'SaleReturnItem'),
+    ('sales', 'SaleReturn'),
+    ('sales', 'Payment'),
+    ('sales', 'SaleItem'),
+    ('sales', 'Sale'),
+    ('sales', 'QuotationItem'),
+    ('sales', 'Quotation'),
+    ('sales', 'RegisterSessionCurrencyBalance'),
+    ('sales', 'RegisterSession'),
+
+    # --- Les achats.
+    ('purchases', 'SupplierPaymentAllocation'),
+    ('purchases', 'SupplierPayment'),
+    ('purchases', 'PurchaseReturnItem'),
+    ('purchases', 'PurchaseReturn'),
+    ('purchases', 'GoodsReceiptItem'),
+    ('purchases', 'GoodsReceipt'),
+    ('purchases', 'PurchaseOrderItem'),
+    ('purchases', 'PurchaseOrder'),
+
+    # --- Le stock : les MOUVEMENTS et les comptages, puis les soldes.
+    ('inventory', 'InventoryCount'),
+    ('inventory', 'InventorySession'),
+    ('inventory', 'StockAdjustmentItem'),
+    ('inventory', 'StockAdjustment'),
+    ('inventory', 'StockTransferItem'),
+    ('inventory', 'StockTransfer'),
+    ('inventory', 'StockMovement'),
+    ('inventory', 'StockBatch'),
+    ('inventory', 'Stock'),
+
+    # --- La caisse.
+    ('cashbook', 'CashMovement'),
+    ('cashbook', 'Expense'),
+
+    # --- La dette et la fidélité des clients. Les CLIENTS restent.
+    ('contacts', 'CustomerTransaction'),
+    ('contacts', 'CustomerBalance'),
+    ('settings', 'LoyaltyTransaction'),
+    ('settings', 'CustomerLoyalty'),
+
+    # --- Les compteurs de documents : sans eux, la numérotation reprendrait où
+    # l'essai l'avait laissée, sur un établissement qui n'a plus aucune pièce.
+    ('core', 'DocumentSequence'),
+]
+
+#: Ce qu'elle GARDE, et c'est la moitié du contrat.
+#:
+#: Articles, catégories, marques, unités, tarifs, entrepôts, caisses, moyens de
+#: paiement, devises, programme de fidélité, réglages, membres, clients et
+#: fournisseurs. Un marchand qui remet son essai à zéro veut refaire ses ventes,
+#: pas resaisir son catalogue.
+GARDES_PAR_LA_REMISE_A_ZERO = [
+    'products.Product', 'products.Category', 'products.Brand', 'products.Unit',
+    'products.PriceList', 'products.ProductPrice', 'products.ProductVariant',
+    'inventory.Warehouse', 'inventory.StockLocation',
+    'sales.Register', 'sales.PaymentMethod',
+    'contacts.Customer', 'contacts.Supplier', 'contacts.SupplierProduct',
+    'cashbook.IncomeCategory', 'cashbook.ExpenseCategory',
+    'settings.LoyaltyProgram', 'settings.LoyaltyReward',
+    'settings.OrganizationCurrency', 'settings.OrganizationSettings',
+    'organizations.Branch', 'organizations.OrganizationMembership',
+]
+
+
+class RemiseAZeroRefusee(Exception):
+    """Refus DÉTERMINISTE : l'établissement n'est pas un essai, ou pas confirmé."""
+
+
+@transaction.atomic
+def reset_trial_data(organization, *, confirmation: str, dry_run: bool = False) -> dict:
+    """
+    Efface les OPÉRATIONS d'un établissement d'essai, et garde sa configuration.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ T8 DU RETOUR DE TEST, DEMANDÉ DEUX FOIS.                                │
+    │                                                                          │
+    │ « Supprimer les ventes et les opérations effectuées » après un essai.    │
+    │ L'annulation comptable d'une vente existe et contrepasse ; ce qui        │
+    │ n'existait nulle part, c'est la remise à zéro.                           │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ⚠ TROIS VERROUS, ET IL EN FAUT TROIS.
+
+    1. L'abonnement doit être en statut `trial`. Un établissement en production
+       porte des pièces comptables et le papier déjà remis à ses clients : rien
+       ne doit pouvoir les effacer, pas même son propriétaire.
+    2. La `confirmation` doit être le NOM de l'établissement, saisi. Un bouton
+       derrière un simple « êtes-vous sûr » se presse par réflexe.
+    3. L'appelant vérifie le rôle (`IsTenantOwner`) : ce n'est pas un geste de
+       comptoir.
+
+    ⚠ ON N'OFFRE PAS LA SUPPRESSION D'UNE VENTE RÉGLÉE, et c'est pourquoi cette
+    opération est globale : effacer une pièce isolée trouerait la série de
+    numéros et contredirait le papier déjà remis au client. Ici il ne reste
+    AUCUNE pièce, et les compteurs repartent de zéro avec elles.
+
+    `dry_run` rend les mêmes comptes sans rien écrire : c'est ce que l'écran
+    montre avant de demander la confirmation.
+    """
+    from django.apps import apps
+
+    attendu = (organization.name or '').strip()
+    if (confirmation or '').strip() != attendu:
+        raise RemiseAZeroRefusee(
+            f"Saisissez le nom de l'établissement pour confirmer : « {attendu} »."
+        )
+
+    abonnement = (
+        organization.subscriptions.order_by('-created_at').first()
+        if hasattr(organization, 'subscriptions') else None
+    )
+    if abonnement is None or not abonnement.is_trial:
+        raise RemiseAZeroRefusee(
+            "La remise à zéro est réservée aux établissements en période d'essai. "
+            "Une vente réglée ne s'efface pas : elle s'annule, et la contrepassation "
+            "laisse sa trace."
+        )
+
+    comptes = {}
+    for app_label, nom in EFFACES_PAR_LA_REMISE_A_ZERO:
+        modele = apps.get_model(app_label, nom)
+        # ⚠ `all_objects` quand il existe : un manager de suppression douce
+        # filtrerait `is_deleted=False` et LAISSERAIT les lignes déjà
+        # supprimées, qui continueraient de descendre au tirage en pierres
+        # tombales - donc une base locale qui ne se vide jamais tout à fait.
+        manager = getattr(modele, 'all_objects', None) or modele.objects
+        qs = manager.filter(organization=organization)
+        n = qs.count()
+        if n:
+            comptes[f'{app_label}.{nom}'] = n
+            if not dry_run:
+                qs.delete()
+
+    if dry_run:
+        # ⚠ On annule ce que la transaction aurait pu écrire : `count()` n'écrit
+        # rien, mais un `dry_run` qui laisserait la transaction ouverte sur un
+        # chemin futur serait un piège.
+        transaction.set_rollback(True)
+
+    return comptes

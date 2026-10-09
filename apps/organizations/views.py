@@ -159,6 +159,12 @@ def _dashboard_top_product(row):
     }
 
 
+from apps.organizations.services import (
+    GARDES_PAR_LA_REMISE_A_ZERO,
+    RemiseAZeroRefusee,
+    reset_trial_data,
+)
+
 class OrganizationViewSet(viewsets.ModelViewSet):
     """
     ViewSet pour la gestion des organisations.
@@ -283,6 +289,62 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         }
         
         return Response(stats)
+
+    @action(detail=True, methods=['post'], url_path='reset-trial')
+    def reset_trial(self, request, pk=None):
+        """Efface les OPÉRATIONS d'un établissement d'essai. T8 du retour de test.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ TROIS VERROUS, ET IL EN FAUT TROIS.                                 │
+        │                                                                      │
+        │ 1. Le RÔLE : propriétaire seul. `OrganizationViewSet` ne porte que   │
+        │    `IsAuthenticated` et borne par appartenance - un gérant atteint   │
+        │    donc cette route, et le contrôle est fait ICI, explicitement.     │
+        │ 2. L'ABONNEMENT doit être en essai. Un établissement en production   │
+        │    porte des pièces comptables et le papier remis à ses clients.     │
+        │ 3. La CONFIRMATION est le nom de l'établissement, saisi : un bouton  │
+        │    derrière un simple « êtes-vous sûr » se presse par réflexe.       │
+        └──────────────────────────────────────────────────────────────────────┘
+
+        `POST {"dry_run": true}` rend les mêmes comptes SANS rien écrire : c'est
+        ce que l'écran montre avant de demander la confirmation. Sur ce chemin,
+        la confirmation n'est pas exigée - on ne fait que compter.
+        """
+        organization = self.get_object()
+
+        membership = OrganizationMembership.objects.filter(
+            organization=organization, user=request.user, is_active=True
+        ).first()
+        if membership is None or membership.role != OrganizationMembership.Role.OWNER:
+            return Response(
+                {'detail': "Seul le propriétaire peut remettre un essai à zéro."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        a_blanc = bool(request.data.get('dry_run'))
+        # Un aperçu ne demande pas la confirmation : il ne détruit rien, et
+        # l'exiger obligerait à taper le nom pour simplement regarder.
+        confirmation = (
+            organization.name if a_blanc else request.data.get('confirmation', '')
+        )
+
+        try:
+            comptes = reset_trial_data(
+                organization, confirmation=confirmation, dry_run=a_blanc
+            )
+        except RemiseAZeroRefusee as refus:
+            # Refus DÉTERMINISTE : jamais un 500, et le message dit ce qu'on
+            # attend - le nom à saisir, ou pourquoi l'essai est requis.
+            return Response({'detail': str(refus)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({
+            'dry_run': a_blanc,
+            'deleted': comptes,
+            'total': sum(comptes.values()),
+            # Ce qui RESTE est la moitié du contrat : un marchand qui remet son
+            # essai à zéro veut refaire ses ventes, pas resaisir son catalogue.
+            'kept': GARDES_PAR_LA_REMISE_A_ZERO,
+        })
 
     @action(detail=True, methods=['get'])
     def dashboard(self, request, pk=None):
