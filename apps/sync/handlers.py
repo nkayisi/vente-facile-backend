@@ -1306,3 +1306,100 @@ def expense_category_update(ctx, payload):
         ExpenseCategoryCreateSerializer, ExpenseCategoryDetailSerializer,
         'expense_category', "Cette catégorie de dépense",
     )
+
+
+# ------------------------------------------------- réquisitions de produits
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ UNE RÉQUISITION SE SAISIT AU FOND D'UN DÉPÔT, SOUVENT SANS RÉSEAU.      │
+# │                                                                          │
+# │ C'est même la situation ordinaire : on constate un rayon vide là où il   │
+# │ est, pas devant un ordinateur. Sans acte de journal, la demande se       │
+# │ perdrait entre le dépôt et le bureau - ce que le papier qu'on emporte au │
+# │ marché existe justement pour éviter. T12 du retour de test.              │
+# └──────────────────────────────────────────────────────────────────────────┘
+
+@handler('requisition.create', permission='requisitions.create')
+def requisition_create(ctx, payload):
+    from apps.inventory.models import Warehouse
+    from apps.purchases.models import Requisition
+    from apps.purchases.serializers import (
+        RequisitionCreateSerializer, RequisitionSerializer,
+    )
+    from apps.purchases.services import RequisitionRefusee, create_requisition
+
+    entree = RequisitionCreateSerializer(data=payload)
+    entree.is_valid(raise_exception=True)
+    donnees = entree.validated_data
+
+    depot = _objet_de_lorg(Warehouse, ctx, donnees['warehouse'], 'Entrepôt')
+    assert_warehouse_allowed_for_membership(ctx.membership, str(depot.id))
+
+    try:
+        requisition = create_requisition(
+            ctx.organization,
+            warehouse=depot,
+            lignes=[
+                {
+                    'product': l['product'],
+                    'quantity_requested': l['quantity_requested'],
+                    'notes': l.get('notes', ''),
+                }
+                for l in donnees['items']
+            ],
+            requested_by=ctx.user,
+            notes=donnees.get('notes', ''),
+            # ⚠ LE NUMÉRO DU TERMINAL EST REPRIS. Une réquisition imprimée au
+            # fond d'un dépôt porte déjà son numéro ; le remplacer ferait que
+            # le papier du magasinier ne désigne plus rien.
+            reference=donnees.get('reference') or None,
+        )
+    except RequisitionRefusee as refus:
+        raise OperationRejected(str(refus), code='business')
+
+    return {
+        'id': str(requisition.id),
+        'reference': requisition.reference,
+        'authoritative': RequisitionSerializer(requisition).data,
+    }
+
+
+def _transition_requisition(ctx, payload, action):
+    from apps.purchases.models import Requisition
+    from apps.purchases.serializers import RequisitionSerializer
+    from apps.purchases.services import RequisitionRefusee, transition_requisition
+
+    requisition = _objet_de_lorg(
+        Requisition, ctx, payload.get('requisition'), 'Réquisition'
+    )
+    try:
+        transition_requisition(
+            requisition, action, user=ctx.user, notes=payload.get('notes', '')
+        )
+    except RequisitionRefusee as refus:
+        # ⚠ DÉTERMINISTE, jamais `retry` : réessayer une approbation déjà faite
+        # la renverrait indéfiniment - le défaut de l'ancienne file.
+        raise OperationRejected(str(refus), code='business')
+
+    requisition.refresh_from_db()
+    return {'authoritative': RequisitionSerializer(requisition).data}
+
+
+@handler('requisition.submit', permission='requisitions.create')
+def requisition_submit(ctx, payload):
+    return _transition_requisition(ctx, payload, 'submit')
+
+
+@handler('requisition.cancel', permission='requisitions.create')
+def requisition_cancel(ctx, payload):
+    return _transition_requisition(ctx, payload, 'cancel')
+
+
+@handler('requisition.approve', permission='requisitions.approve')
+def requisition_approve(ctx, payload):
+    return _transition_requisition(ctx, payload, 'approve')
+
+
+@handler('requisition.reject', permission='requisitions.approve')
+def requisition_reject(ctx, payload):
+    return _transition_requisition(ctx, payload, 'reject')

@@ -111,6 +111,9 @@ class ChampsSousHorlogeTests(TestCase):
         ('apps.sales.models', 'SaleReturn', 'return_date'),
         ('apps.inventory.models', 'StockBatch', 'received_at'),
         ('apps.inventory.models', 'StockTransfer', 'requested_at'),
+        # Une réquisition se saisit au fond d'un dépôt, souvent sans réseau :
+        # son heure est celle de l'ACTE, que le journal repose au rejeu.
+        ('apps.purchases.models', 'Requisition', 'requested_at'),
     ]
 
     def _champ(self, chemin, modele, nom):

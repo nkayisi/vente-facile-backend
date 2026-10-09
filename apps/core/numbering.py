@@ -19,6 +19,9 @@ PREFIX_ADJUSTMENT = 'AJU'
 PREFIX_SALE_RETURN = 'RET'
 PREFIX_CASH_SESSION = 'CZ'
 PREFIX_EXPENSE = 'DEP'
+#: Réquisition de produits (T12). Elle s'imprime : le magasinier l'emporte au
+#: marché, et son numéro est ce qui permet d'y revenir.
+PREFIX_REQUISITION = 'REQ'
 
 
 @transaction.atomic

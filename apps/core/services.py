@@ -275,6 +275,8 @@ class PermissionService:
             'sale_returns.view', 'sale_returns.create', 'sale_returns.approve',
             # Achats / Fournisseurs
             'purchases.view', 'purchases.create', 'purchases.edit', 'purchases.receive',
+            # Réquisitions (T12) : demander, et DÉCIDER.
+            'requisitions.view', 'requisitions.create', 'requisitions.approve',
             'suppliers.view', 'suppliers.create', 'suppliers.edit', 'suppliers.delete',
             # Clients
             'customers.view', 'customers.create', 'customers.edit', 'customers.delete',
@@ -319,6 +321,8 @@ class PermissionService:
             'sale_returns.view', 'sale_returns.create', 'sale_returns.approve',
             # Achats / Fournisseurs
             'purchases.view', 'purchases.create', 'purchases.edit', 'purchases.receive',
+            # Réquisitions (T12) : demander, et DÉCIDER.
+            'requisitions.view', 'requisitions.create', 'requisitions.approve',
             'suppliers.view', 'suppliers.create', 'suppliers.edit', 'suppliers.delete',
             # Clients
             'customers.view', 'customers.create', 'customers.edit', 'customers.delete',
@@ -355,6 +359,9 @@ class PermissionService:
             'inventory.print',
             # Achats / Fournisseurs (réceptions)
             'purchases.view', 'purchases.receive',
+            # ⚠ Le magasinier DEMANDE mais ne DÉCIDE pas : c'est lui qui voit
+            # le rayon vide, et c'est le gérant qui engage l'argent.
+            'requisitions.view', 'requisitions.create',
             'suppliers.view', 'suppliers.create', 'suppliers.edit',
             # Clients (lecture seule)
             'customers.view',

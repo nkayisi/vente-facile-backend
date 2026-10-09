@@ -15,8 +15,11 @@ from __future__ import annotations
 from decimal import Decimal
 
 from django.db import transaction
+from django.db.models import F
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
+
+from apps.core.clock import maintenant
 
 
 TWO_PLACES = Decimal('0.01')
@@ -241,3 +244,216 @@ class GoodsReceiptStockService:
                 notes=f"Annulation réception {grn.reference}",
                 created_by=user,
             )
+
+
+# ==============================================================================
+# RÉQUISITIONS DE PRODUITS (T12)
+# ==============================================================================
+
+class RequisitionRefusee(Exception):
+    """Refus métier DÉTERMINISTE : le journal le traduit en `rejected`."""
+
+
+def lignes_proposees(organization, warehouse, *, inclure_rupture_seule=False):
+    """
+    Les articles dont le stock est DÉJÀ sous leur seuil, dans cet entrepôt.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ L'ÉCRAN PROPOSE D'EMBLÉE, IL NE FAIT PAS CHERCHER.                      │
+    │                                                                          │
+    │ C'est la demande de T12, mot pour mot : « un écran qui propose d'emblée  │
+    │ les articles dont le stock est déjà sous le seuil de réassort ». Faire   │
+    │ chercher un par un dans un catalogue de plusieurs centaines d'articles   │
+    │ reviendrait à demander au magasinier de refaire le travail que le seuil  │
+    │ existe pour faire.                                                       │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ⚠ LE CRITÈRE EST CELUI DE `check_low_stock_alerts` ET DE `status=low`, et il
+    doit l'être : un article qui déclenche une alerte et qui n'apparaîtrait pas
+    ici ferait douter des deux écrans. `track_inventory` est exigé - un service
+    n'a pas de seuil - et le seuil doit être RÉEL : un `reorder_point` à zéro ne
+    déclenche rien, sinon tout article épuisé serait réquisitionné en
+    permanence, y compris ceux qu'on ne réapprovisionne pas.
+
+    `inclure_rupture_seule` restreint aux ruptures : c'est ce qu'on emporte au
+    marché quand on n'a pas le temps de tout racheter.
+    """
+    from apps.inventory.models import Stock
+
+    qs = (
+        Stock.objects.filter(
+            organization=organization,
+            warehouse=warehouse,
+            product__track_inventory=True,
+            product__is_active=True,
+            product__reorder_point__gt=0,
+        )
+        .select_related('product', 'product__unit')
+        .order_by('product__name')
+    )
+    qs = qs.filter(quantity__lte=F('product__reorder_point'))
+    if inclure_rupture_seule:
+        qs = qs.filter(quantity__lte=0)
+
+    lignes = []
+    for s in qs:
+        seuil = s.product.reorder_point or Decimal('0')
+        dispo = s.quantity or Decimal('0')
+        lignes.append({
+            'product': s.product,
+            'stock': dispo,
+            'reorder_point': seuil,
+            # ⚠ LE MANQUE EST UNE PROPOSITION, PAS UNE DÉCISION : on propose de
+            # remonter au seuil, et le magasinier corrige. Lui imposer la
+            # quantité ferait acheter un carton là où il sait qu'il en faut dix.
+            'suggested': max(seuil - dispo, Decimal('0')),
+        })
+    return lignes
+
+
+@transaction.atomic
+def create_requisition(
+    organization, *, warehouse, lignes, requested_by=None, notes='', reference=None,
+):
+    """
+    Crée une réquisition en BROUILLON, avec son instantané de stock.
+
+    ⚠ LE STOCK ET LE SEUIL SONT FIGÉS ICI. Les relire à l'impression donnerait
+    le stock d'aujourd'hui, qui a bougé : le document ne dirait plus pourquoi la
+    demande a été faite, et son lecteur ne pourrait pas juger si elle tient
+    encore. Même règle que l'instantané d'une session d'inventaire.
+
+    ⚠ L'ATTENDU EST RELEVÉ, JAMAIS SAISI. Le client envoie l'article et la
+    quantité demandée ; le stock et le seuil viennent de la base. Les laisser
+    saisir permettrait d'écrire une pénurie qui n'existe pas, sur un document
+    qui sert à engager de l'argent.
+    """
+    from apps.core.numbering import PREFIX_REQUISITION, allocate_document_number
+    from apps.inventory.models import Stock
+    from apps.products.models import Product
+    from apps.purchases.models import Requisition, RequisitionItem
+
+    if not lignes:
+        raise RequisitionRefusee("Une réquisition sans article ne demande rien.")
+
+    requisition = Requisition.objects.create(
+        organization=organization,
+        warehouse=warehouse,
+        # Le numéro du client est REPRIS quand il en fournit un : une
+        # réquisition imprimée au fond d'un dépôt porte déjà son numéro, et le
+        # remplacer ferait que le papier ne désigne plus rien.
+        reference=reference or allocate_document_number(organization, PREFIX_REQUISITION),
+        status=Requisition.Status.DRAFT,
+        requested_by=requested_by,
+        notes=notes or '',
+    )
+
+    # Un seul aller-retour pour tous les stocks ET tous les seuils concernés.
+    ids = [l['product'].id if hasattr(l['product'], 'id') else l['product'] for l in lignes]
+    stocks = {
+        s.product_id: s
+        for s in Stock.objects.filter(
+            organization=organization, warehouse=warehouse, product_id__in=ids
+        )
+    }
+    # ⚠ LE SEUIL EST RELEVÉ SUR L'ARTICLE, JAMAIS PRIS DANS LE CORPS. Mesuré
+    # contre le vrai serveur : la première écriture le lisait dans la ligne
+    # envoyée, que l'API ne porte pas, et l'instantané sortait à `0.000` sous
+    # une proposition qui annonçait 12 - le document aurait dit que l'article
+    # n'avait aucun seuil, alors que c'est son seuil qui a déclenché la demande.
+    seuils = dict(
+        Product.objects.filter(organization=organization, id__in=ids)
+        .values_list('id', 'reorder_point')
+    )
+
+    for ligne in lignes:
+        produit = ligne['product']
+        pid = produit.id if hasattr(produit, 'id') else produit
+        quantite = Decimal(str(ligne['quantity_requested']))
+        if quantite <= 0:
+            raise RequisitionRefusee(
+                "Une quantité demandée doit être supérieure à zéro."
+            )
+        s = stocks.get(pid)
+        RequisitionItem.objects.create(
+            organization=organization,
+            requisition=requisition,
+            product_id=pid,
+            quantity_requested=quantite,
+            # `null` ne se lit jamais comme zéro ailleurs, mais ici l'absence de
+            # ligne de stock SIGNIFIE zéro : l'article n'a jamais été reçu dans
+            # ce dépôt, et c'est exactement ce qu'une réquisition constate.
+            stock_at_request=(s.quantity if s else Decimal('0')),
+            reorder_point_at_request=seuils.get(pid) or Decimal('0'),
+            notes=ligne.get('notes') or '',
+        )
+
+    return requisition
+
+
+#: Les transitions permises, et depuis quel état.
+#:
+#: ⚠ UNE TABLE, PAS UNE CHAÎNE DE `if`. C'est la forme retenue pour les
+#: transferts, les ajustements et les inventaires : un refus devient
+#: DÉTERMINISTE et se lit, au lieu de dépendre de l'ordre des conditions.
+TRANSITIONS_REQUISITION = {
+    'submit': ('draft', 'submitted'),
+    'approve': ('submitted', 'approved'),
+    'reject': ('submitted', 'rejected'),
+    'cancel': (None, 'cancelled'),
+}
+
+
+@transaction.atomic
+def transition_requisition(requisition, action, *, user=None, notes=''):
+    """
+    Fait avancer une réquisition, ou refuse DÉTERMINISTEMENT.
+
+    ⚠ UN REFUS N'EST JAMAIS UN `retry`. Réessayer une approbation déjà faite
+    n'aurait aucun sens, et le journal du terminal la renverrait indéfiniment -
+    le défaut de l'ancienne file pris par l'autre bout.
+
+    ⚠ `cancel` PART DE N'IMPORTE OÙ sauf d'un état terminal : on annule une
+    demande qu'on n'aurait pas dû faire, et le marchand ne doit pas avoir à
+    la faire approuver d'abord pour pouvoir la retirer.
+    """
+    from apps.purchases.models import Requisition
+
+    if action not in TRANSITIONS_REQUISITION:
+        raise RequisitionRefusee(f"Transition inconnue : {action}.")
+
+    depart, arrivee = TRANSITIONS_REQUISITION[action]
+    terminaux = {
+        Requisition.Status.APPROVED,
+        Requisition.Status.REJECTED,
+        Requisition.Status.CANCELLED,
+    }
+
+    if requisition.status == arrivee:
+        # Idempotence : le terminal a pu pousser deux fois. On rend la pièce
+        # telle quelle plutôt que de refuser - un verdict d'échec ferait
+        # réessayer une transition déjà appliquée.
+        return requisition
+
+    if depart is None:
+        if requisition.status in terminaux:
+            raise RequisitionRefusee(
+                f"Cette réquisition est déjà {requisition.get_status_display().lower()}."
+            )
+    elif requisition.status != depart:
+        raise RequisitionRefusee(
+            f"Une réquisition {requisition.get_status_display().lower()} ne peut pas "
+            f"passer à « {dict(Requisition.Status.choices)[arrivee].lower()} »."
+        )
+
+    requisition.status = arrivee
+    champs = ['status']
+
+    if action in ('approve', 'reject'):
+        requisition.decided_by = user
+        requisition.decided_at = maintenant()
+        requisition.decision_notes = notes or ''
+        champs += ['decided_by', 'decided_at', 'decision_notes']
+
+    requisition.save(update_fields=champs)
+    return requisition

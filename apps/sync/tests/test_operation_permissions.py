@@ -67,6 +67,7 @@ class ContratDesPermissionsTests(APITestCase):
         from apps.products.views import (
             BrandViewSet, CategoryViewSet, ProductViewSet, UnitViewSet,
         )
+        from apps.purchases.views import RequisitionViewSet
         from apps.sales.views import (
             QuotationViewSet, RegisterSessionViewSet, SaleReturnViewSet, SaleViewSet,
         )
@@ -96,6 +97,14 @@ class ContratDesPermissionsTests(APITestCase):
             'sale_return.reject': (SaleReturnViewSet, 'reject'),
             'quotation.create': (QuotationViewSet, 'create'),
             'quotation.convert': (QuotationViewSet, 'convert'),
+            # Réquisitions (T12). Le magasinier DEMANDE, le gérant DÉCIDE :
+            # `create`/`submit`/`cancel` d'un côté, `approve`/`reject` de
+            # l'autre, et le croisement avec la vue le tient.
+            'requisition.create': (RequisitionViewSet, 'create'),
+            'requisition.submit': (RequisitionViewSet, 'submit'),
+            'requisition.cancel': (RequisitionViewSet, 'cancel'),
+            'requisition.approve': (RequisitionViewSet, 'approve'),
+            'requisition.reject': (RequisitionViewSet, 'reject'),
             'inventory_session.create': (InventorySessionViewSet, 'create'),
             'inventory_session.start': (InventorySessionViewSet, 'start'),
             'inventory_session.count': (InventorySessionViewSet, 'count'),

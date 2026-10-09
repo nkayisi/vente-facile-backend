@@ -19,6 +19,7 @@ from apps.core.api_mixins import (
 )
 from apps.core.warehouse_scope import (
     accessible_warehouse_ids,
+    assert_warehouse_allowed_for_request,
     get_membership_for_request,
 )
 from apps.core.api_permissions import (
@@ -27,13 +28,20 @@ from apps.core.api_permissions import (
 )
 from .models import (
     PurchaseOrder, PurchaseOrderItem, GoodsReceipt, GoodsReceiptItem,
-    SupplierPayment, PurchaseReturn
+    SupplierPayment, PurchaseReturn, Requisition
 )
 from .serializers import (
     PurchaseOrderListSerializer, PurchaseOrderDetailSerializer, PurchaseOrderCreateSerializer,
     GoodsReceiptListSerializer, GoodsReceiptDetailSerializer, GoodsReceiptCreateSerializer,
     SupplierPaymentListSerializer, SupplierPaymentDetailSerializer, SupplierPaymentCreateSerializer,
-    PurchaseReturnListSerializer, PurchaseReturnDetailSerializer, PurchaseReturnCreateSerializer
+    PurchaseReturnListSerializer, PurchaseReturnDetailSerializer, PurchaseReturnCreateSerializer,
+    RequisitionSerializer, RequisitionCreateSerializer,
+)
+from .services import (
+    RequisitionRefusee,
+    create_requisition,
+    lignes_proposees,
+    transition_requisition,
 )
 
 
@@ -590,3 +598,188 @@ class PurchaseReturnViewSet(
         purchase_return.save()
         
         return Response({'status': 'cancelled'})
+
+
+# ==============================================================================
+# RÉQUISITIONS DE PRODUITS (T12)
+# ==============================================================================
+
+class RequisitionViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
+    """
+    Réquisitions : la liste de ce qu'il faut acheter.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ T12 DU RETOUR DE TEST. Rien n'existait sous ce nom.                     │
+    │                                                                          │
+    │ Et ce n'est PAS une commande d'achat : `PurchaseOrder.supplier` est      │
+    │ obligatoire, alors qu'une réquisition dit « il nous manque ceci » sans   │
+    │ qu'on sache encore chez qui l'acheter.                                   │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ⚠ LE MAGASINIER DEMANDE, LE GÉRANT DÉCIDE. C'est lui qui voit le rayon
+    vide ; c'est le gérant qui engage l'argent. `requisitions.create` va donc
+    au magasinier, `requisitions.approve` non.
+    """
+
+    queryset = Requisition.objects.all()
+    serializer_class = RequisitionSerializer
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ['status', 'warehouse']
+    search_fields = ['reference', 'notes']
+    ordering_fields = ['requested_at', 'reference']
+    ordering = ['-requested_at']
+
+    # L'entrepôt POUR lequel on demande borne la lecture : un magasinier ne voit
+    # pas ce qui manque dans un dépôt qui ne lui est pas confié.
+    warehouse_scope_field = 'warehouse_id'
+
+    action_permissions = {
+        'list': 'requisitions.view',
+        'retrieve': 'requisitions.view',
+        'create': 'requisitions.create',
+        'proposer': 'requisitions.create',
+        'submit': 'requisitions.create',
+        'cancel': 'requisitions.create',
+        'approve': 'requisitions.approve',
+        'reject': 'requisitions.approve',
+        # Modifier et supprimer n'existent pas : une réquisition se CORRIGE en
+        # l'annulant et en en créant une autre. Elle s'imprime et s'emporte au
+        # marché ; la réécrire sous le même numéro ferait que le papier du
+        # magasinier ne désigne plus la même demande.
+        'update': DENY,
+        'partial_update': DENY,
+        'destroy': DENY,
+    }
+
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return RequisitionCreateSerializer
+        return RequisitionSerializer
+
+    def get_queryset(self):
+        return super().get_queryset().select_related(
+            'warehouse', 'requested_by', 'decided_by'
+        ).prefetch_related('items__product__unit')
+
+    @action(detail=False, methods=['get'])
+    def proposer(self, request):
+        """Les articles DÉJÀ sous leur seuil, prêts à être réquisitionnés.
+
+        Params : ``warehouse`` (requis), ``rupture=true`` pour s'en tenir aux
+        ruptures - ce qu'on emporte au marché quand on n'a pas le temps de tout
+        racheter.
+        """
+        from apps.inventory.models import Warehouse
+
+        org = self.get_organization()
+        wid = request.query_params.get('warehouse')
+        if not wid:
+            return Response(
+                {'warehouse': "Indiquez l'entrepôt pour lequel vous demandez."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # Le périmètre, par le même chemin que partout : un refus LÈVE, il ne
+        # rend jamais un ensemble vide.
+        assert_warehouse_allowed_for_request(request, wid)
+        depot = Warehouse.objects.filter(organization=org, id=wid).first()
+        if depot is None:
+            return Response(
+                {'warehouse': "Entrepôt introuvable."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        rupture = str(request.query_params.get('rupture', '')).lower() in ('1', 'true')
+        lignes = lignes_proposees(org, depot, inclure_rupture_seule=rupture)
+
+        return Response({
+            'warehouse': str(depot.id),
+            'warehouse_name': depot.name,
+            'items': [
+                {
+                    'product': str(l['product'].id),
+                    'product_name': l['product'].name,
+                    'product_sku': l['product'].sku,
+                    'unit_name': getattr(l['product'].unit, 'name', None),
+                    'stock': l['stock'],
+                    'reorder_point': l['reorder_point'],
+                    'suggested': l['suggested'],
+                }
+                for l in lignes
+            ],
+        })
+
+    def create(self, request, *args, **kwargs):
+        from apps.inventory.models import Warehouse
+
+        entree = RequisitionCreateSerializer(data=request.data)
+        entree.is_valid(raise_exception=True)
+        donnees = entree.validated_data
+
+        org = self.get_organization()
+        assert_warehouse_allowed_for_request(request, str(donnees['warehouse']))
+        depot = Warehouse.objects.filter(
+            organization=org, id=donnees['warehouse']
+        ).first()
+        if depot is None:
+            return Response(
+                {'warehouse': "Entrepôt introuvable."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        try:
+            requisition = create_requisition(
+                org,
+                warehouse=depot,
+                lignes=[
+                    {
+                        'product': l['product'],
+                        'quantity_requested': l['quantity_requested'],
+                        'notes': l.get('notes', ''),
+                    }
+                    for l in donnees['items']
+                ],
+                requested_by=request.user,
+                notes=donnees.get('notes', ''),
+                reference=donnees.get('reference') or None,
+            )
+        except RequisitionRefusee as refus:
+            return Response({'detail': str(refus)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            RequisitionSerializer(requisition).data, status=status.HTTP_201_CREATED
+        )
+
+    def _transition(self, request, action_nom):
+        requisition = self.get_object()
+        try:
+            transition_requisition(
+                requisition,
+                action_nom,
+                user=request.user,
+                notes=request.data.get('notes', ''),
+            )
+        except RequisitionRefusee as refus:
+            return Response({'detail': str(refus)}, status=status.HTTP_400_BAD_REQUEST)
+        requisition.refresh_from_db()
+        return Response(RequisitionSerializer(requisition).data)
+
+    @action(detail=True, methods=['post'])
+    def submit(self, request, pk=None):
+        """Soumettre la demande à décision."""
+        return self._transition(request, 'submit')
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        """Approuver : c'est le geste qui engage l'argent."""
+        return self._transition(request, 'approve')
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        """Rejeter. Ne bouge NI le stock NI la caisse : l'état le plus prudent."""
+        return self._transition(request, 'reject')
+
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        """Annuler sa propre demande, depuis n'importe quel état non terminal."""
+        return self._transition(request, 'cancel')

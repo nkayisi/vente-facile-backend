@@ -4,6 +4,7 @@ from django.core.validators import MinValueValidator
 from decimal import Decimal
 from apps.core.models import TenantModel, TenantSoftDeleteModel
 from apps.core.managers import TenantSoftDeleteManager
+from apps.core.clock import maintenant
 
 
 class PurchaseOrder(TenantSoftDeleteModel):
@@ -598,3 +599,126 @@ class PurchaseReturnItem(TenantModel):
 
     def __str__(self):
         return f"{self.product.name} x {self.quantity}"
+
+
+# ==============================================================================
+# RÉQUISITIONS DE PRODUITS
+# ==============================================================================
+
+class Requisition(TenantSoftDeleteModel):
+    """
+    Ce qu'il faut acheter : une demande, avant toute commande.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ CE N'EST PAS UNE COMMANDE D'ACHAT, ET C'EST POURQUOI ELLE EXISTE.       │
+    │                                                                          │
+    │ `PurchaseOrder.supplier` est OBLIGATOIRE : une commande est passée À    │
+    │ quelqu'un. Une réquisition dit « il nous manque ceci », et le marchand   │
+    │ ne sait pas encore chez qui il l'achètera - c'est même souvent la        │
+    │ question qu'il se pose en la lisant. Rendre `supplier` nullable pour     │
+    │ l'y faire entrer affaiblirait le modèle de commande sur une table        │
+    │ chaude, et ferait porter deux sens à un même statut `draft`.             │
+    │                                                                          │
+    │ T12 du retour de test.                                                   │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
+    class Status(models.TextChoices):
+        DRAFT = 'draft', 'Brouillon'
+        SUBMITTED = 'submitted', 'Soumise'
+        APPROVED = 'approved', 'Approuvée'
+        REJECTED = 'rejected', 'Rejetée'
+        CANCELLED = 'cancelled', 'Annulée'
+
+    reference = models.CharField(max_length=50, db_index=True)
+
+    # L'entrepôt POUR LEQUEL on demande : c'est lui qui manque de marchandise,
+    # et c'est lui qui borne le périmètre de lecture.
+    warehouse = models.ForeignKey(
+        'inventory.Warehouse',
+        on_delete=models.PROTECT,
+        related_name='requisitions',
+    )
+
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.DRAFT, db_index=True
+    )
+
+    notes = models.TextField(blank=True)
+
+    requested_by = models.ForeignKey(
+        'users.User', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='requisitions_demandees',
+    )
+    decided_by = models.ForeignKey(
+        'users.User', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='requisitions_decidees',
+    )
+    decided_at = models.DateTimeField(null=True, blank=True, editable=False)
+    decision_notes = models.TextField(blank=True)
+
+    # ⚠ `default=maintenant` et non `auto_now_add` : une réquisition saisie au
+    # fond d'un dépôt sans réseau porte l'heure de l'ACTE, que le journal
+    # repose au rejeu. `auto_now_add` la daterait du jour de sa poussée.
+    requested_at = models.DateTimeField(default=maintenant, editable=False)
+
+    class Meta:
+        db_table = 'requisitions'
+        ordering = ['-requested_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['organization', 'reference'],
+                name='unique_requisition_reference_per_org',
+            )
+        ]
+        indexes = [
+            models.Index(fields=['organization', 'status']),
+            models.Index(fields=['organization', 'warehouse']),
+        ]
+
+    def __str__(self):
+        return f"{self.reference} ({self.get_status_display()})"
+
+
+class RequisitionItem(TenantModel):
+    """
+    Une ligne de réquisition : l'article, et la quantité à acheter.
+
+    ⚠ LE STOCK ET LE SEUIL SONT FIGÉS À LA SAISIE, comme l'instantané d'une
+    session d'inventaire. Les relire plus tard donnerait le stock d'aujourd'hui,
+    qui a bougé depuis : le document imprimé ne dirait plus pourquoi la demande
+    a été faite, et son lecteur ne pourrait pas juger si elle tient encore.
+    """
+
+    requisition = models.ForeignKey(
+        Requisition, on_delete=models.CASCADE, related_name='items'
+    )
+    product = models.ForeignKey(
+        'products.Product', on_delete=models.PROTECT, related_name='requisition_items'
+    )
+
+    quantity_requested = models.DecimalField(max_digits=12, decimal_places=3)
+
+    #: Le stock disponible AU MOMENT de la demande, dans cet entrepôt.
+    stock_at_request = models.DecimalField(
+        max_digits=12, decimal_places=3, default=Decimal('0')
+    )
+    #: Le seuil de réassort au moment de la demande.
+    reorder_point_at_request = models.DecimalField(
+        max_digits=12, decimal_places=3, default=Decimal('0')
+    )
+
+    notes = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        db_table = 'requisition_items'
+        ordering = ['id']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['requisition', 'product'],
+                name='unique_requisition_item_per_product',
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.product_id} x{self.quantity_requested}"

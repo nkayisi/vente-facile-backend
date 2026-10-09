@@ -7,7 +7,8 @@ from rest_framework import serializers
 from decimal import Decimal
 from .models import (
     PurchaseOrder, PurchaseOrderItem, GoodsReceipt, GoodsReceiptItem,
-    SupplierPayment, SupplierPaymentAllocation, PurchaseReturn, PurchaseReturnItem
+    SupplierPayment, SupplierPaymentAllocation, PurchaseReturn, PurchaseReturnItem,
+    Requisition, RequisitionItem,
 )
 
 logger = logging.getLogger(__name__)
@@ -792,3 +793,98 @@ class PurchaseReturnCreateSerializer(serializers.ModelSerializer):
         purchase_return.save()
         
         return purchase_return
+
+
+# ==============================================================================
+# RÉQUISITIONS DE PRODUITS (T12)
+# ==============================================================================
+
+class RequisitionItemSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    product_sku = serializers.CharField(source='product.sku', read_only=True)
+    unit_name = serializers.CharField(source='product.unit.name', read_only=True)
+
+    class Meta:
+        model = RequisitionItem
+        fields = [
+            'id', 'product', 'product_name', 'product_sku', 'unit_name',
+            'quantity_requested', 'stock_at_request', 'reorder_point_at_request',
+            'notes',
+        ]
+        # ⚠ L'instantané est RELEVÉ par le service, jamais saisi : le laisser
+        # écrire permettrait d'inscrire une pénurie qui n'existe pas, sur un
+        # document qui sert à engager de l'argent.
+        read_only_fields = ['stock_at_request', 'reorder_point_at_request']
+
+
+class RequisitionSerializer(serializers.ModelSerializer):
+    items = RequisitionItemSerializer(many=True, read_only=True)
+    warehouse_name = serializers.CharField(source='warehouse.name', read_only=True)
+    requested_by_name = serializers.SerializerMethodField()
+    decided_by_name = serializers.SerializerMethodField()
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+
+    class Meta:
+        model = Requisition
+        fields = [
+            'id', 'reference', 'warehouse', 'warehouse_name', 'status',
+            'status_display', 'notes', 'requested_by', 'requested_by_name',
+            'decided_by', 'decided_by_name', 'decided_at', 'decision_notes',
+            'requested_at', 'items',
+        ]
+        read_only_fields = [
+            'reference', 'status', 'requested_by', 'decided_by', 'decided_at',
+            'decision_notes', 'requested_at',
+        ]
+
+    @staticmethod
+    def _nom(user):
+        if not user:
+            return None
+        return f"{user.first_name} {user.last_name}".strip() or user.email
+
+    def get_requested_by_name(self, obj):
+        return self._nom(obj.requested_by)
+
+    def get_decided_by_name(self, obj):
+        return self._nom(obj.decided_by)
+
+
+class RequisitionLineInputSerializer(serializers.Serializer):
+    """Une ligne telle que le client l'envoie : l'article et la quantité."""
+
+    product = serializers.UUIDField()
+    quantity_requested = serializers.DecimalField(max_digits=12, decimal_places=3)
+    notes = serializers.CharField(required=False, allow_blank=True, max_length=255)
+
+
+class RequisitionCreateSerializer(serializers.Serializer):
+    """
+    Le corps d'une création, et c'est EXACTEMENT celui que le journal envoie.
+
+    La parité n'est pas surveillée, elle est structurelle : le gestionnaire de
+    synchronisation rejoue cet acte par ce serializer et par le service que la
+    vue appelle, sans dialecte intermédiaire.
+    """
+
+    warehouse = serializers.UUIDField()
+    notes = serializers.CharField(required=False, allow_blank=True)
+    items = RequisitionLineInputSerializer(many=True)
+    #: Le numéro du TERMINAL, quand il en a déjà imprimé un. Le serveur le
+    #: reprend : un papier qui porte un numéro remplacé ensuite ne désigne plus
+    #: rien.
+    reference = serializers.CharField(required=False, allow_blank=True, max_length=50)
+
+    def validate_items(self, value):
+        if not value:
+            raise serializers.ValidationError(
+                "Une réquisition sans article ne demande rien."
+            )
+        vus = set()
+        for ligne in value:
+            if ligne['product'] in vus:
+                raise serializers.ValidationError(
+                    "Un même article ne peut figurer qu'une fois."
+                )
+            vus.add(ligne['product'])
+        return value
