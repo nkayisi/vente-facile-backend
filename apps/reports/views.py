@@ -41,7 +41,7 @@ from apps.organizations.models import OrganizationMembership
 from apps.sales.models import Sale, SaleItem, Payment
 from apps.sales.profit_allocation import allocated_line_ht_revenues_for_sale, effective_unit_cost
 from apps.products.models import Product
-from apps.inventory.models import Stock, StockBatch
+from apps.inventory.models import Stock, StockBatch, Warehouse
 from apps.inventory.packaging import PackagingProfile, PackagingService
 from apps.contacts.models import Customer
 from apps.settings.services import CurrencyService
@@ -173,6 +173,7 @@ class StatisticsViewSet(ExportResponseMixin, ActionPaginationMixin,
         'product_profits': 'reports.view',
         'sales_by_packaging': 'reports.view',
         'user_activity': 'reports.view',
+        'by_warehouse': 'reports.view',
         # Ma propre journée : le caissier n'a pas `reports.view`, et c'est
         # voulu. `dashboard.view` que les quatre rôles portent, l'endpoint
         # n'acceptant aucune cible autre que le demandeur.
@@ -842,6 +843,203 @@ class StatisticsViewSet(ExportResponseMixin, ActionPaginationMixin,
         return Response(self._user_activity_data(
             request, org, membership, start_date, end_date, group_by
         ))
+
+    @action(detail=False, methods=['get'], url_path='by-warehouse')
+    def by_warehouse(self, request):
+        """Rapport financier VENTILÉ par entrepôt, caisse comprise.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ LE FILTRE EXISTAIT, LA VENTILATION NON.                             │
+        │                                                                      │
+        │ Les huit onglets se FILTRENT par entrepôt depuis le lot de           │
+        │ septembre, donc un gérant peut lire un dépôt à la fois. Mais aucune  │
+        │ action ne rendait une ligne PAR dépôt : comparer deux boutiques      │
+        │ demandait de changer le filtre, de relever les chiffres à la main,   │
+        │ et de les additionner soi-même - c'est-à-dire de refaire dehors ce   │
+        │ que le serveur sait faire, avec le risque d'additionner deux devises.│
+        └──────────────────────────────────────────────────────────────────────┘
+
+        ⚠ LA CAISSE N'A PAS D'ENTREPÔT : ELLE SE DÉRIVE, PAR TROIS CHEMINS.
+        `CashMovement` ne porte aucun entrepôt ; il se déduit de sa vente, de sa
+        dépense, ou de sa session et du comptoir de celle-ci. Les trois chemins
+        et leur ORDRE sont ceux de `filter_cash_movement_queryset` : un
+        quatrième jeu de règles ferait un quatrième solde.
+
+        ⚠ UN MOUVEMENT RATTACHÉ À RIEN N'ENTRE DANS AUCUNE LIGNE, et c'est
+        voulu : un apport sans tiroir est une opération d'ÉTABLISSEMENT, comme
+        un loyer. L'imputer à un dépôt gonflerait celui-là ; l'imputer à tous
+        ferait que la somme des lignes dépasse le total. Il est donc compté
+        dans le TOTAL seulement, et l'écart se lit.
+
+        Tout est en devise PRINCIPALE, au taux FIGÉ sur chaque pièce : un
+        rapport dont les chiffres d'hier bougent avec le cours n'est pas
+        relisable. C'est la convention de tout `apps/reports/`.
+
+        Params : ``date_from``/``date_to`` ou ``period``. Gardé par
+        ``reports.view``, et borné au périmètre du lecteur - un gérant ne voit
+        que ses dépôts, le propriétaire les voit tous.
+        """
+        org = self.get_organization()
+        start_date, end_date, _, _ = self._parse_date_range(request)
+        lignes, total = self._warehouse_report_rows(request, org, start_date, end_date)
+        return Response({
+            'currency': CurrencyService.primary_code(org),
+            'period': {
+                'start': start_date.strftime('%Y-%m-%d'),
+                'end': end_date.strftime('%Y-%m-%d'),
+            },
+            'warehouses': lignes,
+            'total': total,
+        })
+
+    def _warehouse_report_rows(self, request, org, start_date, end_date):
+        """
+        Les lignes du rapport par entrepôt, et leur total.
+
+        ⚠ L'ACTION ET L'EXPORT APPELLENT CETTE MÊME MÉTHODE. C'est la règle du
+        registre d'exports : deux constructeurs feraient deux rapports, et le
+        document finirait par annoncer autre chose que l'écran qui l'a
+        déclenché - ce que ce dépôt a déjà payé sur les huit onglets.
+        """
+
+        wh_ids = self._accessible_warehouse_ids(request)
+        depots = Warehouse.objects.filter(organization=org, is_deleted=False)
+        if wh_ids is not None:
+            depots = depots.filter(id__in=wh_ids)
+        depots = list(depots.order_by('name').values('id', 'name', 'code'))
+
+        # --- Ventes, par entrepôt ---------------------------------------------
+        ventes = self._scope_sales(
+            Sale.objects.filter(
+                organization=org,
+                status__in=['completed', 'partially_paid'],
+                sale_date__date__gte=start_date,
+                sale_date__date__lte=end_date,
+            ),
+            request,
+        )
+        par_vente = {
+            r['warehouse_id']: r
+            for r in ventes.values('warehouse_id').annotate(
+                n=Count('id'), total=primary_sum('total')
+            )
+        }
+
+        # --- Dépenses, par entrepôt -------------------------------------------
+        depenses = self._scope_expenses(
+            Expense.objects.filter(
+                organization=org,
+                expense_date__gte=start_date,
+                expense_date__lte=end_date,
+            ),
+            request,
+        )
+        par_depense = {
+            r['warehouse_id']: r
+            for r in depenses.values('warehouse_id').annotate(
+                n=Count('id'), total=primary_sum('amount')
+            )
+        }
+
+        # --- Caisse, par entrepôt DÉRIVÉ --------------------------------------
+        mouvements = self._scope_cash_movements(
+            CashMovement.objects.filter(
+                organization=org,
+                is_cancelled=False,
+                movement_date__date__gte=start_date,
+                movement_date__date__lte=end_date,
+            ),
+            request,
+        ).annotate(
+            depot=Coalesce(
+                'sale__warehouse_id',
+                'expense__warehouse_id',
+                'session__register__warehouse_id',
+            )
+        )
+        par_caisse = {}
+        for r in mouvements.values('depot', 'direction').annotate(
+            total=primary_sum('amount')
+        ):
+            c = par_caisse.setdefault(r['depot'], {'in': Decimal('0'), 'out': Decimal('0')})
+            c[r['direction']] = c.get(r['direction'], Decimal('0')) + (r['total'] or Decimal('0'))
+
+        # --- Valeur du stock, par entrepôt ------------------------------------
+        # Règle unique : `avg_cost` sinon `product.cost_price`. La recopier
+        # ferait sortir le même stock à deux valeurs selon l'écran.
+        # ⚠ LE PÉRIMÈTRE AUSSI ICI, ET SON ABSENCE ÉTAIT UNE FUITE. MESURÉE.
+        #
+        # Les lignes par dépôt ne lisent que leur propre clé, donc elles
+        # étaient justes ; mais le TOTAL somme ce dictionnaire. Sans borne, un
+        # gérant d'un seul dépôt lisait 3 182 000 pour un dépôt qui en porte
+        # 2 706 000, et un gérant SANS entrepôt lisait la valeur du stock de
+        # tout l'établissement - sur un rapport dont le métier est justement de
+        # ne montrer que son périmètre.
+        stocks_vus = Stock.objects.filter(organization=org)
+        if wh_ids is not None:
+            # `[]` compris : un membre sans affectation ne voit aucun stock, et
+            # `__in=[]` le rend sans qu'on ait à écrire la branche.
+            stocks_vus = stocks_vus.filter(warehouse_id__in=wh_ids)
+        par_stock = {
+            r['warehouse_id']: r['v'] or Decimal('0')
+            for r in stocks_vus
+            .values('warehouse_id')
+            .annotate(v=Sum(Stock.total_value_expression()))
+        }
+
+        def sou(v):
+            return (v or Decimal('0')).quantize(Decimal('0.01'))
+
+        lignes = []
+        for d in depots:
+            wid = d['id']
+            v = par_vente.get(wid, {})
+            e = par_depense.get(wid, {})
+            c = par_caisse.get(wid, {})
+            entrees = c.get('in', Decimal('0'))
+            sorties = c.get('out', Decimal('0'))
+            lignes.append({
+                'warehouse_id': str(wid),
+                'warehouse_name': d['name'],
+                'warehouse_code': d['code'],
+                'sales_count': v.get('n', 0),
+                'sales_total': sou(v.get('total')),
+                'expenses_count': e.get('n', 0),
+                'expenses_total': sou(e.get('total')),
+                'cash_in': sou(entrees),
+                'cash_out': sou(sorties),
+                'cash_net': sou(entrees - sorties),
+                'stock_value': sou(par_stock.get(wid)),
+                'result': sou((v.get('total') or Decimal('0')) - (e.get('total') or Decimal('0'))),
+            })
+
+        # Le TOTAL porte aussi ce qui n'est rattaché à aucun dépôt : ventes
+        # anciennes sans entrepôt, dépenses d'établissement, apports sans
+        # tiroir. La somme des lignes est donc inférieure au total, et c'est
+        # cet écart qui dit qu'il existe des opérations d'établissement.
+        total_ventes = ventes.aggregate(n=Count('id'), total=primary_sum('total'))
+        total_depenses = depenses.aggregate(n=Count('id'), total=primary_sum('amount'))
+        total_caisse = {
+            r['direction']: r['total'] or Decimal('0')
+            for r in mouvements.values('direction').annotate(total=primary_sum('amount'))
+        }
+        t_in = total_caisse.get('in', Decimal('0'))
+        t_out = total_caisse.get('out', Decimal('0'))
+
+        return lignes, {
+            'sales_count': total_ventes['n'],
+            'sales_total': sou(total_ventes['total']),
+            'expenses_count': total_depenses['n'],
+            'expenses_total': sou(total_depenses['total']),
+            'cash_in': sou(t_in),
+            'cash_out': sou(t_out),
+            'cash_net': sou(t_in - t_out),
+            'stock_value': sou(sum(par_stock.values(), Decimal('0'))),
+            'result': sou(
+                (total_ventes['total'] or Decimal('0'))
+                - (total_depenses['total'] or Decimal('0'))
+            ),
+        }
 
     @action(detail=False, methods=['get'])
     def summary(self, request):

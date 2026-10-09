@@ -136,6 +136,19 @@ CUSTOMERS_COLUMNS = [
     ReportColumn('current_balance', 'Dette', 30, KIND_MONEY),
 ]
 
+#: Le rapport financier par entrepôt (T6). Une colonne par GRANDEUR, jamais un
+#: « détail » fourre-tout : une phrase ne se trie ni ne se somme, et le tableur
+#: la reçoit comme du texte - le défaut déjà corrigé sur la vue d'ensemble.
+WAREHOUSE_COLUMNS = [
+    ReportColumn('warehouse_name', 'Entrepôt', 44, KIND_TEXT),
+    ReportColumn('sales_total', 'Ventes', 28, KIND_MONEY),
+    ReportColumn('expenses_total', 'Dépenses', 28, KIND_MONEY),
+    ReportColumn('cash_in', 'Caisse entrées', 28, KIND_MONEY),
+    ReportColumn('cash_out', 'Caisse sorties', 28, KIND_MONEY),
+    ReportColumn('stock_value', 'Valeur du stock', 30, KIND_MONEY),
+    ReportColumn('result', 'Résultat', 28, KIND_MONEY),
+]
+
 DAILY_CASH_COLUMNS = [
     ReportColumn('time', 'Heure', 18, KIND_TEXT),
     ReportColumn('type_display', 'Type', 34, KIND_TEXT),
@@ -212,6 +225,7 @@ EXPORT_BASENAMES = {
     'stock': 'rapport_etat_du_stock',
     'profits': 'rapport_benefices_par_produit',
     'user-activity': 'rapport_par_utilisateur',
+    'by-warehouse': 'rapport_financier_par_entrepot',
     'receivables': 'rapport_creances',
 }
 
@@ -504,6 +518,49 @@ def build_customers_spec(viewset, request, ctx: TabContext) -> ReportSpec:
         columns=CUSTOMERS_COLUMNS, rows=rows,
         empty='Aucune donnée pour cette période',
         totals=('order_count', 'total_purchases', 'current_balance'),
+    )
+
+
+def build_warehouse_spec(viewset, request, ctx: TabContext) -> ReportSpec:
+    """
+    Le rapport financier ventilé par entrepôt, caisse comprise.
+
+    ⚠ IL APPELLE LE MÊME CONSTRUCTEUR DE LIGNES QUE L'ACTION. Deux
+    constructeurs feraient deux rapports, et le document finirait par annoncer
+    autre chose que l'écran qui l'a déclenché.
+
+    ⚠ LA SOMME DES LIGNES PEUT ÊTRE INFÉRIEURE AU TOTAL, et le document le DIT
+    plutôt que de laisser le lecteur conclure à une erreur : une vente sans
+    entrepôt, une charge d'établissement, un apport sans tiroir n'entrent dans
+    aucune ligne. Les imputer à un dépôt gonflerait celui-là ; les imputer à
+    tous ferait dépasser le total.
+    """
+    lignes, total = viewset._warehouse_report_rows(
+        request, ctx.organization, ctx.start_date, ctx.end_date
+    )
+
+    ecart = (total['sales_total'] or ZERO) - sum(
+        (l['sales_total'] or ZERO) for l in lignes
+    )
+    # ⚠ `ctx.money` FORMATE comme le tableau. Sans lui la synthèse sort
+    # « 12500.00 » à côté d'un tableau qui écrit « 12 500 », sur le même
+    # document : le même montant s'y lirait de deux façons.
+    synthese = [
+        ('Entrepôts', str(len(lignes))),
+        ('Ventes (total)', ctx.money(total['sales_total'])),
+        ('Dépenses (total)', ctx.money(total['expenses_total'])),
+        ('Résultat (total)', ctx.money(total['result'])),
+    ]
+    if ecart:
+        synthese.append(("Hors entrepôt (dans le total seul)", ctx.money(ecart)))
+
+    return _spec(
+        ctx, onglet='Par entrepôt', section='Rapport financier',
+        columns=WAREHOUSE_COLUMNS, rows=lignes,
+        extra_summary=synthese,
+        empty="Aucun entrepôt dans votre périmètre",
+        totals=('sales_total', 'expenses_total', 'cash_in', 'cash_out',
+                'stock_value', 'result'),
     )
 
 
@@ -810,6 +867,7 @@ TAB_BUILDERS = {
     'stock': build_stock_spec,
     'profits': build_profits_spec,
     'user-activity': build_user_activity_spec,
+    'by-warehouse': build_warehouse_spec,
     # Les créances ne sont pas un onglet de la page mais une rubrique à elles
     # seules : elles passent par le MÊME registre pour porter la même marque.
     'receivables': build_receivables_spec,

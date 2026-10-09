@@ -37,6 +37,7 @@ CHEMINS_PUBLIES = {
     'daily_cash_report',
     'export',
     'product_profits',
+    'by-warehouse',
     'my-activity',
     'product_supplies',
     'profit_margins',
@@ -69,6 +70,8 @@ CHEMINS_DU_TERMINAL = {
     # « Ma journée » : la seule lecture de rapport ouverte à un caissier, qui
     # n'a pas `reports.view`. Tiret VOULU, l'action déclarant un `url_path`.
     'my-activity',
+    # Le rapport financier ventilé par entrepôt (T6). Tiret voulu également.
+    'by-warehouse',
 }
 
 

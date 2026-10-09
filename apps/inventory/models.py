@@ -236,18 +236,28 @@ class Stock(TenantModel):
         )
 
     @classmethod
+    def total_value_expression(cls):
+        """
+        La valeur d'UNE ligne de stock, en expression de base.
+
+        Exportée pour que l'agrégat GROUPÉ par entrepôt (rapport financier par
+        dépôt) la consomme aussi : recopier `quantity * unit_cost_expression()`
+        ferait sortir le même stock à deux valeurs selon l'écran, ce que ce
+        dépôt a déjà payé une fois.
+        """
+        from django.db.models import DecimalField, ExpressionWrapper, F
+
+        return ExpressionWrapper(
+            F('quantity') * cls.unit_cost_expression(),
+            output_field=DecimalField(max_digits=24, decimal_places=4),
+        )
+
+    @classmethod
     def total_value_for(cls, queryset):
         """Valeur totale d'un ensemble de stocks, agrégée en base."""
-        from django.db.models import DecimalField, ExpressionWrapper, F, Sum
+        from django.db.models import Sum
 
-        return queryset.aggregate(
-            v=Sum(
-                ExpressionWrapper(
-                    F('quantity') * cls.unit_cost_expression(),
-                    output_field=DecimalField(max_digits=24, decimal_places=4),
-                )
-            )
-        )['v'] or Decimal('0')
+        return queryset.aggregate(v=Sum(cls.total_value_expression()))['v'] or Decimal('0')
 
     def save(self, *args, **kwargs):
         from django.core.exceptions import ValidationError

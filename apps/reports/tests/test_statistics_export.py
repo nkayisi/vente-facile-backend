@@ -51,8 +51,13 @@ def montant(valeur, devise='CDF'):
     return format_number(Decimal(valeur), currency_decimals(devise))
 ONGLETS = tuple(TAB_BUILDERS)
 
-#: Les huit onglets de la page, sans la rubrique des créances.
-ONGLETS_DE_LA_PAGE = tuple(o for o in ONGLETS if o != 'receivables')
+#: Les RUBRIQUES qui ne sont pas des onglets de la page. Elles ont leur propre
+#: écran et leur propre fenêtre, mais passent par le MÊME registre pour porter
+#: la même marque que les huit documents de la page.
+RUBRIQUES_HORS_PAGE = frozenset({'receivables', 'by-warehouse'})
+
+#: Les huit onglets de la page.
+ONGLETS_DE_LA_PAGE = tuple(o for o in ONGLETS if o not in RUBRIQUES_HORS_PAGE)
 
 #: Ceux qui portent les relevés globaux, c'est-à-dire ceux dont la fenêtre est
 #: celle de la page. Les deux autres ont la leur, et le disent en tête.
@@ -133,15 +138,15 @@ class _BaseExport(APITestCase):
 
 class FormatsEtOngletsTests(_BaseExport):
 
-    def test_le_registre_couvre_les_huit_onglets_ET_les_creances(self):
+    def test_le_registre_couvre_les_huit_onglets_ET_les_rubriques(self):
         """
         Un balayage qui ne balaie rien passe et ne prouve rien.
 
-        Les créances ne sont pas un onglet de la page - elles ont leur propre
-        rubrique - mais elles passent par le MÊME registre, pour porter la même
-        marque que les huit autres documents.
+        Deux rubriques ne sont pas des onglets de la page - les créances, et le
+        rapport financier par entrepôt - mais elles passent par le MÊME
+        registre, pour porter la même marque que les huit autres documents.
         """
-        self.assertEqual(set(ONGLETS_DE_LA_PAGE) | {'receivables'}, set(ONGLETS))
+        self.assertEqual(set(ONGLETS_DE_LA_PAGE) | RUBRIQUES_HORS_PAGE, set(ONGLETS))
         self.assertEqual(len(ONGLETS_DE_LA_PAGE), 8)
         self.assertEqual(set(ONGLETS), set(EXPORT_BASENAMES))
 
