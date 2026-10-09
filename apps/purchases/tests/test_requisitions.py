@@ -35,6 +35,17 @@ class RequisitionsTests(APITestCase):
         self.org = self.d['org']
         self.wh = self.d['warehouse']
 
+        # ⚠ `create`, pas `get_or_create` : le manager de `Unit` emploie un
+        # combinateur, et `get_or_create` lève alors « Calling QuerySet.get(...)
+        # with filters after ... is not supported ». La fixture est neuve à
+        # chaque test, donc il n'y a rien à retrouver.
+        from apps.products.models import Unit
+        # ⚠ `Unit` n'a PAS de slug, contrairement à `Product`, `Category` et
+        # `Brand` : son nom est court et déjà unique par organisation.
+        self.unite = Unit.objects.create(
+            organization=self.org, name='PIECE', symbol='pc',
+        )
+
         self.magasinier = self.d['cashier_b']
         m = OrganizationMembership.objects.get(user=self.magasinier, organization=self.org)
         m.role = OrganizationMembership.Role.STOCK_KEEPER
@@ -56,6 +67,9 @@ class RequisitionsTests(APITestCase):
             organization=self.org, name=nom, sku=sku, slug=sku.lower(),
             cost_price=Decimal('10'), selling_price=Decimal('15'),
             track_inventory=True, reorder_point=Decimal(seuil),
+            # ⚠ L'unité est NOMMÉE sur le document (« 5 PIECES ») : sans elle,
+            # `format_base_total` rend un nombre nu, et « 5 » ne dit pas 5 quoi.
+            unit=self.unite,
         )
         Stock.objects.create(
             organization=self.org, product=p, warehouse=self.wh,
@@ -281,3 +295,65 @@ class RequisitionsTests(APITestCase):
     def test_le_service_leve_un_refus_DETERMINISTE(self):
         with self.assertRaises(RequisitionRefusee):
             create_requisition(self.org, warehouse=self.wh, lignes=[])
+
+
+class DocumentDeRequisitionTests(RequisitionsTests):
+    """
+    Le document qu'on emporte au marché.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ IL LIT L'INSTANTANÉ, JAMAIS LE STOCK DU JOUR.                           │
+    │                                                                          │
+    │ C'est toute la raison d'être du figeage : le papier doit dire pourquoi   │
+    │ la demande a été faite, et le stock a bougé depuis.                      │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
+    def _document(self, qui, rid, fmt='csv'):
+        return self._get(self.__class__.URL + f'{rid}/export/', **{}) if False else (
+            self._get(qui, f'{self.URL}{rid}/export/', export_format=fmt)
+        )
+
+    def test_les_trois_formats_sortent(self):
+        req = self._creer(self.magasinier)
+        for fmt in ('pdf', 'xlsx', 'csv'):
+            with self.subTest(format=fmt):
+                r = self._document(self.magasinier, req['id'], fmt)
+                self.assertEqual(r.status_code, status.HTTP_200_OK)
+                self.assertGreater(len(r.content), 100)
+
+    def test_il_porte_le_NUMERO_et_l_entrepot(self):
+        req = self._creer(self.magasinier)
+        corps = self._document(self.magasinier, req['id']).content.decode('utf-8-sig')
+        self.assertIn(req['reference'], corps)
+        self.assertIn(self.wh.name, corps)
+
+    def test_il_lit_l_INSTANTANE_meme_si_le_stock_a_bouge(self):
+        req = self._creer(self.magasinier)
+        Stock.objects.filter(product=self.manquant, warehouse=self.wh).update(
+            quantity=Decimal('999')
+        )
+        corps = self._document(self.magasinier, req['id']).content.decode('utf-8-sig')
+        # Le stock figé était 5, pas 999.
+        self.assertIn('5', corps)
+        self.assertNotIn('999', corps)
+
+    def test_les_quantites_portent_leur_UNITE(self):
+        """« 5 » ne dit pas 5 quoi, et c'est au marché que la question se pose."""
+        req = self._creer(self.magasinier)
+        corps = self._document(self.magasinier, req['id']).content.decode('utf-8-sig')
+        self.assertIn('PIECE', corps.upper())
+
+    def test_la_colonne_du_PRIX_CONSTATE_est_vide(self):
+        """
+        Délibérément : le magasinier y écrit au stylo le prix qu'on lui annonce.
+        Même intention que la feuille d'inventaire.
+        """
+        req = self._creer(self.magasinier)
+        corps = self._document(self.magasinier, req['id']).content.decode('utf-8-sig')
+        self.assertIn('Prix constaté', corps)
+
+    def test_un_caissier_ne_peut_pas_l_imprimer(self):
+        req = self._creer(self.magasinier)
+        r = self._document(self.d['cashier_a'], req['id'])
+        self.assertEqual(r.status_code, status.HTTP_403_FORBIDDEN)

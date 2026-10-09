@@ -12,6 +12,7 @@ from django.utils import timezone
 from decimal import Decimal
 
 from apps.core.api_mixins import (
+    ExportResponseMixin,
     TenantViewSetMixin,
     AuditMixin,
     WarehouseScopedQuerysetMixin,
@@ -604,7 +605,9 @@ class PurchaseReturnViewSet(
 # RÉQUISITIONS DE PRODUITS (T12)
 # ==============================================================================
 
-class RequisitionViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
+class RequisitionViewSet(
+    ExportResponseMixin, TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
+):
     """
     Réquisitions : la liste de ce qu'il faut acheter.
 
@@ -639,6 +642,8 @@ class RequisitionViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         'retrieve': 'requisitions.view',
         'create': 'requisitions.create',
         'proposer': 'requisitions.create',
+        # Le document s'emporte au marché : le LIRE suffit, le décider non.
+        'export': 'requisitions.view',
         'submit': 'requisitions.create',
         'cancel': 'requisitions.create',
         'approve': 'requisitions.approve',
@@ -763,6 +768,39 @@ class RequisitionViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
             return Response({'detail': str(refus)}, status=status.HTTP_400_BAD_REQUEST)
         requisition.refresh_from_db()
         return Response(RequisitionSerializer(requisition).data)
+
+    @action(detail=True, methods=['get'], url_path='export')
+    def export(self, request, pk=None):
+        """La réquisition, en PDF, classeur ou CSV - celle qu'on emporte au marché.
+
+        ⚠ ELLE LIT L'INSTANTANÉ, jamais le stock du jour : `stock_at_request` a
+        été figé à la saisie, et le relire donnerait le stock d'aujourd'hui, qui
+        a bougé depuis. Le papier ne dirait plus pourquoi la demande a été faite.
+        """
+        from apps.purchases.requisition_document import (
+            DOCUMENT_BASENAMES,
+            build_requisition_document,
+        )
+        from apps.settings.services import CurrencyService
+
+        fmt = self.get_export_format(request)
+        requisition = self.get_object()
+        organization = self.get_organization()
+        items = requisition.items.select_related(
+            'product', 'product__unit', 'product__packaging_unit'
+        ).order_by('product__name')
+
+        spec = build_requisition_document(
+            requisition, items, organization,
+            currency=CurrencyService.primary_code(organization),
+        )
+        # ⚠ `render_export` et NON `export_file_response` : le second attend un
+        # tampon DÉJÀ rendu, et lui passer la description rend
+        # « 'ReportSpec' object has no attribute 'getvalue' » - un 500 sur les
+        # trois formats à la fois.
+        return self.render_export(
+            spec, f"{DOCUMENT_BASENAMES['requisition']}_{requisition.reference}", fmt
+        )
 
     @action(detail=True, methods=['post'])
     def submit(self, request, pk=None):
