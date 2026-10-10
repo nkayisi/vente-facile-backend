@@ -20,110 +20,148 @@ def _expiring_quantity(batch):
     return PackagingService.format_base_total(batch.product, batch.quantity)
 
 
-def _readable_stock(product, total_available):
+def _lecture_du_rayon(rayon):
     """
-    Stock d'un produit dans ses propres termes, tous entrepôts confondus.
+    Le stock d'UN rayon dans ses propres termes.
 
-    Le total qui déclenche l'alerte est un DISPONIBLE (quantité moins réservé),
-    alors que les deux compteurs cumulés portent la quantité brute. Les
-    présenter ensemble laisserait croire que 4 casiers sont libres alors qu'un
-    est réservé : la ventilation n'est donc rendue que lorsque rien n'est
-    réservé, c'est-à-dire quand les deux lectures coïncident. Sinon on nomme
-    l'unité de détail, ce qui reste lisible sans rien affirmer de faux.
+    ⚠ La ventilation n'est rendue que si RIEN n'est réservé. Le total qui
+    déclenche l'alerte est un DISPONIBLE (quantité moins réservé) alors que les
+    deux compteurs portent la quantité brute : les présenter ensemble
+    laisserait croire que 4 casiers sont libres alors qu'un est réservé. Sinon
+    on nomme l'unité de détail, ce qui reste lisible sans rien affirmer de faux.
     """
     from apps.inventory.packaging import PackagingService
 
-    factor = PackagingService.factor(product)
-    if factor is None:
-        return PackagingService.format_base_total(product, total_available)
-
-    packages = getattr(product, 'total_packages', 0) or 0
-    loose = getattr(product, 'total_loose', 0) or 0
-    if packages * factor + loose == total_available:
-        return PackagingService.format_split(product, packages, loose)
-    return PackagingService.format_base_total(product, total_available)
+    produit = rayon.product
+    if PackagingService.factor(produit) is None:
+        return PackagingService.format_base_total(produit, rayon.quantity)
+    if (rayon.reserved_quantity or 0) > 0:
+        return PackagingService.format_base_total(produit, rayon.quantity)
+    return PackagingService.format_split(
+        produit, rayon.package_quantity or 0, rayon.loose_quantity or 0
+    )
 
 
 @shared_task
 def check_low_stock_alerts():
-    """Check for products with low stock and create alerts."""
-    from django.db.models import Sum, F, Value, DecimalField
-    from django.db.models.functions import Coalesce
-    from apps.products.models import Product
-    from apps.notifications.models import Alert
+    """
+    Prévient des rayons sous leur seuil, PAR ENTREPÔT.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ L'ALERTE ÉTAIT AGRÉGÉE SUR TOUTE L'ORGANISATION, DONC INADRESSABLE.     │
+    │                                                                          │
+    │ Elle sommait les dépôts et ne nommait aucun : impossible, alors, de      │
+    │ tenir la règle de périmètre - un gérant doit être alerté pour SES        │
+    │ dépôts. Ou bien il recevait des ruptures d'un magasin où il ne met pas   │
+    │ les pieds, ou bien il ne recevait rien. Et le chiffre lui-même mentait   │
+    │ par omission : « 3 casiers » tous dépôts confondus ne dit pas que la     │
+    │ boutique est vide pendant que la réserve est pleine, ce qui est          │
+    │ exactement le cas qu'un réassort doit traiter.                           │
+    │                                                                          │
+    │ L'alerte porte désormais son entrepôt (`data.warehouse_id`), et c'est    │
+    │ lui que `notifications.services.destinataires` oppose.                   │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ⚠ **UN RAYON QUI SE VIDE EST UN FAIT NOUVEAU.** La déduplication couvrait
+    `LOW_STOCK` et `OUT_OF_STOCK` ensemble - juste pour ne pas répéter la même
+    alerte à chaque battement, faux pour une AGGRAVATION : un produit déjà
+    signalé « bas » qui tombe à zéro ne produisait plus rien, et le marchand
+    n'apprenait jamais la rupture. La déduplication est désormais par (rayon,
+    TYPE), et le passage de l'un à l'autre résout l'alerte précédente.
+    """
+    from django.db.models import F
+    from apps.inventory.models import Stock
     from apps.inventory.packaging import PackagingService
+    from apps.notifications.models import Alert
+    from apps.notifications.services import alerter
 
-    # Stock disponible total agrégé en base + filtre directement sur les produits
-    # sous le seuil (une requête au lieu d'une requête Stock par produit).
-    # Un produit sans ligne de stock → total 0 (out-of-stock), comme avant.
-    # `unit` et `packaging_unit` alimentent le libellé « 3 casiers +
-    # 7 bouteilles » de l'alerte : sans eux, deux requêtes par produit alerté.
-    products = list(Product.objects.filter(
-        is_active=True,
-        is_deleted=False,
-        track_inventory=True
-    ).select_related('organization', 'unit', 'packaging_unit').annotate(
-        total_available=Coalesce(
-            Sum(F('stocks__quantity') - F('stocks__reserved_quantity')),
-            Value(0, output_field=DecimalField(max_digits=20, decimal_places=3)),
-        ),
-        total_packages=Coalesce(
-            Sum('stocks__package_quantity'),
-            Value(0, output_field=DecimalField(max_digits=20, decimal_places=3)),
-        ),
-        total_loose=Coalesce(
-            Sum('stocks__loose_quantity'),
-            Value(0, output_field=DecimalField(max_digits=20, decimal_places=3)),
-        ),
-    ).filter(total_available__lte=F('reorder_point')))
-
-    if not products:
+    # Le critère est celui de `StockFilter` et de `lignes_proposees` : suivi,
+    # seuil réel, quantité au-dessous. Trois conditions, et il faut les trois.
+    rayons = list(
+        Stock.objects
+        .filter(
+            product__is_active=True,
+            product__is_deleted=False,
+            product__track_inventory=True,
+            product__reorder_point__gt=0,
+            quantity__lte=F('product__reorder_point'),
+        )
+        .select_related(
+            'organization', 'warehouse',
+            'product', 'product__unit', 'product__packaging_unit',
+        )
+    )
+    if not rayons:
         return
 
-    # Produits ayant déjà une alerte de stock ACTIVE (une seule requête).
-    # On couvre LOW_STOCK ET OUT_OF_STOCK : un produit à 0 génère une alerte
-    # OUT_OF_STOCK, donc filtrer sur le seul type LOW_STOCK recréerait un
-    # doublon à chaque exécution.
-    already_alerted = set(
-        Alert.objects.filter(
-            alert_type__in=[Alert.AlertType.LOW_STOCK, Alert.AlertType.OUT_OF_STOCK],
-            resource_type='product',
-            resource_id__in=[p.id for p in products],
-            status=Alert.Status.ACTIVE,
-        ).values_list('resource_id', flat=True)
-    )
+    def _type(rayon):
+        return (
+            Alert.AlertType.OUT_OF_STOCK if rayon.quantity <= 0
+            else Alert.AlertType.LOW_STOCK
+        )
 
-    for product in products:
-        if product.id in already_alerted:
+    # Les alertes ACTIVES de ces rayons, en une requête. La clé est le couple
+    # (rayon, type) : c'est ce qui laisse passer l'aggravation.
+    actives = {}
+    for a in Alert.objects.filter(
+        alert_type__in=[Alert.AlertType.LOW_STOCK, Alert.AlertType.OUT_OF_STOCK],
+        resource_type='stock',
+        resource_id__in=[r.id for r in rayons],
+        status=Alert.Status.ACTIVE,
+    ):
+        actives.setdefault(a.resource_id, []).append(a)
+
+    for rayon in rayons:
+        genre = _type(rayon)
+        deja = actives.get(rayon.id, [])
+        if any(a.alert_type == genre for a in deja):
             continue
 
-        total_stock = product.total_available
-        severity = Alert.Severity.CRITICAL if total_stock == 0 else Alert.Severity.HIGH
-        alert_type = Alert.AlertType.OUT_OF_STOCK if total_stock == 0 else Alert.AlertType.LOW_STOCK
+        # ⚠ L'ANCIENNE ALERTE SE RÉSOUT, elle ne s'empile pas : un rayon vide
+        # n'est plus « bas », et laisser les deux actives ferait compter deux
+        # fois le même rayon dans tout décompte d'alertes.
+        perimees = [a for a in deja if a.alert_type != genre]
+        if perimees:
+            Alert.objects.filter(id__in=[a.id for a in perimees]).update(
+                status=Alert.Status.RESOLVED, resolved_at=timezone.now(),
+                updated_at=timezone.now(),
+            )
 
-        # « un stock de 147.000 » ne dit rien au gérant d'un produit vendu au
-        # casier : il ne saura pas s'il lui reste six casiers ou trois. Les deux
-        # compteurs sont cumulés tous entrepôts confondus, comme le total qui
-        # déclenche l'alerte, et le seuil est rendu dans la même unité.
-        stock_text = _readable_stock(product, total_stock)
-        reorder_text = PackagingService.format_base_total(product, product.reorder_point)
+        produit = rayon.product
+        stock_text = _lecture_du_rayon(rayon)
+        reorder_text = PackagingService.format_base_total(
+            produit, produit.reorder_point
+        )
+        vide = genre == Alert.AlertType.OUT_OF_STOCK
 
-        Alert.objects.create(
-            organization=product.organization,
-            alert_type=alert_type,
-            severity=severity,
-            title=f"Stock bas: {product.name}",
-            message=f"Le produit {product.name} (SKU: {product.sku}) a un stock de {stock_text}. "
-                   f"Le seuil de réapprovisionnement est de {reorder_text}.",
-            resource_type='product',
-            resource_id=product.id,
+        alerter(
+            rayon.organization,
+            alert_type=genre,
+            severity=Alert.Severity.CRITICAL if vide else Alert.Severity.HIGH,
+            title=(
+                f"Rupture : {produit.name} ({rayon.warehouse.name})" if vide
+                else f"Stock bas : {produit.name} ({rayon.warehouse.name})"
+            ),
+            message=(
+                f"{produit.name} (SKU : {produit.sku}) est à {stock_text} "
+                f"dans {rayon.warehouse.name}. "
+                f"Le seuil de réapprovisionnement est de {reorder_text}."
+            ),
+            resource_type='stock',
+            resource_id=rayon.id,
             data={
-                'product_id': str(product.id),
-                'product_name': product.name,
-                'current_stock': float(total_stock),
+                'product_id': str(produit.id),
+                'product_name': produit.name,
+                # ⚠ C'EST CE CHAMP QUI REND L'ALERTE ADRESSABLE. Sans lui, le
+                # service de livraison ne peut pas la borner à un dépôt.
+                'warehouse_id': str(rayon.warehouse_id),
+                'warehouse_name': rayon.warehouse.name,
+                'current_stock': float(rayon.quantity),
                 'current_stock_display': stock_text,
-                'reorder_point': product.reorder_point
-            }
+                'reorder_point': float(produit.reorder_point),
+            },
+            action_url='/dashboard/stock/stock-levels',
+            action_label='Voir le rayon',
         )
 
 
@@ -133,6 +171,7 @@ def check_expiring_products():
     from django.conf import settings
     from apps.inventory.models import StockBatch
     from apps.notifications.models import Alert
+    from apps.notifications.services import alerter
     
     warning_days = settings.VENTE_FACILE.get('EXPIRY_WARNING_DAYS', 30)
     warning_date = timezone.localdate() + timedelta(days=warning_days)
@@ -141,7 +180,7 @@ def check_expiring_products():
         expiry_date__lte=warning_date,
         expiry_date__gte=timezone.localdate(),
         quantity__gt=0
-    ).select_related('product', 'product__unit', 'organization')
+    ).select_related('product', 'product__unit', 'organization', 'warehouse')
     
     for batch in expiring_batches:
         existing_alert = Alert.objects.filter(
@@ -155,8 +194,8 @@ def check_expiring_products():
         if not existing_alert:
             days_until_expiry = (batch.expiry_date - timezone.localdate()).days
             
-            Alert.objects.create(
-                organization=batch.organization,
+            alerter(
+                batch.organization,
                 alert_type=Alert.AlertType.EXPIRING_PRODUCT,
                 severity=Alert.Severity.HIGH if days_until_expiry <= 7 else Alert.Severity.MEDIUM,
                 title=f"Produit bientôt périmé: {batch.product.name}",
@@ -170,8 +209,15 @@ def check_expiring_products():
                     'product_name': batch.product.name,
                     'batch_number': batch.batch_number,
                     'expiry_date': str(batch.expiry_date),
-                    'quantity': float(batch.quantity)
-                }
+                    'quantity': float(batch.quantity),
+                    # ⚠ UN LOT PORTE SON DÉPÔT : c'est ce qui rend l'alerte
+                    # adressable. Sans ce champ, la péremption d'un lot de la
+                    # réserve irait aussi au gérant de la boutique d'en face.
+                    'warehouse_id': str(batch.warehouse_id),
+                    'warehouse_name': batch.warehouse.name,
+                },
+                action_url='/dashboard/stock/stock-levels',
+                action_label='Voir le lot',
             )
 
 
@@ -194,6 +240,7 @@ def check_customer_payment_due():
     from django.conf import settings
     from apps.contacts.models import Customer
     from apps.notifications.models import Alert
+    from apps.notifications.services import alerter
     from apps.sales.models import Sale
 
     today = timezone.localdate()
@@ -231,8 +278,8 @@ def check_customer_payment_due():
         if _alert_exists(sale.organization, Alert.AlertType.PAYMENT_OVERDUE, sale.id):
             continue
 
-        Alert.objects.create(
-            organization=sale.organization,
+        alerter(
+            sale.organization,
             alert_type=Alert.AlertType.PAYMENT_OVERDUE,
             severity=(
                 Alert.Severity.HIGH if days_late > 7 else Alert.Severity.MEDIUM
@@ -263,8 +310,8 @@ def check_customer_payment_due():
             continue
 
         days_left = (sale.due_date - today).days
-        Alert.objects.create(
-            organization=sale.organization,
+        alerter(
+            sale.organization,
             alert_type=Alert.AlertType.PAYMENT_DUE,
             severity=Alert.Severity.LOW,
             title=f"Échéance proche : {sale.customer.name}",
@@ -303,8 +350,8 @@ def check_customer_payment_due():
             continue
 
         used_percent = int(customer.current_balance / customer.credit_limit * 100)
-        Alert.objects.create(
-            organization=customer.organization,
+        alerter(
+            customer.organization,
             alert_type=Alert.AlertType.CREDIT_LIMIT,
             severity=(
                 Alert.Severity.HIGH if used_percent >= 100 else Alert.Severity.MEDIUM
@@ -343,7 +390,8 @@ def _customer_alert_exists(customer):
 def check_subscription_expiry():
     """Check for subscriptions nearing expiry."""
     from apps.subscriptions.models import Subscription
-    from apps.notifications.models import Alert, Notification
+    from apps.notifications.models import Alert
+    from apps.notifications.services import alerter
     
     warning_date = timezone.now() + timedelta(days=7)
     
@@ -363,8 +411,8 @@ def check_subscription_expiry():
         if not existing_alert:
             days_remaining = (subscription.current_period_end - timezone.now()).days
             
-            Alert.objects.create(
-                organization=subscription.organization,
+            alerter(
+                subscription.organization,
                 alert_type=Alert.AlertType.SUBSCRIPTION_EXPIRING,
                 severity=Alert.Severity.CRITICAL if days_remaining <= 3 else Alert.Severity.HIGH,
                 title="Abonnement expire bientôt",
@@ -374,24 +422,16 @@ def check_subscription_expiry():
                     'subscription_id': str(subscription.id),
                     'plan_name': subscription.plan.name,
                     'expiry_date': str(subscription.current_period_end)
-                }
+                },
+                # ⚠ LA BOUCLE ÉCRITE À LA MAIN DISPARAÎT, et c'est le sens de
+                # ce lot. Elle cherchait `role='owner'` : le fan-out rend la
+                # même chose en opposant `subscription.view`, que le catalogue
+                # n'accorde qu'au propriétaire. La différence est qu'un marchand
+                # qui accorde ce droit par `extra_permissions` est désormais
+                # servi, et que c'était ici la SEULE alerte livrée sur sept.
+                action_url='/dashboard/subscription',
+                action_label='Renouveler',
             )
-            
-            owners = subscription.organization.memberships.filter(
-                role='owner',
-                is_active=True
-            ).select_related('user')
-            
-            for membership in owners:
-                Notification.objects.create(
-                    organization=subscription.organization,
-                    user=membership.user,
-                    notification_type=Notification.NotificationType.WARNING,
-                    title="Abonnement expire bientôt",
-                    message=f"Votre abonnement expire dans {days_remaining} jours.",
-                    action_url='/settings/subscription',
-                    action_label='Renouveler'
-                )
 
 
 @shared_task

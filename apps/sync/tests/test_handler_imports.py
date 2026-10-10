@@ -36,6 +36,21 @@ from apps.sync import handlers as module_handlers
 
 SOURCE = Path(inspect.getfile(module_handlers))
 
+#: Les fichiers dont le corps ne s'évalue qu'à l'appel, donc jamais au chargement.
+#:
+#: ⚠ LES TÂCHES CELERY ONT EXACTEMENT LA MÊME PROPRIÉTÉ QUE LES HANDLERS, et le
+#: défaut y est réapparu le jour même où ce garde-fou a été écrit :
+#: `check_low_stock_alerts` employait `PackagingService` sans l'importer. Un
+#: battement de Celery aurait rendu l'alerte muette - et une tâche qui échoue ne
+#: se voit que dans un journal que personne ne lit.
+SOURCES = [SOURCE] + [
+    Path(inspect.getfile(importlib.import_module(nom)))
+    for nom in (
+        'apps.notifications.tasks',
+        'apps.subscriptions.tasks',
+    )
+]
+
 
 def imports_dans_les_corps():
     """
@@ -49,15 +64,19 @@ def imports_dans_les_corps():
     évalués au chargement, donc déjà éprouvés par le simple fait que la suite
     démarre. Ce sont les imports différés qui échappent à tout.
     """
-    arbre = ast.parse(SOURCE.read_text(encoding='utf-8'))
     trouves = []
-    for noeud in ast.walk(arbre):
-        if not isinstance(noeud, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for interne in ast.walk(noeud):
-            if isinstance(interne, ast.ImportFrom) and interne.module:
-                for alias in interne.names:
-                    trouves.append((noeud.name, interne.lineno, interne.module, alias.name))
+    for fichier in SOURCES:
+        arbre = ast.parse(fichier.read_text(encoding='utf-8'))
+        for noeud in ast.walk(arbre):
+            if not isinstance(noeud, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for interne in ast.walk(noeud):
+                if isinstance(interne, ast.ImportFrom) and interne.module:
+                    for alias in interne.names:
+                        trouves.append(
+                            (fichier, noeud.name, interne.lineno,
+                             interne.module, alias.name)
+                        )
     return trouves
 
 
@@ -74,8 +93,8 @@ class ImportsDesHandlersTests(SimpleTestCase):
         trouves = imports_dans_les_corps()
         self.assertGreater(
             len(trouves), 30,
-            f"Seulement {len(trouves)} imports différés trouvés dans {SOURCE} : "
-            "le balayage ne balaie plus rien.",
+            f"Seulement {len(trouves)} imports différés trouvés dans "
+            f"{len(SOURCES)} fichiers : le balayage ne balaie plus rien.",
         )
 
     def test_chaque_import_differe_designe_un_symbole_qui_EXISTE(self):
@@ -84,17 +103,18 @@ class ImportsDesHandlersTests(SimpleTestCase):
         lignes : importer le module, puis `getattr`.
         """
         manquants = []
-        for fonction, ligne, module, symbole in imports_dans_les_corps():
+        for fichier, fonction, ligne, module, symbole in imports_dans_les_corps():
             try:
                 cible = importlib.import_module(module)
             except ImportError as exc:
                 manquants.append(
-                    f"{SOURCE.name}:{ligne} ({fonction}) : module '{module}' introuvable - {exc}"
+                    f"{fichier.name}:{ligne} ({fonction}) : "
+                    f"module '{module}' introuvable - {exc}"
                 )
                 continue
             if not hasattr(cible, symbole):
                 manquants.append(
-                    f"{SOURCE.name}:{ligne} ({fonction}) : "
+                    f"{fichier.name}:{ligne} ({fonction}) : "
                     f"'{module}' ne déclare aucun '{symbole}'"
                 )
         self.assertEqual(manquants, [], "\n".join(manquants))
@@ -126,11 +146,17 @@ def noms_libres_par_handler():
     est signalé. Les fausses alertes qui en resteraient se voient d'un coup
     d'oeil, là où un nom oublié ne se voit qu'au comptoir.
     """
-    arbre = ast.parse(SOURCE.read_text(encoding='utf-8'))
+    libres = []
+    for fichier in SOURCES:
+        libres.extend(_noms_libres_du_fichier(fichier))
+    return libres
 
-    globaux = set(dir(__builtins__)) if isinstance(__builtins__, dict) is False else set(__builtins__)
+
+def _noms_libres_du_fichier(fichier):
+    arbre = ast.parse(fichier.read_text(encoding='utf-8'))
+
     import builtins
-    globaux |= set(dir(builtins))
+    globaux = set(dir(builtins))
 
     for noeud in arbre.body:
         if isinstance(noeud, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -169,6 +195,23 @@ def noms_libres_par_handler():
                 lies |= {(a.asname or a.name).split('.')[0] for a in interne.names}
             elif isinstance(interne, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 lies.add(interne.name)
+                # ⚠ ET SES PARAMÈTRES. Une fonction imbriquée lie les siens
+                # dans SA portée, pas dans celle de son hôte : sans cette
+                # ligne, le balayage criait sur `_alert_exists(organization,
+                # alert_type, resource_id)` de `check_customer_payment_due`,
+                # qui est parfaitement correct. Un garde-fou qui crie sur du
+                # code légitime finit désactivé, et on perd le contrôle avec
+                # lui. On SUR-APPROXIME donc les liaisons : le pire qu'il
+                # puisse arriver est de taire un nom libre dans une fonction
+                # imbriquée, là où l'alternative est de n'avoir plus de test.
+                if not isinstance(interne, ast.ClassDef):
+                    ia = interne.args
+                    for a in (*ia.posonlyargs, *ia.args, *ia.kwonlyargs):
+                        lies.add(a.arg)
+                    if ia.vararg:
+                        lies.add(ia.vararg.arg)
+                    if ia.kwarg:
+                        lies.add(ia.kwarg.arg)
             elif isinstance(interne, ast.Name) and isinstance(interne.ctx, (ast.Store, ast.Del)):
                 lies.add(interne.id)
             elif isinstance(interne, ast.ExceptHandler) and interne.name:
@@ -181,7 +224,7 @@ def noms_libres_par_handler():
         for interne in ast.walk(fonction):
             if isinstance(interne, ast.Name) and isinstance(interne.ctx, ast.Load):
                 if interne.id not in lies:
-                    libres.append((fonction.name, interne.lineno, interne.id))
+                    libres.append((fichier, fonction.name, interne.lineno, interne.id))
 
     return libres
 
@@ -196,22 +239,24 @@ class NomsLibresDesHandlersTests(SimpleTestCase):
         qu'il voit bien des corps de handler - donc au moins une fonction
         décorée et plusieurs dizaines de lectures de noms.
         """
-        arbre = ast.parse(SOURCE.read_text(encoding='utf-8'))
-        corps = [
-            n for n in arbre.body
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-        ]
+        corps = []
+        for fichier in SOURCES:
+            arbre = ast.parse(fichier.read_text(encoding='utf-8'))
+            corps += [
+                n for n in arbre.body
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ]
         self.assertGreater(
             len(corps), 40,
-            f"Seulement {len(corps)} fonctions trouvées dans {SOURCE} : "
-            "le balayage ne balaie plus rien.",
+            f"Seulement {len(corps)} fonctions trouvées dans {len(SOURCES)} "
+            "fichiers : le balayage ne balaie plus rien.",
         )
 
     def test_aucun_handler_ne_lit_un_nom_qui_n_EXISTE_PAS(self):
         libres = noms_libres_par_handler()
         details = [
-            f"{SOURCE.name}:{ligne} ({fonction}) : '{nom}' n'est ni importé, "
+            f"{fichier.name}:{ligne} ({fonction}) : '{nom}' n'est ni importé, "
             "ni défini, ni un paramètre"
-            for fonction, ligne, nom in libres
+            for fichier, fonction, ligne, nom in libres
         ]
         self.assertEqual(libres, [], "\n".join(details))
