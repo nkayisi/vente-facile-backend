@@ -80,9 +80,58 @@ class DeviceEnrollSerializer(serializers.Serializer):
 
 class DeviceSessionSerializer(serializers.Serializer):
     device_token = serializers.CharField()
+    #: Le jeton de notification poussée, s'il vient de changer.
+    #:
+    #: ⚠ IL VOYAGE AVEC LE RÉVEIL, et pas sur un endpoint à lui. Expo renouvelle
+    #: ce jeton sans prévenir - réinstallation, restauration, mise à jour du
+    #: système - et le réveil est le seul chemin qu'un terminal emprunte à coup
+    #: sûr, à chaque démarrage et à chaque retour au premier plan. Un endpoint
+    #: séparé ne serait appelé qu'une fois, et les envois iraient ensuite dans
+    #: le vide pendant des semaines sans que rien ne le signale.
+    push_token = serializers.CharField(required=False, allow_blank=True)
+    #: `true` quand l'appareil a REFUSÉ la permission.
+    push_refused = serializers.BooleanField(required=False)
 
 
 # -------------------------------------------------------------------- services
+
+
+def _enregistrer_jeton_push(device, donnees):
+    """
+    Range l'adresse de notification de cet appareil.
+
+    ⚠ UN JETON VU AILLEURS EST DÉTACHÉ. Expo réattribue une adresse quand une
+    application est réinstallée : sans ce nettoyage, deux lignes `Device`
+    porteraient le même jeton et l'ancien propriétaire recevrait les alertes du
+    nouveau - c'est-à-dire les ruptures et les créances d'un établissement qui
+    n'est plus le sien.
+
+    ⚠ ON N'ÉCRIT QUE CE QUI CHANGE. `touch()` vient de poser `last_seen_at` ;
+    repousser `push_token` à chaque réveil ferait un `UPDATE` par battement sur
+    une table que le tirage pagine.
+    """
+    from django.utils import timezone
+
+    jeton = (donnees.get('push_token') or '').strip()
+    refuse = donnees.get('push_refused')
+    champs = []
+
+    if jeton and jeton != device.push_token:
+        Device.objects.filter(push_token=jeton).exclude(pk=device.pk).update(
+            push_token='', updated_at=timezone.now(),
+        )
+        device.push_token = jeton
+        device.push_refused_at = None
+        champs += ['push_token', 'push_refused_at']
+    elif refuse and device.push_refused_at is None:
+        # Refusé : on le NOTE, pour ne pas redemander à chaque démarrage sur un
+        # appareil qui a déjà dit non.
+        device.push_refused_at = timezone.now()
+        device.push_token = ''
+        champs += ['push_refused_at', 'push_token']
+
+    if champs:
+        device.save(update_fields=champs + ['updated_at'])
 
 
 def client_ip(request):
@@ -558,6 +607,7 @@ class DeviceSessionView(APIView):
             )
 
         device.touch(ip=client_ip(request))
+        _enregistrer_jeton_push(device, serializer.validated_data)
         return Response(build_session_payload(device.user, device.organization, device))
 
 

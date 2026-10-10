@@ -460,6 +460,15 @@ MOKO_API_V2_URL = config(
     default='https://moko.gofreshpay.com',
 )
 MOKO_API_KEY = config('MOKO_API_KEY', default='')
+
+# Jeton de compte Expo pour l'envoi poussé.
+#
+# ⚠ FACULTATIF, et l'absence n'est PAS une erreur : un projet Expo dont la
+# vérification d'envoi n'est pas activée accepte les messages sans
+# authentification. Lever au démarrage pour un canal de rappel empêcherait de
+# vendre à cause d'un outil censé aider - c'est la règle déjà posée sur le DSN
+# Sentry du terminal.
+EXPO_ACCESS_TOKEN = os.getenv('EXPO_ACCESS_TOKEN', '')
 # URL publique du backend pour le callback (MOKO doit pouvoir joindre cette URL)
 PUBLIC_BACKEND_URL = config('PUBLIC_BACKEND_URL', default='http://127.0.0.1:8005')
 # Secret partagé inclus en query param de l'URL de callback pour authentifier MOKO.

@@ -223,6 +223,31 @@ class Device(models.Model):
     last_ip = models.GenericIPAddressField(null=True, blank=True)
     expires_at = models.DateTimeField()
 
+    #: Jeton de notification poussée, tel qu'Expo le rend.
+    #:
+    #: ┌──────────────────────────────────────────────────────────────────────┐
+    #: │ IL VIT SUR L'APPAREIL, PAS SUR LE COMPTE.                           │
+    #: │                                                                      │
+    #: │ Une personne a plusieurs terminaux, et un terminal change de porteur │
+    #: │ - un caissier du matin, un autre du soir. Posé sur `User`, un envoi  │
+    #: │ atteindrait le dernier appareil connecté et aucun autre ; posé ici,  │
+    #: │ il atteint chaque appareil que ce compte a enrôlé, et il part avec   │
+    #: │ l'appareil quand on le révoque.                                      │
+    #: │                                                                      │
+    #: │ ⚠ IL NE S'AUTHENTIFIE PAS. C'est une ADRESSE : quiconque la détient  │
+    #: │ peut faire sonner le téléphone, rien de plus. Elle ne donne accès à  │
+    #: │ aucune donnée, et c'est pourquoi elle voyage en clair là où          │
+    #: │ `token_hash` est haché.                                              │
+    #: └──────────────────────────────────────────────────────────────────────┘
+    push_token = models.CharField(max_length=255, blank=True, db_index=True)
+
+    #: Quand l'appareil a refusé la permission, ou n'a pas pu rendre de jeton.
+    #:
+    #: ⚠ DISTINCT D'UN JETON VIDE. Vide veut dire « on n'a pas encore demandé » ;
+    #: ceci veut dire « on a demandé, et c'est non ». Les confondre ferait
+    #: redemander à chaque démarrage, sur un appareil qui a déjà dit non.
+    push_refused_at = models.DateTimeField(null=True, blank=True)
+
     revoked_at = models.DateTimeField(null=True, blank=True)
     revoked_by = models.ForeignKey(
         'users.User', on_delete=models.SET_NULL, null=True, blank=True,

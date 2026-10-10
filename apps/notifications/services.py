@@ -189,6 +189,7 @@ def notifier(alert, *, action_url='', action_label=''):
 
     if creees:
         Notification.objects.bulk_create(creees)
+        _pousser(creees)
     return creees
 
 
@@ -330,12 +331,33 @@ def _permission_de_decision(resource_type):
     return PERMISSION_DE_DECISION.get(resource_type, 'organization.settings')
 
 
+def _pousser(notifications):
+    """
+    Fait sonner les téléphones, et jamais au prix de l'acte.
+
+    ⚠ LE PUSH EST UN RAPPEL, pas le porteur de l'information : la notification
+    est déjà en base quand on arrive ici. C'est ce qui permet d'avaler toute
+    erreur - un service injoignable ne doit pas défaire une approbation
+    d'ajustement - et ce qui rend un push perdu sans conséquence.
+    """
+    try:
+        from apps.notifications.push import pousser_notifications
+
+        pousser_notifications(notifications)
+    except Exception:  # noqa: BLE001 - voir l'encadré
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Envoi poussé impossible", exc_info=True
+        )
+
+
 def _notifier_un(alerte, membre_ou_user, *, action_url='', action_label=''):
     """Une notification pour une personne nommée, sans fan-out."""
     user = getattr(membre_ou_user, 'user', membre_ou_user)
     if _deja_notifie(alerte, user):
         return None
-    return Notification.objects.create(
+    creee = Notification.objects.create(
         organization=alerte.organization,
         user=user,
         notification_type=TON_PAR_GRAVITE.get(
@@ -348,6 +370,8 @@ def _notifier_un(alerte, membre_ou_user, *, action_url='', action_label=''):
         data={**(alerte.data or {}), 'alert_id': str(alerte.id),
               'alert_type': alerte.alert_type},
     )
+    _pousser([creee])
+    return creee
 
 
 def _livrer_a_qui_peut(alerte, permission, *, sauf=None, action_url='',
