@@ -115,12 +115,16 @@ def _detacher(jeton):
     demain avec les mêmes ventes en file : révoquer sa session l'enfermerait
     dehors. On oublie l'adresse, et le prochain réveil en posera une neuve.
     """
-    from django.utils import timezone
-
+    from apps.core.bulk import bulk_update_rows
     from apps.users.models import Device
 
-    Device.objects.filter(push_token=jeton).update(
-        push_token='', updated_at=timezone.now(),
+    # ⚠ PAR `bulk_update_rows`, jamais `update()` nu. Il pose `updated_at` lui
+    # aussi, mais une règle qu'il faut se rappeler à chaque appel finit par être
+    # oubliée - et une ligne dont l'horodatage ne bouge pas est invisible au
+    # tirage, définitivement. Le garde-fou de `test_bulk_write_visibility` l'a
+    # d'ailleurs attrapé ici, par l'AST.
+    bulk_update_rows(
+        Device.objects.filter(push_token=jeton), push_token=''
     )
 
 

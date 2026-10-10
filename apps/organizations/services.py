@@ -107,7 +107,12 @@ EFFACES_PAR_LA_REMISE_A_ZERO = [
     ('sales', 'RegisterSessionCurrencyBalance'),
     ('sales', 'RegisterSession'),
 
-    # --- Les achats.
+    # --- Les achats. La RÉQUISITION en premier : elle ne référence aucune
+    # commande - c'est tout ce qui la distingue d'un bon d'achat - mais elle
+    # est bien une donnée d'exploitation de l'essai, et la garder laisserait
+    # au marchand une liste de courses qui ne correspond plus à son stock.
+    ('purchases', 'RequisitionItem'),
+    ('purchases', 'Requisition'),
     ('purchases', 'SupplierPaymentAllocation'),
     ('purchases', 'SupplierPayment'),
     ('purchases', 'PurchaseReturnItem'),

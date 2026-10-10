@@ -117,8 +117,12 @@ def _enregistrer_jeton_push(device, donnees):
     champs = []
 
     if jeton and jeton != device.push_token:
-        Device.objects.filter(push_token=jeton).exclude(pk=device.pk).update(
-            push_token='', updated_at=timezone.now(),
+        # ⚠ PAR `bulk_update_rows` : voir l'encadré de `apps/core/bulk.py`.
+        from apps.core.bulk import bulk_update_rows
+
+        bulk_update_rows(
+            Device.objects.filter(push_token=jeton).exclude(pk=device.pk),
+            push_token='',
         )
         device.push_token = jeton
         device.push_refused_at = None
