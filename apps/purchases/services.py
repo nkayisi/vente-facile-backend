@@ -313,7 +313,8 @@ def lignes_proposees(organization, warehouse, *, inclure_rupture_seule=False):
 
 @transaction.atomic
 def create_requisition(
-    organization, *, warehouse, lignes, requested_by=None, notes='', reference=None,
+    organization, *, warehouse, lignes, requested_by=None, notes='',
+    reference=None, requisition_id=None,
 ):
     """
     Crée une réquisition en BROUILLON, avec son instantané de stock.
@@ -327,6 +328,22 @@ def create_requisition(
     quantité demandée ; le stock et le seuil viennent de la base. Les laisser
     saisir permettrait d'écrire une pénurie qui n'existe pas, sur un document
     qui sert à engager de l'argent.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ `requisition_id` : L'IDENTIFIANT DU TERMINAL EST HONORÉ.                │
+    │                                                                          │
+    │ MESURÉ sur le vrai serveur : sans lui, la pièce naissait sous un UUID    │
+    │ neuf. Le terminal, qui route sa fiche et adresse ses transitions par     │
+    │ l'identifiant qu'il a tiré, se retrouvait alors avec une réquisition     │
+    │ qu'il ne pouvait plus désigner : sa propre fiche la déclarait            │
+    │ introuvable, et un `requisition.submit` mis en file juste après la        │
+    │ création revenait « Réquisition introuvable » - un refus DÉTERMINISTE,   │
+    │ donc une quarantaine, pour un geste parfaitement légitime.               │
+    │                                                                          │
+    │ C'est le motif de `session_id` sur `open_register_session`, et la même   │
+    │ forme : `**({'id': …} if … else {})`, pour que la vue - qui n'en fournit  │
+    │ aucun - garde l'allocation de la base.                                   │
+    └──────────────────────────────────────────────────────────────────────────┘
     """
     from apps.core.numbering import PREFIX_REQUISITION, allocate_document_number
     from apps.inventory.models import Stock
@@ -337,6 +354,7 @@ def create_requisition(
         raise RequisitionRefusee("Une réquisition sans article ne demande rien.")
 
     requisition = Requisition.objects.create(
+        **({'id': requisition_id} if requisition_id else {}),
         organization=organization,
         warehouse=warehouse,
         # Le numéro du client est REPRIS quand il en fournit un : une

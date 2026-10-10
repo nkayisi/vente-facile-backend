@@ -1333,7 +1333,9 @@ def requisition_create(ctx, payload):
     donnees = entree.validated_data
 
     depot = _objet_de_lorg(Warehouse, ctx, donnees['warehouse'], 'Entrepôt')
-    assert_warehouse_allowed_for_membership(ctx.membership, str(depot.id))
+    # Le périmètre, par le MÊME chemin que la vue et que les autres actes de
+    # stock : un refus LÈVE, il ne rend jamais un ensemble vide.
+    assert_warehouse_allowed_for_request(ctx.request, str(depot.id))
 
     try:
         requisition = create_requisition(
@@ -1353,6 +1355,9 @@ def requisition_create(ctx, payload):
             # fond d'un dépôt porte déjà son numéro ; le remplacer ferait que
             # le papier du magasinier ne désigne plus rien.
             reference=donnees.get('reference') or None,
+            # ⚠ L'IDENTIFIANT DU TERMINAL EST HONORÉ : il route sa fiche et
+            # adresse ses transitions avec. Voir l'encadré de `create_requisition`.
+            requisition_id=payload.get('id'),
         )
     except RequisitionRefusee as refus:
         raise OperationRejected(str(refus), code='business')

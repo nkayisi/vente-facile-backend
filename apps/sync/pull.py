@@ -595,6 +595,14 @@ INVENTORY_CHILDREN = (
               model='inventory.InventoryCount', parent_field='session'),
 )
 
+#: Lignes d'une réquisition. Elles descendent AVEC elle, comme les lignes de
+#: vente : `RequisitionItem` n'a pas de suppression douce, donc une ligne
+#: retirée resterait à jamais en base locale si elle descendait seule.
+REQUISITION_CHILDREN = (
+    PullChild(name='items', table='requisition_items',
+              model='purchases.RequisitionItem', parent_field='requisition'),
+)
+
 #: Ordre de tirage. Les référentiels d'abord : le point de vente s'ouvre dès que
 #: l'organisation, les moyens de paiement, les produits et les stocks sont là,
 #: le reste continue en arrière-plan.
@@ -699,6 +707,12 @@ PULL_TABLES = (
     # l'organisation, là où `StockTransferViewSet` borne en OU.
     PullTable('stock_transfers', 'inventory.StockTransfer', soft_delete=True,
               scope='transfer', children=TRANSFER_CHILDREN),
+    # Réquisitions (T12). Bornées par l'entrepôt POUR lequel on demande : un
+    # magasinier ne voit pas ce qui manque dans un dépôt qui ne lui est pas
+    # confié. Elles descendent parce qu'une réquisition se saisit au fond d'un
+    # dépôt, et qu'approuvée par le gérant elle doit revenir au demandeur.
+    PullTable('requisitions', 'purchases.Requisition', soft_delete=True,
+              warehouse_path='warehouse_id', children=REQUISITION_CHILDREN),
     PullTable('stock_adjustments', 'inventory.StockAdjustment', soft_delete=True,
               warehouse_path='warehouse_id', children=ADJUSTMENT_CHILDREN),
     PullTable('inventory_sessions', 'inventory.InventorySession', soft_delete=True,
