@@ -109,6 +109,14 @@ class Alert(TenantModel):
         SUBSCRIPTION_EXPIRING = 'subscription_expiring', 'Abonnement expire bientôt'
         SUBSCRIPTION_EXPIRED = 'subscription_expired', 'Abonnement expiré'
         CREDIT_LIMIT = 'credit_limit', 'Limite de crédit atteinte'
+        # ⚠ DEUX GENRES NOMMÉS plutôt que `SYSTEM` avec un discriminant caché
+        # dans `data`. `alert_type` est un champ de FILTRE : une alerte dont la
+        # nature vit dans une clé JSON ne peut pas se filtrer, et le marchand
+        # ne pourrait pas demander « montre-moi les pertes ». C'est aussi lui
+        # qui décide du droit d'être prévenu (`PERMISSION_PAR_ALERTE`), et une
+        # sortie de stock concerne qui voit le stock, pas le seul propriétaire.
+        STOCK_EXIT = 'stock_exit', 'Sortie de stock'
+        APPROVAL = 'approval', 'Décision attendue'
         SYSTEM = 'system', 'Système'
 
     class Severity(models.TextChoices):

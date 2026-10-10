@@ -52,6 +52,15 @@ PERMISSION_PAR_ALERTE = {
     Alert.AlertType.CREDIT_LIMIT: 'customers.view',
     Alert.AlertType.SUBSCRIPTION_EXPIRING: 'subscription.view',
     Alert.AlertType.SUBSCRIPTION_EXPIRED: 'subscription.view',
+    # Une sortie qui ne rapporte rien - casse, péremption - concerne qui voit
+    # le stock du dépôt, pas le seul propriétaire.
+    Alert.AlertType.STOCK_EXIT: 'stock.view',
+    # ⚠ `APPROVAL` n'entre PAS dans le fan-out par droit de VOIR : une demande
+    # va à qui peut TRANCHER (`PERMISSION_DE_DECISION`) et une décision au seul
+    # demandeur. Les deux passent par `_livrer_a_qui_peut` et `_notifier_un`,
+    # jamais par `notifier`. La valeur reste déclarée pour que la LISTE des
+    # alertes se borne correctement : la lire est bien un droit de voir.
+    Alert.AlertType.APPROVAL: 'dashboard.view',
     # ⚠ `SYSTEM` n'a pas de droit NOMMÉ, et c'est délibéré : une alerte système
     # ne porte sur aucune rubrique. Elle va au propriétaire, qui est le seul à
     # pouvoir agir sur la configuration de l'établissement.
@@ -196,3 +205,242 @@ def alerter(organization, **champs):
     alert = Alert.objects.create(organization=organization, **champs)
     notifier(alert, action_url=action_url, action_label=action_label)
     return alert
+
+
+# ---------------------------------------------------------------------------
+# Les actes qui attendent une décision, et les décisions prises
+# ---------------------------------------------------------------------------
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ ON PRÉVIENT DEPUIS LE SERVICE, PAS DEPUIS LA VUE.                       │
+# │                                                                          │
+# │ Un transfert se soumet au back-office ET par le journal du terminal ; le │
+# │ brancher sur la vue laisserait muet tout ce qui vient du comptoir, c'est- │
+# │ à-dire la moitié des demandes. C'est la doctrine de ce dépôt : l'effet   │
+# │ vit dans le service que les deux surfaces appellent.                     │
+# └──────────────────────────────────────────────────────────────────────────┘
+
+def _nom(user):
+    """
+    Le nom d'une personne, ou « quelqu'un » : on n'affiche jamais un vide.
+
+    ⚠ C'est `full_name`, une PROPRIÉTÉ, et non `get_full_name()` de Django :
+    ce projet a son propre modèle d'utilisateur. L'appeler lève un
+    `AttributeError` qui, dans un service de notification, se propage à l'acte
+    qu'il accompagne - une approbation d'ajustement aurait échoué pour un
+    message.
+    """
+    if user is None:
+        return "quelqu'un"
+    return user.full_name or user.email
+
+
+def demande_approbation(
+    organization, *, quoi, reference, par, entrepot=None, resource_type='',
+    resource_id=None, detail='', action_url='',
+):
+    """
+    « Une décision vous attend. »
+
+    ⚠ ELLE N'EST PAS ADRESSÉE À CELUI QUI DEMANDE. Un magasinier qui soumet un
+    transfert sait qu'il l'a soumis ; lui renvoyer sa propre demande fait du
+    bruit, et le bruit est ce qui apprend à ne plus lire les alertes. Le fan-out
+    s'en charge par le droit : `requisitions.approve` et `stock_transfers.ship`
+    ne vont pas au magasinier.
+    """
+    alerte = Alert.objects.create(
+        organization=organization,
+        alert_type=Alert.AlertType.APPROVAL,
+        severity=Alert.Severity.MEDIUM,
+        title=f"{quoi} à approuver : {reference}",
+        message=(
+            f"{_nom(par)} a soumis {quoi.lower()} {reference}"
+            + (f" ({detail})" if detail else "")
+            + ". Une décision est attendue."
+        ),
+        resource_type=resource_type,
+        resource_id=resource_id,
+        data={
+            'kind': 'approval_request',
+            'reference': reference,
+            **({'warehouse_id': str(entrepot)} if entrepot else {}),
+        },
+    )
+    # ⚠ LE DROIT D'APPROUVER, PAS LE DROIT DE VOIR : c'est le seul cas où les
+    # deux diffèrent, et prévenir qui ne peut pas décider ne sert à rien.
+    _livrer_a_qui_peut(alerte, _permission_de_decision(resource_type),
+                       sauf=par, action_url=action_url,
+                       action_label='Voir la demande')
+    return alerte
+
+
+def decision_prise(
+    organization, *, quoi, reference, decidee_par, pour, approuvee,
+    entrepot=None, motif='', action_url='',
+):
+    """
+    « Votre demande a été tranchée. »
+
+    Le pendant du précédent, et le retour de test le demande nommément : « plus
+    un message quand la décision est prise ». Sans lui, celui qui a soumis
+    rouvre son écran toutes les heures pour savoir où il en est.
+
+    ⚠ ELLE VA À CELUI QUI A DEMANDÉ, et à lui seul : c'est SA demande, et le
+    fan-out par droit enverrait la nouvelle à tous les gérants de l'organisation.
+    """
+    verdict = "approuvée" if approuvee else "rejetée"
+    alerte = Alert.objects.create(
+        organization=organization,
+        alert_type=Alert.AlertType.APPROVAL,
+        severity=Alert.Severity.LOW if approuvee else Alert.Severity.MEDIUM,
+        title=f"{quoi} {verdict} : {reference}",
+        message=(
+            f"{_nom(decidee_par)} a {verdict} {quoi.lower()} {reference}."
+            + (f" Motif : {motif}" if motif else "")
+        ),
+        data={
+            'kind': 'approval_decision',
+            'reference': reference,
+            'approved': approuvee,
+            **({'warehouse_id': str(entrepot)} if entrepot else {}),
+        },
+    )
+    if pour is not None and pour.is_active:
+        _notifier_un(
+            alerte, pour,
+            action_url=action_url, action_label='Voir la décision',
+        )
+    return alerte
+
+
+#: Le droit qui permet de TRANCHER, par nature de pièce.
+#:
+#: ⚠ Ce ne sont pas les mêmes codes que `PERMISSION_PAR_ALERTE` : voir une
+#: demande et la trancher sont deux droits distincts, et c'est précisément la
+#: séparation qu'un circuit d'approbation existe pour tenir.
+PERMISSION_DE_DECISION = {
+    'requisition': 'requisitions.approve',
+    'stock_transfer': 'stock_transfers.ship',
+    'stock_adjustment': 'stock_adjustments.approve',
+    'expense': 'cashbook.approve_expense',
+}
+
+
+def _permission_de_decision(resource_type):
+    return PERMISSION_DE_DECISION.get(resource_type, 'organization.settings')
+
+
+def _notifier_un(alerte, membre_ou_user, *, action_url='', action_label=''):
+    """Une notification pour une personne nommée, sans fan-out."""
+    user = getattr(membre_ou_user, 'user', membre_ou_user)
+    if _deja_notifie(alerte, user):
+        return None
+    return Notification.objects.create(
+        organization=alerte.organization,
+        user=user,
+        notification_type=TON_PAR_GRAVITE.get(
+            alerte.severity, Notification.NotificationType.INFO
+        ),
+        title=alerte.title,
+        message=alerte.message,
+        action_url=action_url,
+        action_label=action_label,
+        data={**(alerte.data or {}), 'alert_id': str(alerte.id),
+              'alert_type': alerte.alert_type},
+    )
+
+
+def _livrer_a_qui_peut(alerte, permission, *, sauf=None, action_url='',
+                       action_label=''):
+    """
+    Prévient qui détient `permission`, dans le périmètre de l'alerte.
+
+    `sauf` écarte l'auteur de la demande : il sait ce qu'il vient de faire.
+    """
+    depot = _entrepot_de_lalerte(alerte)
+    membres = (
+        OrganizationMembership.objects
+        .filter(organization=alerte.organization, is_active=True)
+        .select_related('user')
+        .prefetch_related('assigned_warehouses')
+    )
+
+    for m in membres:
+        if sauf is not None and m.user_id == sauf.id:
+            continue
+        if not m.user.is_active:
+            continue
+        if permission not in PermissionService.get_effective_permissions(m):
+            continue
+        if depot and m.role != OrganizationMembership.Role.OWNER:
+            permis = {str(w.id) for w in m.assigned_warehouses.all()}
+            if depot not in permis:
+                continue
+        _notifier_un(alerte, m, action_url=action_url, action_label=action_label)
+
+
+# ---------------------------------------------------------------------------
+# Les sorties de stock
+# ---------------------------------------------------------------------------
+
+#: Les sorties qu'on SIGNALE, et seulement celles-là.
+#:
+#: ⚠ ON NE SIGNALE PAS UNE VENTE. Chaque encaissement sort du stock : prévenir
+#: à chaque fois ferait de l'alerte le bruit de fond du comptoir, et personne ne
+#: verrait plus la perte qui compte. Ce qu'un marchand veut savoir, ce sont les
+#: sorties qui ne rapportent rien - casse, péremption - et celles qu'une main a
+#: saisies à l'écran.
+SORTIES_SIGNALEES = {
+    'damage': ('Perte ou dommage', Alert.Severity.HIGH),
+    'expired': ('Sortie pour péremption', Alert.Severity.MEDIUM),
+    'adjustment_out': ('Ajustement négatif', Alert.Severity.MEDIUM),
+    'return_out': ('Retour fournisseur', Alert.Severity.LOW),
+}
+
+
+def sortie_de_stock(mouvement):
+    """
+    Signale une sortie de stock qui ne vient pas d'une vente.
+
+    Appelée par `create_stock_movement`, donc par la vue comme par le journal.
+    """
+    nature = SORTIES_SIGNALEES.get(mouvement.movement_type)
+    if nature is None:
+        return None
+
+    libelle, gravite = nature
+    from apps.inventory.packaging import PackagingService
+
+    quantite = PackagingService.format_base_total(
+        mouvement.product, abs(mouvement.quantity)
+    )
+    return alerter(
+        mouvement.organization,
+        alert_type=Alert.AlertType.STOCK_EXIT,
+        severity=gravite,
+        title=f"{libelle} : {mouvement.product.name}",
+        # ⚠ FORMULATION INVARIABLE. « 3 casiers sont sortis » contre « 1 casier
+        # est sorti » : le nombre ET le genre dépendent d'un nom d'unité que le
+        # marchand a saisi, et qu'aucun lexique ne permet d'accorder. C'est la
+        # famille de faute déjà payée sur « Ouvrir un BOITE » et « 11 BOITES
+        # scellés ». On nomme donc la sortie, et la quantité suit.
+        message=(
+            f"{libelle} : {quantite} de {mouvement.product.name}, "
+            f"depuis {mouvement.warehouse.name}"
+            + (f". Motif : {mouvement.notes}" if mouvement.notes else ".")
+        ),
+        resource_type='stock_movement',
+        resource_id=mouvement.id,
+        data={
+            'kind': 'stock_exit',
+            'movement_type': mouvement.movement_type,
+            'product_id': str(mouvement.product_id),
+            'product_name': mouvement.product.name,
+            'quantity': float(abs(mouvement.quantity)),
+            'quantity_display': quantite,
+            'warehouse_id': str(mouvement.warehouse_id),
+            'warehouse_name': mouvement.warehouse.name,
+        },
+        action_url='/dashboard/stock/movements',
+        action_label='Voir le mouvement',
+    )

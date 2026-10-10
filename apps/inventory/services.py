@@ -416,7 +416,19 @@ def approve_transfer(transfer, user):
     transfer.status = 'pending'
     transfer.approved_by = user
     transfer.save()
-    
+
+    # La décision est prise : celui qui a demandé doit l'apprendre, sinon il
+    # rouvre son écran toutes les heures pour savoir où il en est.
+    from apps.notifications.services import decision_prise
+
+    decision_prise(
+        transfer.organization,
+        quoi='Le transfert', reference=transfer.reference,
+        decidee_par=user, pour=transfer.requested_by, approuvee=True,
+        entrepot=transfer.source_warehouse_id,
+        action_url='/dashboard/stock/transfers',
+    )
+
     return {'status': 'approved'}
 
 
@@ -842,7 +854,20 @@ def approve_adjustment(adjustment, user):
         adjustment.approved_by = user
         adjustment.approved_at = maintenant()
         adjustment.save()
-    
+
+    # ⚠ HORS du `atomic` : prévenir n'est pas une partie de l'écriture
+    # comptable, et un défaut de livraison ne doit pas annuler un ajustement
+    # de stock déjà appliqué.
+    from apps.notifications.services import decision_prise
+
+    decision_prise(
+        adjustment.organization,
+        quoi="L'ajustement", reference=adjustment.reference,
+        decidee_par=user, pour=adjustment.created_by, approuvee=True,
+        entrepot=adjustment.warehouse_id,
+        action_url='/dashboard/stock/adjustments',
+    )
+
     return {'status': 'approved'}
 
 
@@ -854,7 +879,17 @@ def reject_adjustment(adjustment, user):
     
     adjustment.status = 'rejected'
     adjustment.save()
-    
+
+    from apps.notifications.services import decision_prise
+
+    decision_prise(
+        adjustment.organization,
+        quoi="L'ajustement", reference=adjustment.reference,
+        decidee_par=user, pour=adjustment.created_by, approuvee=False,
+        entrepot=adjustment.warehouse_id,
+        action_url='/dashboard/stock/adjustments',
+    )
+
     return {'status': 'rejected'}
 
 

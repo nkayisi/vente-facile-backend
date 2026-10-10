@@ -153,4 +153,12 @@ def create_stock_movement(serializer, *, organization, user, request=None, **ext
         verrouille = Product.objects.select_for_update().get(pk=produit.pk)
         ProductPricingService.apply(verrouille, prix)
 
+    # ⚠ LA SORTIE SE SIGNALE DEPUIS LE SERVICE, PAS DEPUIS LA VUE : un
+    # mouvement se saisit au back-office ET par le journal du terminal, et le
+    # brancher sur la vue laisserait muet tout ce qui vient du comptoir. Une
+    # vente n'y entre pas - voir `SORTIES_SIGNALEES`.
+    from apps.notifications.services import sortie_de_stock
+
+    sortie_de_stock(mouvement)
+
     return mouvement

@@ -558,6 +558,22 @@ def submit_expense(expense, user=None):
         )
     expense.status = 'pending'
     expense.save(update_fields=['status', 'updated_at'])
+
+    # ⚠ LE TROISIÈME DÉCLENCHEUR DU RETOUR DE TEST : « réquisitions de dépense
+    # en attente d'approbation ». Le circuit existait entièrement - cinq
+    # transitions, partagées par la vue et le journal - et personne n'était
+    # prévenu qu'une décision attendait.
+    from apps.notifications.services import demande_approbation
+
+    demande_approbation(
+        expense.organization,
+        quoi='La dépense', reference=expense.reference,
+        par=expense.created_by,
+        entrepot=expense.warehouse_id,
+        resource_type='expense', resource_id=expense.id,
+        detail=f"{expense.amount} {expense.currency}",
+        action_url='/dashboard/cashbook/expenses',
+    )
     return expense
 
 
@@ -578,6 +594,16 @@ def approve_expense(expense, user):
     create_cash_movement_for_expense(
         expense, user=user, session=_session_pour(expense.organization, user)
     )
+
+    from apps.notifications.services import decision_prise
+
+    decision_prise(
+        expense.organization,
+        quoi='La dépense', reference=expense.reference,
+        decidee_par=user, pour=expense.created_by, approuvee=True,
+        entrepot=expense.warehouse_id,
+        action_url='/dashboard/cashbook/expenses',
+    )
     return expense
 
 
@@ -597,6 +623,16 @@ def reject_expense(expense, reason='', user=None):
     if reason:
         expense.notes = f"{expense.notes}\n--- Rejet ---\n{reason}".strip()
     expense.save(update_fields=['status', 'notes', 'updated_at'])
+
+    from apps.notifications.services import decision_prise
+
+    decision_prise(
+        expense.organization,
+        quoi='La dépense', reference=expense.reference,
+        decidee_par=user, pour=expense.created_by, approuvee=False,
+        entrepot=expense.warehouse_id, motif=reason or '',
+        action_url='/dashboard/cashbook/expenses',
+    )
     return expense
 
 

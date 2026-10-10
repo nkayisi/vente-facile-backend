@@ -474,4 +474,31 @@ def transition_requisition(requisition, action, *, user=None, notes=''):
         champs += ['decided_by', 'decided_at', 'decision_notes']
 
     requisition.save(update_fields=champs)
+
+    # ⚠ PRÉVENIR DEPUIS LE SERVICE, pas depuis la vue : une réquisition se
+    # soumet au back-office ET par le journal du terminal, et le brancher sur
+    # la vue laisserait muet tout ce qui vient du fond d'un dépôt - c'est-à-dire
+    # la quasi-totalité des demandes.
+    from apps.notifications.services import decision_prise, demande_approbation
+
+    if action == 'submit':
+        demande_approbation(
+            requisition.organization,
+            quoi='La réquisition', reference=requisition.reference,
+            par=requisition.requested_by,
+            entrepot=requisition.warehouse_id,
+            resource_type='requisition', resource_id=requisition.id,
+            detail=f"{requisition.items.count()} article(s)",
+            action_url='/dashboard/stock/requisitions',
+        )
+    elif action in ('approve', 'reject'):
+        decision_prise(
+            requisition.organization,
+            quoi='La réquisition', reference=requisition.reference,
+            decidee_par=user, pour=requisition.requested_by,
+            approuvee=(action == 'approve'),
+            entrepot=requisition.warehouse_id, motif=notes or '',
+            action_url='/dashboard/stock/requisitions',
+        )
+
     return requisition

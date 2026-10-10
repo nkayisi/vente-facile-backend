@@ -451,3 +451,231 @@ class ApiTests(TestCase):
         r = api.get('/api/v1/notifications/', **self.entetes)
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.data['results'], [])
+
+
+class CircuitApprobationTests(TestCase):
+    """
+    Les deux déclencheurs que le retour de test nomme : « demandes
+    d'approbation […] plus un message quand la décision est prise ».
+
+    ⚠ Aucun des deux n'existait, et le circuit était entièrement là : cinq
+    transitions sur une dépense, quatre sur une réquisition, partagées par la
+    vue et par le journal. Ce qui manquait est qu'une décision ATTENDE sans que
+    personne ne le sache, et qu'une fois prise elle ne revienne jamais à celui
+    qui avait demandé.
+    """
+
+    def setUp(self):
+        ctx = make_org_with_users()
+        self.__dict__.update(ctx)
+
+        self.gerant = OrganizationMembership.objects.get(
+            user=self.manager, organization=self.org
+        )
+        self.gerant.assigned_warehouses.set([self.warehouse])
+
+        self.magasinier = make_user('stock@vf.test', 'Stock', 'Keeper')
+        mk = OrganizationMembership.objects.create(
+            user=self.magasinier, organization=self.org,
+            role=OrganizationMembership.Role.STOCK_KEEPER, is_active=True,
+        )
+        mk.assigned_warehouses.set([self.warehouse])
+
+        self.produit = Product.objects.create(
+            organization=self.org, name='Lait 1L', sku='LAIT', slug='lait-1l',
+            track_inventory=True, reorder_point=Decimal('12.000'),
+            cost_price=Decimal('1000'), selling_price=Decimal('1500'),
+        )
+        Stock.objects.create(
+            organization=self.org, product=self.produit,
+            warehouse=self.warehouse, quantity=Decimal('5.000'),
+        )
+
+    def _requisition(self):
+        from apps.purchases.services import create_requisition
+
+        return create_requisition(
+            self.org, warehouse=self.warehouse,
+            lignes=[{'product': self.produit, 'quantity_requested': Decimal('24')}],
+            requested_by=self.magasinier,
+        )
+
+    def test_une_demande_soumise_PREVIENT_qui_peut_decider(self):
+        from apps.purchases.services import transition_requisition
+
+        req = self._requisition()
+        transition_requisition(req, 'submit', user=self.magasinier)
+
+        self.assertTrue(
+            Notification.objects.filter(
+                user=self.manager, data__kind='approval_request'
+            ).exists(),
+            "Une décision attend et personne ne le sait.",
+        )
+
+    def test_elle_ne_revient_PAS_a_celui_qui_demande(self):
+        """
+        Il sait ce qu'il vient de soumettre. Lui renvoyer sa propre demande
+        fait du bruit, et le bruit est ce qui apprend à ne plus lire les
+        alertes.
+
+        ┌──────────────────────────────────────────────────────────────────┐
+        │ L'AUTEUR DOIT ÊTRE QUELQU'UN QUI PEUT DÉCIDER, sinon ce test ne  │
+        │ démontre rien.                                                   │
+        │                                                                  │
+        │ Écrit avec le MAGASINIER comme auteur, il passait même en        │
+        │ retirant l'exclusion `sauf` : le magasinier n'a pas              │
+        │ `requisitions.approve`, donc le filtre de droit l'écartait déjà. │
+        │ Il passait pour une raison qui n'était pas la sienne - le piège  │
+        │ que ce dépôt a déjà payé sur `permissions.test.ts`. Vérifié par  │
+        │ mutation : avec un gérant, il tombe.                             │
+        │                                                                  │
+        │ Et c'est un cas RÉEL : un gérant crée et soumet ses propres      │
+        │ demandes, et il a le droit de les trancher.                      │
+        └──────────────────────────────────────────────────────────────────┘
+        """
+        from apps.purchases.services import create_requisition, transition_requisition
+
+        req = create_requisition(
+            self.org, warehouse=self.warehouse,
+            lignes=[{'product': self.produit, 'quantity_requested': Decimal('24')}],
+            requested_by=self.manager,
+        )
+        transition_requisition(req, 'submit', user=self.manager)
+        self.assertFalse(
+            Notification.objects.filter(
+                user=self.manager, data__kind='approval_request'
+            ).exists(),
+            "Le gérant a reçu sa propre demande d'approbation.",
+        )
+
+    def test_un_magasinier_n_est_pas_prevenu_d_une_demande_a_approuver(self):
+        """
+        ⚠ LE DROIT D'ÊTRE PRÉVENU EST ICI LE DROIT DE TRANCHER, et c'est le
+        seul cas où il diffère du droit de voir. `requisitions.approve` ne va
+        pas au magasinier : prévenir qui ne peut pas décider ne sert à rien.
+        """
+        from apps.purchases.services import transition_requisition
+
+        autre = make_user('stock2@vf.test', 'Stock', 'Deux')
+        m2 = OrganizationMembership.objects.create(
+            user=autre, organization=self.org,
+            role=OrganizationMembership.Role.STOCK_KEEPER, is_active=True,
+        )
+        m2.assigned_warehouses.set([self.warehouse])
+
+        req = self._requisition()
+        transition_requisition(req, 'submit', user=self.magasinier)
+        self.assertFalse(Notification.objects.filter(user=autre).exists())
+
+    def test_LA_DECISION_PRISE_revient_a_celui_qui_avait_demande(self):
+        """
+        Sans ce message, celui qui a soumis rouvre son écran toutes les heures
+        pour savoir où il en est.
+        """
+        from apps.purchases.services import transition_requisition
+
+        req = self._requisition()
+        transition_requisition(req, 'submit', user=self.magasinier)
+        transition_requisition(req, 'approve', user=self.owner)
+
+        n = Notification.objects.filter(
+            user=self.magasinier, data__kind='approval_decision'
+        ).first()
+        self.assertIsNotNone(n, "La décision n'est jamais revenue au demandeur.")
+        self.assertTrue(n.data['approved'])
+        self.assertIn(req.reference, n.title)
+
+    def test_un_REJET_revient_avec_son_motif(self):
+        from apps.purchases.services import transition_requisition
+
+        req = self._requisition()
+        transition_requisition(req, 'submit', user=self.magasinier)
+        transition_requisition(
+            req, 'reject', user=self.owner, notes='Trop cher ce mois-ci'
+        )
+
+        n = Notification.objects.filter(
+            user=self.magasinier, data__kind='approval_decision'
+        ).first()
+        self.assertFalse(n.data['approved'])
+        self.assertIn('Trop cher ce mois-ci', n.message)
+
+    def test_la_decision_ne_va_PAS_a_tous_les_gerants(self):
+        """
+        C'est SA demande : le fan-out par droit enverrait la nouvelle à tous les
+        gérants de l'établissement.
+        """
+        from apps.purchases.services import transition_requisition
+
+        req = self._requisition()
+        transition_requisition(req, 'submit', user=self.magasinier)
+        Notification.objects.all().delete()
+        transition_requisition(req, 'approve', user=self.owner)
+
+        destinataires_reels = set(
+            Notification.objects.values_list('user_id', flat=True)
+        )
+        self.assertEqual(destinataires_reels, {self.magasinier.id})
+
+
+class SortieDeStockTests(TestCase):
+    """Le cinquième déclencheur : « sortie de stock »."""
+
+    def setUp(self):
+        ctx = make_org_with_users()
+        self.__dict__.update(ctx)
+        OrganizationMembership.objects.get(
+            user=self.manager, organization=self.org
+        ).assigned_warehouses.set([self.warehouse])
+
+        self.produit = Product.objects.create(
+            organization=self.org, name='Lait 1L', sku='LAIT', slug='lait-1l',
+            track_inventory=True, cost_price=Decimal('1000'),
+            selling_price=Decimal('1500'),
+        )
+        self.rayon = Stock.objects.create(
+            organization=self.org, product=self.produit,
+            warehouse=self.warehouse, quantity=Decimal('50.000'),
+        )
+
+    def _mouvement(self, genre):
+        from apps.inventory.models import StockMovement
+        from apps.notifications.services import sortie_de_stock
+
+        m = StockMovement.objects.create(
+            organization=self.org, product=self.produit,
+            warehouse=self.warehouse, movement_type=genre,
+            quantity=Decimal('3.000'), quantity_before=Decimal('50.000'),
+            quantity_after=Decimal('47.000'), created_by=self.manager,
+            notes='Carton tombé',
+        )
+        sortie_de_stock(m)
+        return m
+
+    def test_une_PERTE_est_signalee(self):
+        self._mouvement('damage')
+        alerte = Alert.objects.get(data__kind='stock_exit')
+        self.assertEqual(alerte.severity, Alert.Severity.HIGH)
+        self.assertIn('Carton tombé', alerte.message)
+        self.assertTrue(Notification.objects.filter(user=self.manager).exists())
+
+    def test_UNE_VENTE_N_EST_PAS_SIGNALEE(self):
+        """
+        ⚠ Chaque encaissement sort du stock : prévenir à chaque fois ferait de
+        l'alerte le bruit de fond du comptoir, et personne ne verrait plus la
+        perte qui compte.
+        """
+        self._mouvement('sale')
+        self.assertFalse(Alert.objects.filter(data__kind='stock_exit').exists())
+
+    def test_UNE_ENTREE_N_EST_PAS_SIGNALEE(self):
+        self._mouvement('purchase')
+        self.assertFalse(Alert.objects.filter(data__kind='stock_exit').exists())
+
+    def test_elle_NOMME_son_depot_et_sa_quantite(self):
+        self._mouvement('expired')
+        alerte = Alert.objects.get(data__kind='stock_exit')
+        self.assertEqual(alerte.data['warehouse_id'], str(self.warehouse.id))
+        self.assertIn(self.warehouse.name, alerte.message)
+        self.assertEqual(alerte.data['quantity'], 3.0)

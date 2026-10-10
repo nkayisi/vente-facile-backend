@@ -31,7 +31,7 @@ class AlertSerializer(serializers.ModelSerializer):
         source='get_severity_display', read_only=True
     )
     acknowledged_by_name = serializers.CharField(
-        source='acknowledged_by.get_full_name', read_only=True, default=''
+        source='acknowledged_by.full_name', read_only=True, default=''
     )
 
     class Meta:
