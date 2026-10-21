@@ -246,9 +246,38 @@ class AddPaymentAndCancelTests(_BaseSaleFlowTest):
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
         return resp.data['id']
 
-    def test_add_payment_completes_sale_and_decrements_stock_once(self):
+    def _stock(self):
+        return Stock.objects.get(
+            product=self.product, warehouse=self.warehouse,
+        ).quantity
+
+    def test_le_stock_sort_a_l_emission_et_une_seule_fois(self):
+        """
+        Le stock sort quand la MARCHANDISE sort, pas quand l'argent rentre.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ CE TEST A LONGTEMPS AFFIRMÉ LE CONTRAIRE.                            │
+        │                                                                      │
+        │ Il relevait le stock APRÈS la création de la vente à crédit, puis    │
+        │ constatait l'écart au règlement. Il décrivait donc fidèlement un      │
+        │ défaut - une vente à crédit ne retirait RIEN du stock - et c'est ce   │
+        │ qui le rendait permanent : le marchand livrait la marchandise, et son │
+        │ rayon la montrait toujours en place.                                  │
+        │                                                                      │
+        │ Ce qu'il prouve n'a pas changé : le stock ne sort qu'UNE fois. Seul   │
+        │ le moment où on l'attend a été corrigé.                              │
+        └──────────────────────────────────────────────────────────────────────┘
+        """
+        stock_avant = self._stock()
+
         sale_id = self._create_credit_sale(total='2000.00')
-        stock_before = Stock.objects.get(product=self.product, warehouse=self.warehouse).quantity
+
+        # L'émission suffit : la vente est `pending`, et le stock est déjà sorti.
+        sale = Sale.objects.get(pk=sale_id)
+        self.assertEqual(sale.status, 'pending')
+        self.assertEqual(sale.amount_due, Decimal('2000.00'))
+        stock_emis = self._stock()
+        self.assertEqual(stock_avant - stock_emis, Decimal('1.000'))
 
         self.client.force_authenticate(user=self.cashier_a)
         resp = self.client.post(
@@ -259,19 +288,41 @@ class AddPaymentAndCancelTests(_BaseSaleFlowTest):
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
         self.assertEqual(resp.data['status'], 'completed')
 
-        stock_after = Stock.objects.get(product=self.product, warehouse=self.warehouse).quantity
-        self.assertEqual(stock_before - stock_after, Decimal('1.000'))
+        # Le règlement ne REdécrémente pas : `apply_decrement` est idempotent.
+        self.assertEqual(self._stock(), stock_emis)
 
-        # Idempotence : un second add_payment doit être refusé (vente completed)
+        # Un second règlement est refusé (vente déjà soldée), stock intact.
         resp2 = self.client.post(
             f'/api/v1/sales/{sale_id}/add-payment/',
             {'payment_method': str(self.payment_method.id), 'amount': '100'},
             format='json', **self._headers(),
         )
         self.assertEqual(resp2.status_code, status.HTTP_400_BAD_REQUEST)
-        # Stock inchangé
-        stock_final = Stock.objects.get(product=self.product, warehouse=self.warehouse).quantity
-        self.assertEqual(stock_final, stock_after)
+        self.assertEqual(self._stock(), stock_emis)
+
+    def test_un_seul_mouvement_de_vente_est_trace(self):
+        """
+        Le garde-fou du double décrément, pris par la trace plutôt que par le
+        solde : deux `StockMovement` de vente passeraient inaperçus sur un
+        entrepôt tolérant le découvert, où le solde descend sans se plaindre.
+        """
+        from apps.inventory.models import StockMovement
+
+        sale_id = self._create_credit_sale(total='2000.00')
+        self.client.force_authenticate(user=self.cashier_a)
+        self.client.post(
+            f'/api/v1/sales/{sale_id}/add-payment/',
+            {'payment_method': str(self.payment_method.id), 'amount': '2000.00'},
+            format='json', **self._headers(),
+        )
+
+        self.assertEqual(
+            StockMovement.objects.filter(
+                reference_type='sale', reference_id=sale_id,
+                movement_type='sale',
+            ).count(),
+            1,
+        )
 
     def test_cancel_credit_sale_overpaid_restores_balance_correctly(self):
         """

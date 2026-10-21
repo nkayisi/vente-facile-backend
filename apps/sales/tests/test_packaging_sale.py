@@ -280,8 +280,22 @@ class PriceGuardTests(_PackagingSaleSetup):
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_quantite_fractionnaire_refusee(self):
-        self._supply(packages=2)
+    def test_quantite_fractionnaire_acceptee(self):
+        """
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ CE TEST EXIGEAIT UN REFUS, ET LE REFUS A ÉTÉ LEVÉ.                   │
+        │                                                                      │
+        │ Il affirmait « se vend par unités entières », au motif qu'une         │
+        │ fraction rendrait le partage scellé/vrac incalculable. C'était vrai  │
+        │ du RAYON, pas de la vente - et le rayon sait désormais le dire :      │
+        │ `_settle` reverse la part entamée d'un contenant au vrac.             │
+        │                                                                      │
+        │ Un commerce ne vend pas que des pièces : on sert 1,5 L au détail et  │
+        │ on pèse 0,5 kg. Le serveur l'acceptait déjà sur un produit SANS      │
+        │ conditionnement ; seul le produit conditionné était fermé.            │
+        └──────────────────────────────────────────────────────────────────────┘
+        """
+        self._supply(packages=2)   # 2 paquets scellés = 24 bouteilles
 
         response = self.client.post(
             '/api/v1/sales/',
@@ -301,8 +315,17 @@ class PriceGuardTests(_PackagingSaleSetup):
             },
             format='json', **self._headers,
         )
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn('unités entières', str(response.data))
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        stock = Stock.objects.get(product=self.product, warehouse=self.warehouse)
+        # Un paquet a été ouvert pour servir le détail : 1 scellé + 10,5 au vrac.
+        self.assertEqual(stock.quantity, Decimal('22.500'))
+        self.assertEqual(stock.package_quantity, Decimal('1.000'))
+        self.assertEqual(stock.loose_quantity, Decimal('10.500'))
+        # L'invariant du partage tient, et c'est lui qui compte.
+        self.assertEqual(
+            stock.package_quantity * 12 + stock.loose_quantity, stock.quantity,
+        )
 
     def test_conditionnement_refuse_sur_produit_simple(self):
         simple = Product.objects.create(

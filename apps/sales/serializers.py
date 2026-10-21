@@ -8,7 +8,8 @@ from django.db import transaction
 from .models import (
     Register, RegisterSession, RegisterSessionCurrencyBalance,
     Sale, SaleItem, PaymentMethod, Payment,
-    SaleReturn, SaleReturnItem, Quotation, QuotationItem
+    SaleReturn, SaleReturnItem, Quotation, QuotationItem,
+    SaleCurrencyTotal,
 )
 from .sale_validation import max_sale_discount_percent
 from apps.core.warehouse_scope import accessible_warehouse_ids, get_membership_for_request
@@ -325,9 +326,15 @@ class SaleItemSerializer(serializers.ModelSerializer):
             'returned_quantity', 'returnable_quantity',
             'discount_amount', 'discount_percentage',
             'tax_rate', 'tax_amount',
-            'subtotal', 'total', 'notes'
+            'subtotal', 'total', 'notes',
+            # ⚠ LA DEVISE D'ANNONCE SE LIT, pas seulement s'écrit. Sans elle,
+            # le ticket ne peut PAS dire dans quelle monnaie le prix a été
+            # annoncé - et c'est le papier que le client emporte.
+            'price_currency', 'price_exchange_rate',
         ]
-        read_only_fields = ['id', 'subtotal', 'total', 'tax_amount']
+        read_only_fields = [
+            'id', 'subtotal', 'total', 'tax_amount', 'price_exchange_rate',
+        ]
 
     def get_returned_quantity(self, obj):
         """
@@ -411,9 +418,18 @@ class SaleItemCreateSerializer(serializers.ModelSerializer):
             'product', 'variant', 'batch',
             'quantity', 'unit_price',
             'package_quantity', 'package_unit_price', 'loose_quantity',
-            'discount_percentage', 'tax_rate', 'notes'
+            'discount_percentage', 'tax_rate', 'notes',
+            # La devise dans laquelle CE prix a été annoncé au client. Absente :
+            # la ligne suit la facture, ce qu'elle a toujours fait.
+            # ⚠ Le TAUX n'est pas accepté du client : il est résolu par le
+            # serveur depuis les taux de l'établissement, sans quoi un appel
+            # forgé fixerait son propre cours.
+            'price_currency',
         ]
-        extra_kwargs = {'quantity': {'required': False}}
+        extra_kwargs = {
+            'quantity': {'required': False},
+            'price_currency': {'required': False},
+        }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -482,14 +498,22 @@ class SaleItemCreateSerializer(serializers.ModelSerializer):
                     )
                 })
 
-            # Le facteur est un entier : vendre une fraction d'unité de détail
-            # rendrait le partage scellé/vrac incalculable.
-            if package_quantity % 1 or loose_quantity % 1:
-                raise serializers.ValidationError({
-                    'quantity': (
-                        f"« {product.name} » se vend par unités entières."
-                    )
-                })
+            # ┌──────────────────────────────────────────────────────────────┐
+            # │ UNE QUANTITÉ SE VEND AU POIDS, ET CE REFUS L'INTERDISAIT.     │
+            # │                                                              │
+            # │ Ici vivait « se vend par unités entières », au motif qu'une   │
+            # │ fraction « rendrait le partage scellé/vrac incalculable ».    │
+            # │ C'était vrai du RAYON, pas de la vente : une ligne de vente   │
+            # │ STOCKE ses deux compteurs, alors que `Stock` les             │
+            # │ reconstitue. Et le rayon sait désormais le dire - `_settle`   │
+            # │ reverse la part entamée d'un contenant au vrac, parce qu'un   │
+            # │ demi-carton ouvert EST du vrac.                              │
+            # │                                                              │
+            # │ Tous les champs de quantité du projet sont des              │
+            # │ `DecimalField(max_digits=15, decimal_places=3)` : trois       │
+            # │ décimales étaient acceptées partout SAUF ici, et c'est ce qui │
+            # │ empêchait de vendre 0,5 kg de farine.                        │
+            # └──────────────────────────────────────────────────────────────┘
 
             data['quantity'] = PackagingService.to_base(
                 product, package_quantity, loose_quantity
@@ -689,6 +713,22 @@ def _points_out(value):
     return int(quantized) if quantized == quantized.to_integral_value() else float(quantized)
 
 
+class SaleCurrencyTotalSerializer(serializers.ModelSerializer):
+    """
+    Un sous-total de vente, dans UNE devise.
+
+    Lu par les écrans qui ventilent - ticket, fiche de vente - et par eux
+    seuls : tout le reste continue de lire les scalaires de `Sale`, convertis
+    en devise de facture, pour ne pas joindre cette table dans un agrégat.
+    """
+
+    class Meta:
+        model = SaleCurrencyTotal
+        fields = ['currency', 'subtotal', 'tax_amount', 'discount_amount',
+                  'total', 'exchange_rate']
+        read_only_fields = fields
+
+
 class SaleDetailSerializer(serializers.ModelSerializer):
     """Serializer complet pour le détail d'une vente."""
     
@@ -707,6 +747,9 @@ class SaleDetailSerializer(serializers.ModelSerializer):
     loyalty_points_balance = serializers.SerializerMethodField()
     loyalty_program_active = serializers.SerializerMethodField()
     loyalty_max_redeemable = serializers.SerializerMethodField()
+    # ⚠ Rendu seulement sur le DÉTAIL : la liste n'en a pas besoin, et une
+    # jointure de plus par ligne de liste se paierait sur chaque page.
+    currency_totals = SaleCurrencyTotalSerializer(many=True, read_only=True)
 
     class Meta:
         model = Sale
@@ -719,7 +762,7 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             'subtotal', 'tax_amount', 'discount_amount', 'discount_percentage',
             'loyalty_redemption_amount', 'total',
             'amount_paid', 'amount_due', 'change_amount', 'change_currency',
-            'currency', 'exchange_rate',
+            'currency', 'exchange_rate', 'currency_totals',
             'notes', 'internal_notes',
             'sold_by', 'sold_by_name',
             'sale_date', 'due_date', 'is_pos', 'receipt_printed',
@@ -1325,14 +1368,32 @@ class SaleCreateSerializer(serializers.ModelSerializer):
                 packaging_factor=item_data.get('packaging_factor'),
                 discount_percentage=discount_pct,
                 tax_rate=tax_rate,
-                notes=item_data.get('notes', '')
+                notes=item_data.get('notes', ''),
+                # La devise ANNONCÉE pour cette ligne. Vide : elle suit la
+                # facture, et `ventiler` l'y ramènera. Le TAUX, lui, n'est
+                # jamais accepté du client - le serveur le résout.
+                price_currency=(item_data.get('price_currency') or ''),
             )
         
-        # Relire les valeurs réelles sauvegardées par SaleItem.save()
-        saved_items = sale.items.all()
-        items_subtotal = sum((i.subtotal for i in saved_items), Decimal('0.00'))
-        items_discount_total = sum((i.discount_amount for i in saved_items), Decimal('0.00'))
-        tax_total = sum((i.tax_amount for i in saved_items), Decimal('0.00'))
+        # Relire les valeurs réelles sauvegardées par SaleItem.save().
+        # ⚠ MATÉRIALISÉ : `sale.items.all()` est un queryset PARESSEUX, et
+        # `ventiler` pose `price_currency` sur chaque ligne avant de les
+        # enregistrer en lot. Sur un queryset, chaque parcours rend des objets
+        # NEUFS : les valeurs résolues seraient perdues entre la boucle et
+        # l'écriture, sans qu'aucune erreur ne le dise.
+        saved_items = list(sale.items.all())
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ LES LIGNES NE SE SOMMENT PAS SANS REGARDER LEUR DEVISE.          │
+        # │                                                                  │
+        # │ Ces trois sommes additionnaient `item.subtotal` sans rien         │
+        # │ demander : juste tant qu'une vente n'avait qu'une devise, faux    │
+        # │ dès qu'une ligne est annoncée en francs sur une facture en        │
+        # │ dollars. `ventiler` écrit un sous-total PAR devise - ce que le    │
+        # │ client lit sur son ticket - et rend ces trois-là déjà convertis   │
+        # │ au taux FIGÉ de chaque ligne.                                     │
+        # └──────────────────────────────────────────────────────────────────┘
+        from .currency_totals import ventiler
+        items_subtotal, items_discount_total, tax_total = ventiler(sale, saved_items)
         
         # Calculer les totaux de la vente
         sale.subtotal = items_subtotal.quantize(TWO_PLACES)
@@ -1408,19 +1469,13 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         sale.amount_paid = total_paid.quantize(TWO_PLACES)
         sale.amount_due = (sale.total - sale.amount_paid).quantize(TWO_PLACES)
 
-        change_amount = Decimal('0.00')
+        # Formule UNIQUE, partagée avec `consume_advance` et
+        # `apply_payment_to_sale` : elle était écrite cinq fois, et les copies
+        # avaient déjà divergé sur le cas `pending`.
+        from .services import recalculer_solde_et_statut
+        recalculer_solde_et_statut(sale)
+        change_amount = sale.change_amount or Decimal('0.00')
         change_currency = sale.change_currency or sale.currency
-        if sale.amount_paid >= sale.total:
-            # Monnaie rendue dans la devise choisie par le caissier (défaut = vente).
-            change_amount, change_currency, _ = resolve_change(sale, change_currency)
-            sale.change_amount = change_amount
-            sale.change_currency = change_currency
-            sale.amount_due = Decimal('0.00')
-            sale.status = 'completed'
-        elif sale.amount_paid > 0:
-            sale.status = 'partially_paid'
-        else:
-            sale.status = 'pending'
 
         sale.save()
 
@@ -1434,10 +1489,30 @@ class SaleCreateSerializer(serializers.ModelSerializer):
             if change_amount > 0:
                 record_change(org, sale, change_amount, change_currency, user)
         
-        # Mettre à jour le stock si la vente est complétée et qu'un entrepôt est défini.
-        # Décrémentation centralisée : FIFO sur les lots + re-check `allow_negative_stock`
-        # sous lock + StockMovement, le tout idempotent.
-        if sale.status == 'completed' and warehouse:
+        # ┌─────────────────────────────────────────────────────────────────────┐
+        # │ LA MARCHANDISE SORT À L'ÉMISSION, PAYÉE OU NON.                     │
+        # │                                                                     │
+        # │ La garde était `status == 'completed'`, et le statut ne vient que du │
+        # │ montant payé (plus haut) : une vente à crédit sortait en `pending`   │
+        # │ et son stock n'était JAMAIS retiré - il ne l'était qu'au règlement.  │
+        # │ Le client, lui, était parti avec les articles.                       │
+        # │                                                                     │
+        # │ C'était en outre incohérent avec le pré-contrôle de stock, qui       │
+        # │ s'exécute pour TOUTES les ventes et refuse si le stock manque : le   │
+        # │ serveur vérifiait un stock qu'il ne retirait pas.                    │
+        # │                                                                     │
+        # │ `draft` est exclu - un brouillon n'engage rien - et `cancelled` ne   │
+        # │ peut pas se produire ici, mais le dire ferme le cas pour de bon.    │
+        # └─────────────────────────────────────────────────────────────────────┘
+        #
+        # Décrémentation centralisée : FIFO sur les lots + re-check
+        # `allow_negative_stock` sous lock + StockMovement, le tout idempotent
+        # (`is_committed`). Les deux autres appelants - `apply_payment_to_sale`
+        # au basculement vers `completed`, et `register_sale_debt` quand une
+        # avance solde tout - deviennent donc des no-op sur une vente déjà
+        # décrémentée. Ils RESTENT : ils sont le seul chemin de décrément des
+        # ventes déjà en base qui n'ont jamais été décrémentées.
+        if sale.status not in ('draft', 'cancelled') and warehouse:
             from .services import SaleStockService
             SaleStockService.apply_decrement(sale, self.context['request'].user)
         

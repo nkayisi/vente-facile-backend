@@ -425,28 +425,21 @@ class Sale(TenantSyncableModel):
             self.change_currency = self.currency
         super().save(*args, **kwargs)
 
-    def calculate_totals(self):
-        """Recalculate sale totals from items."""
-        TWO_PLACES = Decimal('0.01')
-        items = self.items.all()
-        self.subtotal = sum((item.subtotal for item in items), Decimal('0.00')).quantize(TWO_PLACES)
-        self.tax_amount = sum((item.tax_amount for item in items), Decimal('0.00')).quantize(TWO_PLACES)
-        
-        items_discount = sum((item.discount_amount for item in items), Decimal('0.00')).quantize(TWO_PLACES)
-        
-        global_discount = Decimal('0.00')
-        if self.discount_percentage > 0:
-            net_after_item_discounts = self.subtotal - items_discount
-            global_discount = (net_after_item_discounts * self.discount_percentage / 100).quantize(TWO_PLACES)
-        
-        self.discount_amount = (items_discount + global_discount).quantize(TWO_PLACES)
-        self.total = (self.subtotal - self.discount_amount + self.tax_amount).quantize(TWO_PLACES)
-        self.amount_due = (self.total - self.amount_paid).quantize(TWO_PLACES)
-        
-        if self.amount_paid >= self.total:
-            self.change_amount = (self.amount_paid - self.total).quantize(TWO_PLACES)
-            self.amount_due = Decimal('0.00')
-
+    # ┌──────────────────────────────────────────────────────────────────────┐
+    # │ `calculate_totals()` VIVAIT ICI, ET ELLE ÉTAIT MORTE.                │
+    # │                                                                      │
+    # │ Aucun appelant dans tout `apps/`, tests compris - et c'était le      │
+    # │ premier endroit où l'on serait allé « corriger » les totaux d'une    │
+    # │ vente, pour s'apercevoir ensuite que rien n'avait bougé. Elle avait  │
+    # │ d'ailleurs déjà dérivé : elle ignorait la remise en MONTANT fixe et  │
+    # │ les points de fidélité, que le sérialiseur applique tous deux.       │
+    # │                                                                      │
+    # │ Le solde et le statut vivent dans                                    │
+    # │ `services.recalculer_solde_et_statut`, appelée par le sérialiseur de │
+    # │ vente, par `consume_advance` et par `apply_payment_to_sale`. Les     │
+    # │ totaux de LIGNE restent calculés par `SaleItem.save()`, seule source │
+    # │ de vérité à ce niveau.                                               │
+    # └──────────────────────────────────────────────────────────────────────┘
 
 class SaleItem(TenantModel, SyncableModel):
     """Individual line items in a sale."""
@@ -482,6 +475,34 @@ class SaleItem(TenantModel, SyncableModel):
         decimal_places=3,
         validators=[MinValueValidator(Decimal('0.001'))]
     )
+    # ┌──────────────────────────────────────────────────────────────────────┐
+    # │ LA DEVISE EST PORTÉE PAR LA LIGNE, ET SON TAUX EST FIGÉ.             │
+    # │                                                                      │
+    # │ Un marchand dont le catalogue est tenu en dollars annonce certains   │
+    # │ articles en francs. `unit_price` est donc libellé dans               │
+    # │ `price_currency` - pas dans la devise de la vente - et c'est         │
+    # │ `price_exchange_rate` qui ramène la ligne en devise principale.      │
+    # │                                                                      │
+    # │ ⚠ LE TAUX EST FIGÉ À LA VENTE, JAMAIS RELU. Un rapport dont les      │
+    # │ chiffres d'hier bougent avec le cours n'est pas relisable, et c'est  │
+    # │ la règle que tout ce dépôt applique déjà.                            │
+    # │                                                                      │
+    # │ ⚠ `cost_price` N'EST PAS CONCERNÉ : il vient du catalogue, qui n'a   │
+    # │ aucune devise, donc il est DÉJÀ en principale. Lui appliquer ce taux │
+    # │ le diviserait par le cours et ferait passer la marge de 40 % à       │
+    # │ 100 %. Le dépôt a déjà payé cette erreur sur les rapports.           │
+    # └──────────────────────────────────────────────────────────────────────┘
+    price_currency = models.CharField(
+        max_length=3, blank=True, default='',
+        help_text="Devise dans laquelle le prix de cette ligne a été annoncé. "
+                  "Vide : la devise de la vente, résolue à l'enregistrement.",
+    )
+    price_exchange_rate = models.DecimalField(
+        max_digits=20, decimal_places=12, default=Decimal('1.000000000000'),
+        help_text="Unités de devise PRINCIPALE pour 1 unité de `price_currency`, "
+                  "figé au moment de la vente.",
+    )
+
     unit_price = models.DecimalField(max_digits=15, decimal_places=2)
 
     # Vente en gros : part de `quantity` vendue en conditionnements entiers.
@@ -613,6 +634,67 @@ class SaleItem(TenantModel, SyncableModel):
         self.total = (taxable_amount + self.tax_amount).quantize(TWO_PLACES)
         
         super().save(*args, **kwargs)
+
+
+
+class SaleCurrencyTotal(TenantModel):
+    """
+    Sous-total d'une vente POUR UNE DEVISE.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ UNE VENTE PEUT ÊTRE LIBELLÉE EN PLUSIEURS MONNAIES, ET ELLES NE          │
+    │ S'ADDITIONNENT PAS.                                                      │
+    │                                                                          │
+    │ Un marchand congolais annonce la farine en francs et le savon importé    │
+    │ en dollars, sur le même ticket. Chaque ligne suit sa devise              │
+    │ indépendamment ; c'est exactement le motif de `CustomerBalance` pour la  │
+    │ dette, et de `RegisterSessionCurrencyBalance` pour le tiroir.            │
+    │                                                                          │
+    │ ⚠ LES SCALAIRES DE `Sale` RESTENT, et c'est ce qui rend ce modèle        │
+    │ tenable. `Sale.total`, `amount_due` et `amount_paid` demeurent la somme  │
+    │ CONVERTIE en devise de facture : les deux cent trente-trois lectures du  │
+    │ serveur, les dix-sept agrégats `primary_sum` et les cinq filtres SQL     │
+    │ `amount_due__gt=0` continuent de fonctionner sans jointure - donc sans   │
+    │ le fan-out qui, mesuré dans ce dépôt, faisait rendre 217 227,70 à une    │
+    │ somme qui valait 107 356,40.                                             │
+    │                                                                          │
+    │ Seuls les écrans qui veulent la ventilation interrogent cette table.     │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    Écriture exclusivement par `apps.sales.services`.
+    """
+
+    sale = models.ForeignKey(
+        'Sale', on_delete=models.CASCADE, related_name='currency_totals',
+    )
+    currency = models.CharField(max_length=3)
+
+    subtotal = models.DecimalField(max_digits=15, decimal_places=2, default=Decimal('0.00'))
+    tax_amount = models.DecimalField(max_digits=15, decimal_places=2, default=Decimal('0.00'))
+    discount_amount = models.DecimalField(max_digits=15, decimal_places=2, default=Decimal('0.00'))
+    total = models.DecimalField(max_digits=15, decimal_places=2, default=Decimal('0.00'))
+
+    exchange_rate = models.DecimalField(
+        max_digits=20, decimal_places=12, default=Decimal('1.000000000000'),
+        help_text="Unités de devise PRINCIPALE pour 1 unité de `currency`, "
+                  "FIGÉ au moment de la vente. Jamais le taux du jour.",
+    )
+
+    class Meta:
+        db_table = 'sale_currency_totals'
+        ordering = ['currency']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['sale', 'currency'],
+                name='unique_sale_total_per_currency',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['organization', 'currency']),
+        ]
+
+    def __str__(self):
+        return f"{self.sale_id} {self.currency} {self.total}"
 
 
 class PaymentMethod(TenantModel):

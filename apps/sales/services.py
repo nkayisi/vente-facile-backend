@@ -588,6 +588,53 @@ def get_advance_payment_method(organization):
 
 
 @transaction.atomic
+def recalculer_solde_et_statut(sale, change_currency=None, avec_monnaie=True):
+    """
+    Pose `amount_due`, le statut, et la monnaie rendue s'il y a lieu.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ CETTE FORMULE ÉTAIT ÉCRITE CINQ FOIS.                                    │
+    │                                                                          │
+    │ `SaleCreateSerializer.create`, `consume_advance`, `apply_payment_to_sale`,│
+    │ la conversion d'un devis, et une commande de rattrapage - plus une        │
+    │ sixième copie MORTE, `Sale.calculate_totals()`, qui n'avait aucun         │
+    │ appelant et qui est le premier endroit où l'on serait allé « corriger »   │
+    │ les totaux.                                                              │
+    │                                                                          │
+    │ Les trois copies vivantes avaient déjà divergé sur le cas `pending` :     │
+    │ deux d'entre elles ne le produisaient jamais, et c'était juste chez elles │
+    │ (un règlement a forcément été encaissé) mais faux comme règle générale.   │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    `avec_monnaie` est à `False` quand le surplus ne peut pas être rendu : une
+    avance client consommée n'ouvre pas le tiroir, l'argent y est entré le jour
+    où l'avance a été versée.
+
+    Ne sauvegarde pas : l'appelant maîtrise le moment de l'écriture, et plusieurs
+    d'entre eux ont d'autres champs à poser dans le même `save()`.
+    """
+    sale.amount_paid = sale.amount_paid.quantize(TWO_PLACES)
+    sale.amount_due = (sale.total - sale.amount_paid).quantize(TWO_PLACES)
+
+    if sale.amount_paid >= sale.total:
+        if avec_monnaie:
+            cible = change_currency or sale.change_currency or sale.currency
+            change_amount, resolue, _ = resolve_change(sale, cible)
+            sale.change_amount = change_amount
+            sale.change_currency = resolue
+        sale.amount_due = Decimal('0.00')
+        sale.status = 'completed'
+    else:
+        # Rien à rendre tant qu'il reste à payer. Posé EXPLICITEMENT : sans
+        # cela un `change_amount` résiduel survivrait à un règlement partiel,
+        # et le tiroir annoncerait une monnaie rendue qui n'a pas eu lieu.
+        sale.change_amount = Decimal('0.00')
+        # Rien n'a été encaissé du tout : la facture est due en entier.
+        sale.status = 'partially_paid' if sale.amount_paid > 0 else 'pending'
+
+    return sale.status
+
+
 def register_sale_debt(sale, user, notes=''):
     """
     Porte au compte du client ce qui reste à payer sur une facture émise, puis
@@ -643,13 +690,11 @@ def register_sale_debt(sale, user, notes=''):
     )
 
     sale.amount_paid = (sale.amount_paid + consumed).quantize(TWO_PLACES)
-    sale.amount_due = (sale.total - sale.amount_paid).quantize(TWO_PLACES)
-    became_complete = sale.amount_due <= 0
-    if became_complete:
-        sale.amount_due = Decimal('0.00')
-        sale.status = 'completed'
-    else:
-        sale.status = 'partially_paid'
+    # Une avance consommée ne rend AUCUNE monnaie : l'argent est entré au
+    # tiroir le jour où le client a versé son avance, pas aujourd'hui.
+    became_complete = (
+        recalculer_solde_et_statut(sale, avec_monnaie=False) == 'completed'
+    )
     sale.save(update_fields=['amount_paid', 'amount_due', 'status'])
 
     if became_complete:
@@ -812,20 +857,9 @@ def apply_payment_to_sale(sale_id, user, *, payment_method_id=None,
     applied_payments = [p for p in payments if p.status != PaymentModel.Status.FAILED]
     for p in applied_payments:
         sale.amount_paid += p.amount
-    sale.amount_due = (sale.total - sale.amount_paid).quantize(TWO_PLACES)
-
-    change_amount = Decimal('0.00')
-    resolved_change_currency = change_currency or sale.change_currency or sale.currency
-    if sale.amount_paid >= sale.total:
-        change_amount, resolved_change_currency, _ = resolve_change(
-            sale, resolved_change_currency,
-        )
-        sale.change_amount = change_amount
-        sale.change_currency = resolved_change_currency
-        sale.amount_due = Decimal('0.00')
-        sale.status = 'completed'
-    else:
-        sale.status = 'partially_paid'
+    recalculer_solde_et_statut(sale, change_currency=change_currency)
+    change_amount = sale.change_amount or Decimal('0.00')
+    resolved_change_currency = sale.change_currency
 
     sale.save()
 

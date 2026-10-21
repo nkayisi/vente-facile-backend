@@ -101,6 +101,8 @@ EFFACES_PAR_LA_REMISE_A_ZERO = [
     ('sales', 'SaleReturn'),
     ('sales', 'Payment'),
     ('sales', 'SaleItem'),
+    # Enfant de `Sale`, comme les lignes : effacé AVANT son parent.
+    ('sales', 'SaleCurrencyTotal'),
     ('sales', 'Sale'),
     ('sales', 'QuotationItem'),
     ('sales', 'Quotation'),

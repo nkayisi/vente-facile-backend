@@ -78,7 +78,11 @@ class TopProductSerializer(serializers.Serializer):
     product_id = serializers.UUIDField()
     product_name = serializers.CharField()
     product_sku = serializers.CharField()
-    quantity_sold = serializers.IntegerField()
+    # ⚠ `IntegerField` TRONQUAIT : la source est un `Sum('quantity')` à trois
+    # décimales, et une vente de 0,5 kg de farine s'affichait donc « 0 » dans
+    # le rapport, pendant que `packages_sold` et `loose_sold` juste en dessous
+    # conservaient leurs décimales. Le total mentait, sa ventilation non.
+    quantity_sold = serializers.DecimalField(max_digits=15, decimal_places=3)
     # Ce qui est SORTI du rayon, dans les termes de la vente : « 10 casiers +
     # 5 bouteilles ». La somme brute masquait la forme de vente, alors que
     # 10 casiers et 245 bouteilles ne se réapprovisionnent pas pareil.
@@ -157,7 +161,8 @@ class SalesByCategorySerializer(serializers.Serializer):
     category_id = serializers.UUIDField(allow_null=True)
     category_name = serializers.CharField()
     total_revenue = serializers.DecimalField(max_digits=15, decimal_places=2)
-    quantity_sold = serializers.DecimalField(max_digits=15, decimal_places=2)
+    # Trois décimales, comme la source : quantiser à deux perdait le gramme.
+    quantity_sold = serializers.DecimalField(max_digits=15, decimal_places=3)
     percentage = serializers.DecimalField(max_digits=5, decimal_places=2)
 
 

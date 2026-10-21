@@ -47,7 +47,7 @@ produit ayant déjà du stock, et les écrivains qui ignorent le conditionnement
 from __future__ import annotations
 
 import logging
-from decimal import ROUND_CEILING, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
@@ -820,6 +820,28 @@ class PackagingService:
         if packages < 0:
             loose += packages * factor
             packages = ZERO
+
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ UN CONTENANT ENTAMÉ EST DU VRAC, JAMAIS UN DEMI-SCELLÉ.          │
+        # │                                                                  │
+        # │ Depuis que la vente accepte les quantités fractionnaires, un     │
+        # │ `delta_packages` de -2,5 est possible : le rayon passerait alors  │
+        # │ de 10 contenants scellés à « 7,5 », un état qui n'existe pas en  │
+        # │ magasin - il y a 7 scellés et un contenant OUVERT, dont le       │
+        # │ reliquat se compte au détail.                                    │
+        # │                                                                  │
+        # │ C'est la règle que `split()` tient déjà pour la reconstitution   │
+        # │ (« un carton entamé ne se rescelle pas ») ; sans elle, les deux   │
+        # │ chemins normalisaient différemment le même rayon.                │
+        # │                                                                  │
+        # │ Sans effet sur l'existant : aucun chemin ne produisait de         │
+        # │ contenant fractionnaire avant, le sérialiseur de vente le        │
+        # │ refusant. La garde ne mord donc que sur le cas neuf.             │
+        # └──────────────────────────────────────────────────────────────────┘
+        entame = packages - packages.to_integral_value(rounding=ROUND_FLOOR)
+        if entame:
+            packages -= entame
+            loose += entame * factor
 
         stock.package_quantity = packages.quantize(ZERO)
         stock.loose_quantity = loose.quantize(ZERO)
