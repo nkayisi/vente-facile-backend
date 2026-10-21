@@ -662,6 +662,19 @@ class Requisition(TenantSoftDeleteModel):
     # repose au rejeu. `auto_now_add` la daterait du jour de sa poussée.
     requested_at = models.DateTimeField(default=maintenant, editable=False)
 
+    # ┌──────────────────────────────────────────────────────────────────────────┐
+    # │ IL MANQUAIT, ET UNE PIÈCE SUPPRIMÉE EN DOUCEUR RESTAIT VISIBLE.         │
+    # │                                                                          │
+    # │ `Requisition` hérite de `TenantSoftDeleteModel` et gardait le            │
+    # │ `models.Manager` automatique - seule des quatre de ce fichier, ses trois │
+    # │ sœurs le déclarant toutes. `GET /requisitions/` rendait donc les lignes  │
+    # │ supprimées, leur `retrieve` répondait 200, et `_objet_de_lorg` laissait  │
+    # │ une transition du journal agir dessus. Pendant ce temps le TIRAGE les    │
+    # │ cachait correctement (`soft_delete=True`) : c'était la seule des trois   │
+    # │ surfaces à être juste, et les deux autres disaient le contraire.         │
+    # └──────────────────────────────────────────────────────────────────────────┘
+    objects = TenantSoftDeleteManager()
+
     class Meta:
         db_table = 'requisitions'
         ordering = ['-requested_at']

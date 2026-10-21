@@ -19,7 +19,7 @@ from apps.core.api_permissions import DENY, HasPermission, IsTenantMember
 from apps.core.mixins import TenantQuerysetMixin
 from apps.notifications.models import Alert, Notification
 from apps.notifications.serializers import AlertSerializer, NotificationSerializer
-from apps.notifications.services import destinataires
+from apps.notifications.services import perimetre_de
 
 
 class NotificationViewSet(TenantQuerysetMixin, viewsets.ReadOnlyModelViewSet):
@@ -108,23 +108,37 @@ class AlertViewSet(TenantQuerysetMixin, viewsets.ReadOnlyModelViewSet):
         'destroy': DENY,
     }
 
+    def get_queryset(self):
+        # ⚠ `acknowledged_by` est NÉCESSAIRE : `AlertSerializer` rend
+        #   `acknowledged_by.full_name`, qui est une PROPRIÉTÉ - donc une
+        #   requête par ligne sans ce préchargement.
+        return super().get_queryset().select_related('acknowledged_by')
+
     def filter_queryset(self, queryset):
         queryset = super().filter_queryset(queryset)
-        membership = self._membership()
-        if membership is None:
+        perimetre = perimetre_de(self._membership())
+        if perimetre is None:
             return queryset.none()
 
-        # ⚠ On filtre EN PYTHON, et c'est assumé. Le périmètre d'une alerte vit
-        # dans son `data` JSON, pas dans une colonne : l'exprimer en SQL
-        # demanderait une requête par type d'alerte, et c'est exactement la
-        # divergence que ce point d'entrée unique existe pour empêcher. La
-        # liste est bornée par la pagination, et les alertes actives d'un
-        # établissement se comptent en dizaines.
-        permises = [
-            a.id for a in queryset
-            if any(m.id == membership.id for m in destinataires(a))
-        ]
-        return queryset.filter(id__in=permises)
+        # ┌──────────────────────────────────────────────────────────────────────┐
+        # │ LE PÉRIMÈTRE S'EXPRIME EN SQL, ET LA LISTE SE PAGINE ENFIN.         │
+        # │                                                                      │
+        # │ Cette méthode appelait `destinataires(a)` PAR ALERTE, et DRF appelle │
+        # │ `filter_queryset()` AVANT `paginate_queryset()` : le balayage        │
+        # │ parcourait donc toute la table, et chaque appel rejouait la requête  │
+        # │ d'appartenance avec son `prefetch_related`. Mesuré sur la base de    │
+        # │ développement - 1042 alertes de stock après la migration : un        │
+        # │ `GET /alerts/` chargeait 1042 lignes, émettait ~2000 requêtes, puis  │
+        # │ bâtissait un `id__in` de mille éléments. La justification écrite ici │
+        # │ - « la liste est bornée par la pagination » - était fausse.          │
+        # │                                                                      │
+        # │ ⚠ ET LA RÈGLE RESTE UNIQUE : `PerimetreAlertes.borner()` et         │
+        # │   `.retient()` sortent de la même classe, et un test les croise     │
+        # │   DANS LES DEUX SENS. C'est le motif de `membership_targets_q`, et   │
+        # │   la seule chose qui garde impossible « une alerte reçue en          │
+        # │   notification et introuvable dans la liste ».                       │
+        # └──────────────────────────────────────────────────────────────────────┘
+        return perimetre.borner(queryset)
 
     def _membership(self):
         from apps.core.api_permissions import _get_membership

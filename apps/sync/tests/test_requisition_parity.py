@@ -224,3 +224,56 @@ class RequisitionParityTests(APITestCase):
 
         self.assertEqual(r.data['results'][0]['verdict'], 'duplicate')
         self.assertEqual(Requisition.objects.filter(organization=self.org).count(), 1)
+
+    # --------------------------------------------------- l'appartenance de l'article
+
+    def test_un_article_d_une_AUTRE_organisation_est_REFUSE(self):
+        """
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ LA MOITIÉ QUI COMPTE : LE JOURNAL EST LE CHEMIN LE MOINS GARDÉ.     │
+        │                                                                      │
+        │ `RequisitionCreateSerializer.product` est un `UUIDField` NU. La vue  │
+        │ et le journal passent tous deux par `create_requisition`, donc le    │
+        │ contrôle y vit - et c'est ce test qui prouve que les deux surfaces   │
+        │ refusent, plutôt qu'une seule.                                        │
+        └──────────────────────────────────────────────────────────────────────┘
+
+        Le verdict est `rejected` et non `retry` : un corps qui désigne
+        l'article d'autrui ne passera jamais, et le marteler remplirait la
+        quarantaine d'un refus qui ne bougera pas.
+        """
+        from apps.organizations.models import Organization
+        from apps.purchases.models import RequisitionItem
+
+        voisine = Organization.objects.create(name='Concurrent', slug='concurrent')
+        etranger = Product.objects.create(
+            organization=voisine, name='Secret commercial', sku='SEC-1',
+            slug='sec-1', track_inventory=True,
+            cost_price=Decimal('1'), selling_price=Decimal('2'),
+        )
+
+        r = self._journal('requisition.create', self._corps(items=[{
+            'product': str(etranger.id), 'quantity_requested': '5', 'notes': '',
+        }]))
+        verdict = r.data['results'][0]
+        self.assertEqual(verdict['verdict'], 'rejected', verdict)
+        self.assertFalse(
+            RequisitionItem.objects.filter(product=etranger).exists(),
+            "La ligne a été persistée : le bordereau imprimerait le nom de "
+            "l'article d'une autre organisation.",
+        )
+
+    def test_un_article_INEXISTANT_est_REFUSE_et_non_avale(self):
+        """
+        Sans contrôle, la clé étrangère lève un `IntegrityError` : le verdict
+        sortait en `retry`, donc l'acte repartait à chaque synchronisation.
+        """
+        r = self._journal('requisition.create', self._corps(items=[{
+            'product': str(uuid4()), 'quantity_requested': '5', 'notes': '',
+        }]))
+        self.assertEqual(r.data['results'][0]['verdict'], 'rejected', r.data)
+
+    def test_un_article_LEGITIME_passe_toujours(self):
+        """Le contrôle : le garde-fou ne ferme pas le cas ordinaire."""
+        r = self._journal('requisition.create', self._corps(id=str(uuid4())))
+        self.assertEqual(r.data['results'][0]['verdict'], 'applied', r.data)

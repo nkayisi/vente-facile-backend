@@ -48,6 +48,12 @@ SOURCES = [SOURCE] + [
     for nom in (
         'apps.notifications.tasks',
         'apps.subscriptions.tasks',
+        # ⚠ `services` A LA MÊME PROPRIÉTÉ, et pour la même raison : ses imports
+        #   sont différés pour ne pas croiser `tasks.py`, qui l'importe. Son
+        #   `_enfiler_le_rappel` est le seul lien entre une alerte et la tâche
+        #   qui fait sonner les téléphones ; un symbole mal nommé y survivrait à
+        #   toute la suite et ne se verrait qu'au premier rappel d'un marchand.
+        'apps.notifications.services',
     )
 ]
 

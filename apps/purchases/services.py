@@ -384,6 +384,41 @@ def create_requisition(
         .values_list('id', 'reorder_point')
     )
 
+    # ┌──────────────────────────────────────────────────────────────────────────┐
+    # │ L'ARTICLE DOIT APPARTENIR À L'ÉTABLISSEMENT, ET LE CONTRÔLE EST ICI.    │
+    # │                                                                          │
+    # │ `RequisitionCreateSerializer.product` est un `UUIDField` NU : ni la vue, │
+    # │ ni le gestionnaire de synchronisation ne valident l'appartenance. Un     │
+    # │ identifiant d'une autre organisation était donc persisté, puis relu par  │
+    # │ `RequisitionItemSerializer` (`product_name`, `product_sku`, `unit_name`) │
+    # │ et par le bordereau imprimé. MESURÉ : la ligne sortait avec le nom de    │
+    # │ l'article d'autrui et un instantané à `0.000`, `stocks` et `seuils`      │
+    # │ étant les seuls à être filtrés par organisation.                         │
+    # │                                                                          │
+    # │ Le contrôle vit dans le SERVICE, pas dans le serializer : la vue ET le   │
+    # │ journal passent par là, donc la parité n'est pas surveillée, elle est    │
+    # │ structurelle. C'est la règle de §5.5.                                    │
+    # └──────────────────────────────────────────────────────────────────────────┘
+    #
+    # Les clés de `seuils` sont l'ensemble AUTORITAIRE : la requête qui les
+    # relève est déjà bornée à l'organisation, et `Product.objects` est un
+    # `TenantSoftDeleteManager`, donc une fiche supprimée en douceur est écartée
+    # du même coup.
+    #
+    # ⚠ LE MESSAGE NE RÉPÈTE PAS L'IDENTIFIANT. Le renvoyer confirmerait au
+    #   client qu'un article d'une autre organisation existe. On dit COMBIEN
+    #   d'articles sont refusés, jamais lesquels.
+    #
+    # Le refus arrive APRÈS la création de l'en-tête, et c'est sans conséquence :
+    # la fonction est `@transaction.atomic`, donc rien n'est écrit. C'est aussi
+    # ce qui rend sûr le refus de quantité nulle, quelques lignes plus bas.
+    etrangers = len(set(ids) - set(seuils))
+    if etrangers:
+        raise RequisitionRefusee(
+            f"{etrangers} article(s) demandé(s) n'appartiennent pas à cet "
+            "établissement."
+        )
+
     for ligne in lignes:
         produit = ligne['product']
         pid = produit.id if hasattr(produit, 'id') else produit

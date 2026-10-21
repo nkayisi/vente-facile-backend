@@ -31,7 +31,6 @@ SORTIES_FIFO = [
 ]
 
 
-@transaction.atomic
 def create_stock_movement(serializer, *, organization, user, request=None, **extra):
     """
     Écrit le mouvement ET son effet sur le stock. Appelé par la vue ET le journal.
@@ -39,6 +38,73 @@ def create_stock_movement(serializer, *, organization, user, request=None, **ext
     ``request`` sert au seul contrôle de périmètre entrepôt ; il est exigé dès
     qu'il est fourni, comme la vue l'exige (l'entrepôt n'est jamais facultatif
     sur un mouvement).
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ CETTE ENVELOPPE N'EST PAS ATOMIQUE - MAIS CE N'EST PLUS ELLE QUI TIENT   │
+    │ LE RÉSEAU HORS DES VERROUS.                                              │
+    │                                                                          │
+    │ L'écriture est dans `_ecrire_mouvement`, qui garde le `atomic` et ses    │
+    │ deux `select_for_update` (la ligne de stock, puis l'article). Le          │
+    │ SIGNALEMENT est ici, donc hors de ce `atomic` - QUAND C'EST LA VUE QUI   │
+    │ APPELLE, et seulement alors.                                             │
+    │                                                                          │
+    │ ⚠ SUR LE CHEMIN DU JOURNAL, CETTE SCISSION NE DÉVERROUILLE RIEN.        │
+    │   `sync/operations.py` ouvre un `atomic` autour de CHAQUE gestionnaire - │
+    │   §5.5 l'exige : la trace `SyncOperation` s'écrit dans le même `atomic`  │
+    │   que l'effet. Le `atomic` de `_ecrire_mouvement` n'y est donc qu'un     │
+    │   POINT DE SAUVEGARDE, et ses deux verrous de ligne tiennent jusqu'au    │
+    │   commit EXTÉRIEUR, c'est-à-dire pendant tout ce qui suit cet appel. La  │
+    │   version précédente de cet encadré affirmait « après le commit, verrous │
+    │   relâchés » : c'était vrai d'un appelant sur deux.                      │
+    │                                                                          │
+    │ CE QUI TIENT LE RÉSEAU DEHORS EST `transaction.on_commit`, dans          │
+    │ `notifications.services._pousser` - le seul endroit qui le puisse, étant │
+    │ en aval des DEUX appelants et des huit chemins qui préviennent. L'alerte │
+    │ et ses notifications s'écrivent toujours ici, dans la transaction de     │
+    │ l'appelant ; seul l'envoi attend le commit, et il part désormais en      │
+    │ tâche. Un acte défait ne fait donc plus sonner un téléphone pour une     │
+    │ notification que le rollback vient d'effacer.                            │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ⚠ LA SCISSION RESTE, POUR CE QU'ELLE TIENT VRAIMENT : sur le chemin de la
+    vue, une alerte qui échoue à s'écrire - le `DataError` d'un titre trop long
+    - ne défait pas le mouvement du magasinier. Sur le chemin du journal elle
+    ne tient même pas cela : l'écriture de l'alerte est dans le `atomic`
+    extérieur, et c'est `borner_titre` qui empêche ce défaut, pas cette
+    enveloppe.
+
+    ⚠ L'ANCIEN ENCADRÉ REFUSAIT `on_commit` « PARCE QUE LES QUATRE TESTS DE
+    `SortieDeStockTests` DEVIENDRAIENT AVEUGLES ». C'était faux, et la mesure
+    portait sur un AUTRE changement : ces quatre tests
+    (`notifications/tests/test_livraison_alertes.py`) appellent `sortie_de_stock`
+    et n'observent que des LIGNES, l'`Alert` et ses `Notification`. Aucun ne
+    regarde l'envoi, aucun ne remplace `envoyer`, et aucun n'entre même dans
+    cette fonction. Différer le seul ENVOI les laisse verts sans toucher une
+    ligne - seuls les six de `test_push.py::AdressageTests` l'observent, et le
+    MOMENT de l'envoi se démontre sous `TransactionTestCase`, seule enveloppe
+    où un commit a réellement lieu.
+    """
+    mouvement = _ecrire_mouvement(
+        serializer, organization=organization, user=user, request=request, **extra
+    )
+
+    # ⚠ LA SORTIE SE SIGNALE DEPUIS LE SERVICE, PAS DEPUIS LA VUE : un
+    # mouvement se saisit au back-office ET par le journal du terminal, et le
+    # brancher sur la vue laisserait muet tout ce qui vient du comptoir. Une
+    # vente n'y entre pas - voir `SORTIES_SIGNALEES`.
+    from apps.notifications.services import sortie_de_stock
+
+    sortie_de_stock(mouvement)
+
+    return mouvement
+
+
+@transaction.atomic
+def _ecrire_mouvement(serializer, *, organization, user, request=None, **extra):
+    """L'écriture seule : le mouvement, le stock, les lots, les prix.
+
+    Tenue sous `atomic` avec ses verrous. **Rien de réseau ne doit entrer
+    ici** - voir l'encadré de `create_stock_movement`.
     """
     from .models import STOCK_IN_MOVEMENT_TYPES
     from .packaging import PackagingService
@@ -152,13 +218,5 @@ def create_stock_movement(serializer, *, organization, user, request=None, **ext
         # sinon deux approvisionnements simultanés peuvent s'interbloquer.
         verrouille = Product.objects.select_for_update().get(pk=produit.pk)
         ProductPricingService.apply(verrouille, prix)
-
-    # ⚠ LA SORTIE SE SIGNALE DEPUIS LE SERVICE, PAS DEPUIS LA VUE : un
-    # mouvement se saisit au back-office ET par le journal du terminal, et le
-    # brancher sur la vue laisserait muet tout ce qui vient du comptoir. Une
-    # vente n'y entre pas - voir `SORTIES_SIGNALEES`.
-    from apps.notifications.services import sortie_de_stock
-
-    sortie_de_stock(mouvement)
 
     return mouvement

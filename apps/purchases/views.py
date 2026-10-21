@@ -606,7 +606,8 @@ class PurchaseReturnViewSet(
 # ==============================================================================
 
 class RequisitionViewSet(
-    ExportResponseMixin, TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet
+    ExportResponseMixin, WarehouseScopedQuerysetMixin, TenantViewSetMixin,
+    AuditMixin, viewsets.ModelViewSet
 ):
     """
     Réquisitions : la liste de ce qu'il faut acheter.
@@ -635,6 +636,19 @@ class RequisitionViewSet(
 
     # L'entrepôt POUR lequel on demande borne la lecture : un magasinier ne voit
     # pas ce qui manque dans un dépôt qui ne lui est pas confié.
+    #
+    # ⚠ IL EST LU PAR `WarehouseScopedQuerysetMixin`, ET PAR RIEN D'AUTRE.
+    #   Cette classe était la seule des cinq de ce fichier à le déclarer SANS
+    #   hériter du mixin : l'attribut était alors mort, seul le filtre de tenant
+    #   s'appliquait, et un magasinier de WH-NORD listait les réquisitions de
+    #   WH-MAIN. Rien ne le signalait - c'est le défaut d'attribut mort déjà
+    #   relevé sur `ExpenseViewSet`. Le tirage, lui, EST borné
+    #   (`PullTable('requisitions', warehouse_path='warehouse_id')`), donc les
+    #   deux surfaces disaient deux choses du même périmètre.
+    #
+    # ⚠ PAS de `WarehouseAssertCreateMixin` : `create()` appelle déjà
+    #   `assert_warehouse_allowed_for_request` plus bas, et l'ajouter ferait
+    #   deux contrôles du même geste.
     warehouse_scope_field = 'warehouse_id'
 
     action_permissions = {

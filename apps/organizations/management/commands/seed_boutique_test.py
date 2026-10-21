@@ -23,10 +23,31 @@ Idempotente : relancée, elle ne duplique rien et rend le même état.
 """
 from decimal import Decimal
 
-from django.core.management.base import BaseCommand
+import os
+
+from django.conf import settings
+from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 
-MOT_DE_PASSE = "Test@2026"
+#: Le mot de passe des six comptes.
+#:
+#: ┌──────────────────────────────────────────────────────────────────────────────┐
+#: │ IL EST PUBLIÉ DANS LA SOURCE, ET C'EST POURQUOI LA COMMANDE SE REFUSE HORS  │
+#: │ DÉVELOPPEMENT.                                                               │
+#: │                                                                              │
+#: │ Elle crée SIX comptes, dont un `owner` d'organisation. Lancée contre la base │
+#: │ de production - une méprise facile : les deux commandes sont adjacentes dans │
+#: │ la documentation, et `assign_default_warehouse` est une normalisation        │
+#: │ légitime de production - elle livre un accès propriétaire à quiconque lit ce │
+#: │ dépôt. Et `owner@test.vf` est repris PAR COURRIEL, globalement : son mot de  │
+#: │ passe est RÉINITIALISÉ s'il diffère, donc la commande peut s'emparer d'un    │
+#: │ compte existant.                                                             │
+#: └──────────────────────────────────────────────────────────────────────────────┘
+#:
+#: ⚠ LE DÉFAUT LITTÉRAL NE SERT QU'EN `DEBUG`. Le retirer rendrait la commande
+#:   inutilisable pour ce qu'elle existe : éprouver les six rôles en local.
+#:   `VF_SEED_PASSWORD` le remplace partout ailleurs.
+MOT_DE_PASSE = os.environ.get("VF_SEED_PASSWORD") or "Test@2026"
 NOM_ORG = "Boutique Test VF"
 
 # ⚠ Le rôle le plus FAIBLE qui porte la permission de l'acte, jamais `owner`.
@@ -59,9 +80,25 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument("--dry-run", action="store_true",
                             help="Montre ce qui serait fait, sans rien écrire.")
+        parser.add_argument(
+            "--force", action="store_true",
+            help=(
+                "Lancer hors développement. À n'employer qu'en sachant que la "
+                "commande crée six comptes, dont un propriétaire."
+            ),
+        )
 
     def handle(self, *args, **options):
         self.sec = options["dry_run"]
+        # ⚠ L'APERÇU PASSE, SEULE L'ÉCRITURE EST REFUSÉE. Le refus s'exécutait
+        #   AVANT que `--dry-run` ne soit lu, si bien que l'aperçu en lecture
+        #   seule - qui n'écrit rien, et qui est la façon la plus sûre
+        #   d'inspecter avant de décider - était refusé avec le chemin
+        #   d'écriture, alors que la docstring de ce module l'annonce.
+        #   L'opérateur apprenait à tendre vers `--force` par réflexe, ce qui
+        #   est exactement ce que ce refus cherche à rendre délibéré.
+        if not self.sec:
+            self._refuser_hors_developpement(options["force"])
         if self.sec:
             self.stdout.write(self.style.WARNING("--dry-run : aucune écriture.\n"))
         try:
@@ -71,6 +108,32 @@ class Command(BaseCommand):
                     raise _Annule()
         except _Annule:
             self.stdout.write(self.style.WARNING("\nAnnulé (--dry-run)."))
+
+    # ------------------------------------------------------------------ verrou
+
+    def _refuser_hors_developpement(self, force):
+        """
+        Deux verrous, comme la remise à zéro d'essai.
+
+        ⚠ LE REFUS NOMME LA BASE VISÉE. « Je refuse » sans dire contre quoi
+        ferait relancer avec `--force` par réflexe - et c'est précisément le
+        geste qu'on cherche à rendre délibéré.
+
+        ⚠ IL NE VISE QUE LE CHEMIN D'ÉCRITURE. `--dry-run` n'écrit rien : le
+        refuser lui aussi retirait le seul moyen d'inspecter sans engager.
+        """
+        if settings.DEBUG or force:
+            return
+        base = settings.DATABASES["default"].get("NAME", "?")
+        hote = settings.DATABASES["default"].get("HOST") or "local"
+        raise CommandError(
+            f"Refusé : `DEBUG` est faux, donc cette base ({base} sur {hote}) "
+            "n'est pas une base de développement. Cette commande crée six "
+            f"comptes dont un PROPRIÉTAIRE, au mot de passe de "
+            f"{_source_du_mot_de_passe()}.\n"
+            "Si c'est bien ce que vous voulez : relancez avec --force, et "
+            "posez VF_SEED_PASSWORD."
+        )
 
     # ------------------------------------------------------------------ étapes
 
@@ -347,11 +410,37 @@ class Command(BaseCommand):
             f"statut={d.status} (le cas de T2)")
 
     def _resume(self, org):
+        # ⚠ ON N'IMPRIME LE MOT DE PASSE QUE S'IL EST DÉJÀ PUBLIC. Posé par
+        #   `VF_SEED_PASSWORD`, c'est un secret que l'opérateur connaît déjà :
+        #   le réécrire ici le verserait dans les journaux de CI et dans
+        #   l'historique du shell pour rien.
         self.stdout.write(self.style.SUCCESS(
             f"\nBoutique de test prête.\n"
             f"  Organisation : {org.name}\n"
             f"  X-Organization-ID : {org.id}\n"
-            f"  Mot de passe commun : {MOT_DE_PASSE}\n"))
+            f"  Mot de passe commun : {_source_du_mot_de_passe()}\n"))
+
+
+def _source_du_mot_de_passe():
+    """
+    D'OÙ vient le mot de passe, jamais sa VALEUR.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ LE REFUS PUBLIAIT LE SECRET QU'IL EXISTE POUR PROTÉGER.                 │
+    │                                                                          │
+    │ Il interpolait `MOT_DE_PASSE` dans son `CommandError`. Quand              │
+    │ `VF_SEED_PASSWORD` EST posé - le chemin de production, c'est-à-dire le    │
+    │ seul où un opérateur l'aura posé - le vrai secret partait vers stdout,    │
+    │ stderr, les journaux de CI et l'historique du shell. Le refus devenait    │
+    │ ainsi la fuite la plus sûre de la commande.                               │
+    │                                                                          │
+    │ La valeur par défaut, elle, est publiée dans ce fichier : la nommer n'y  │
+    │ ajoute rien, et elle est ce dont l'opérateur a besoin en développement.   │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+    if os.environ.get("VF_SEED_PASSWORD"):
+        return "`VF_SEED_PASSWORD`"
+    return f"« {MOT_DE_PASSE} », publié dans la source"
 
 
 class _Annule(Exception):

@@ -265,3 +265,86 @@ class ClassementDesModelesTests(APITestCase):
     def test_aucun_modele_n_est_dans_les_DEUX_listes(self):
         effaces = {f'{a}.{n}' for a, n in EFFACES_PAR_LA_REMISE_A_ZERO}
         self.assertEqual(effaces & set(GARDES_PAR_LA_REMISE_A_ZERO), set())
+
+
+class LignesSupprimeesEnDouceurTests(RemiseAZeroTests):
+    """
+    Une pièce supprimée en douceur part AUSSI, et c'est tout l'objet.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ `all_objects` N'EXISTE NULLE PART, ET LE `getattr` LE TAISAIT.          │
+    │                                                                          │
+    │ Le service cherchait un manager `all_objects` - introuvable dans tout le │
+    │ dépôt - et retombait sur `objects`, qui filtre `is_deleted=False`. Une  │
+    │ vente annulée survivait donc à la remise à zéro pendant que ses lignes   │
+    │ et ses règlements, de simples `TenantModel`, étaient effacés : il        │
+    │ restait une vente SANS LIGNES, sous des compteurs repartis de zéro.      │
+    │                                                                          │
+    │ Le commentaire posé deux lignes au-dessus affirmait exactement           │
+    │ l'inverse de ce que le code faisait.                                     │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
+    def test_une_vente_SUPPRIMEE_EN_DOUCEUR_est_bien_effacee(self):
+        from apps.sales.models import Sale
+
+        vente = Sale.objects.filter(organization=self.org).first()
+        self.assertIsNotNone(vente, "La fixture doit porter une vente.")
+        vente.soft_delete()
+
+        reset_trial_data(self.org, confirmation=self.org.name)
+
+        self.assertFalse(
+            Sale.objects.with_deleted().filter(organization=self.org).exists(),
+            "La vente supprimée en douceur a survécu : la remise à zéro laisse "
+            "des pièces que le marchand croit effacées.",
+        )
+
+    def test_elle_ne_laisse_AUCUNE_ligne_orpheline(self):
+        """
+        Le vrai dommage : les enfants partaient, le parent restait. Une vente
+        sans lignes, sous un compteur de documents remis à zéro.
+        """
+        from apps.sales.models import Sale, SaleItem
+
+        vente = Sale.objects.filter(organization=self.org).first()
+        vente.soft_delete()
+        reset_trial_data(self.org, confirmation=self.org.name)
+
+        self.assertEqual(
+            Sale.objects.with_deleted().filter(organization=self.org).count(), 0
+        )
+        self.assertEqual(
+            SaleItem.objects.filter(organization=self.org).count(), 0
+        )
+
+    def test_les_SEPT_modeles_a_suppression_douce_sont_couverts(self):
+        """
+        Le balayage : tout modèle de la liste qui porte `with_deleted` doit
+        être lu par ce chemin. Sans ce contrôle, un modèle ajouté demain
+        reprendrait le défaut en silence.
+        """
+        from django.apps import apps as registre
+
+        from apps.organizations.services import EFFACES_PAR_LA_REMISE_A_ZERO
+
+        doux = [
+            f'{app}.{nom}'
+            for app, nom in EFFACES_PAR_LA_REMISE_A_ZERO
+            if hasattr(registre.get_model(app, nom).objects, 'with_deleted')
+        ]
+        #: Un balayage qui ne trouve rien passerait au vert.
+        self.assertGreaterEqual(len(doux), 7, doux)
+
+    def test_l_apercu_COMPTE_aussi_les_lignes_supprimees(self):
+        """
+        `dry_run` sert à annoncer au marchand ce qui va partir : sous-compter
+        lui ferait croire qu'il reste moins qu'il ne reste.
+        """
+        from apps.sales.models import Sale
+
+        Sale.objects.filter(organization=self.org).first().soft_delete()
+        comptes = reset_trial_data(
+            self.org, confirmation=self.org.name, dry_run=True
+        )
+        self.assertGreaterEqual(comptes.get('sales.Sale', 0), 1, comptes)

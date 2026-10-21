@@ -357,3 +357,140 @@ class DocumentDeRequisitionTests(RequisitionsTests):
         req = self._creer(self.magasinier)
         r = self._document(self.d['cashier_a'], req['id'])
         self.assertEqual(r.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class PerimetreDesRequisitionsTests(RequisitionsTests):
+    """
+    Ce qu'un rôle a le droit de LIRE, et ce qu'un client a le droit d'ÉCRIRE.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ DEUX FUITES, ET AUCUN TEST NE LES COUVRAIT.                             │
+    │                                                                          │
+    │ 1. `RequisitionViewSet` déclarait `warehouse_scope_field` SANS hériter   │
+    │    du mixin qui le lit : l'attribut était mort, et un magasinier lisait  │
+    │    les réquisitions d'un dépôt qui ne lui est pas confié - contre sa     │
+    │    propre docstring et contre le tirage, qui EST borné.                  │
+    │ 2. `create_requisition` écrivait `product_id` sans jamais vérifier son   │
+    │    appartenance : un identifiant d'une AUTRE organisation était          │
+    │    persisté, puis relu par le serializer et par le bordereau imprimé.    │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
+    def setUp(self):
+        super().setUp()
+        # Un second dépôt, auquel le magasinier n'est PAS affecté. C'est la
+        # seule configuration qui exécute le code de périmètre : en `owner`,
+        # `accessible_warehouse_ids` sort en amont.
+        self.autre_wh = Warehouse.objects.create(
+            organization=self.org, branch=self.d['branch'],
+            name='Dépôt Nord', code='NORD-WH',
+        )
+        self.ailleurs = create_requisition(
+            self.org, warehouse=self.autre_wh,
+            lignes=[{'product': self.manquant, 'quantity_requested': Decimal('3')}],
+            requested_by=self.d['owner'],
+        )
+
+    # --- La lecture ----------------------------------------------------------
+
+    def test_un_magasinier_ne_LISTE_pas_le_depot_d_un_autre(self):
+        r = self._get(self.magasinier, self.URL)
+        self.assertEqual(r.status_code, status.HTTP_200_OK)
+        vues = {l['id'] for l in r.data['results']}
+        self.assertNotIn(str(self.ailleurs.id), vues)
+
+    def test_un_magasinier_n_OUVRE_pas_le_depot_d_un_autre(self):
+        """
+        ⚠ 404 ET NON 403 : le périmètre borne le queryset, donc la pièce n'est
+        même pas VUE. Un 403 confirmerait son existence.
+        """
+        r = self._get(self.magasinier, f'{self.URL}{self.ailleurs.id}/')
+        self.assertEqual(r.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_il_n_en_IMPRIME_pas_le_bordereau(self):
+        """Le document passe par `get_object()`, donc par le même périmètre."""
+        r = self._get(
+            self.magasinier, f'{self.URL}{self.ailleurs.id}/export/',
+            export_format='csv',
+        )
+        self.assertEqual(r.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_le_PROPRIETAIRE_voit_les_deux_depots(self):
+        """Le contrôle : son accès vient de son RÔLE, pas d'une affectation."""
+        r = self._get(self.d['owner'], self.URL)
+        vues = {l['id'] for l in r.data['results']}
+        self.assertIn(str(self.ailleurs.id), vues)
+
+    def test_il_voit_bien_SON_depot(self):
+        """Second contrôle : le périmètre ne doit pas tout fermer."""
+        sienne = self._creer(self.magasinier)
+        r = self._get(self.magasinier, self.URL)
+        self.assertIn(sienne['id'], {l['id'] for l in r.data['results']})
+
+    # --- L'écriture ----------------------------------------------------------
+
+    def _article_ailleurs(self):
+        """Un article d'une AUTRE organisation, par un chemin qui ne tient qu'à
+        son identifiant."""
+        from apps.organizations.models import Organization
+
+        voisine = Organization.objects.create(name='Concurrent', slug='concurrent')
+        return Product.objects.create(
+            organization=voisine, name='Secret commercial', sku='SEC-1',
+            slug='sec-1', cost_price=Decimal('1'), selling_price=Decimal('2'),
+            track_inventory=True,
+        )
+
+    def test_un_article_d_une_AUTRE_organisation_est_refuse(self):
+        etranger = self._article_ailleurs()
+        r = self._post(self.magasinier, self.URL, {
+            'warehouse': str(self.wh.id),
+            'items': [{'product': str(etranger.id), 'quantity_requested': '5'}],
+        })
+        self.assertEqual(r.status_code, status.HTTP_400_BAD_REQUEST, r.data)
+        # ⚠ On vise la LIGNE, pas le compte de réquisitions : la fixture en
+        #   porte déjà une (`self.ailleurs`), et compter ferait passer le test
+        #   pour une raison qui n'est pas la sienne.
+        from apps.purchases.models import RequisitionItem
+        self.assertFalse(
+            RequisitionItem.objects.filter(product=etranger).exists()
+        )
+
+    def test_le_message_ne_REPETE_PAS_l_identifiant(self):
+        """
+        Le renvoyer confirmerait au client qu'un identifiant d'une autre
+        organisation existe. On dit COMBIEN d'articles sont refusés, pas
+        lesquels.
+        """
+        etranger = self._article_ailleurs()
+        r = self._post(self.magasinier, self.URL, {
+            'warehouse': str(self.wh.id),
+            'items': [{'product': str(etranger.id), 'quantity_requested': '5'}],
+        })
+        self.assertNotIn(str(etranger.id), str(r.data))
+
+    def test_un_article_INEXISTANT_rend_400_et_non_500(self):
+        """
+        Sans contrôle, la clé étrangère lève un `IntegrityError` non rattrapé.
+        """
+        import uuid
+
+        r = self._post(self.magasinier, self.URL, {
+            'warehouse': str(self.wh.id),
+            'items': [{'product': str(uuid.uuid4()), 'quantity_requested': '5'}],
+        })
+        self.assertEqual(r.status_code, status.HTTP_400_BAD_REQUEST, r.data)
+
+    def test_le_service_refuse_DETERMINISTEMENT(self):
+        """Le refus doit être un `RequisitionRefusee`, donc `rejected` côté
+        journal - jamais un `retry` sur un corps qui ne passera jamais."""
+        etranger = self._article_ailleurs()
+        with self.assertRaises(RequisitionRefusee):
+            create_requisition(
+                self.org, warehouse=self.wh,
+                lignes=[{'product': etranger, 'quantity_requested': Decimal('1')}],
+            )
+
+    def test_un_article_LEGITIME_passe_toujours(self):
+        """Le contrôle : le garde-fou ne doit pas fermer le cas ordinaire."""
+        self.assertEqual(self._creer(self.magasinier)['status'], 'draft')

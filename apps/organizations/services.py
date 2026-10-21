@@ -224,12 +224,37 @@ def reset_trial_data(organization, *, confirmation: str, dry_run: bool = False) 
     comptes = {}
     for app_label, nom in EFFACES_PAR_LA_REMISE_A_ZERO:
         modele = apps.get_model(app_label, nom)
-        # ⚠ `all_objects` quand il existe : un manager de suppression douce
-        # filtrerait `is_deleted=False` et LAISSERAIT les lignes déjà
-        # supprimées, qui continueraient de descendre au tirage en pierres
-        # tombales - donc une base locale qui ne se vide jamais tout à fait.
-        manager = getattr(modele, 'all_objects', None) or modele.objects
-        qs = manager.filter(organization=organization)
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ `with_deleted()`, ET SURTOUT PAS `all_objects`.                  │
+        # │                                                                  │
+        # │ MESURÉ : `all_objects` n'existe NULLE PART dans ce dépôt - le    │
+        # │ balayage ne trouvait que la ligne qui le cherchait. `getattr`     │
+        # │ rendait donc toujours `None`, on retombait sur `objects`, et      │
+        # │ `TenantSoftDeleteManager` filtre `is_deleted=False`.              │
+        # │                                                                  │
+        # │ Conséquence sur les sept modèles à suppression douce (`Sale`,     │
+        # │ `SaleReturn`, `Quotation`, `Requisition`, `StockTransfer`,        │
+        # │ `StockAdjustment`, `InventorySession`) : une vente annulée        │
+        # │                                                                   │
+        # │ ⚠ `Requisition` N'EN ÉTAIT PAS, ET C'ÉTAIT UN AUTRE DÉFAUT.      │
+        # │   Son manager était le `models.Manager` automatique, qui ne filtre │
+        # │   rien : elle tombait sur `base.all()` et voyait tout. La phrase   │
+        # │   ci-dessus ne vaut donc que depuis que le manager lui a été posé  │
+        # │   (session du 2026-10-12) - avant, elle était fausse pour elle, et │
+        # │   juste pour les six autres.                                       │
+        # │ SURVIVAIT pendant que ses `SaleItem` et ses `Payment` - de        │
+        # │ simples `TenantModel` - étaient effacés. Il restait une vente     │
+        # │ SANS LIGNES, sous un `DocumentSequence` remis à zéro, et les      │
+        # │ comptes rendus au marchand sous-estimaient ce qui reste.          │
+        # │                                                                  │
+        # │ L'échappatoire réelle est `with_deleted()`, portée par            │
+        # │ `SoftDeleteManager` et `TenantSoftDeleteManager`.                 │
+        # └──────────────────────────────────────────────────────────────────┘
+        base = modele.objects
+        complet = (
+            base.with_deleted() if hasattr(base, 'with_deleted') else base.all()
+        )
+        qs = complet.filter(organization=organization)
         n = qs.count()
         if n:
             comptes[f'{app_label}.{nom}'] = n

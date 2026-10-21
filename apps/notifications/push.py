@@ -37,7 +37,11 @@ EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send'
 TAILLE_LOT = 100
 
 #: Un envoi ne doit pas retenir une requête HTTP ni un battement de Celery.
-DELAI = 10
+#:
+#: ⚠ DIX SECONDES ÉTAIENT UN CHOIX SANS BORNE AUTOUR. Ce délai ne borne QU'UN
+#: appel ; ce qui bornait la SÉRIE n'existait pas. L'arrêt au premier lot refusé
+#: (voir `envoyer`) la borne désormais, et ce délai peut donc se resserrer.
+DELAI = 5
 
 
 def _jeton_valide(jeton):
@@ -67,8 +71,16 @@ def envoyer(messages):
     envoyes = 0
     for debut in range(0, len(retenus), TAILLE_LOT):
         lot = retenus[debut:debut + TAILLE_LOT]
-        if _envoyer_un_lot(lot):
-            envoyes += len(lot)
+        if not _envoyer_un_lot(lot):
+            # ⚠ ON S'ARRÊTE, ON N'INSISTE PAS. Un lot refusé veut dire que le
+            # transport est muet, pas que ce lot-là déplaisait : poursuivre
+            # payait `DELAI` à chacun des suivants. Mesuré sur un établissement
+            # à mille notifications : dix lots, donc dix fois le délai, pour
+            # zéro message livré - et c'est cela, non le délai par appel, qui
+            # promenait `check_low_stock_alerts` jusqu'à sa limite de tâche.
+            # Un push perdu ne perd rien, la notification est en base.
+            break
+        envoyes += len(lot)
     return envoyes
 
 

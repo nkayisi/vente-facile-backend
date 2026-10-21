@@ -14,7 +14,8 @@ import json
 from decimal import Decimal
 from unittest.mock import patch
 
-from django.test import TestCase
+from django.db import connection, transaction
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 
 from apps.notifications.models import Alert, Notification
@@ -60,6 +61,21 @@ class FormeDuJetonTests(TestCase):
             self.assertEqual(envoi.call_count, 3)
 
 
+# ┌──────────────────────────────────────────────────────────────────────────────┐
+# │ L'ENVOI PART APRÈS LE COMMIT, DONC CES TESTS DOIVENT FAIRE COMMITER.        │
+# │                                                                              │
+# │ `_pousser` enfile par `transaction.on_commit` - c'est ce qui sort le réseau  │
+# │ des verrous de l'acte - et `TestCase` enveloppe chaque test dans un          │
+# │ `atomic` qui ne commite jamais. Sans `captureOnCommitCallbacks`, les rappels │
+# │ ne partent pas et ces six tests passeraient en n'observant RIEN.             │
+# │                                                                              │
+# │ ⚠ `EAGER_PROPAGATES` N'EST PAS DÉCORATIF. Sans lui, Celery avale            │
+# │   l'exception d'une tâche en mode eager, et                                  │
+# │   `test_l_envoi_qui_LEVE_ne_defait_PAS_l_acte` - que l'encadré de ce fichier │
+# │   appelle la garantie centrale - passerait en démontrant l'avalement de      │
+# │   CELERY au lieu du nôtre.                                                   │
+# └──────────────────────────────────────────────────────────────────────────────┘
+@override_settings(CELERY_TASK_ALWAYS_EAGER=True, CELERY_TASK_EAGER_PROPAGATES=True)
 class AdressageTests(TestCase):
     def setUp(self):
         ctx = make_org_with_users()
@@ -85,7 +101,8 @@ class AdressageTests(TestCase):
 
     def test_la_livraison_en_base_DECLENCHE_le_push(self):
         with patch('apps.notifications.push.envoyer', return_value=1) as envoi:
-            self._alerte()
+            with self.captureOnCommitCallbacks(execute=True):
+                self._alerte()
             self.assertTrue(envoi.called)
             messages = envoi.call_args[0][0]
             self.assertEqual(messages[0]['to'], JETON)
@@ -105,21 +122,24 @@ class AdressageTests(TestCase):
         from apps.notifications.services import notifier
 
         with patch('apps.notifications.push.envoyer', return_value=1) as envoi:
-            notifier(alerte)
+            with self.captureOnCommitCallbacks(execute=True):
+                notifier(alerte)
             self.assertLessEqual(len(envoi.call_args[0][0][0]['body']), 140)
 
     def test_un_appareil_REVOQUE_ne_sonne_plus(self):
         self.appareil.revoked_at = timezone.now()
         self.appareil.save(update_fields=['revoked_at'])
         with patch('apps.notifications.push.envoyer', return_value=0) as envoi:
-            self._alerte()
+            with self.captureOnCommitCallbacks(execute=True):
+                self._alerte()
             self.assertEqual(envoi.call_args[0][0], [])
 
     def test_un_appareil_SANS_jeton_ne_sonne_pas(self):
         self.appareil.push_token = ''
         self.appareil.save(update_fields=['push_token'])
         with patch('apps.notifications.push.envoyer', return_value=0) as envoi:
-            self._alerte()
+            with self.captureOnCommitCallbacks(execute=True):
+                self._alerte()
             self.assertEqual(envoi.call_args[0][0], [])
 
     def test_une_alerte_d_une_AUTRE_organisation_ne_sonne_pas_ici(self):
@@ -140,11 +160,13 @@ class AdressageTests(TestCase):
         )
 
         with patch('apps.notifications.push.envoyer', return_value=0) as envoi:
-            alerter(
-                ailleurs,
-                alert_type=Alert.AlertType.SYSTEM, severity=Alert.Severity.LOW,
-                title='Ailleurs', message='Autre établissement',
-            )
+            with self.captureOnCommitCallbacks(execute=True):
+                alerter(
+                    ailleurs,
+                    alert_type=Alert.AlertType.SYSTEM,
+                    severity=Alert.Severity.LOW,
+                    title='Ailleurs', message='Autre établissement',
+                )
             self.assertEqual([m['to'] for m in envoi.call_args[0][0]], [])
 
     def test_l_envoi_qui_LEVE_ne_defait_PAS_l_acte(self):
@@ -157,7 +179,8 @@ class AdressageTests(TestCase):
             'apps.notifications.push.pousser_notifications',
             side_effect=RuntimeError('service injoignable'),
         ):
-            alerte = self._alerte()
+            with self.captureOnCommitCallbacks(execute=True):
+                alerte = self._alerte()
 
         self.assertTrue(Alert.objects.filter(id=alerte.id).exists())
         self.assertTrue(
@@ -331,3 +354,167 @@ class EnregistrementDuJetonTests(TestCase):
         avant = self.appareil.updated_at
         self._poser(push_token=JETON)
         self.assertEqual(self.appareil.updated_at, avant)
+
+
+# ---------------------------------------------------------------------------
+# Le MOMENT de l'envoi
+# ---------------------------------------------------------------------------
+
+
+class PushApresCommitTests(TransactionTestCase):
+    """
+    L'envoi part APRÈS le commit, verrous relâchés.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ `TransactionTestCase` ET NON `TestCase`, ET C'EST TOUT L'OBJET.         │
+    │                                                                          │
+    │ Sous `TestCase`, l'enveloppe du test est elle-même un `atomic` : aucun   │
+    │ commit réel n'a lieu, donc le MOMENT de l'envoi est inobservable - on    │
+    │ ne peut qu'exécuter les rappels à la main. Ici le commit est vrai, et    │
+    │ c'est la seule enveloppe où « après le commit » veut dire quelque chose. │
+    │ Précédent : `core/tests/test_numbering.py::ConcurrentAllocationTests`.   │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
+    def setUp(self):
+        ctx = make_org_with_users()
+        self.__dict__.update(ctx)
+        OrganizationMembership.objects.get(
+            user=self.manager, organization=self.org
+        ).assigned_warehouses.set([self.warehouse])
+        Device.objects.create(
+            user=self.manager, organization=self.org, name='POS 1',
+            platform='android', device_code='AAAA', token_hash='x' * 64,
+            expires_at=timezone.now() + timezone.timedelta(days=30),
+            push_token=JETON,
+        )
+
+    def _alerte(self):
+        return alerter(
+            self.org,
+            alert_type=Alert.AlertType.LOW_STOCK, severity=Alert.Severity.HIGH,
+            title='Stock bas', message='Rayon sous son seuil',
+            data={'warehouse_id': str(self.warehouse.id)},
+        )
+
+    def test_rien_n_est_enfile_AVANT_le_commit(self):
+        """
+        ⚠ LE DÉFAUT MESURÉ : un POST de dix secondes tournait sous les deux
+        `select_for_update` de `_ecrire_mouvement`, parce que l'`atomic` du
+        journal les retient jusqu'à SON commit. Ce qu'on exige ici est qu'à
+        l'intérieur d'une transaction ouverte, RIEN ne soit encore parti.
+        """
+        from apps.notifications import tasks
+
+        with patch.object(tasks.pousser_le_rappel, 'delay') as enfile:
+            with transaction.atomic():
+                self._alerte()
+                enfile.assert_not_called()
+
+            # Le commit est passé : le rappel part maintenant, et lui seul.
+            self.assertEqual(enfile.call_count, 1)
+
+    def test_l_enfilement_a_lieu_HORS_de_toute_transaction(self):
+        """Les verrous de l'acte sont relâchés quand le rappel part."""
+        from apps.notifications import tasks
+
+        vu = {}
+
+        def espion(ids):
+            vu['dans_la_transaction'] = connection.in_atomic_block
+
+        with patch.object(tasks.pousser_le_rappel, 'delay', side_effect=espion):
+            with transaction.atomic():
+                self._alerte()
+
+        self.assertFalse(
+            vu['dans_la_transaction'],
+            "Le rappel part sous les verrous de l'acte.",
+        )
+
+    def test_un_acte_DEFAIT_ne_fait_pas_sonner(self):
+        """
+        ⚠ Les rappels d'une transaction annulée sont JETÉS. Avant, une
+        opération du journal qui finit `rejected` poussait un rappel pour une
+        notification que le rollback venait d'effacer.
+        """
+        from apps.notifications import tasks
+
+        class Annule(Exception):
+            pass
+
+        with patch.object(tasks.pousser_le_rappel, 'delay') as enfile:
+            with self.assertRaises(Annule):
+                with transaction.atomic():
+                    self._alerte()
+                    raise Annule()
+
+        enfile.assert_not_called()
+        self.assertFalse(Alert.objects.filter(organization=self.org).exists())
+
+
+class CourtierInjoignableTests(TestCase):
+    """
+    Un courtier muet ne défait pas l'acte, et ne change AUCUN verdict.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ C'EST LE MODE DE PANNE PROPRE À LA FORME EN TÂCHE, ET LE PIRE DU LOT.   │
+    │                                                                          │
+    │ Une exception qui s'échappe d'un rappel de commit enregistré dans le     │
+    │ `try` de `sync/operations.py` est levée depuis `Atomic.__exit__`, donc   │
+    │ APRÈS le commit. Elle atterrit dans son `except Exception`, qui écrit    │
+    │ alors une trace `rejected` PAR-DESSUS un effet appliqué et commité - et  │
+    │ `rejected` ne se réessaie jamais. Un hoquet de redis mettrait donc en    │
+    │ quarantaine une vente qui est bel et bien passée.                        │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
+    def setUp(self):
+        ctx = make_org_with_users()
+        self.__dict__.update(ctx)
+        OrganizationMembership.objects.get(
+            user=self.manager, organization=self.org
+        ).assigned_warehouses.set([self.warehouse])
+
+    def test_un_courtier_muet_ne_defait_pas_l_acte(self):
+        from kombu.exceptions import OperationalError
+
+        from apps.notifications import tasks
+
+        with patch.object(
+            tasks.pousser_le_rappel, 'delay',
+            side_effect=OperationalError('courtier injoignable'),
+        ):
+            with self.captureOnCommitCallbacks(execute=True):
+                alerte = alerter(
+                    self.org,
+                    alert_type=Alert.AlertType.LOW_STOCK,
+                    severity=Alert.Severity.HIGH,
+                    title='Stock bas', message='Rayon sous son seuil',
+                    data={'warehouse_id': str(self.warehouse.id)},
+                )
+
+        self.assertTrue(Alert.objects.filter(id=alerte.id).exists())
+        self.assertTrue(
+            Notification.objects.filter(data__alert_id=str(alerte.id)).exists()
+        )
+
+    def test_la_limite_douce_de_CELERY_n_est_PAS_avalee(self):
+        """
+        ⚠ `SoftTimeLimitExceeded` descend de `CeleryError`, donc d'`Exception` :
+        le `except` de `_pousser` la prenait, et aucun battement d'alerte ne
+        pouvait s'arrêter - il allait au SIGKILL de la limite dure, worker mort,
+        tournée à moitié faite. Une limite douce existe pour être attrapée par
+        la TÂCHE, pas par le premier `except` du chemin.
+        """
+        from celery.exceptions import SoftTimeLimitExceeded
+
+        from apps.notifications.services import _enfiler_le_rappel
+        from apps.notifications import tasks
+
+        with patch.object(
+            tasks.pousser_le_rappel, 'delay',
+            side_effect=SoftTimeLimitExceeded(),
+        ):
+            with self.assertRaises(SoftTimeLimitExceeded):
+                _enfiler_le_rappel(['peu-importe'])
