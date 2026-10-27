@@ -22,6 +22,15 @@ PREFIX_EXPENSE = 'DEP'
 #: Réquisition de produits (T12). Elle s'imprime : le magasinier l'emporte au
 #: marché, et son numéro est ce qui permet d'y revenir.
 PREFIX_REQUISITION = 'REQ'
+#: Achats (lot 13). Les trois générateurs d'origine triaient leurs références
+#: ALPHABÉTIQUEMENT (« K » passe au-dessus de « 0 », donc une référence
+#: d'appareil trouait la série) et datait leur préfixe en UTC, donc au mauvais
+#: jour entre 23 h et minuit à Kinshasa. `allocate_document_number` n'a ni l'un
+#: ni l'autre : son rang vient d'un compteur verrouillé, par organisation.
+PREFIX_PURCHASE_ORDER = 'CMD'
+PREFIX_GOODS_RECEIPT = 'BR'
+PREFIX_SUPPLIER_PAYMENT = 'RGF'
+PREFIX_PURCHASE_RETURN = 'RTF'
 
 
 @transaction.atomic

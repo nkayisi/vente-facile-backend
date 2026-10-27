@@ -2,6 +2,7 @@
 Core services for tenant management and permissions.
 """
 from django.db import transaction
+from rest_framework.serializers import ValidationError
 from guardian.shortcuts import assign_perm, remove_perm, get_perms
 from apps.organizations.models import Organization, OrganizationMembership, Branch
 
@@ -128,24 +129,34 @@ class OrganizationService:
             )
         
         # Créer la devise principale de l'organisation
+        #
+        # ⚠ ON REFUSE, ON NE FABRIQUE PLUS.
+        #
+        # Ce bloc insérait une `Currency` pour tout code inconnu, avec
+        # `symbol=code` et `decimal_places=2`. Après quoi TOUT l'établissement
+        # était faux à vie - tickets, exports, POS, clôture Z : un XAF ainsi
+        # fabriqué imprimait « 12 500,00 FCFA » sur une monnaie qui n'a pas de
+        # décimale, et aucune synchronisation ne l'aurait corrigé. Une devise que
+        # la plateforme ignore n'est pas à une organisation de l'inventer.
+        #
+        # Les trois appelants sont sûrs : les deux serializers d'organisation et
+        # celui de l'inscription valident désormais le code contre cette même
+        # table (`apps.settings.currency_validation`), et `seed_boutique_test`
+        # passe « CDF ».
+        #
+        # ⚠ `is_active=True` est dans le filtre, et il y manquait : sans lui, une
+        # devise retirée du catalogue restait acceptable ici alors que les
+        # serializers la refusent, et les deux portes ne disaient pas la même
+        # chose du même code.
         currency_code = organization.currency or 'CDF'
-        currency_obj = Currency.objects.filter(code=currency_code).first()
+        currency_obj = Currency.objects.filter(
+            code=currency_code, is_active=True
+        ).first()
         if not currency_obj:
-            # Fallback: créer la devise si elle n'existe pas
-            currency_defaults = {
-                'CDF': ('Franc Congolais', 'FC', 0),
-                'USD': ('Dollar Américain', '$', 2),
-                'EUR': ('Euro', '€', 2),
-            }
-            name_c, symbol, decimals = currency_defaults.get(currency_code, (currency_code, currency_code, 2))
-            currency_obj = Currency.objects.create(
-                code=currency_code,
-                name=name_c,
-                symbol=symbol,
-                decimal_places=decimals,
-                is_active=True
-            )
-        
+            raise ValidationError({
+                'currency': f"La devise '{currency_code}' n'est pas prise en charge."
+            })
+
         OrganizationCurrency.objects.create(
             organization=organization,
             currency=currency_obj,

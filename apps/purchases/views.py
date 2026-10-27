@@ -12,17 +12,25 @@ from django.utils import timezone
 from decimal import Decimal
 
 from apps.core.api_mixins import (
+    ExportableListMixin,
     ExportResponseMixin,
     TenantViewSetMixin,
     AuditMixin,
     WarehouseScopedQuerysetMixin,
     WarehouseAssertCreateMixin,
+    describe_filters,
+)
+from apps.core.report_params import perimeter_filters, period_label
+from .filters import (
+    GoodsReceiptFilter, PurchaseOrderFilter, PurchaseReturnFilter,
+    SupplierPaymentFilter,
 )
 from apps.core.warehouse_scope import (
     accessible_warehouse_ids,
     assert_warehouse_allowed_for_request,
     get_membership_for_request,
 )
+from apps.contacts import supplier_debt
 from apps.core.api_permissions import (
     DENY,
     IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission
@@ -51,6 +59,7 @@ from .services import (
 # =============================================================================
 
 class PurchaseOrderViewSet(
+    ExportableListMixin,
     WarehouseScopedQuerysetMixin,
     WarehouseAssertCreateMixin,
     TenantViewSetMixin,
@@ -74,7 +83,7 @@ class PurchaseOrderViewSet(
     queryset = PurchaseOrder.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission, TenantObjectPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['status', 'supplier', 'warehouse']
+    filterset_class = PurchaseOrderFilter
     search_fields = ['reference', 'supplier__name']
     ordering_fields = ['order_date', 'total', 'reference']
     ordering = ['-order_date']
@@ -102,7 +111,72 @@ class PurchaseOrderViewSet(
         # refusée à tous : l'endpoint figure au schéma OpenAPI et ne répondait
         # à personne.
         'pending': 'purchases.view',
+        # Un document d'achat ne dit rien de plus que la liste qu'il
+        # reproduit : même droit, et surtout pas un droit à part - une
+        # action non déclarée est REFUSÉE à tous, et c'est ainsi que
+        # `pending` et `locked_products` ont dormi sans appelant.
+        'export': 'purchases.view',
     }
+
+    export_basename = 'commandes-achat'
+
+    def build_export_spec(self, request, queryset):
+        """Décrit le journal des commandes tel que l'écran le montre."""
+        from apps.settings.services import CurrencyService
+
+        from .reports import build_purchase_orders_report
+
+        organization = self.get_organization()
+        params = request.query_params
+        statuts = dict(PurchaseOrder.Status.choices)
+        filtres = describe_filters(params, {
+            'status': ('Statut', lambda v: statuts.get(v, v), 'Tous'),
+            'search': ('Recherche', lambda v: v, '-'),
+        })
+        filtres.extend(perimeter_filters(params, organization))
+        periode = period_label(params)
+        if periode:
+            filtres.insert(0, ('Période', periode))
+
+        return build_purchase_orders_report(
+            queryset,
+            organization,
+            currency=CurrencyService.primary_code(organization),
+            filters_applied=filtres,
+        )
+
+    def create(self, request, *args, **kwargs):
+        """
+        Crée la pièce et rend son DÉTAIL complet (avec `id` et `reference`).
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ SANS CET OVERRIDE, L'ÉCRAN NAVIGUE VERS `undefined`.                │
+        │                                                                      │
+        │ DRF répond à un POST avec le serializer d'ÉCRITURE, qui ne déclare   │
+        │ ni `id`, ni `reference`, ni aucun nom résolu. Les quatre écrans       │
+        │ d'achat lisent `r.data.id` pour ouvrir la fiche qu'ils viennent de   │
+        │ créer, et `r.data.reference` pour la nommer dans leur message : les  │
+        │ deux valaient `undefined`, et l'URL d'arrivée était un 404.          │
+        │                                                                      │
+        │ C'est le défaut exact corrigé sur `POST /expenses/`, où le reçu de   │
+        │ dépense sortait SANS NUMÉRO et le fichier s'appelait                 │
+        │ `depense-undefined.pdf`. `createExpense` annonçait pourtant          │
+        │ `Promise<ApiResponse<Expense>>` : axios rend `any`, et TypeScript    │
+        │ n'avait rien à dire.                                                  │
+        └──────────────────────────────────────────────────────────────────────┘
+
+        Calqué sur `SaleViewSet.create` et `ExpenseViewSet.create`.
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        piece = self.perform_create(serializer)
+        if piece is None:
+            piece = serializer.instance
+        piece.refresh_from_db()
+        return Response(
+            PurchaseOrderDetailSerializer(piece, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -110,20 +184,6 @@ class PurchaseOrderViewSet(
         elif self.action == 'create':
             return PurchaseOrderCreateSerializer
         return PurchaseOrderDetailSerializer
-
-    def get_queryset(self):
-        """Filtre supplémentaire par date."""
-        queryset = super().get_queryset()
-        
-        date_from = self.request.query_params.get('date_from')
-        date_to = self.request.query_params.get('date_to')
-        
-        if date_from:
-            queryset = queryset.filter(order_date__gte=date_from)
-        if date_to:
-            queryset = queryset.filter(order_date__lte=date_to)
-        
-        return queryset
 
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
@@ -209,6 +269,7 @@ class PurchaseOrderViewSet(
 # =============================================================================
 
 class GoodsReceiptViewSet(
+    ExportableListMixin,
     WarehouseScopedQuerysetMixin,
     WarehouseAssertCreateMixin,
     TenantViewSetMixin,
@@ -229,7 +290,7 @@ class GoodsReceiptViewSet(
     queryset = GoodsReceipt.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission, TenantObjectPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['status', 'purchase_order', 'warehouse']
+    filterset_class = GoodsReceiptFilter
     search_fields = ['reference', 'supplier_invoice']
     ordering = ['-receipt_date']
     
@@ -247,10 +308,75 @@ class GoodsReceiptViewSet(
         'cancel': 'purchases.edit',
         # Une réception se complète ou s'annule, elle ne se réécrit pas :
         # ses lignes ont déjà bougé le stock et le coût moyen pondéré.
+        'export': 'purchases.view',
         'update': DENY,
         'partial_update': DENY,
         'destroy': DENY,
     }
+
+    export_basename = 'receptions'
+
+    def build_export_spec(self, request, queryset):
+        """Décrit le journal des réceptions tel que l'écran le montre.
+
+        Le queryset arrive DÉJÀ filtré et NON paginé (`ExportableListMixin`) :
+        c'est ce qui garantit que le fichier couvre le même périmètre que
+        l'écran qui l'a déclenché, et non ses cinquante premières lignes.
+        """
+        from apps.settings.services import CurrencyService
+
+        from .reports import build_goods_receipts_report
+
+        organization = self.get_organization()
+        params = request.query_params
+        statuts = dict(GoodsReceipt.Status.choices)
+        filtres = describe_filters(params, {
+            'status': ('Statut', lambda v: statuts.get(v, v), 'Tous'),
+            'search': ('Recherche', lambda v: v, '-'),
+        })
+        # Le PÉRIMÈTRE, et il n'est jamais tu : la liste accepte `warehouse` et
+        # `user`, donc le fichier serait filtré sans le dire.
+        filtres.extend(perimeter_filters(params, organization))
+
+        return build_goods_receipts_report(
+            queryset,
+            organization,
+            currency=CurrencyService.primary_code(organization),
+            filters_applied=filtres,
+        )
+
+    def create(self, request, *args, **kwargs):
+        """
+        Crée la pièce et rend son DÉTAIL complet (avec `id` et `reference`).
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ SANS CET OVERRIDE, L'ÉCRAN NAVIGUE VERS `undefined`.                │
+        │                                                                      │
+        │ DRF répond à un POST avec le serializer d'ÉCRITURE, qui ne déclare   │
+        │ ni `id`, ni `reference`, ni aucun nom résolu. Les quatre écrans       │
+        │ d'achat lisent `r.data.id` pour ouvrir la fiche qu'ils viennent de   │
+        │ créer, et `r.data.reference` pour la nommer dans leur message : les  │
+        │ deux valaient `undefined`, et l'URL d'arrivée était un 404.          │
+        │                                                                      │
+        │ C'est le défaut exact corrigé sur `POST /expenses/`, où le reçu de   │
+        │ dépense sortait SANS NUMÉRO et le fichier s'appelait                 │
+        │ `depense-undefined.pdf`. `createExpense` annonçait pourtant          │
+        │ `Promise<ApiResponse<Expense>>` : axios rend `any`, et TypeScript    │
+        │ n'avait rien à dire.                                                  │
+        └──────────────────────────────────────────────────────────────────────┘
+
+        Calqué sur `SaleViewSet.create` et `ExpenseViewSet.create`.
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        piece = self.perform_create(serializer)
+        if piece is None:
+            piece = serializer.instance
+        piece.refresh_from_db()
+        return Response(
+            GoodsReceiptDetailSerializer(piece, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -261,56 +387,36 @@ class GoodsReceiptViewSet(
 
     @action(detail=True, methods=['post'])
     def complete(self, request, pk=None):
-        """Valide la réception et met à jour le stock."""
+        """Valide la réception : le stock entre, la commande avance, la dette s'inscrit.
+
+        Le corps vit dans `services.completer_reception`. Il était écrit ICI, et
+        trois règles y avaient dérivé : la quantité reçue s'incrémentait dès le
+        brouillon, le statut de la commande se décidait sur une somme
+        inter-articles, et la dette fournisseur ne s'inscrivait nulle part.
+        """
+        from .services import TransitionReceptionRefusee, completer_reception
+
         grn = self.get_object()
-
-        if grn.status != 'draft':
+        try:
+            completer_reception(grn, request.user)
+        except TransitionReceptionRefusee as exc:
             return Response(
-                {'error': 'Cette réception est déjà validée'},
-                status=status.HTTP_400_BAD_REQUEST
+                {'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST
             )
-
-        from .services import GoodsReceiptStockService
-
-        with transaction.atomic():
-            GoodsReceiptStockService.apply_increment(grn, request.user)
-
-            po = grn.purchase_order
-            totals = po.items.aggregate(
-                total_ordered=Sum('quantity_ordered'),
-                total_received=Sum('quantity_received'),
-            )
-            total_ordered = totals['total_ordered'] or Decimal('0.000')
-            total_received = totals['total_received'] or Decimal('0.000')
-
-            po.status = 'received' if total_received >= total_ordered else 'partially_received'
-            po.save()
-
-            grn.status = 'completed'
-            grn.save()
-
         return Response({'status': 'completed'})
 
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
         """Annule une réception (avant validation uniquement)."""
+        from .services import TransitionReceptionRefusee, annuler_reception
+
         grn = self.get_object()
-        
-        if grn.status != 'draft':
+        try:
+            annuler_reception(grn, request.user)
+        except TransitionReceptionRefusee as exc:
             return Response(
-                {'error': 'Seules les réceptions en brouillon peuvent être annulées'},
-                status=status.HTTP_400_BAD_REQUEST
+                {'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST
             )
-        
-        # Annuler les quantités reçues sur la commande
-        for item in grn.items.all():
-            if item.purchase_order_item:
-                item.purchase_order_item.quantity_received -= item.quantity_accepted
-                item.purchase_order_item.save()
-        
-        grn.status = 'cancelled'
-        grn.save()
-        
         return Response({'status': 'cancelled'})
 
 
@@ -319,6 +425,7 @@ class GoodsReceiptViewSet(
 # =============================================================================
 
 class SupplierPaymentViewSet(
+    ExportableListMixin,
     WarehouseScopedQuerysetMixin,
     TenantViewSetMixin,
     AuditMixin,
@@ -337,7 +444,7 @@ class SupplierPaymentViewSet(
     queryset = SupplierPayment.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission, TenantObjectPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['status', 'supplier', 'payment_method']
+    filterset_class = SupplierPaymentFilter
     search_fields = ['reference', 'supplier__name', 'payment_reference']
     ordering = ['-payment_date']
     
@@ -357,13 +464,71 @@ class SupplierPaymentViewSet(
         'cancel': 'purchases.edit',
         # Un règlement fournisseur s'annule, il ne se corrige pas : le
         # réécrire changerait un montant déjà imputé à des factures.
+        'export': 'purchases.view',
         'update': DENY,
         'partial_update': DENY,
         'destroy': DENY,
     }
 
+    export_basename = 'reglements-fournisseurs'
+
+    def build_export_spec(self, request, queryset):
+        """Décrit le journal des règlements tel que l'écran le montre."""
+        from apps.settings.services import CurrencyService
+
+        from .reports import build_supplier_payments_report
+
+        organization = self.get_organization()
+        params = request.query_params
+        statuts = dict(SupplierPayment.Status.choices)
+        filtres = describe_filters(params, {
+            'status': ('Statut', lambda v: statuts.get(v, v), 'Tous'),
+            'search': ('Recherche', lambda v: v, '-'),
+        })
+        filtres.extend(perimeter_filters(params, organization))
+
+        return build_supplier_payments_report(
+            queryset,
+            organization,
+            currency=CurrencyService.primary_code(organization),
+            filters_applied=filtres,
+        )
+
     def get_queryset(self):
         return super().get_queryset().distinct()
+
+    def create(self, request, *args, **kwargs):
+        """
+        Crée la pièce et rend son DÉTAIL complet (avec `id` et `reference`).
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ SANS CET OVERRIDE, L'ÉCRAN NAVIGUE VERS `undefined`.                │
+        │                                                                      │
+        │ DRF répond à un POST avec le serializer d'ÉCRITURE, qui ne déclare   │
+        │ ni `id`, ni `reference`, ni aucun nom résolu. Les quatre écrans       │
+        │ d'achat lisent `r.data.id` pour ouvrir la fiche qu'ils viennent de   │
+        │ créer, et `r.data.reference` pour la nommer dans leur message : les  │
+        │ deux valaient `undefined`, et l'URL d'arrivée était un 404.          │
+        │                                                                      │
+        │ C'est le défaut exact corrigé sur `POST /expenses/`, où le reçu de   │
+        │ dépense sortait SANS NUMÉRO et le fichier s'appelait                 │
+        │ `depense-undefined.pdf`. `createExpense` annonçait pourtant          │
+        │ `Promise<ApiResponse<Expense>>` : axios rend `any`, et TypeScript    │
+        │ n'avait rien à dire.                                                  │
+        └──────────────────────────────────────────────────────────────────────┘
+
+        Calqué sur `SaleViewSet.create` et `ExpenseViewSet.create`.
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        piece = self.perform_create(serializer)
+        if piece is None:
+            piece = serializer.instance
+        piece.refresh_from_db()
+        return Response(
+            SupplierPaymentDetailSerializer(piece, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -373,10 +538,38 @@ class SupplierPaymentViewSet(
         return SupplierPaymentDetailSerializer
 
     @action(detail=True, methods=['post'])
+    @transaction.atomic
     def cancel(self, request, pk=None):
-        """Annule un paiement fournisseur."""
+        """Annule un paiement fournisseur.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ CE CORPS N'ÉTAIT PAS ATOMIQUE, ET LA DETTE SE RECRÉDITAIT DEUX FOIS.│
+        │                                                                      │
+        │ `ATOMIC_REQUESTS` est à `False` (et doit y rester, le journal de     │
+        │ synchronisation en dépend) : il n'y avait donc AUCUNE transaction    │
+        │ autour de ces quatre écritures. Or `supplier_debt.reverse_payment`   │
+        │ porte son propre `@transaction.atomic` et COMMITE seul : un échec du │
+        │ mouvement de caisse ou du `save()` final laissait la dette déjà      │
+        │ restituée pendant que `status` restait `completed`. Le seul garde-fou │
+        │ d'idempotence étant ce statut, un second essai recréditait la dette   │
+        │ une seconde fois et redécrémentait `amount_paid` des commandes.      │
+        │                                                                      │
+        │ Le verrou sur la ligne ferme la même porte côté concurrence : deux   │
+        │ annulations simultanées franchissaient toutes deux le contrôle de    │
+        │ statut.                                                              │
+        └──────────────────────────────────────────────────────────────────────┘
+        """
         payment = self.get_object()
-        
+        verrouille = SupplierPayment.objects.select_for_update().filter(
+            pk=payment.pk
+        ).first()
+        if verrouille is None:
+            return Response(
+                {'error': 'Ce paiement est introuvable'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        payment.status = verrouille.status
+
         if payment.status == 'cancelled':
             return Response(
                 {'error': 'Ce paiement est déjà annulé'},
@@ -390,10 +583,20 @@ class SupplierPaymentViewSet(
             po.amount_due = po.total - po.amount_paid
             po.save()
         
-        # Remettre le solde fournisseur
+        # Restitue la dette que ce règlement avait éteinte. Écrire
+        # `current_balance += amount` à la main, c'est ce que faisaient les
+        # trois sites d'origine : aucun grand livre, aucune devise, et le
+        # scalaire dérivait des soldes par devise qu'il résume.
         supplier = payment.supplier
-        supplier.current_balance += payment.amount
-        supplier.save()
+        supplier_debt.reverse_payment(
+            supplier, payment.amount,
+            currency=payment.currency,
+            exchange_rate=payment.exchange_rate,
+            supplier_payment=payment,
+            reference=payment.reference,
+            notes=f"Annulation du règlement {payment.reference}",
+            user=request.user,
+        )
         
         # Enregistrer le mouvement de caisse inverse (remboursement fournisseur).
         # Passe par `_movement` comme tous les autres flux : la devise et le taux
@@ -448,7 +651,7 @@ class PurchaseReturnViewSet(
     queryset = PurchaseReturn.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission, TenantObjectPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['status', 'supplier']
+    filterset_class = PurchaseReturnFilter
     search_fields = ['reference', 'supplier__name']
     ordering = ['-return_date']
     
@@ -473,6 +676,39 @@ class PurchaseReturnViewSet(
         'destroy': DENY,
     }
 
+    def create(self, request, *args, **kwargs):
+        """
+        Crée la pièce et rend son DÉTAIL complet (avec `id` et `reference`).
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ SANS CET OVERRIDE, L'ÉCRAN NAVIGUE VERS `undefined`.                │
+        │                                                                      │
+        │ DRF répond à un POST avec le serializer d'ÉCRITURE, qui ne déclare   │
+        │ ni `id`, ni `reference`, ni aucun nom résolu. Les quatre écrans       │
+        │ d'achat lisent `r.data.id` pour ouvrir la fiche qu'ils viennent de   │
+        │ créer, et `r.data.reference` pour la nommer dans leur message : les  │
+        │ deux valaient `undefined`, et l'URL d'arrivée était un 404.          │
+        │                                                                      │
+        │ C'est le défaut exact corrigé sur `POST /expenses/`, où le reçu de   │
+        │ dépense sortait SANS NUMÉRO et le fichier s'appelait                 │
+        │ `depense-undefined.pdf`. `createExpense` annonçait pourtant          │
+        │ `Promise<ApiResponse<Expense>>` : axios rend `any`, et TypeScript    │
+        │ n'avait rien à dire.                                                  │
+        └──────────────────────────────────────────────────────────────────────┘
+
+        Calqué sur `SaleViewSet.create` et `ExpenseViewSet.create`.
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        piece = self.perform_create(serializer)
+        if piece is None:
+            piece = serializer.instance
+        piece.refresh_from_db()
+        return Response(
+            PurchaseReturnDetailSerializer(piece, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
+
     def get_serializer_class(self):
         if self.action == 'list':
             return PurchaseReturnListSerializer
@@ -482,88 +718,41 @@ class PurchaseReturnViewSet(
 
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
-        """Approuve un retour et déduit le stock."""
+        """Approuve un retour : la marchandise sort du rayon.
+
+        Le corps vit dans `services.approuver_retour`. Il était écrit ICI, où
+        il verrouillait `Stock` par `select_for_update` HORS de toute
+        transaction - donc 500 sur PostgreSQL, et invisible à tout test
+        (`APITestCase` ouvre sa propre transaction).
+        """
+        from .services import TransitionReceptionRefusee, approuver_retour
+
         purchase_return = self.get_object()
-        
-        if purchase_return.status != 'draft':
+        try:
+            approuver_retour(purchase_return, request.user)
+        except TransitionReceptionRefusee as exc:
             return Response(
-                {'error': 'Seuls les retours en brouillon peuvent être approuvés'},
-                status=status.HTTP_400_BAD_REQUEST
+                {'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST
             )
-        
-        from apps.inventory.models import Stock, StockMovement
-        
-        from apps.inventory.packaging import PackagingService
-
-        for item in purchase_return.items.select_related('product').all():
-            stock = Stock.objects.select_for_update().filter(
-                organization=purchase_return.organization,
-                product=item.product,
-                variant=item.variant,
-                warehouse=purchase_return.warehouse
-            ).first()
-
-            if stock:
-                quantity_before = stock.quantity
-                # Ce chemin écrivait `stock.quantity` directement, ce qui
-                # rongeait silencieusement le nombre de contenants scellés.
-                # Retirer des unités puise d'abord dans le vrac, puis ouvre un
-                # contenant : on ne rescelle jamais.
-                PackagingService.apply_base_delta(stock, item.product, -item.quantity)
-                stock.last_movement_at = timezone.now()
-                stock.save()
-                
-                StockMovement.objects.create(
-                    organization=purchase_return.organization,
-                    product=item.product,
-                    variant=item.variant,
-                    warehouse=purchase_return.warehouse,
-                    batch=item.batch,
-                    movement_type='return_out',
-                    quantity=-item.quantity,
-                    unit_cost=item.unit_cost,
-                    quantity_before=quantity_before,
-                    quantity_after=stock.quantity,
-                    reference_type='purchase_return',
-                    reference_id=purchase_return.id,
-                    created_by=request.user
-                )
-        
-        purchase_return.status = 'approved'
-        purchase_return.save()
-        
         return Response({'status': 'approved'})
 
     @action(detail=True, methods=['post'])
     def ship(self, request, pk=None):
-        """Marque un retour comme expédié."""
+        """Expédie un retour : la dette s'éteint d'abord, le reliquat revient en caisse.
+
+        Le corps vit dans `services.expedier_retour`. Il était écrit ICI, et il
+        enregistrait une entrée de caisse du montant ENTIER tout en décrémentant
+        aussi le solde du fournisseur : le même retour comptait deux fois.
+        """
+        from .services import TransitionReceptionRefusee, expedier_retour
+
         purchase_return = self.get_object()
-        
-        if purchase_return.status != 'approved':
+        try:
+            expedier_retour(purchase_return, request.user)
+        except TransitionReceptionRefusee as exc:
             return Response(
-                {'error': 'Seuls les retours approuvés peuvent être expédiés'},
-                status=status.HTTP_400_BAD_REQUEST
+                {'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST
             )
-        
-        purchase_return.status = 'shipped'
-        purchase_return.save()
-        
-        # Enregistrer le mouvement de caisse (remboursement fournisseur attendu)
-        if purchase_return.total_amount and purchase_return.total_amount > 0:
-            from apps.cashbook.services import record_purchase_return_refund
-            record_purchase_return_refund(
-                organization=purchase_return.organization,
-                purchase_return=purchase_return,
-                amount=purchase_return.total_amount,
-                supplier=purchase_return.supplier,
-                user=request.user,
-            )
-            
-            # Réduire le solde fournisseur (on nous doit moins)
-            supplier = purchase_return.supplier
-            supplier.current_balance -= purchase_return.total_amount
-            supplier.save()
-        
         return Response({'status': 'shipped'})
 
     @action(detail=True, methods=['post'])

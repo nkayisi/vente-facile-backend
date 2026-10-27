@@ -68,26 +68,25 @@ class ReferenceGenerator:
 
     @staticmethod
     def generate_purchase_reference(organization):
-        """Generate purchase order reference: PO-YYYYMMDD-XXXX"""
-        from apps.purchases.models import PurchaseOrder
-        
-        today = timezone.now()
-        prefix = f"PO-{today.strftime('%Y%m%d')}"
-        
-        last = PurchaseOrder.objects.filter(
-            organization=organization,
-            reference__startswith=prefix
-        ).order_by('-reference').first()
-        
-        if last:
-            try:
-                num = int(last.reference.split('-')[-1]) + 1
-            except (ValueError, IndexError):
-                num = 1
-        else:
-            num = 1
-        
-        return f"{prefix}-{num:04d}"
+        """Référence de commande d'achat, par le compteur verrouillé.
+
+        ⚠ Le corps d'origine triait les références ALPHABÉTIQUEMENT puis
+        incrémentait le dernier rang lu, et datait son préfixe en UTC. Les deux
+        défauts sont ceux corrigés sur `generate_expense_reference` en
+        septembre : « K » passe au-dessus de « 0 », donc une référence
+        d'appareil trouait la série, et entre 23 h et minuit UTC le préfixe
+        portait la veille à Kinshasa.
+
+        `allocate_document_number` n'a ni l'un ni l'autre : son rang vient d'un
+        `DocumentSequence` relu sous verrou, par organisation et par année.
+        Conserver cette méthode plutôt que la supprimer laisse un point d'entrée
+        nommé, au cas où un appelant reviendrait.
+        """
+        from apps.core.numbering import (
+            PREFIX_PURCHASE_ORDER, allocate_document_number,
+        )
+
+        return allocate_document_number(organization, PREFIX_PURCHASE_ORDER)
 
     @staticmethod
     def generate_transfer_reference(organization):

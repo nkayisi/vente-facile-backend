@@ -7,10 +7,11 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Sum, Count
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from rest_framework.exceptions import ValidationError as DRFValidationError
 
 from apps.core.api_mixins import TenantViewSetMixin, AuditMixin
+from apps.settings.currency_validation import valider_code_devise
 from apps.core.api_permissions import (
     IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission
 )
@@ -451,7 +452,10 @@ class SupplierViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     ordering = ['name']
     
     select_related_fields = ['created_by']
-    prefetch_related_fields = ['products']
+    # ⚠ `balances` EST OBLIGATOIRE : les deux serializers rendent les soldes par
+    # devise, et sans ce préchargement la liste paierait une requête par
+    # fournisseur. Le ViewSet des clients le précharge pour la même raison.
+    prefetch_related_fields = ['products', 'balances']
     
     action_permissions = {
         'list': 'suppliers.view',
@@ -464,6 +468,10 @@ class SupplierViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         'products': 'suppliers.view',
         'with_balance': 'suppliers.view',
         'search': 'suppliers.view',
+        'ledger': 'suppliers.view',
+        # Corriger un solde est une écriture comptable : même droit que
+        # modifier la fiche du fournisseur, et pas `suppliers.view`.
+        'adjust_balance': 'suppliers.edit',
     }
 
     def get_serializer_class(self):
@@ -513,6 +521,136 @@ class SupplierViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         
         serializer = SupplierProductSerializer(products, many=True)
         return Response(serializer.data)
+
+    @action(detail=True, methods=['get'])
+    def ledger(self, request, pk=None):
+        """Grand livre du fournisseur : ce qui a bougé son solde, et pourquoi.
+
+        ⚠ Un solde sans grand livre ne s'explique pas, et c'est le seul moyen
+        de rapprocher un solde d'une facture fournisseur posée sur le comptoir.
+        Même arbitrage que pour le grand livre d'un client.
+        """
+        from apps.contacts.models import SupplierTransaction
+
+        supplier = self.get_object()
+        lignes = SupplierTransaction.objects.filter(
+            supplier=supplier,
+        ).select_related('purchase_order', 'goods_receipt', 'supplier_payment')
+
+        page = self.paginate_queryset(lignes)
+        donnees = [
+            {
+                'id': str(l.id),
+                'type': l.transaction_type,
+                'type_display': l.get_transaction_type_display(),
+                'amount': str(l.amount),
+                'currency': l.currency,
+                'balance_before': str(l.balance_before),
+                'balance_after': str(l.balance_after),
+                'purchase_order_reference': (
+                    l.purchase_order.reference if l.purchase_order else None
+                ),
+                'goods_receipt_reference': (
+                    l.goods_receipt.reference if l.goods_receipt else None
+                ),
+                'payment_reference': (
+                    l.supplier_payment.reference if l.supplier_payment else None
+                ),
+                'reference': l.reference,
+                'notes': l.notes,
+                'created_at': l.created_at,
+            }
+            for l in (page if page is not None else lignes)
+        ]
+        if page is not None:
+            return self.get_paginated_response(donnees)
+        return Response(donnees)
+
+    @action(detail=True, methods=['post'], url_path='adjust-balance')
+    def adjust_balance(self, request, pk=None):
+        """Corrige le solde d'un fournisseur, sur décision humaine.
+
+        ⚠ CET ENDPOINT N'EST PAS UN CONFORT, IL FERME UN ÉCART NOMMÉ.
+        La dette inscrite à la réception est une RECONSTRUCTION
+        (`purchases.services.valeur_recue`) : une facture fournisseur peut
+        porter des lignes qu'aucune commande ne prévoyait, et le total
+        reconstitué ne sera alors pas celui du papier. Sans ce geste, l'écart
+        resterait pour toujours et le marchand n'aurait aucun moyen de le
+        rattraper.
+
+        `delta` est SIGNÉ, et le signe suit la convention des soldes : positif
+        creuse la dette (nous devons davantage), négatif la réduit.
+        """
+        from apps.contacts.supplier_debt import adjust_balance as ajuster
+
+        supplier = self.get_object()
+        try:
+            delta = Decimal(str(request.data.get('delta', '0')))
+        except (InvalidOperation, TypeError, ValueError):
+            return Response(
+                {'delta': "Montant illisible."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if delta == 0:
+            return Response(
+                {'delta': "Un ajustement de zéro ne corrige rien."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        notes = (request.data.get('notes') or '').strip()
+        if not notes:
+            # Un ajustement sans motif est une écriture dont plus personne ne
+            # saura l'origine : c'est la seule chose qu'un grand livre ne peut
+            # pas reconstituer.
+            return Response(
+                {'notes': "Expliquez la correction : elle ne se devine pas."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ⚠ LA DEVISE EST VALIDÉE ICI, ET ELLE NE L'ÉTAIT PAS.
+        # `CurrencyService.resolve` est appelé en mode NON strict par le service
+        # de dette : un code inconnu y passait tel quel et créait une ligne
+        # `SupplierBalance` dans une monnaie que la plateforme ignore - et un
+        # code de plus de trois caractères faisait répondre 500, la colonne
+        # étant un `CharField(max_length=3)`. MESURÉ : `{"currency": "DOLLARS"}`
+        # rendait une erreur interne.
+        devise = (request.data.get('currency') or '').strip()
+        if devise:
+            try:
+                devise = valider_code_devise(devise)
+            except DRFValidationError as exc:
+                return Response(
+                    {'currency': exc.detail},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        txn = ajuster(
+            supplier, delta,
+            currency=devise or None,
+            notes=notes,
+            user=request.user,
+        )
+        # ⚠ `adjust_balance` REND `None` QUAND LE MONTANT S'ARRONDIT À ZÉRO.
+        # Le solde est tenu au centime : un delta de `0.001` passe le contrôle
+        # `delta == 0` ci-dessus, puis `_ecrire` le quantise à `0.00` et sort
+        # sans rien écrire. Lire `txn.id` dessus faisait répondre 500 - MESURÉ.
+        if txn is None:
+            return Response(
+                {'delta': (
+                    "Un ajustement inférieur au centime ne corrige rien : "
+                    "le solde est tenu au centime."
+                )},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        supplier.refresh_from_db()
+        return Response({
+            'id': str(txn.id),
+            'amount': str(txn.amount),
+            'currency': txn.currency,
+            'balance_before': str(txn.balance_before),
+            'balance_after': str(txn.balance_after),
+            'current_balance': str(supplier.current_balance),
+        })
 
     @action(detail=False, methods=['get'], url_path='with-balance')
     def with_balance(self, request):

@@ -201,3 +201,92 @@ class RayonApresUneVenteFractionnaireTests(_VenteAuPoidsSetup):
         item = Sale.objects.get(pk=resp.data['id']).items.first()
         self.assertEqual(item.package_quantity, Decimal('2.500'))
         self.assertEqual(item.quantity, Decimal('62.500'))
+
+
+class RapportDesQuantitesTests(_VenteAuPoidsSetup):
+    """
+    Le chiffre que le marchand lit après avoir vendu au poids.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ « 0 ARTICLE VENDU » APRÈS UNE VENTE DE 0,5 KG.                           │
+    │                                                                          │
+    │ `SalesStatsSerializer.total_items_sold` était un `IntegerField` alors    │
+    │ que sa source est un `Coalesce(Sum('quantity'), ...,                      │
+    │ output_field=DecimalField())` à trois décimales. C'est le TROISIÈME       │
+    │ champ de la même série : ses deux voisins ont été corrigés et portent     │
+    │ même le commentaire qui nomme le défaut.                                  │
+    │                                                                          │
+    │ L'asymétrie était prouvée : le même chiffre exporté en PDF passe par      │
+    │ `format_quantity()` et garde, lui, ses décimales. L'écran mentait, le     │
+    │ document non.                                                             │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ⚠ LA VENTE DOIT ÊTRE PAYÉE. `_get_sales_stats` ne compte que les ventes
+    `completed` ou `partially_paid` : une vente à crédit non réglée, comme
+    celles du reste de ce fichier, n'entrerait dans aucun total et le test
+    passerait pour une raison qui n'est pas la sienne.
+    """
+
+    def _vendre_comptant(self, quantite):
+        resp = self.client.post(
+            '/api/v1/sales/',
+            {
+                'register': str(self.register.id),
+                'warehouse': str(self.warehouse.id),
+                'sale_type': 'retail', 'is_pos': True,
+                'items': [{
+                    'product': str(self.farine.id),
+                    'quantity': quantite,
+                    'unit_price': '1500.00',
+                }],
+                'payments': [{
+                    'payment_method': str(self.payment_method.id),
+                    # ⚠ Un MONTANT n'a que deux décimales, et une quantité en a
+                    # trois : `1500.00 * 0.5` sort à `750.000` et le serveur
+                    # refuse. C'est le défaut symétrique de celui qu'on corrige,
+                    # et il est juste.
+                    'amount': str(
+                        (Decimal('1500.00') * Decimal(quantite)).quantize(Decimal('0.01'))
+                    ),
+                }],
+            },
+            format='json', **self._headers,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        return resp
+
+    def _statistiques(self):
+        """
+        ⚠ LE RÔLE CHANGE POUR LIRE, et c'est le plus faible qui porte le droit.
+
+        Le caissier VEND (c'est lui que cette suite authentifie) mais n'a pas
+        `reports.view` : l'endpoint lui répond 403, et le test échouerait pour
+        une raison qui n'est pas la sienne. Le gérant l'a ; le propriétaire
+        l'aurait aussi, mais il sort du périmètre d'entrepôt en amont et la
+        moitié du code de portée ne serait pas exécutée.
+        """
+        self.client.force_authenticate(user=self.manager)
+        resp = self.client.get('/api/v1/reports/statistics/sales/', **self._headers)
+        self.client.force_authenticate(user=self.cashier_a)
+        return resp
+
+    def test_un_demi_kilo_vendu_ne_se_lit_pas_zero(self):
+        self._vendre_comptant('0.5')
+        resp = self._statistiques()
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        # DRF sérialise un `DecimalField` en chaîne : c'est le contrat de toute
+        # la plateforme, et le back-office coerce au point d'affichage.
+        self.assertEqual(Decimal(resp.data['total_items_sold']), Decimal('0.500'))
+
+    def test_le_total_porte_ses_trois_decimales(self):
+        self._vendre_comptant('0.5')
+        self._vendre_comptant('1.25')
+        resp = self._statistiques()
+        self.assertEqual(Decimal(resp.data['total_items_sold']), Decimal('1.750'))
+
+    def test_une_quantite_entiere_ne_change_pas_de_lecture(self):
+        # Le contrôle : la correction ne doit rien changer là où elle ne porte
+        # pas, et un entier reste un entier.
+        self._vendre_comptant('3')
+        resp = self._statistiques()
+        self.assertEqual(Decimal(resp.data['total_items_sold']), Decimal('3.000'))

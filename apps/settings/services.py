@@ -274,6 +274,35 @@ class CurrencyService:
         }
     
     @classmethod
+    def infos_par_code(cls, code):
+        """Nom, symbole et décimales d'une devise, lus dans la TABLE.
+
+        ⚠ CETTE FONCTION EXISTE PARCE QUE SA LOGIQUE ÉTAIT ÉCRITE DEUX FOIS.
+        `get_display_info` ci-dessous et `_get_default_currency_info` de
+        `apps/organizations/serializers.py` portaient le même repli
+        `{CDF, USD, EUR}`, mot pour mot : pour toute autre devise, ils rendaient
+        `symbol=code` et `decimal_places=2`, donc un XAF s'affichait à deux
+        décimales sur une monnaie qui n'en a pas. Deux copies d'une même règle
+        finissent par diverger ; celles-ci avaient déjà le même défaut.
+
+        Le repli ultime garde `decimal_places=2` : il n'est atteint que par un code
+        absent de la table, c'est-à-dire par aucune devise que les serializers
+        laissent désormais entrer. C'est la même borne que `currency_decimals` de
+        `apps.core.exports`, et pour la même raison.
+        """
+        from apps.settings.models import Currency
+
+        code = (code or 'CDF').upper()
+        row = (
+            Currency.objects.filter(code=code)
+            .values('name', 'symbol', 'decimal_places')
+            .first()
+        )
+        if row:
+            return {'code': code, **row}
+        return {'code': code, 'name': code, 'symbol': code, 'decimal_places': 2}
+
+    @classmethod
     def get_display_info(cls, organization):
         """
         Retourne les infos de la devise principale pour l'affichage.
@@ -290,15 +319,8 @@ class CurrencyService:
                 'decimal_places': primary.currency.decimal_places,
             }
         
-        # Fallback
-        code = organization.currency or 'CDF'
-        defaults = {
-            'CDF': {'name': 'Franc Congolais', 'symbol': 'FC', 'decimal_places': 0},
-            'USD': {'name': 'Dollar Américain', 'symbol': '$', 'decimal_places': 2},
-            'EUR': {'name': 'Euro', 'symbol': '€', 'decimal_places': 2},
-        }
-        info = defaults.get(code, {'name': code, 'symbol': code, 'decimal_places': 2})
-        return {'code': code, **info}
+        # Pas de ligne principale : on interroge la table avant d'abandonner.
+        return cls.infos_par_code(organization.currency)
     
     @classmethod
     def format_amount(cls, amount, organization=None, currency_code=None):

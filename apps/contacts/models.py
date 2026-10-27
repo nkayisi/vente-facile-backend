@@ -360,6 +360,173 @@ class Supplier(TenantSyncableModel):
         ).aggregate(total=primary_sum('total'))['total'] or Decimal('0.00')
 
 
+class SupplierBalance(TenantModel):
+    """
+    Dette d'un fournisseur pour UNE devise.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ AVANT CE LOT, LA DETTE FOURNISSEUR NE S'INSCRIVAIT NULLE PART.          │
+    │                                                                          │
+    │ Trois endroits écrivaient `supplier.current_balance` à la main : le      │
+    │ règlement la DÉCRÉMENTAIT, son annulation la recréditait, et un retour   │
+    │ la décrémentait encore. Rien ne la CRÉDITAIT à la réception des          │
+    │ marchandises : payer un fournisseur rendait donc son solde négatif, pour │
+    │ toujours. C'est exactement le défaut que le côté client a déjà payé sur  │
+    │ le devis converti, « qui créait une facture due sans inscrire la dette,  │
+    │ alors que son règlement la décrémentait ».                               │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    En RDC un même fournisseur peut être facturé en CDF et en USD ; ces
+    montants ne s'additionnent pas. Chaque ligne suit une devise
+    indépendamment. Le champ scalaire `Supplier.current_balance` reste la somme
+    convertie en devise principale, pour le tri et les rapports.
+
+    Convention de signe, MIROIR de celle du client : positif = NOUS devons de
+    l'argent au fournisseur, négatif = nous avons payé d'avance (acompte non
+    encore consommé par une réception).
+
+    Écriture exclusivement via `apps.contacts.supplier_debt`.
+    """
+
+    supplier = models.ForeignKey(
+        Supplier,
+        on_delete=models.CASCADE,
+        related_name='balances'
+    )
+    currency = models.CharField(max_length=3)
+
+    amount = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        default=Decimal('0.00')
+    )
+
+    class Meta:
+        db_table = 'supplier_balances'
+        ordering = ['currency']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['supplier', 'currency'],
+                name='unique_supplier_balance_per_currency'
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['organization', 'currency']),
+        ]
+
+    def __str__(self):
+        return f"{self.supplier.name} - {self.amount} {self.currency}"
+
+
+class SupplierTransaction(TenantModel):
+    """
+    Grand livre d'un fournisseur : ce qui a bougé son solde, et pourquoi.
+
+    Un solde sans grand livre ne s'explique pas. C'est le même arbitrage que
+    pour `CustomerTransaction` : `balance_before` / `balance_after` sont ce qui
+    permet de rapprocher un solde d'une facture fournisseur posée sur le
+    comptoir.
+
+    ``amount``, ``balance_before`` et ``balance_after`` sont exprimés dans
+    ``currency`` (la devise du mouvement), et non en devise principale.
+    """
+
+    class TransactionType(models.TextChoices):
+        RECEIPT = 'receipt', 'Réception de marchandises'
+        PAYMENT = 'payment', 'Règlement au fournisseur'
+        RETURN = 'return', 'Retour au fournisseur'
+        ADJUSTMENT = 'adjustment', 'Ajustement'
+
+    supplier = models.ForeignKey(
+        Supplier,
+        on_delete=models.CASCADE,
+        related_name='transactions'
+    )
+
+    transaction_type = models.CharField(
+        max_length=20,
+        choices=TransactionType.choices
+    )
+
+    amount = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal('0.01'))]
+    )
+
+    # Devise du mouvement. Défaut VIDE, résolu dans `save()` vers la devise
+    # principale de l'organisation, comme Sale, Payment, Expense, CashMovement.
+    currency = models.CharField(max_length=3, blank=True, default='')
+    # Unités de devise principale pour 1 unité de `currency` (principale = 1).
+    exchange_rate = models.DecimalField(
+        max_digits=20,
+        decimal_places=12,
+        default=Decimal('1')
+    )
+
+    balance_before = models.DecimalField(max_digits=15, decimal_places=2)
+    balance_after = models.DecimalField(max_digits=15, decimal_places=2)
+
+    # Les trois pièces qui peuvent faire bouger un solde fournisseur. Elles
+    # sont nullables parce qu'un ajustement n'en porte aucune, et parce qu'un
+    # règlement sans allocation n'est rattaché à aucune commande.
+    purchase_order = models.ForeignKey(
+        'purchases.PurchaseOrder',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='supplier_transactions'
+    )
+    goods_receipt = models.ForeignKey(
+        'purchases.GoodsReceipt',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='supplier_transactions'
+    )
+    supplier_payment = models.ForeignKey(
+        'purchases.SupplierPayment',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='supplier_transactions'
+    )
+
+    reference = models.CharField(max_length=100, blank=True)
+    notes = models.TextField(blank=True)
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name='supplier_transactions'
+    )
+
+    class Meta:
+        db_table = 'supplier_transactions'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['supplier', 'transaction_type']),
+            models.Index(fields=['supplier', 'created_at']),
+        ]
+
+    def save(self, *args, **kwargs):
+        # Résolution centralisée : plusieurs chemins créent ces lignes
+        # (réception, règlement, retour), le modèle est le seul endroit sûr.
+        if self.organization_id:
+            from apps.settings.services import CurrencyService
+            self.currency, self.exchange_rate = CurrencyService.resolve(
+                self.organization, self.currency, self.exchange_rate,
+            )
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return (
+            f"{self.get_transaction_type_display()} - {self.amount} "
+            f"{self.currency} ({self.supplier.name})"
+        )
+
+
 class SupplierProduct(TenantModel):
     """
     Products supplied by specific suppliers.

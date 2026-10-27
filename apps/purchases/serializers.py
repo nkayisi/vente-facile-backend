@@ -18,6 +18,29 @@ logger = logging.getLogger(__name__)
 # PURCHASE ORDER ITEM SERIALIZERS
 # =============================================================================
 
+def _organisation(serializer):
+    """
+    L'organisation du contexte, résolue par la VUE et non par l'en-tête HTTP.
+
+    ⚠ Les trois serializers de création lisaient
+    `request.headers.get('X-Organization-ID')` puis faisaient un `get()` dessus.
+    Deux conséquences : un en-tête absent ou malformé rendait 500 au lieu de 400,
+    et aucun chemin qui ne soit pas une requête HTTP ne pouvait les emprunter -
+    ce qui ferme d'avance la porte au journal de synchronisation. C'est le
+    défaut qu'`_validate_product_prices` a déjà payé côté inventaire.
+
+    `TenantViewSetMixin.get_organization` mémoïse la résolution sur la requête
+    et rend 404 sur un en-tête sans appartenance : ne pas le court-circuiter,
+    sans quoi le filtre d'organisation de `get_queryset` sauterait.
+    """
+    vue = serializer.context.get('view')
+    if vue is not None and hasattr(vue, 'get_organization'):
+        return vue.get_organization()
+    raise serializers.ValidationError(
+        "Organisation introuvable dans le contexte de la requête."
+    )
+
+
 class PurchaseOrderItemSerializer(serializers.ModelSerializer):
     """Serializer pour les lignes de commande d'achat."""
     
@@ -207,12 +230,14 @@ class PurchaseOrderCreateSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         items_data = validated_data.pop('items')
         
-        from apps.core.utils import ReferenceGenerator
-        organization = self.context['request'].headers.get('X-Organization-ID')
-        from apps.organizations.models import Organization
-        org = Organization.objects.get(id=organization)
-        
-        validated_data['reference'] = ReferenceGenerator.generate_purchase_reference(org)
+        from apps.core.numbering import (
+            PREFIX_PURCHASE_ORDER, allocate_document_number,
+        )
+
+        org = _organisation(self)
+        validated_data['reference'] = allocate_document_number(
+            org, PREFIX_PURCHASE_ORDER,
+        )
         validated_data['organization'] = org
         validated_data['created_by'] = self.context['request'].user
         
@@ -391,6 +416,17 @@ class GoodsReceiptItemCreateSerializer(serializers.ModelSerializer):
 class GoodsReceiptListSerializer(serializers.ModelSerializer):
     """Serializer léger pour les listes de réceptions."""
     
+    # ⚠ LA DEVISE D'UNE PIÈCE D'ACHAT EST CELLE DE SA COMMANDE.
+    # Ni `GoodsReceipt` ni `PurchaseReturn` ne porte de devise à lui, et
+    # `expedier_retour` comme `enregistrer_reglement` résolvent la leur depuis
+    # `purchase_order.currency`. Sans ce champ, les écrans rendaient leurs
+    # montants sous le symbole de la devise PRINCIPALE : « 40 000 FC » sur un
+    # retour de 40 000 USD, dans la phrase même qui annonce un geste
+    # irréversible.
+    purchase_order_currency = serializers.CharField(
+        source='purchase_order.currency', read_only=True, default=''
+    )
+    
     purchase_order_reference = serializers.CharField(
         source='purchase_order.reference', read_only=True
     )
@@ -403,6 +439,7 @@ class GoodsReceiptListSerializer(serializers.ModelSerializer):
         model = GoodsReceipt
         fields = [
             'id', 'reference', 'purchase_order', 'purchase_order_reference',
+            'purchase_order_currency',
             'warehouse', 'warehouse_name',
             'status', 'status_display',
             'receipt_date', 'supplier_invoice', 'supplier_delivery_note',
@@ -418,6 +455,17 @@ class GoodsReceiptListSerializer(serializers.ModelSerializer):
 class GoodsReceiptDetailSerializer(serializers.ModelSerializer):
     """Serializer complet pour le détail d'une réception."""
     
+    # ⚠ LA DEVISE D'UNE PIÈCE D'ACHAT EST CELLE DE SA COMMANDE.
+    # Ni `GoodsReceipt` ni `PurchaseReturn` ne porte de devise à lui, et
+    # `expedier_retour` comme `enregistrer_reglement` résolvent la leur depuis
+    # `purchase_order.currency`. Sans ce champ, les écrans rendaient leurs
+    # montants sous le symbole de la devise PRINCIPALE : « 40 000 FC » sur un
+    # retour de 40 000 USD, dans la phrase même qui annonce un geste
+    # irréversible.
+    purchase_order_currency = serializers.CharField(
+        source='purchase_order.currency', read_only=True, default=''
+    )
+    
     purchase_order_reference = serializers.CharField(
         source='purchase_order.reference', read_only=True
     )
@@ -429,6 +477,7 @@ class GoodsReceiptDetailSerializer(serializers.ModelSerializer):
         model = GoodsReceipt
         fields = [
             'id', 'reference', 'purchase_order', 'purchase_order_reference',
+            'purchase_order_currency',
             'warehouse', 'warehouse_name',
             'status', 'receipt_date',
             'supplier_invoice', 'supplier_delivery_note',
@@ -459,53 +508,33 @@ class GoodsReceiptCreateSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         items_data = validated_data.pop('items')
         
-        organization = self.context['request'].headers.get('X-Organization-ID')
-        from apps.organizations.models import Organization
-        org = Organization.objects.get(id=organization)
-        
-        # Générer la référence
-        from django.utils import timezone
-        today = timezone.now()
-        prefix = f"GRN{today.strftime('%Y%m%d')}"
-        
-        last = GoodsReceipt.objects.filter(
-            organization=org,
-            reference__startswith=prefix
-        ).order_by('-reference').first()
-        
-        if last:
-            try:
-                num = int(last.reference.split('-')[-1]) + 1
-            except (ValueError, IndexError, AttributeError) as exc:
-                # Format de référence inattendu (ancienne convention, données
-                # migrées, ...). On loggue pour diagnostic et on repart à 1.
-                logger.warning(
-                    "Format de référence inattendu pour %s : %r (%s)",
-                    last.__class__.__name__, last.reference, exc,
-                )
-                num = 1
-        else:
-            num = 1
-        
-        validated_data['reference'] = f"{prefix}-{num:04d}"
+        from apps.core.numbering import (
+            PREFIX_GOODS_RECEIPT, allocate_document_number,
+        )
+
+        org = _organisation(self)
+        validated_data['reference'] = allocate_document_number(
+            org, PREFIX_GOODS_RECEIPT,
+        )
         validated_data['organization'] = org
         validated_data['received_by'] = self.context['request'].user
-        
+
         grn = GoodsReceipt.objects.create(**validated_data)
-        
+
         for item_data in items_data:
             GoodsReceiptItem.objects.create(
                 goods_receipt=grn,
                 organization=org,
                 **item_data
             )
-            
-            # Mettre à jour la quantité reçue sur la commande
-            po_item = item_data.get('purchase_order_item')
-            if po_item:
-                po_item.quantity_received += item_data['quantity_accepted']
-                po_item.save()
-        
+
+        # ⚠ `quantity_received` NE BOUGE PAS ICI, et c'est le correctif.
+        # L'incrémenter dès le brouillon faisait qu'une réception saisie puis
+        # oubliée gonflait `quantity_pending` pour toujours : la commande
+        # s'annonçait reçue alors que rien n'était entré en rayon. Le stock, le
+        # statut de la commande et la dette bougent tous à la VALIDATION
+        # (`services.completer_reception`) ; la quantité reçue n'avait aucune
+        # raison d'être seule à bouger avant.
         return grn
 
 
@@ -578,81 +607,89 @@ class SupplierPaymentCreateSerializer(serializers.ModelSerializer):
             'notes', 'allocations'
         ]
 
-    def create(self, validated_data):
-        allocations_data = validated_data.pop('allocations', [])
-        
-        organization = self.context['request'].headers.get('X-Organization-ID')
-        from apps.organizations.models import Organization
-        org = Organization.objects.get(id=organization)
-        
-        # Générer la référence
-        from django.utils import timezone
-        today = timezone.now()
-        prefix = f"PAY{today.strftime('%Y%m%d')}"
-        
-        last = SupplierPayment.objects.filter(
-            organization=org,
-            reference__startswith=prefix
-        ).order_by('-reference').first()
-        
-        if last:
-            try:
-                num = int(last.reference.split('-')[-1]) + 1
-            except (ValueError, IndexError, AttributeError) as exc:
-                # Format de référence inattendu (ancienne convention, données
-                # migrées, ...). On loggue pour diagnostic et on repart à 1.
-                logger.warning(
-                    "Format de référence inattendu pour %s : %r (%s)",
-                    last.__class__.__name__, last.reference, exc,
+    def validate(self, data):
+        """
+        Borne l'imputation : même établissement, même fournisseur, et pas plus
+        que ce qui est versé.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ `purchase_order` EST UN CHAMP DE RELATION NON BORNÉ.                │
+        │                                                                      │
+        │ `SupplierPaymentAllocationSerializer` l'expose par un               │
+        │ `ModelSerializer`, donc DRF le construit sur `PurchaseOrder.objects` │
+        │ ENTIER - aucun filtre d'organisation, aucun filtre de fournisseur.   │
+        │ `enregistrer_reglement` écrit ensuite `amount_paid` et `amount_due`  │
+        │ sur la commande désignée : une commande d'une AUTRE organisation     │
+        │ était donc modifiable depuis l'extérieur. C'est le défaut exact que  │
+        │ `create_requisition` vient de fermer sur son `product` nu.          │
+        └──────────────────────────────────────────────────────────────────────┘
+
+        ⚠ ET LA SOMME DES IMPUTATIONS NE DOIT PAS DÉPASSER LE VERSEMENT.
+        `settle_debt` ne réduit la dette que du montant réellement payé, tandis
+        que chaque `amount_paid` était crédité de ce que le client demandait :
+        la somme des commandes dues cessait de correspondre au solde qu'elle
+        résume, et c'est très exactement la divergence que l'imputation existe
+        pour empêcher.
+        """
+        allocations = data.get('allocations') or []
+        if not allocations:
+            return data
+
+        org = _organisation(self)
+        fournisseur = data.get('supplier')
+
+        for alloc in allocations:
+            po = alloc['purchase_order']
+            if po.organization_id != org.id or po.supplier_id != getattr(
+                fournisseur, 'id', None
+            ):
+                # ⚠ LE MESSAGE NE RÉPÈTE PAS LA RÉFÉRENCE : la renvoyer
+                # confirmerait au client qu'une commande d'autrui existe.
+                raise serializers.ValidationError({
+                    'allocations': (
+                        "Une commande imputée n'appartient pas à ce fournisseur."
+                    )
+                })
+
+        total = sum(
+            (Decimal(alloc['amount']) for alloc in allocations), Decimal('0.00')
+        )
+        if total > Decimal(data['amount']):
+            raise serializers.ValidationError({
+                'allocations': (
+                    f"L'imputation totale ({total}) dépasse le montant versé "
+                    f"({data['amount']})."
                 )
-                num = 1
-        else:
-            num = 1
-        
-        validated_data['reference'] = f"{prefix}-{num:04d}"
-        validated_data['organization'] = org
-        validated_data['created_by'] = self.context['request'].user
-        validated_data['status'] = 'completed'
-        
-        payment = SupplierPayment.objects.create(**validated_data)
-        
-        for alloc_data in allocations_data:
-            SupplierPaymentAllocation.objects.create(
-                payment=payment,
-                organization=org,
-                **alloc_data
-            )
-            
-            # Mettre à jour le montant payé sur la commande
-            po = alloc_data['purchase_order']
-            po.amount_paid += alloc_data['amount']
-            po.amount_due = po.total - po.amount_paid
-            po.save()
-        
-        # Mettre à jour le solde fournisseur
-        supplier = payment.supplier
-        supplier.current_balance -= payment.amount
-        supplier.save()
-        
-        # Enregistrer le mouvement de caisse
-        from apps.cashbook.services import record_purchase_payment
-        # Lier au premier PO alloué s'il existe
-        first_po = allocations_data[0]['purchase_order'] if allocations_data else None
-        record_purchase_payment(
-            organization=org,
-            purchase_order=first_po,
-            amount=payment.amount,
-            supplier=supplier,
-            # La sortie de caisse est dans la devise réellement décaissée.
-            # `SupplierPayment.save()` l'a résolue vers une devise activée de
-            # l'organisation, elle est donc fiable (auparavant le champ portait
-            # un défaut 'USD' sans rapport, qu'on ne pouvait pas suivre).
-            currency=payment.currency,
-            exchange_rate=payment.exchange_rate,
+            })
+
+        return data
+
+    def create(self, validated_data):
+        """Délègue à `services.enregistrer_reglement`.
+
+        Ce corps faisait tout lui-même, et portait quatre défauts : organisation
+        lue dans l'en-tête HTTP, référence triée alphabétiquement et datée en
+        UTC, écriture inline de `supplier.current_balance` (sans devise, sans
+        grand livre), et aucune imputation quand aucune allocation n'était
+        fournie - le solde baissait pendant que chaque `amount_due` restait
+        intact.
+        """
+        from .services import enregistrer_reglement
+
+        allocations_data = validated_data.pop('allocations', [])
+        return enregistrer_reglement(
+            _organisation(self),
+            validated_data['supplier'],
+            validated_data['amount'],
+            payment_date=validated_data['payment_date'],
+            currency=validated_data.get('currency'),
+            exchange_rate=validated_data.get('exchange_rate'),
+            payment_method=validated_data.get('payment_method'),
+            payment_reference=validated_data.get('payment_reference', ''),
+            notes=validated_data.get('notes', ''),
+            allocations=allocations_data,
             user=self.context['request'].user,
         )
-        
-        return payment
 
 
 # =============================================================================
@@ -677,6 +714,17 @@ class PurchaseReturnItemSerializer(serializers.ModelSerializer):
 class PurchaseReturnListSerializer(serializers.ModelSerializer):
     """Serializer léger pour les listes de retours fournisseur."""
     
+    # ⚠ LA DEVISE D'UNE PIÈCE D'ACHAT EST CELLE DE SA COMMANDE.
+    # Ni `GoodsReceipt` ni `PurchaseReturn` ne porte de devise à lui, et
+    # `expedier_retour` comme `enregistrer_reglement` résolvent la leur depuis
+    # `purchase_order.currency`. Sans ce champ, les écrans rendaient leurs
+    # montants sous le symbole de la devise PRINCIPALE : « 40 000 FC » sur un
+    # retour de 40 000 USD, dans la phrase même qui annonce un geste
+    # irréversible.
+    purchase_order_currency = serializers.CharField(
+        source='purchase_order.currency', read_only=True, default=''
+    )
+    
     supplier_name = serializers.CharField(source='supplier.name', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     items_count = serializers.SerializerMethodField()
@@ -685,7 +733,8 @@ class PurchaseReturnListSerializer(serializers.ModelSerializer):
         model = PurchaseReturn
         fields = [
             'id', 'reference', 'supplier', 'supplier_name',
-            'purchase_order', 'status', 'status_display',
+            'purchase_order', 'purchase_order_currency',
+            'status', 'status_display',
             'total_amount', 'return_date',
             'items_count', 'created_at'
         ]
@@ -698,6 +747,17 @@ class PurchaseReturnListSerializer(serializers.ModelSerializer):
 class PurchaseReturnDetailSerializer(serializers.ModelSerializer):
     """Serializer complet pour le détail d'un retour fournisseur."""
     
+    # ⚠ LA DEVISE D'UNE PIÈCE D'ACHAT EST CELLE DE SA COMMANDE.
+    # Ni `GoodsReceipt` ni `PurchaseReturn` ne porte de devise à lui, et
+    # `expedier_retour` comme `enregistrer_reglement` résolvent la leur depuis
+    # `purchase_order.currency`. Sans ce champ, les écrans rendaient leurs
+    # montants sous le symbole de la devise PRINCIPALE : « 40 000 FC » sur un
+    # retour de 40 000 USD, dans la phrase même qui annonce un geste
+    # irréversible.
+    purchase_order_currency = serializers.CharField(
+        source='purchase_order.currency', read_only=True, default=''
+    )
+    
     supplier_name = serializers.CharField(source='supplier.name', read_only=True)
     warehouse_name = serializers.CharField(source='warehouse.name', read_only=True)
     created_by_name = serializers.CharField(source='created_by.full_name', read_only=True)
@@ -707,7 +767,8 @@ class PurchaseReturnDetailSerializer(serializers.ModelSerializer):
         model = PurchaseReturn
         fields = [
             'id', 'reference', 'supplier', 'supplier_name',
-            'purchase_order', 'warehouse', 'warehouse_name',
+            'purchase_order', 'purchase_order_currency',
+            'warehouse', 'warehouse_name',
             'status', 'total_amount', 'reason', 'return_date',
             'created_by', 'created_by_name',
             'items', 'created_at', 'updated_at'
@@ -732,38 +793,95 @@ class PurchaseReturnCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Au moins un article est requis.")
         return value
 
+    def validate(self, data):
+        """
+        Borne chaque ligne par ce qui RESTE à rendre sur la commande.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ ON POUVAIT RENDRE DEUX FOIS LA MÊME MARCHANDISE.                    │
+        │                                                                      │
+        │ Rien ne comparait la quantité rendue à ce qui avait été reçu, ni à   │
+        │ ce qui avait déjà été rendu. Deux retours identiques sortaient donc  │
+        │ deux fois la marchandise du stock et éteignaient deux fois la dette. │
+        │ C'est le défaut exact corrigé côté VENTES le 2 octobre, resté ouvert │
+        │ ici.                                                                 │
+        └──────────────────────────────────────────────────────────────────────┘
+
+        ⚠ Un retour SANS commande d'origine n'est pas borné, et c'est une
+        limite assumée : on ne sait alors ni de quelle livraison la
+        marchandise vient, ni ce qui a déjà été rendu dessus. Le stock, lui,
+        reste opposé à l'approbation. Le back-office crée toujours un retour
+        depuis sa commande.
+
+        ⚠ Le message porte les TROIS nombres. Un refus qui dirait seulement
+        « quantité trop élevée » laisserait le magasinier devant son carton
+        sans savoir quoi saisir.
+        """
+        from django.db.models import Sum
+
+        po = data.get('purchase_order')
+        if not po:
+            return data
+
+        recues = {
+            ligne['product_id']: ligne['total'] or Decimal('0.000')
+            for ligne in GoodsReceiptItem.objects.filter(
+                goods_receipt__purchase_order=po,
+                goods_receipt__status=GoodsReceipt.Status.COMPLETED,
+                goods_receipt__is_deleted=False,
+            ).values('product_id').annotate(total=Sum('quantity_accepted'))
+        }
+        # ⚠ Un retour REJETÉ ou ANNULÉ ne consomme rien : la marchandise n'est
+        # jamais repartie. Un BROUILLON, si - il est approuvable, et deux
+        # brouillons sur les mêmes unités seraient tous deux approuvables.
+        # Même raisonnement que le retour de vente.
+        rendues = {
+            ligne['product_id']: ligne['total'] or Decimal('0.000')
+            for ligne in PurchaseReturnItem.objects.filter(
+                purchase_return__purchase_order=po,
+                purchase_return__is_deleted=False,
+            ).exclude(
+                purchase_return__status=PurchaseReturn.Status.CANCELLED
+            ).values('product_id').annotate(total=Sum('quantity'))
+        }
+
+        demandees = {}
+        for item in data.get('items', []):
+            produit = item['product']
+            demandees[produit.id] = (
+                demandees.get(produit.id, Decimal('0.000')) + item['quantity']
+            )
+
+        erreurs = []
+        for produit_id, demandee in demandees.items():
+            recue = recues.get(produit_id, Decimal('0.000'))
+            rendue = rendues.get(produit_id, Decimal('0.000'))
+            reste = recue - rendue
+            if demandee > reste:
+                nom = next(
+                    i['product'].name for i in data['items']
+                    if i['product'].id == produit_id
+                )
+                erreurs.append(
+                    f"{nom} : {rendue} déjà rendu sur {recue} reçu, "
+                    f"il en reste {reste} à rendre (demandé : {demandee})."
+                )
+        if erreurs:
+            raise serializers.ValidationError({'items': erreurs})
+
+        return data
+
     def create(self, validated_data):
         items_data = validated_data.pop('items')
-        
-        organization = self.context['request'].headers.get('X-Organization-ID')
-        from apps.organizations.models import Organization
-        org = Organization.objects.get(id=organization)
-        
-        # Générer la référence
-        from django.utils import timezone
-        today = timezone.now()
-        prefix = f"PRET{today.strftime('%Y%m%d')}"
-        
-        last = PurchaseReturn.objects.filter(
-            organization=org,
-            reference__startswith=prefix
-        ).order_by('-reference').first()
-        
-        if last:
-            try:
-                num = int(last.reference.split('-')[-1]) + 1
-            except (ValueError, IndexError, AttributeError) as exc:
-                # Format de référence inattendu (ancienne convention, données
-                # migrées, ...). On loggue pour diagnostic et on repart à 1.
-                logger.warning(
-                    "Format de référence inattendu pour %s : %r (%s)",
-                    last.__class__.__name__, last.reference, exc,
-                )
-                num = 1
-        else:
-            num = 1
-        
-        validated_data['reference'] = f"{prefix}-{num:04d}"
+
+        from apps.core.numbering import (
+            PREFIX_PURCHASE_RETURN, allocate_document_number,
+        )
+
+        org = _organisation(self)
+        validated_data['reference'] = allocate_document_number(
+            org, PREFIX_PURCHASE_RETURN,
+        )
         validated_data['organization'] = org
         validated_data['created_by'] = self.context['request'].user
         

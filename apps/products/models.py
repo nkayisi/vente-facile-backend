@@ -334,10 +334,42 @@ class Product(TenantSyncableModel):
         default=False,
         help_text="Indique si ce produit est périssable et nécessite un suivi des dates d'expiration"
     )
-    min_stock_level = models.PositiveIntegerField(default=0)
-    max_stock_level = models.PositiveIntegerField(null=True, blank=True)
-    reorder_point = models.PositiveIntegerField(default=0)
-    reorder_quantity = models.PositiveIntegerField(default=0)
+    # ┌──────────────────────────────────────────────────────────────────────┐
+    # │ UN SEUIL DE STOCK EST UNE QUANTITÉ, DONC IL EST DÉCIMAL.             │
+    # │                                                                      │
+    # │ Ces quatre colonnes étaient des `PositiveIntegerField`, comparés en  │
+    # │ SQL à `Stock.quantity` qui porte trois décimales, à une dizaine       │
+    # │ d'endroits (filtres de stock, alertes Celery, rapports, réquisitions).│
+    # │ Un marchand qui vend sa farine au demi-kilo ne pouvait pas demander   │
+    # │ d'alerte à 2,5 kg : le serveur répondait 400 « A valid integer is     │
+    # │ required ».                                                           │
+    # │                                                                      │
+    # │ L'incohérence était DÉJÀ en base, à deux endroits : l'instantané du   │
+    # │ seuil d'une réquisition (`reorder_point_at_request`) est décimal      │
+    # │ depuis son écriture, et `reports/serializers.py` annonçait            │
+    # │ `min_stock_level` en `DecimalField` pour un champ qui ne pouvait      │
+    # │ porter aucune décimale. Le contrat promettait ce que le schéma        │
+    # │ interdisait.                                                          │
+    # │                                                                      │
+    # │ ⚠ LE PLANCHER EST ZÉRO, pas `MIN_QUANTITY` : un seuil de zéro veut   │
+    # │ dire « pas d'alerte », et c'est le défaut de la colonne.             │
+    # └──────────────────────────────────────────────────────────────────────┘
+    min_stock_level = models.DecimalField(
+        max_digits=15, decimal_places=3, default=Decimal('0.000'),
+        validators=[MinValueValidator(Decimal('0'))],
+    )
+    max_stock_level = models.DecimalField(
+        max_digits=15, decimal_places=3, null=True, blank=True,
+        validators=[MinValueValidator(Decimal('0'))],
+    )
+    reorder_point = models.DecimalField(
+        max_digits=15, decimal_places=3, default=Decimal('0.000'),
+        validators=[MinValueValidator(Decimal('0'))],
+    )
+    reorder_quantity = models.DecimalField(
+        max_digits=15, decimal_places=3, default=Decimal('0.000'),
+        validators=[MinValueValidator(Decimal('0'))],
+    )
     
     weight = models.DecimalField(
         max_digits=10,
@@ -568,7 +600,20 @@ class ProductPrice(TenantModel):
     )
     
     price = models.DecimalField(max_digits=15, decimal_places=2)
-    min_quantity = models.PositiveIntegerField(default=1)
+    # Le palier d'une grille tarifaire : « ce prix s'applique à partir de N ».
+    #
+    # ⚠ LE DÉFAUT PASSE DE 1 À 0,001, et c'est une décision métier : un tarif
+    # s'applique désormais dès la plus petite quantité vendable, là où le
+    # défaut à 1 obligeait à décider. Toutes les lignes en base valaient 1 au
+    # moment de la migration, donc le choix n'affecte que les paliers créés
+    # après - et il n'en change aucun existant.
+    #
+    # Il entre dans `unique_together` : Django reconstruit l'index unique, sans
+    # collision nouvelle (1 et 1.000 sont la même valeur numérique).
+    min_quantity = models.DecimalField(
+        max_digits=15, decimal_places=3, default=Decimal('0.001'),
+        validators=[MinValueValidator(Decimal('0.001'))],
+    )
 
     class Meta:
         db_table = 'product_prices'

@@ -3,6 +3,7 @@ Serializers DRF pour l'app Organizations.
 """
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
+from apps.settings.currency_validation import valider_code_devise
 from .models import Organization, OrganizationMembership, Branch, OrganizationInvitation
 
 
@@ -40,15 +41,16 @@ def _get_default_currency_info(organization):
             'decimal_places': primary.currency.decimal_places,
         }
     except OrganizationCurrency.DoesNotExist:
-        # Fallback: utiliser le champ currency de l'organisation
-        code = organization.currency or 'CDF'
-        defaults = {
-            'CDF': {'name': 'Franc Congolais', 'symbol': 'FC', 'decimal_places': 0},
-            'USD': {'name': 'Dollar Américain', 'symbol': '$', 'decimal_places': 2},
-            'EUR': {'name': 'Euro', 'symbol': '€', 'decimal_places': 2},
-        }
-        info = defaults.get(code, {'name': code, 'symbol': code, 'decimal_places': 2})
-        return {'code': code, **info}
+        # Pas de ligne principale : on interroge la table avant d'abandonner.
+        #
+        # ⚠ Ce repli portait la même liste `{CDF, USD, EUR}` que
+        # `CurrencyService.get_display_info`, mot pour mot, et avec le même
+        # défaut : pour toute autre devise il rendait `symbol=code` et
+        # `decimal_places=2`, donc un XAF s'affichait à deux décimales. Le client
+        # tire ses décimales de ce champ : la faute se voyait au comptoir.
+        from apps.settings.services import CurrencyService
+
+        return CurrencyService.infos_par_code(organization.currency)
 
 
 # =============================================================================
@@ -156,6 +158,18 @@ class OrganizationCreateSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id']
 
+    def validate_currency(self, value):
+        """Même règle qu'à l'inscription : la table `Currency` fait autorité.
+
+        ⚠ `POST /organizations/` est une SECONDE PORTE du même acte, et elle
+        appelle le même service. C'est aussi la seule qui pouvait encore
+        atteindre le repli de `OrganizationService.create_organization`, lequel
+        FABRIQUAIT une devise au symbole et aux décimales faux pour un code
+        inconnu. La laisser libre gardait vivante, sur la porte voisine, la
+        classe de défaut que l'inscription vient de fermer.
+        """
+        return valider_code_devise(value)
+
 
 class OrganizationUpdateSerializer(serializers.ModelSerializer):
     """Serializer pour la mise à jour d'organisation."""
@@ -168,6 +182,24 @@ class OrganizationUpdateSerializer(serializers.ModelSerializer):
             'tax_id', 'rccm', 'id_nat',
             'currency', 'timezone', 'settings'
         ]
+
+    def validate_currency(self, value):
+        """Empêche une faute de frappe à trois lettres d'entrer en base.
+
+        ⚠ RELEVÉ, NON TRAITÉ : basculer la devise par `PATCH` est déjà cassé pour
+        une AUTRE raison. Cela écrit `Organization.currency`, que lit
+        `CurrencyService.primary_code`, sans toucher la ligne
+        `OrganizationCurrency` `is_primary`, que lisent `get_primary_currency` et
+        `get_display_info` : les deux autorités divergent alors, les ventes
+        nouvelles prennent le nouveau code au taux 1 pendant que l'affichage et
+        les décimales restent sur l'ancienne principale. Les deux clients
+        promettent d'ailleurs l'inverse - le web exclut `currency` de
+        `updateOrganizationSchema`, et l'écran d'inscription écrit « ne pourra
+        plus être modifiée après la création ». Le geste juste serait de passer ce
+        champ en lecture seule ici ; cela RETIRE une capacité, donc c'est un
+        arbitrage à part.
+        """
+        return valider_code_devise(value)
 
 
 # =============================================================================

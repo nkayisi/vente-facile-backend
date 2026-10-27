@@ -258,6 +258,74 @@ class PriceValidationTests(_ImportSetup):
         self.assertEqual(product.tax_rate, Decimal('16'))
 
 
+class SeuilDeStockTests(_ImportSetup):
+    """
+    Le seuil de stock d'un fichier Excel.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ 0,5 ÉTAIT ÉCRASÉ EN 0, SANS UN MOT.                                      │
+    │                                                                          │
+    │ `parse_int` fait `int(float("0.5"))`, donc ZÉRO. Un marchand qui         │
+    │ importait son catalogue avec « Stock minimum : 0,5 » croyait avoir réglé  │
+    │ une alerte qui ne se déclencherait JAMAIS, et aucune ligne du rapport     │
+    │ d'import ne le signalait. C'est le pire des trois symptômes de ce lot,    │
+    │ parce qu'il ne laisse aucune trace.                                      │
+    │                                                                          │
+    │ La colonne est désormais un `DecimalField(15, 3)` : la décimale est       │
+    │ ACCEPTÉE. Ce qui reste refusé, c'est l'illisible et le négatif, parce     │
+    │ que `parse_decimal` les ramènerait tous deux à zéro en silence - et un    │
+    │ zéro veut dire « pas d'alerte », donc la perte serait muette.             │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
+    def _ligne(self, seuil):
+        return self._row(
+            name='Farine', sku='FAR-01', unit='kg', selling_price=1500,
+            min_stock_level=seuil,
+        )
+
+    def test_un_seuil_decimal_est_enregistre_tel_quel(self):
+        # Le défaut d'origine, pris par l'autre bout : `int(float("0.5"))`
+        # écrivait ZÉRO, et le marchand n'en savait rien.
+        result = self._import([self._ligne('0,5')])
+
+        self.assertEqual(result["created"], 1, self._errors(result))
+        self.assertEqual(
+            Product.objects.get(sku='FAR-01').min_stock_level, Decimal('0.500')
+        )
+
+    def test_un_seuil_entier_passe_inchange(self):
+        # Le contrôle : la correction ne doit rien changer au cas ordinaire.
+        result = self._import([self._ligne(5)])
+
+        self.assertEqual(result["created"], 1, self._errors(result))
+        self.assertEqual(
+            Product.objects.get(sku='FAR-01').min_stock_level, Decimal('5.000')
+        )
+
+    def test_un_seuil_vide_vaut_zero_et_ne_refuse_rien(self):
+        result = self._import([self._ligne(None)])
+
+        self.assertEqual(result["created"], 1, self._errors(result))
+        self.assertEqual(
+            Product.objects.get(sku='FAR-01').min_stock_level, Decimal('0.000')
+        )
+
+    def test_un_seuil_illisible_est_refuse_en_le_nommant(self):
+        # `parse_decimal` retomberait sur zéro, donc sur « pas d'alerte », sans
+        # un mot : c'est la perte silencieuse qu'on refuse, pas la décimale.
+        result = self._import([self._ligne('beaucoup')])
+
+        self.assertEqual(result["created"], 0)
+        self.assertIn("Stock minimum", " ".join(self._errors(result)))
+
+    def test_un_seuil_negatif_est_refuse_en_le_nommant(self):
+        result = self._import([self._ligne('-3')])
+
+        self.assertEqual(result["created"], 0)
+        self.assertIn("négatif", " ".join(self._errors(result)))
+
+
 class ImportGuardTests(_ImportSetup):
     """Comportements existants, verrouillés maintenant qu'on touche au fichier."""
 

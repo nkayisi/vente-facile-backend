@@ -14,6 +14,8 @@ Ce qui garantit qu'un membre borné a toujours au moins un entrepôt.
 │ et le signal l'appellent tous deux.                                          │
 └──────────────────────────────────────────────────────────────────────────────┘
 """
+from decimal import Decimal
+
 from django.db import transaction
 
 from apps.inventory.models import Warehouse
@@ -142,6 +144,12 @@ EFFACES_PAR_LA_REMISE_A_ZERO = [
     # --- La dette et la fidélité des clients. Les CLIENTS restent.
     ('contacts', 'CustomerTransaction'),
     ('contacts', 'CustomerBalance'),
+
+    # --- La dette des fournisseurs. Les FOURNISSEURS restent, comme les
+    # clients : un marchand qui remet son essai à zéro ne resaisit pas son
+    # carnet d'adresses. Le grand livre AVANT les soldes, il les référence.
+    ('contacts', 'SupplierTransaction'),
+    ('contacts', 'SupplierBalance'),
     ('settings', 'LoyaltyTransaction'),
     ('settings', 'CustomerLoyalty'),
 
@@ -262,6 +270,33 @@ def reset_trial_data(organization, *, confirmation: str, dry_run: bool = False) 
             comptes[f'{app_label}.{nom}'] = n
             if not dry_run:
                 qs.delete()
+
+    if not dry_run:
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ LE SCALAIRE DE SOLDE SE REMET À ZÉRO AVEC SON GRAND LIVRE.      │
+        # │                                                                  │
+        # │ `CustomerBalance` et `SupplierBalance` sont effacés ci-dessus,   │
+        # │ mais `current_balance` vit sur le CONTACT, que la remise à zéro  │
+        # │ garde délibérément. Sans cette ligne, la fiche d'un fournisseur  │
+        # │ continuait d'annoncer une dette que plus aucune écriture         │
+        # │ n'explique, et son grand livre s'ouvrait vide : le pire des deux │
+        # │ états, puisque le chiffre a l'air juste.                          │
+        # │                                                                  │
+        # │ ⚠ `bulk_update_rows` et surtout pas `update()` nu : ces deux     │
+        # │ modèles descendent au tirage, et une écriture en masse qui ne    │
+        # │ touche pas `updated_at` est invisible aux terminaux, pour        │
+        # │ toujours. Le garde-fou AST du dépôt le refuse d'ailleurs.        │
+        # └──────────────────────────────────────────────────────────────────┘
+        from apps.core.bulk import bulk_update_rows
+        from apps.contacts.models import Customer, Supplier
+
+        for modele in (Customer, Supplier):
+            bulk_update_rows(
+                modele.objects.with_deleted().filter(
+                    organization=organization,
+                ).exclude(current_balance=Decimal('0.00')),
+                current_balance=Decimal('0.00'),
+            )
 
     if dry_run:
         # ⚠ On annule ce que la transaction aurait pu écrire : `count()` n'écrit

@@ -56,7 +56,16 @@ class SalesStatsSerializer(serializers.Serializer):
     total_sales = serializers.DecimalField(max_digits=15, decimal_places=2)
     total_orders = serializers.IntegerField()
     average_order_value = serializers.DecimalField(max_digits=15, decimal_places=2)
-    total_items_sold = serializers.IntegerField()
+    # ⚠ `IntegerField` TRONQUAIT, et c'est le TROISIÈME champ de la série.
+    # La source est un `Coalesce(Sum('quantity'), ..., output_field=DecimalField())`
+    # à trois décimales : une journée à 0,5 kg de farine vendu s'affichait donc
+    # « 0 article vendu ». Ses deux voisins `TopProductSerializer.quantity_sold`
+    # et `SalesByCategorySerializer.quantity_sold` ont été corrigés et portent
+    # le commentaire qui nomme le défaut ; celui-là a été oublié.
+    #
+    # L'asymétrie était prouvée : le même chiffre exporté passe par
+    # `format_quantity()` et garde, lui, ses décimales.
+    total_items_sold = serializers.DecimalField(max_digits=15, decimal_places=3)
     completed_sales = serializers.IntegerField()
     pending_sales = serializers.IntegerField()
     cancelled_sales = serializers.IntegerField()

@@ -274,8 +274,49 @@ class SupplierProductSerializer(serializers.ModelSerializer):
 # SUPPLIER SERIALIZERS
 # =============================================================================
 
+def _soldes_du_fournisseur(fournisseur):
+    """Les soldes NON NULS d'un fournisseur, par devise.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ UNE FONCTION, ET SURTOUT PAS UN MIXIN.                                   │
+    │                                                                          │
+    │ La première écriture posait `balances = SerializerMethodField()` dans un │
+    │ mixin PLAT. La métaclasse de DRF ne récolte les champs déclarés que dans │
+    │ le namespace de la classe elle-même et dans les `_declared_fields` de    │
+    │ bases qui sont DÉJÀ des serializers : le champ n'était donc pas déclaré, │
+    │ `ModelSerializer` fabriquait une relation inverse par défaut, et l'API   │
+    │ rendait `['aea3833c-...']` - une liste d'IDENTIFIANTS de lignes de solde │
+    │ au lieu des montants. `get_balances` n'était jamais appelé.              │
+    │                                                                          │
+    │ Faire hériter le mixin de `Serializer` ne marche pas non plus :          │
+    │ `ModelSerializer` en descend déjà, et l'ordre de résolution serait       │
+    │ contradictoire. On déclare donc le champ dans CHAQUE serializer, et le   │
+    │ corps vit ici - c'est ce que fait déjà le côté client.                    │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ⚠ `fournisseur.balances.all()` ET SURTOUT PAS `balances_by_currency()` :
+    ce helper émet un `filter()`, ce qui COURT-CIRCUITE le cache de prefetch.
+    La liste des fournisseurs aurait payé une requête par ligne, et le
+    préchargement aurait été payé puis jeté - le défaut exact mesuré sur
+    `assigned_warehouses` en août.
+    """
+    return [
+        {'currency': row.currency, 'amount': str(row.amount)}
+        for row in sorted(fournisseur.balances.all(), key=lambda r: r.currency)
+        if row.amount != 0
+    ]
+
+
 class SupplierListSerializer(serializers.ModelSerializer):
     """Serializer léger pour les listes de fournisseurs."""
+
+    # ⚠ Exposé sur la LISTE **et** sur le DÉTAIL : un scalaire converti ne
+    # se lit dans aucune monnaie, et trier des fournisseurs sur un chiffre
+    # qui n'existe nulle part est ce que le côté client a déjà corrigé.
+    balances = serializers.SerializerMethodField()
+
+    def get_balances(self, obj):
+        return _soldes_du_fournisseur(obj)
     
     class Meta:
         model = Supplier
@@ -283,7 +324,7 @@ class SupplierListSerializer(serializers.ModelSerializer):
             'id', 'code', 'name', 'company_name',
             'contact_person', 'email', 'phone',
             'website', 'address', 'tax_id',
-            'currency', 'current_balance',
+            'currency', 'current_balance', 'balances',
             'bank_name', 'bank_account',
             'is_active'
         ]
@@ -297,6 +338,10 @@ class SupplierDetailSerializer(serializers.ModelSerializer):
     products = SupplierProductSerializer(many=True, read_only=True)
     total_purchases = serializers.SerializerMethodField()
     recent_orders = serializers.SerializerMethodField()
+    balances = serializers.SerializerMethodField()
+
+    def get_balances(self, obj):
+        return _soldes_du_fournisseur(obj)
     
     class Meta:
         model = Supplier
@@ -304,7 +349,7 @@ class SupplierDetailSerializer(serializers.ModelSerializer):
             'id', 'code', 'name', 'company_name',
             'contact_person', 'email', 'phone', 'website',
             'address', 'tax_id',
-            'currency', 'current_balance',
+            'currency', 'current_balance', 'balances',
             'bank_name', 'bank_account',
             'is_active',
             'created_by', 'created_by_name',

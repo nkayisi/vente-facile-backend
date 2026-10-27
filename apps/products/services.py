@@ -1054,6 +1054,40 @@ class ProductExcelService:
                 return int(float(str(value).strip()))
             except (ValueError, TypeError):
                 return default
+
+        def parse_seuil(value, label):
+            """
+            Seuil de stock : décimal, et un refus NOMMÉ plutôt qu'une troncature.
+
+            ┌──────────────────────────────────────────────────────────────────┐
+            │ `parse_int` ÉCRASAIT 0,5 EN 0, SANS UN MOT.                      │
+            │                                                                  │
+            │ `int(float("0.5"))` vaut 0 : un marchand qui importait son        │
+            │ catalogue avec « Stock minimum : 0,5 » croyait avoir réglé une    │
+            │ alerte qui ne se déclencherait JAMAIS, et aucune ligne du rapport │
+            │ d'import ne le signalait. Une donnée perdue en silence est pire   │
+            │ qu'un refus : c'est la leçon que `parse_price` porte déjà juste   │
+            │ au-dessus.                                                       │
+            │                                                                  │
+            │ La colonne est désormais un `DecimalField(15, 3)` : la décimale   │
+            │ est ACCEPTÉE. Ce qui reste refusé, c'est l'illisible et le        │
+            │ négatif, parce que `parse_decimal` les ramènerait tous deux à     │
+            │ zéro en silence - et un zéro veut dire « pas d'alerte ».          │
+            └──────────────────────────────────────────────────────────────────┘
+            """
+            if value is None or str(value).strip() == "":
+                return Decimal("0.000")
+            text = str(value).replace(",", ".").strip()
+            try:
+                nombre = Decimal(text)
+            except (InvalidOperation, ValueError):
+                raise ProductRowError(
+                    f"{label} illisible : « {value} ». Saisissez un nombre, "
+                    f"sans unité ni espace."
+                )
+            if nombre < 0:
+                raise ProductRowError(f"{label} ne peut pas être négatif : « {value} ».")
+            return nombre.quantize(Decimal("0.001"))
         
         category_input = cls._clean_text(row_data.get("category"))
         subcategory_input = cls._clean_text(row_data.get("subcategory"))
@@ -1173,7 +1207,7 @@ class ProductExcelService:
             "is_taxable": parse_bool(row_data.get("is_taxable"), True),
             "track_inventory": parse_bool(row_data.get("track_inventory"), True),
             "has_expiry_date": parse_bool(row_data.get("has_expiry_date"), False),
-            "min_stock_level": parse_int(row_data.get("min_stock_level")),
+            "min_stock_level": parse_seuil(row_data.get("min_stock_level"), "Stock minimum"),
             "short_description": str(row_data.get("short_description") or "").strip(),
             "is_active": True,
         }

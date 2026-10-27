@@ -3,6 +3,7 @@ Serializers DRF pour l'app Users.
 """
 from rest_framework import serializers
 from django.contrib.auth.password_validation import validate_password
+from apps.settings.currency_validation import valider_code_devise
 from .models import User, UserActivity
 
 
@@ -127,11 +128,19 @@ class RegisterWithOrganizationSerializer(serializers.Serializer):
         ],
         default='boutique'
     )
-    currency = serializers.ChoiceField(
-        choices=[('CDF', 'Franc Congolais'), ('USD', 'Dollar US')],
-        default='CDF'
-    )
+    currency = serializers.CharField(max_length=3, default='CDF')
     country = serializers.CharField(max_length=100, default='RDC')
+
+    def validate_currency(self, value):
+        """Toute devise active de la plateforme, pas seulement CDF et USD.
+
+        ⚠ Ce champ portait un `ChoiceField(choices=[CDF, USD])` pendant que le
+        sélecteur des deux clients en offrait vingt et une : un marchand de Douala
+        qui choisissait le franc CFA lisait « « XAF » n'est pas un choix valide »
+        et ne pouvait pas s'inscrire. La liste vit désormais dans la table
+        `Currency`, seule autorité du serveur en la matière.
+        """
+        return valider_code_devise(value)
 
     def validate_email(self, value):
         if User.objects.filter(email=value).exists():
