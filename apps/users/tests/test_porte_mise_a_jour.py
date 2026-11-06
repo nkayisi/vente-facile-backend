@@ -29,7 +29,7 @@ from apps.sales.tests._helpers import make_org_with_users
 from apps.subscriptions.models import GlobalConfig
 from apps.users.devices import app_update_payload, build_session_payload, enroll_device
 
-FICHE_PLAY = 'https://play.google.com/store/apps/details?id=com.cdir.ventefacile'
+FICHE_PLAY = 'https://play.google.com/store/apps/details?id=com.smizone.app'
 FICHE_IOS = 'https://apps.apple.com/app/id123456789'
 
 
@@ -276,7 +276,7 @@ class UrlsMagasinTests(TestCase):
     def test_une_fiche_play_donne_le_raccourci_PUIS_le_repli(self):
         self.assertEqual(
             urls_magasin('android', FICHE_PLAY),
-            ['market://details?id=com.cdir.ventefacile', FICHE_PLAY],
+            ['market://details?id=com.smizone.app', FICHE_PLAY],
         )
 
     def test_une_adresse_de_revendeur_est_servie_telle_quelle(self):

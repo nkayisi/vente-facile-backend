@@ -93,7 +93,7 @@ def urls_magasin(plateforme, url):
     │                                                                          │
     │ Un client qui fabriquerait `market://details?id=` depuis son propre nom  │
     │ de paquet enverrait les APK de préproduction vers une fiche              │
-    │ `com.cdir.ventefacile.preview` qui n'existe pas. Et certains terminaux   │
+    │ `com.smizone.app.preview` qui n'existe pas. Et certains terminaux        │
     │ de comptoir n'ont aucun magasin : leur adresse est celle d'un revendeur  │
     │ ou d'un APK direct, et doit pouvoir changer sans publier de version.     │
     └──────────────────────────────────────────────────────────────────────────┘
