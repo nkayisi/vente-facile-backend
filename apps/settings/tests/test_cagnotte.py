@@ -8,6 +8,7 @@ convertit en y passant.
   se rejoue pas. Son arithmétique vit dans `apps/settings/cagnotte_migration`
   pour cette seule raison - voir l'encadré de ce module.
 """
+import pathlib
 from decimal import Decimal
 
 from django.test import TestCase
@@ -124,6 +125,188 @@ class ConversionDeLaBasculeTests(TestCase):
         self.assertEqual(enorme, Decimal('100.00'))
         minuscule = pourcentage_depuis_bareme(1, Decimal('0.01'), Decimal('1000000.00'))
         self.assertEqual(minuscule, Decimal('0.01'))
+
+
+class ConvertirN_AdresseQueDesChampsQuiEXISTENTTests(TestCase):
+    """
+    Tout champ que `convertir` lit ou écrit existe-t-il À CET INSTANT ?
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ C'EST LA MOITIÉ QUI MANQUAIT, ET ELLE A COÛTÉ UNE PANNE DE PRODUCTION.  │
+    │                                                                          │
+    │ `LaMigrationConvertitLesDEUXModesTests` vérifie que les deux branches    │
+    │ ÉCRIVENT `earn_percent`. Le mode pourcentage le faisait bien - et LISAIT │
+    │ `programme.points_percentage`, un nom que le `RenameField` posé en       │
+    │ opération 1 avait déjà fait disparaître de l'état historique. Le         │
+    │ déploiement a donné `AttributeError: 'LoyaltyProgram' object has no      │
+    │ attribute 'points_percentage'`, `entrypoint.sh` est en `set -e`, donc    │
+    │ Gunicorn n'a jamais démarré : plus personne ne pouvait se connecter.     │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ⚠ POURQUOI TOUTE LA SUITE ÉTAIT VERTE. `convertir` ne fait QUE boucler sur
+      des `objects.all()`, et une base de test est VIDE : les trois corps de
+      boucle ne s'exécutent jamais. Un `RunPython` de conversion n'est donc
+      éprouvé par AUCUN test de ce dépôt, aujourd'hui comme demain. Et même
+      localement, les fixtures n'avaient que des programmes au mode par défaut
+      (`fixed_per_amount`), donc la branche fautive - celle du mode POURCENTAGE
+      - n'avait jamais été exécutée nulle part.
+
+    ⚠ ON NE TESTE DONC PAS L'EFFET, ON TESTE L'ADRESSAGE : chaque attribut
+      touché sur une instance, chaque nom passé à `values_list` et chaque entrée
+      d'`update_fields` doit figurer dans l'état du modèle à la position du
+      `RunPython`. L'arithmétique, elle, est couverte plus haut sur les
+      fonctions pures. C'est sans base de données, et cela vaut pour toute
+      migration future qui renomme puis convertit.
+    """
+
+    APP = 'settings'
+
+    def _etat_au_runpython(self):
+        """L'état des modèles tel que `convertir` le verra, et pas un autre."""
+        from django.db import migrations as dj
+        from django.db.migrations.loader import MigrationLoader
+
+        loader = MigrationLoader(None, ignore_no_migrations=True)
+        cle = (self.APP, '0016_cagnotte_en_argent')
+        self.assertIn(cle, loader.disk_migrations, "Migration de bascule absente.")
+        migration = loader.disk_migrations[cle]
+
+        etat = loader.project_state((self.APP, '0015_horloge_metier'))
+
+        # ⚠ On rejoue les opérations qui PRÉCÈDENT le `RunPython`, et elles
+        #   seules : ce sont les renommages, et c'est exactement ce qui fait
+        #   qu'un ancien nom n'existe plus quand la conversion s'exécute.
+        vues = 0
+        for operation in migration.operations:
+            if isinstance(operation, dj.RunPython):
+                break
+            operation.state_forwards(self.APP, etat)
+            vues += 1
+        else:  # pragma: no cover
+            self.fail("Aucun `RunPython` dans la migration de bascule.")
+        self.assertGreater(vues, 0, "Aucune opération avant la conversion.")
+        return etat
+
+    @staticmethod
+    def _noms_de_champs(etat_modele):
+        noms = {'pk'}
+        for nom, champ in etat_modele.fields.items():
+            noms.add(nom)
+            # Une FK s'adresse aussi par sa colonne : `organization_id`.
+            if getattr(champ, 'remote_field', None) is not None:
+                noms.add(f'{nom}_id')
+        return noms
+
+    def test_aucun_champ_adresse_par_la_conversion_n_a_disparu(self):
+        import ast
+
+        etat = self._etat_au_runpython()
+        modeles = {
+            nom.lower(): etat.models[app, nom]
+            for app, nom in etat.models
+            if app == self.APP
+        }
+        champs = {
+            nom: self._noms_de_champs(modele) for nom, modele in modeles.items()
+        }
+
+        source = (
+            pathlib.Path(__file__).resolve().parents[1]
+            / 'migrations' / '0016_cagnotte_en_argent.py'
+        ).read_text(encoding='utf-8')
+        module = ast.parse(source)
+
+        def modele_de(noeud):
+            """Un `Name` qui NOMME un modèle de l'app, quelle qu'en soit l'origine.
+
+            Reconnaître le nom plutôt que de suivre les affectations couvre d'un
+            coup `X = apps.get_model(...)` et le paramètre de
+            `_taux_par_organisation`, sans parser deux formes.
+            """
+            if isinstance(noeud, ast.Name) and noeud.id.lower() in champs:
+                return noeud.id.lower()
+            return None
+
+        fautes = []
+
+        def exiger(modele, champ, ligne, forme):
+            racine = champ.split('__')[0]
+            if racine not in champs[modele]:
+                fautes.append(
+                    f"ligne {ligne} : {forme} `{champ}` n'existe pas sur "
+                    f"`{modeles[modele].name}` à cette position "
+                    f"(disponibles : {', '.join(sorted(champs[modele]))})"
+                )
+
+        for fonction in [n for n in ast.walk(module) if isinstance(n, ast.FunctionDef)]:
+            # Variables d'instance : `for <v> in <Modele>.objects.all()`
+            instances = {}
+            for boucle in [n for n in ast.walk(fonction) if isinstance(n, ast.For)]:
+                if not isinstance(boucle.target, ast.Name):
+                    continue
+                for nom in ast.walk(boucle.iter):
+                    modele = modele_de(nom)
+                    if modele:
+                        instances[boucle.target.id] = modele
+                        break
+
+            # Appels de queryset : les noms de champs y voyagent en CHAÎNES, donc
+            # aucun `AttributeError` ne les signalerait - ils rendent un
+            # `FieldError` à l'exécution, c'est-à-dire au déploiement.
+            for appel in [n for n in ast.walk(fonction) if isinstance(n, ast.Call)]:
+                if not isinstance(appel.func, ast.Attribute):
+                    continue
+                if appel.func.attr in {'values_list', 'values', 'only', 'filter', 'exclude'}:
+                    modele = None
+                    for nom in ast.walk(appel.func.value):
+                        modele = modele_de(nom)
+                        if modele:
+                            break
+                    if modele:
+                        for arg in appel.args:
+                            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                                exiger(modele, arg.value, arg.lineno, 'le champ')
+                        for mot in appel.keywords:
+                            if mot.arg and mot.arg != 'flat':
+                                exiger(modele, mot.arg, appel.lineno, 'le filtre')
+                    continue
+
+                # `instance.save(update_fields=[...])`
+                if appel.func.attr == 'save':
+                    modele = instances.get(
+                        appel.func.value.id
+                        if isinstance(appel.func.value, ast.Name) else None
+                    )
+                    if not modele:
+                        continue
+                    for mot in appel.keywords:
+                        if mot.arg == 'update_fields' and isinstance(mot.value, (ast.List, ast.Tuple)):
+                            for elt in mot.value.elts:
+                                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                                    exiger(modele, elt.value, elt.lineno, 'update_fields')
+
+            # Attributs touchés sur une instance : lectures ET écritures.
+            appelables = {
+                n.func for n in ast.walk(fonction)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            }
+            for noeud in ast.walk(fonction):
+                if not isinstance(noeud, ast.Attribute) or noeud in appelables:
+                    continue
+                if not isinstance(noeud.value, ast.Name):
+                    continue
+                modele = instances.get(noeud.value.id)
+                if modele:
+                    exiger(modele, noeud.attr, noeud.lineno, "l'attribut")
+
+        self.assertEqual(
+            fautes, [],
+            "La conversion adresse des champs absents de l'état historique :\n  "
+            + "\n  ".join(fautes)
+            + "\n\nUn `RenameField` placé AVANT le `RunPython` fait disparaître "
+              "l'ancien nom : lire l'ancien lève `AttributeError` au déploiement, "
+              "et `entrypoint.sh` est en `set -e`.",
+        )
 
 
 class LaMigrationConvertitLesDEUXModesTests(TestCase):

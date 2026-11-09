@@ -83,8 +83,18 @@ def convertir(apps, schema_editor):
             #   le défaut de la première écriture : `points_percentage` comptait
             #   en POINTS, pas en argent. Voir
             #   `pourcentage_depuis_pourcentage`.
+            #
+            # ⚠ ON LIT `earn_percent`, QUI PORTE ENCORE L'ANCIENNE VALEUR, et
+            #   c'est ce que la première écriture avait manqué. Le `RenameField`
+            #   est l'opération 1 : quand ce `RunPython` s'exécute, le champ
+            #   s'appelle DÉJÀ `earn_percent` et contient le `points_percentage`
+            #   d'avant - un renommage déplace le nom, il ne touche pas la
+            #   donnée. Lire `programme.points_percentage` ici lève
+            #   `AttributeError` : ce nom n'existe plus dans l'état historique à
+            #   cette position, et le modèle historique ne le connaît pas.
+            ancien_pourcentage = programme.earn_percent
             programme.earn_percent = pourcentage_depuis_pourcentage(
-                programme.points_percentage,
+                ancien_pourcentage,
                 programme.point_value,
             )
 
