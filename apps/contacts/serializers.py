@@ -239,12 +239,11 @@ class AdjustBalanceSerializer(serializers.Serializer):
     notes = serializers.CharField(required=False, allow_blank=True, default='')
 
 
-class RedeemPointsToDebtSerializer(serializers.Serializer):
-    """Utilisation des points de fidélité pour éponger la dette d'un client."""
+class UseLoyaltyOnDebtSerializer(serializers.Serializer):
+    """Emploi de la cagnotte de fidélité pour éponger la dette d'un client."""
 
-    points = serializers.DecimalField(
-        max_digits=15, decimal_places=2,
-        min_value=Decimal('0.01'), coerce_to_string=False,
+    amount = serializers.DecimalField(
+        max_digits=15, decimal_places=2, min_value=Decimal('0.01'),
     )
     notes = serializers.CharField(required=False, allow_blank=True, default='')
 

@@ -556,6 +556,37 @@ STOCK_IN_MOVEMENT_TYPES = [
     StockMovement.MovementType.PRODUCTION_IN,
 ]
 
+#: Ce qui SORT du stock. Source unique.
+#:
+#: ┌──────────────────────────────────────────────────────────────────────────────┐
+#: │ ELLE ÉTAIT ÉCRITE DEUX FOIS, ET LES DEUX COPIES AVAIENT DÉJÀ DIVERGÉ.       │
+#: │                                                                              │
+#: │ `SORTIES_FIFO` (`stock_movements.py`) comptait `production_out` parmi les    │
+#: │ sorties ; l'`outgoing_types` de `StockMovementCreateSerializer.validate`,    │
+#: │ non. Le signe d'un `production_out` n'était donc pas normalisé : positif, il │
+#: │ AJOUTAIT du stock pendant que la consommation FIFO le traitait comme une     │
+#: │ sortie. Et depuis qu'une entrée négative est refusée, la seule écriture       │
+#: │ correcte - le négatif - l'était aussi, sous un message parlant d'« entrée ». │
+#: │                                                                              │
+#: │ Latent : aucun client ne propose les deux types de production (ni            │
+#: │ `MOVEMENT_TYPES` du back-office, ni `TYPE_MOUVEMENT_STOCK` du terminal, qui  │
+#: │ le dit dans son test). Mais une liste de sorties qui en oublie une est       │
+#: │ exactement ce qui se redécouvre à l'écran d'un marchand.                     │
+#: └──────────────────────────────────────────────────────────────────────────────┘
+#:
+#: ⚠ `UNPACK` N'EST NI L'UN NI L'AUTRE : il déplace du scellé vers le vrac sans
+#:   changer le total, et le serializer le refuse en tête de `validate`. Le ranger
+#:   d'un côté ferait normaliser un signe sur un mouvement qui n'en a pas.
+STOCK_OUT_MOVEMENT_TYPES = [
+    StockMovement.MovementType.SALE,
+    StockMovement.MovementType.RETURN_OUT,
+    StockMovement.MovementType.TRANSFER_OUT,
+    StockMovement.MovementType.ADJUSTMENT_OUT,
+    StockMovement.MovementType.DAMAGE,
+    StockMovement.MovementType.EXPIRED,
+    StockMovement.MovementType.PRODUCTION_OUT,
+]
+
 
 class StockTransfer(TenantSoftDeleteModel):
     """

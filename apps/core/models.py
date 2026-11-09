@@ -44,7 +44,7 @@ class TimeStampedModel(models.Model):
         de la ligne, et un caissier décide d'accorder du crédit sur ce chiffre.
 
         Le même piège attendait `Stock.package_quantity`, `CustomerLoyalty
-        .current_points` et `Sale.amount_due`, chacun écrit par un
+        .balance` et `Sale.amount_due`, chacun écrit par un
         ``update_fields`` quelque part. Le corriger appel par appel laisserait
         le treizième à écrire ; ici il n'y a plus rien à oublier.
 

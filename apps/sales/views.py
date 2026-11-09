@@ -545,7 +545,9 @@ class SaleViewSet(
                 change_currency=serializer.validated_data.get('change_currency'),
                 reference=serializer.validated_data.get('reference', ''),
                 notes=serializer.validated_data.get('notes', ''),
-                points_used=serializer.validated_data.get('points_used', 0),
+                loyalty_amount_used=serializer.validated_data.get(
+                    'loyalty_amount_used', 0
+                ),
             )
         except DRFValidationError as exc:
             return Response({'error': exc.detail}, status=status.HTTP_400_BAD_REQUEST)

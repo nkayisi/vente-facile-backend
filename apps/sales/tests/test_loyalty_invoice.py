@@ -1,9 +1,16 @@
 """
-Tests des points de fidélité : cumul et utilisation sur facture.
+Tests de la cagnotte de fidélité : crédit et emploi sur facture.
 
 Couvre les dysfonctionnements signalés en production :
 - le cumul ne se faisait pas pour chaque client ;
-- impossible de régler une facture, partiellement ou totalement, avec les points.
+- impossible de régler une facture, partiellement ou totalement, avec la cagnotte.
+
+⚠ CE FICHIER A ÉTÉ PORTÉ, PAS RÉÉCRIT, lors de la bascule points → argent. Les
+  montants y valent DIX FOIS les points d'avant, parce que le programme de la
+  fixture était réglé à `point_value = 10` : une vente de 2 000 rapportait
+  2 points, c'est-à-dire 20 en valeur, et c'est 20 que la cagnotte porte
+  désormais. `earn_percent = 1 %` donne exactement le même argent que l'ancien
+  barème « 1 point par 1 000, 1 point = 10 ».
 """
 from decimal import Decimal
 
@@ -45,17 +52,13 @@ class _LoyaltyBaseTest(APITestCase):
             organization=self.org, name='Client', code='C1', phone='0900000000',
             credit_limit=Decimal('1000000'),
         )
-        # 1 point par 1 000 (devise principale) ; 1 point = 10.
+        # 1 % de la facture reversé dans la cagnotte, en devise principale.
         self.program = LoyaltyProgram.objects.create(
             organization=self.org, is_active=True,
-            points_calculation_type=LoyaltyProgram.PointsCalculationType.FIXED_PER_AMOUNT,
-            points_per_unit=1,
-            amount_per_unit=Decimal('1000.00'),
-            point_value=Decimal('10.00'),
-            min_points_to_redeem=10,
+            earn_percent=Decimal('1.00'),
         )
         self.loyalty = CustomerLoyalty.objects.create(
-            organization=self.org, customer=self.customer, current_points=0,
+            organization=self.org, customer=self.customer, balance=0,
         )
 
     def _headers(self):
@@ -63,7 +66,7 @@ class _LoyaltyBaseTest(APITestCase):
 
     def _set_redemption_ceiling(self, percent):
         """
-        Règle la part de facture réglable en points pour ce programme.
+        Règle la part de facture réglable avec la cagnotte pour ce programme.
 
         Il n'existe pas de « sans plafond » : `MAX_REDEMPTION_PERCENT_CEILING`
         borne durement la configuration à 70 %, une facture garde toujours une
@@ -95,24 +98,24 @@ class _LoyaltyBaseTest(APITestCase):
 class AccumulationTests(_LoyaltyBaseTest):
     """Le cumul doit se faire pour chaque client, dans toutes les devises."""
 
-    def test_completed_sale_credits_points(self):
+    def test_completed_sale_credits_the_wallet(self):
         self._create_sale(sale_type='retail', payments=[{
             'payment_method': str(self.payment_method.id),
             'amount': '2000.00',
         }])
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 2)
-        self.assertEqual(self.loyalty.total_points_earned, 2)
+        self.assertEqual(self.loyalty.balance, 20)
+        self.assertEqual(self.loyalty.total_earned, 20)
 
-    def test_credit_sale_settled_from_customer_page_credits_points(self):
+    def test_credit_sale_settled_from_customer_page_credits_the_wallet(self):
         """
         La cause racine du « pas de cumul » : une vente à crédit soldée depuis
-        la fiche client ne passait jamais `completed`, donc n'attribuait aucun
-        point. Les deux bugs n'en faisaient qu'un.
+        la fiche client ne passait jamais `completed`, donc ne créditait rien.
+        Les deux bugs n'en faisaient qu'un.
         """
         sale_id = self._create_sale()
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 0, "Rien avant le règlement.")
+        self.assertEqual(self.loyalty.balance, 0, "Rien avant le règlement.")
 
         self.client.force_authenticate(user=self.manager)
         resp = self.client.post(
@@ -123,16 +126,16 @@ class AccumulationTests(_LoyaltyBaseTest):
 
         self.assertEqual(Sale.objects.get(pk=sale_id).status, 'completed')
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 2)
+        self.assertEqual(self.loyalty.balance, 20)
 
-    def test_points_accumulate_across_sales(self):
+    def test_le_credit_s_accumule_de_vente_en_vente(self):
         for _ in range(3):
             self._create_sale(sale_type='retail', payments=[{
                 'payment_method': str(self.payment_method.id),
                 'amount': '2000.00',
             }])
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 6)
+        self.assertEqual(self.loyalty.balance, 60)
 
     def test_award_is_idempotent_per_sale(self):
         sale_id = self._create_sale(sale_type='retail', payments=[{
@@ -141,11 +144,11 @@ class AccumulationTests(_LoyaltyBaseTest):
         }])
         sale = Sale.objects.get(pk=sale_id)
 
-        LoyaltyService.award_points_for_sale(sale, user=self.cashier_a)
-        LoyaltyService.award_points_for_sale(sale, user=self.cashier_a)
+        LoyaltyService.award_for_sale(sale, user=self.cashier_a)
+        LoyaltyService.award_for_sale(sale, user=self.cashier_a)
 
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 2)
+        self.assertEqual(self.loyalty.balance, 20)
         self.assertEqual(
             LoyaltyTransaction.objects.filter(
                 sale=sale, transaction_type=LoyaltyTransaction.TransactionType.EARN,
@@ -177,10 +180,10 @@ class _MultiCurrencyLoyaltyTest(_LoyaltyBaseTest):
 class SecondaryCurrencyAccumulationTests(_MultiCurrencyLoyaltyTest):
     """Le barème est en devise principale : une facture en USD doit être convertie."""
 
-    def test_usd_invoice_awards_converted_points(self):
+    def test_usd_invoice_awards_a_converted_credit(self):
         """
-        50 USD = 140 000 CDF ⇒ 140 points. L'ancien code comparait 50 à un
-        barème de 1 000 CDF et attribuait 0 point.
+        50 USD = 140 000 CDF ⇒ 1 400 de cagnotte. L'ancien code comparait 50 à
+        un barème de 1 000 CDF et n'attribuait rien.
         """
         self.client.force_authenticate(user=self.cashier_a)
         resp = self.client.post('/api/v1/sales/', {
@@ -204,25 +207,25 @@ class SecondaryCurrencyAccumulationTests(_MultiCurrencyLoyaltyTest):
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
 
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 140)
+        self.assertEqual(self.loyalty.balance, 1400)
 
 
 class InvoiceRedemptionTests(_LoyaltyBaseTest):
-    """Régler une facture émise avec des points, partiellement ou totalement."""
+    """Régler une facture émise avec la cagnotte, partiellement ou totalement."""
 
     def setUp(self):
         super().setUp()
-        self.loyalty.current_points = 500
-        self.loyalty.save(update_fields=['current_points'])
+        self.loyalty.balance = 5000
+        self.loyalty.save(update_fields=['balance'])
 
-    def test_points_partially_pay_an_invoice(self):
-        """50 points × 10 = 500 imputés sur une facture de 2 000."""
+    def test_la_cagnotte_regle_une_partie_de_la_facture(self):
+        """500 de cagnotte imputés sur une facture de 2 000."""
         sale_id = self._create_sale()
 
         self.client.force_authenticate(user=self.cashier_a)
         resp = self.client.post(
             f'/api/v1/sales/{sale_id}/add-payment/',
-            {'points_used': 50}, format='json', **self._headers(),
+            {'loyalty_amount_used': 500}, format='json', **self._headers(),
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
 
@@ -234,14 +237,14 @@ class InvoiceRedemptionTests(_LoyaltyBaseTest):
         self.assertEqual(sale.total, Decimal('2000.00'))
 
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 450)
+        self.assertEqual(self.loyalty.balance, 4500)
 
-    def test_les_points_ne_soldent_jamais_toute_la_facture(self):
+    def test_la_cagnotte_ne_solde_jamais_toute_la_facture(self):
         """
         Même au plafond maximal, une facture garde une part à encaisser.
 
-        Le client a de quoi couvrir les 2 000 en points (200 × 10) : seuls
-        1 400 passent, la borne dure de 70 % retenant le reste.
+        Le client a de quoi couvrir les 2 000 avec sa cagnotte : seuls 1 400
+        passent, la borne dure de 70 % retenant le reste.
         """
         self._set_redemption_ceiling('70.00')
         sale_id = self._create_sale()
@@ -249,7 +252,7 @@ class InvoiceRedemptionTests(_LoyaltyBaseTest):
         self.client.force_authenticate(user=self.cashier_a)
         resp = self.client.post(
             f'/api/v1/sales/{sale_id}/add-payment/',
-            {'points_used': 200}, format='json', **self._headers(),
+            {'loyalty_amount_used': 2000}, format='json', **self._headers(),
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
 
@@ -258,16 +261,16 @@ class InvoiceRedemptionTests(_LoyaltyBaseTest):
         self.assertEqual(sale.amount_due, Decimal('600.00'))
         self.assertEqual(sale.status, 'partially_paid')
         self.loyalty.refresh_from_db()
-        # 140 points consommés ; la vente n'étant pas soldée, rien n'est gagné.
-        self.assertEqual(self.loyalty.current_points, 360)
+        # 1 400 consommés ; la vente n'étant pas soldée, rien n'est gagné.
+        self.assertEqual(self.loyalty.balance, 3600)
 
-    def test_points_are_capped_by_amount_due(self):
+    def test_la_cagnotte_est_bornee_par_le_reste_du(self):
         """
         On ne peut pas payer plus que ce qui reste dû.
 
         Il faut d'abord encaisser en monnaie pour que le reste dû (400) passe
-        SOUS l'enveloppe de points (1 400) : sinon c'est le plafond qui mord et
-        ce test ne mesurerait plus rien.
+        SOUS l'enveloppe de cagnotte (1 400) : sinon c'est le plafond qui mord
+        et ce test ne mesurerait plus rien.
         """
         self._set_redemption_ceiling('70.00')
         sale_id = self._create_sale(payments=[{
@@ -278,40 +281,40 @@ class InvoiceRedemptionTests(_LoyaltyBaseTest):
         self.client.force_authenticate(user=self.cashier_a)
         self.client.post(
             f'/api/v1/sales/{sale_id}/add-payment/',
-            {'points_used': 500}, format='json', **self._headers(),
+            {'loyalty_amount_used': 5000}, format='json', **self._headers(),
         )
 
         sale = Sale.objects.get(pk=sale_id)
         self.assertEqual(sale.amount_paid, Decimal('2000.00'))
         self.assertEqual(sale.status, 'completed')
         self.loyalty.refresh_from_db()
-        # 400 / 10 = 40 points consommés seulement, + 2 gagnés à la clôture.
-        self.assertEqual(self.loyalty.current_points, 462)
+        # 400 consommés seulement, + 20 gagnés à la clôture.
+        self.assertEqual(self.loyalty.balance, 4620)
 
-    def test_two_successive_points_payments_are_allowed(self):
-        """Une facture peut être réglée en points en plusieurs fois."""
+    def test_deux_reglements_successifs_en_cagnotte_sont_permis(self):
+        """Une facture peut être réglée avec la cagnotte en plusieurs fois."""
         sale_id = self._create_sale()
 
         self.client.force_authenticate(user=self.cashier_a)
         for _ in range(2):
             resp = self.client.post(
                 f'/api/v1/sales/{sale_id}/add-payment/',
-                {'points_used': 50}, format='json', **self._headers(),
+                {'loyalty_amount_used': 500}, format='json', **self._headers(),
             )
             self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
 
         sale = Sale.objects.get(pk=sale_id)
         self.assertEqual(sale.amount_paid, Decimal('1000.00'))
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 400)
+        self.assertEqual(self.loyalty.balance, 4000)
         self.assertEqual(
             LoyaltyTransaction.objects.filter(
                 sale=sale, transaction_type=LoyaltyTransaction.TransactionType.REDEEM,
             ).count(), 2,
         )
 
-    def test_points_payment_creates_no_cash_movement(self):
-        """Les points ne sont pas de l'argent physique : rien au tiroir."""
+    def test_un_reglement_en_cagnotte_ne_touche_pas_le_tiroir(self):
+        """La cagnotte n'est pas de l'argent physique : rien au tiroir."""
         from apps.cashbook.models import CashMovement
 
         sale_id = self._create_sale()
@@ -320,7 +323,7 @@ class InvoiceRedemptionTests(_LoyaltyBaseTest):
         self.client.force_authenticate(user=self.cashier_a)
         self.client.post(
             f'/api/v1/sales/{sale_id}/add-payment/',
-            {'points_used': 50}, format='json', **self._headers(),
+            {'loyalty_amount_used': 500}, format='json', **self._headers(),
         )
 
         self.assertEqual(CashMovement.objects.filter(organization=self.org).count(), before)
@@ -330,13 +333,13 @@ class InvoiceRedemptionTests(_LoyaltyBaseTest):
             ).exists()
         )
 
-    def test_points_payment_reduces_customer_debt(self):
+    def test_un_reglement_en_cagnotte_reduit_la_dette_du_client(self):
         sale_id = self._create_sale()
 
         self.client.force_authenticate(user=self.cashier_a)
         self.client.post(
             f'/api/v1/sales/{sale_id}/add-payment/',
-            {'points_used': 50}, format='json', **self._headers(),
+            {'loyalty_amount_used': 500}, format='json', **self._headers(),
         )
 
         from apps.contacts import services as contacts_services
@@ -344,45 +347,53 @@ class InvoiceRedemptionTests(_LoyaltyBaseTest):
             contacts_services.get_balance(self.customer, 'CDF'), Decimal('1500.00'),
         )
 
-    def test_below_minimum_is_rejected(self):
+    def test_une_petite_part_de_cagnotte_est_acceptee(self):
+        """
+        ⚠ CE TEST AFFIRMAIT L'INVERSE : il exigeait un refus sous
+        `min_points_to_redeem`. Ce minimum existait parce qu'un point n'avait
+        pas de valeur lisible ; un montant en a une, et refuser 50 FC de remise
+        « parce que c'est trop peu » n'a aucun sens au comptoir. Le minimum a
+        disparu avec les points.
+        """
         sale_id = self._create_sale()
 
         self.client.force_authenticate(user=self.cashier_a)
         resp = self.client.post(
             f'/api/v1/sales/{sale_id}/add-payment/',
-            {'points_used': 5}, format='json', **self._headers(),
+            {'loyalty_amount_used': 50}, format='json', **self._headers(),
         )
-        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        self.assertEqual(Sale.objects.get(pk=sale_id).amount_paid, Decimal('50.00'))
 
 
 class DebtRedemptionTests(_LoyaltyBaseTest):
-    """Utiliser les points sur la dette globale du client."""
+    """Employer la cagnotte sur la dette globale du client."""
 
     def setUp(self):
         super().setUp()
-        self.loyalty.current_points = 500
-        self.loyalty.save(update_fields=['current_points'])
+        self.loyalty.balance = 5000
+        self.loyalty.save(update_fields=['balance'])
 
-    def test_points_settle_the_global_debt(self):
+    def test_la_cagnotte_eponge_la_dette_globale(self):
         sale_id = self._create_sale()
 
         self.client.force_authenticate(user=self.manager)
         resp = self.client.post(
-            f'/api/v1/customers/{self.customer.id}/redeem-points/',
-            {'points': 100}, format='json', **self._headers(),
+            f'/api/v1/customers/{self.customer.id}/use-loyalty/',
+            {'amount': 1000}, format='json', **self._headers(),
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
 
         sale = Sale.objects.get(pk=sale_id)
         self.assertEqual(sale.amount_paid, Decimal('1000.00'))
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 400)
+        self.assertEqual(self.loyalty.balance, 4000)
 
     def test_customer_without_debt_is_rejected(self):
         self.client.force_authenticate(user=self.manager)
         resp = self.client.post(
-            f'/api/v1/customers/{self.customer.id}/redeem-points/',
-            {'points': 100}, format='json', **self._headers(),
+            f'/api/v1/customers/{self.customer.id}/use-loyalty/',
+            {'amount': 1000}, format='json', **self._headers(),
         )
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
 
@@ -390,13 +401,13 @@ class DebtRedemptionTests(_LoyaltyBaseTest):
 class ReversalCounterTests(_LoyaltyBaseTest):
     """Les compteurs à vie doivent être corrigés du bon côté."""
 
-    def test_cancel_reverses_earned_points_without_inflating_counters(self):
+    def test_annuler_reprend_le_gain_sans_gonfler_les_compteurs(self):
         sale_id = self._create_sale(sale_type='retail', payments=[{
             'payment_method': str(self.payment_method.id),
             'amount': '2000.00',
         }])
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.total_points_earned, 2)
+        self.assertEqual(self.loyalty.total_earned, 20)
 
         self.client.force_authenticate(user=self.manager)
         resp = self.client.post(
@@ -405,26 +416,26 @@ class ReversalCounterTests(_LoyaltyBaseTest):
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
 
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 0)
-        self.assertEqual(self.loyalty.total_points_earned, 0)
+        self.assertEqual(self.loyalty.balance, 0)
+        self.assertEqual(self.loyalty.total_earned, 0)
 
-    def test_cancel_restores_redeemed_points_to_the_right_counter(self):
+    def test_annuler_une_utilisation_corrige_le_bon_compteur(self):
         """
-        Annuler une utilisation doit réduire `total_points_redeemed`, pas
-        gonfler `total_points_earned` comme le faisait l'ancien code.
+        Annuler une utilisation doit réduire `total_used`, pas gonfler
+        `total_earned` comme le faisait l'ancien code.
         """
-        self.loyalty.current_points = 500
-        self.loyalty.save(update_fields=['current_points'])
+        self.loyalty.balance = 5000
+        self.loyalty.save(update_fields=['balance'])
 
         sale_id = self._create_sale()
         self.client.force_authenticate(user=self.cashier_a)
         self.client.post(
             f'/api/v1/sales/{sale_id}/add-payment/',
-            {'points_used': 50}, format='json', **self._headers(),
+            {'loyalty_amount_used': 500}, format='json', **self._headers(),
         )
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.total_points_redeemed, 50)
-        earned_before = self.loyalty.total_points_earned
+        self.assertEqual(self.loyalty.total_used, 500)
+        earned_before = self.loyalty.total_earned
 
         self.client.force_authenticate(user=self.manager)
         self.client.post(
@@ -432,25 +443,25 @@ class ReversalCounterTests(_LoyaltyBaseTest):
         )
 
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 500)
-        self.assertEqual(self.loyalty.total_points_redeemed, 0)
+        self.assertEqual(self.loyalty.balance, 5000)
+        self.assertEqual(self.loyalty.total_used, 0)
         self.assertEqual(
-            self.loyalty.total_points_earned, earned_before,
-            "Annuler une utilisation ne doit pas gonfler les points gagnés.",
+            self.loyalty.total_earned, earned_before,
+            "Annuler une utilisation ne doit pas gonfler la cagnotte gagnée.",
         )
 
 
 class ReturnReversalTests(_LoyaltyBaseTest):
-    """Un retour total doit reprendre les points, comme une annulation."""
+    """Un retour total doit reprendre la cagnotte, comme une annulation."""
 
-    def test_full_return_reverses_points(self):
+    def test_un_retour_total_reprend_la_cagnotte(self):
         sale_id = self._create_sale(sale_type='retail', payments=[{
             'payment_method': str(self.payment_method.id),
             'amount': '2000.00',
         }])
         sale = Sale.objects.get(pk=sale_id)
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 2)
+        self.assertEqual(self.loyalty.balance, 20)
 
         self.client.force_authenticate(user=self.manager)
         resp = self.client.post('/api/v1/sale-returns/', {
@@ -475,15 +486,13 @@ class ReturnReversalTests(_LoyaltyBaseTest):
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
 
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 0)
+        self.assertEqual(self.loyalty.balance, 0)
 
 
 class ReceiptExposureTests(_LoyaltyBaseTest):
     """
-    Ce que le reçu doit lire. Le POS rejouait le barème avec la seule formule
-    « pourcentage » codée en dur : sur un programme `fixed_per_amount`, qui est
-    le défaut, il annonçait dix fois les points réellement crédités. Le serveur
-    est désormais la seule source.
+    Ce que le reçu doit lire. Le POS rejouait le barème lui-même, et annonçait
+    dix fois ce qui était réellement crédité. Le serveur est la seule source.
     """
 
     def _detail(self, sale_id):
@@ -492,7 +501,7 @@ class ReceiptExposureTests(_LoyaltyBaseTest):
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
         return resp.data
 
-    def test_points_gagnes_correspondent_au_registre(self):
+    def test_le_gain_correspond_au_registre(self):
         sale_id = self._create_sale(sale_type='retail', unit_price='5000.00', payments=[{
             'payment_method': str(self.payment_method.id),
             'amount': '5000.00',
@@ -501,31 +510,33 @@ class ReceiptExposureTests(_LoyaltyBaseTest):
         data = self._detail(sale_id)
         self.loyalty.refresh_from_db()
 
-        # 1 point par 1 000 : 5 points, pas 50 (ce que donnait le 1 % du POS).
-        self.assertEqual(data['loyalty_points_earned'], 5)
-        self.assertEqual(data['loyalty_points_earned'], self.loyalty.total_points_earned)
-        self.assertEqual(data['loyalty_points_balance'], self.loyalty.current_points)
+        # 1 % de 5 000 = 50. ⚠ LE MONTANT VOYAGE EN CHAÎNE, comme tout montant
+        # de la plateforme : c'est `_money_out` qui le fixe, et le comparer à un
+        # nombre passerait pour une égalité là où le type a changé.
+        self.assertEqual(data['loyalty_earned'], '50.00')
+        self.assertEqual(Decimal(data['loyalty_earned']), self.loyalty.total_earned)
+        self.assertEqual(Decimal(data['loyalty_balance']), self.loyalty.balance)
         self.assertTrue(data['loyalty_program_active'])
 
-    def test_bareme_en_pourcentage(self):
-        self.program.points_calculation_type = (
-            LoyaltyProgram.PointsCalculationType.PERCENTAGE
-        )
-        self.program.points_percentage = Decimal('1.00')
-        self.program.save()
-
-        sale_id = self._create_sale(sale_type='retail', unit_price='5000.00', payments=[{
+    def test_le_pourcentage_est_continu(self):
+        """
+        ⚠ CE TEST OPPOSAIT LE POURCENTAGE AU BARÈME PAR TRANCHES. Le barème a
+        disparu : il ne reste qu'un pourcentage, et il est CONTINU - une facture
+        de 5 500 rapporte 55, pas 50. C'était l'intérêt du pourcentage, et c'est
+        désormais la seule règle.
+        """
+        sale_id = self._create_sale(sale_type='retail', unit_price='5500.00', payments=[{
             'payment_method': str(self.payment_method.id),
-            'amount': '5000.00',
+            'amount': '5500.00',
         }])
 
         self.loyalty.refresh_from_db()
-        self.assertEqual(self._detail(sale_id)['loyalty_points_earned'], 50)
-        self.assertEqual(self.loyalty.current_points, 50)
+        self.assertEqual(self._detail(sale_id)['loyalty_earned'], '55.00')
+        self.assertEqual(self.loyalty.balance, Decimal('55.00'))
 
-    def test_points_utilises_exposes(self):
-        self.loyalty.current_points = 100
-        self.loyalty.total_points_earned = 100
+    def test_la_cagnotte_utilisee_est_exposee(self):
+        self.loyalty.balance = 1000
+        self.loyalty.total_earned = 1000
         self.loyalty.save()
 
         self.client.force_authenticate(user=self.cashier_a)
@@ -540,7 +551,7 @@ class ReceiptExposureTests(_LoyaltyBaseTest):
                 'quantity': '1',
                 'unit_price': '2000.00',
             }],
-            'points_used': 50,
+            'loyalty_amount_used': 500,
             'payments': [{
                 'payment_method': str(self.payment_method.id),
                 'amount': '1500.00',
@@ -548,12 +559,12 @@ class ReceiptExposureTests(_LoyaltyBaseTest):
         }, format='json', **self._headers())
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
 
-        # 50 points x 10 = 500 de remise sur 2 000.
+        # 500 de cagnotte en remise sur 2 000.
         self.assertEqual(Decimal(resp.data['loyalty_redemption_amount']), Decimal('500.00'))
-        self.assertEqual(resp.data['loyalty_points_used'], 50)
+        self.assertEqual(resp.data['loyalty_used'], '500.00')
 
         data = self._detail(resp.data['id'])
-        self.assertEqual(data['loyalty_points_used'], 50)
+        self.assertEqual(data['loyalty_used'], '500.00')
         # La fiche de vente et le reçu réimprimé isolent la remise fidélité de
         # la remise commerciale : sans ce montant sur le détail, la déduction
         # se fondrait dans `discount_amount` et disparaîtrait de la facture.
@@ -567,10 +578,10 @@ class ReceiptExposureTests(_LoyaltyBaseTest):
         `discount_amount` cumule les deux : la facture doit pouvoir les séparer.
 
         Sans `loyalty_redemption_amount` exposé à part, l'écran et le reçu
-        afficheraient « Remise 800 » sans dire que 500 viennent des points.
+        afficheraient « Remise 800 » sans dire que 500 viennent de la cagnotte.
         """
-        self.loyalty.current_points = 100
-        self.loyalty.total_points_earned = 100
+        self.loyalty.balance = 1000
+        self.loyalty.total_earned = 1000
         self.loyalty.save()
 
         self.client.force_authenticate(user=self.cashier_a)
@@ -586,7 +597,7 @@ class ReceiptExposureTests(_LoyaltyBaseTest):
                 'unit_price': '2000.00',
             }],
             'global_discount_amount': '300.00',
-            'points_used': 50,
+            'loyalty_amount_used': 500,
             'payments': [],
         }, format='json', **self._headers())
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
@@ -605,7 +616,7 @@ class ReceiptExposureTests(_LoyaltyBaseTest):
             'payment_method': str(self.payment_method.id),
             'amount': '5000.00',
         }])
-        self.assertEqual(self._detail(sale_id)['loyalty_points_earned'], 5)
+        self.assertEqual(self._detail(sale_id)['loyalty_earned'], '50.00')
 
         self.client.force_authenticate(user=self.manager)
         resp = self.client.post(
@@ -614,8 +625,8 @@ class ReceiptExposureTests(_LoyaltyBaseTest):
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
 
-        # Un reçu réimprimé après annulation ne doit plus annoncer de points.
-        self.assertEqual(self._detail(sale_id)['loyalty_points_earned'], 0)
+        # Un reçu réimprimé après annulation ne doit plus annoncer de gain.
+        self.assertEqual(self._detail(sale_id)['loyalty_earned'], '0.00')
 
     def test_sans_programme_actif_le_recu_le_sait(self):
         self.program.is_active = False
@@ -628,18 +639,18 @@ class ReceiptExposureTests(_LoyaltyBaseTest):
 
         data = self._detail(sale_id)
         self.assertFalse(data['loyalty_program_active'])
-        self.assertEqual(data['loyalty_points_earned'], 0)
+        self.assertEqual(data['loyalty_earned'], '0.00')
 
 
 class CustomerLoyaltyEndpointTests(_LoyaltyBaseTest):
     """
     Le POS lit le solde via `?customer=`. L'endpoint était paginé alors que le
     client attendait un tableau : il recevait donc toujours `null`, ce qui
-    masquait tout le panneau fidélité et affichait « 0 pts » sur la fiche.
+    masquait tout le panneau fidélité et affichait un solde nul sur la fiche.
     """
 
     def test_reponse_non_paginee(self):
-        self.loyalty.current_points = 42
+        self.loyalty.balance = 42
         self.loyalty.save()
 
         self.client.force_authenticate(user=self.cashier_a)
@@ -651,17 +662,17 @@ class CustomerLoyaltyEndpointTests(_LoyaltyBaseTest):
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
         self.assertIsInstance(resp.data, list)
         self.assertEqual(len(resp.data), 1)
-        self.assertEqual(resp.data[0]['current_points'], 42)
+        self.assertEqual(Decimal(resp.data[0]['balance']), Decimal('42.00'))
 
 
 class TenderCurrencyIndependenceTests(_MultiCurrencyLoyaltyTest):
     """
-    Les points se calculent sur la FACTURE, jamais sur ce qui est remis.
+    La cagnotte se calcule sur la FACTURE, jamais sur ce qui est remis.
 
     Le montant perçu peut être encaissé dans une autre devise (une facture en
     CDF réglée en dollars, la monnaie rendue dans une troisième). Rien de tout
-    cela ne change ce que le client a acheté : le barème s'applique au total de
-    la facture, ramené en devise principale.
+    cela ne change ce que le client a acheté : le pourcentage s'applique au
+    total de la facture, ramené en devise principale.
     """
 
     def _sell(self, *, unit_price, payments, currency=None, change_currency=None):
@@ -688,7 +699,7 @@ class TenderCurrencyIndependenceTests(_MultiCurrencyLoyaltyTest):
         return resp
 
     def test_facture_en_principale_reglee_en_devise_etrangere(self):
-        """2 800 CDF encaissés en 1 USD : 2 points, comme un règlement en CDF."""
+        """2 800 CDF encaissés en 1 USD : 28 de cagnotte, comme en CDF."""
         resp = self._sell(unit_price='2800.00', payments=[{
             'payment_method': str(self.payment_method.id),
             'amount': '1.00',
@@ -700,11 +711,11 @@ class TenderCurrencyIndependenceTests(_MultiCurrencyLoyaltyTest):
         self.assertEqual(resp.data['status'], 'completed')
 
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 2)
-        self.assertEqual(resp.data['loyalty_points_earned'], 2)
+        self.assertEqual(self.loyalty.balance, 28)
+        self.assertEqual(resp.data['loyalty_earned'], '28.00')
 
     def test_reglement_fractionne_deux_devises(self):
-        """1 400 CDF + 0,5 USD sur une facture de 2 800 CDF : toujours 2 points."""
+        """1 400 CDF + 0,5 USD sur une facture de 2 800 CDF : toujours 28 de cagnotte."""
         resp = self._sell(unit_price='2800.00', payments=[
             {'payment_method': str(self.payment_method.id), 'amount': '1400.00'},
             {
@@ -716,7 +727,7 @@ class TenderCurrencyIndependenceTests(_MultiCurrencyLoyaltyTest):
 
         self.assertEqual(resp.data['status'], 'completed')
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 2)
+        self.assertEqual(self.loyalty.balance, 28)
 
     def test_monnaie_rendue_en_devise_etrangere_ne_change_rien(self):
         """
@@ -736,7 +747,7 @@ class TenderCurrencyIndependenceTests(_MultiCurrencyLoyaltyTest):
         self.assertGreater(Decimal(resp.data['change_amount']), Decimal('0'))
 
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 2)
+        self.assertEqual(self.loyalty.balance, 28)
 
     def test_facture_a_credit_soldee_plus_tard_en_devise_etrangere(self):
         """
@@ -761,7 +772,7 @@ class TenderCurrencyIndependenceTests(_MultiCurrencyLoyaltyTest):
         sale_id = resp.data['id']
 
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 0, "Rien avant le règlement.")
+        self.assertEqual(self.loyalty.balance, 0, "Rien avant le règlement.")
 
         resp = self.client.post(
             f'/api/v1/sales/{sale_id}/add-payment/',
@@ -776,13 +787,13 @@ class TenderCurrencyIndependenceTests(_MultiCurrencyLoyaltyTest):
         self.assertEqual(resp.data['status'], 'completed')
 
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 2)
-        self.assertEqual(resp.data['loyalty_points_earned'], 2)
+        self.assertEqual(self.loyalty.balance, 28)
+        self.assertEqual(resp.data['loyalty_earned'], '28.00')
 
     def test_facture_en_usd_reglee_en_cdf(self):
         """
         Symétrique du cas précédent : facture de 50 USD réglée en 140 000 CDF.
-        L'assiette reste la facture ramenée en principale, soit 140 points.
+        L'assiette reste la facture ramenée en principale, soit 1 400.
         """
         resp = self._sell(
             unit_price='50.00',
@@ -797,22 +808,22 @@ class TenderCurrencyIndependenceTests(_MultiCurrencyLoyaltyTest):
         self.assertEqual(resp.data['currency'], 'USD')
         self.assertEqual(resp.data['status'], 'completed')
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 140)
+        self.assertEqual(self.loyalty.balance, 1400)
 
 
 class RedemptionCurrencyTests(_MultiCurrencyLoyaltyTest):
     """
-    L'utilisation des points traverse les devises sans se perdre.
+    L'emploi de la cagnotte traverse les devises sans se perdre.
 
-    `point_value` est libellé en devise principale ; sur une facture en devise
+    La cagnotte est libellée en devise principale ; sur une facture en devise
     secondaire, la remise doit être reconvertie. Le POS restreignait
-    l'utilisation aux factures en principale : les points disparaissaient en
+    l'utilisation aux factures en principale : la cagnotte disparaissait en
     silence, sans message au caissier.
     """
 
     def test_remise_convertie_dans_la_devise_de_facture(self):
-        self.loyalty.current_points = 280
-        self.loyalty.total_points_earned = 280
+        self.loyalty.balance = 2800
+        self.loyalty.total_earned = 2800
         self.loyalty.save()
 
         self.client.force_authenticate(user=self.cashier_a)
@@ -828,8 +839,8 @@ class RedemptionCurrencyTests(_MultiCurrencyLoyaltyTest):
                 'quantity': '1',
                 'unit_price': '50.00',
             }],
-            # 280 points x 10 CDF = 2 800 CDF = 1 USD de remise.
-            'points_used': 280,
+            # 2 800 CDF de cagnotte = 1 USD de remise.
+            'loyalty_amount_used': 2800,
             'payments': [{
                 'payment_method': str(self.payment_method.id),
                 'amount': '49.00',
@@ -843,18 +854,18 @@ class RedemptionCurrencyTests(_MultiCurrencyLoyaltyTest):
         )
         self.assertEqual(Decimal(resp.data['total']), Decimal('49.00'))
         self.assertEqual(resp.data['status'], 'completed')
-        self.assertEqual(resp.data['loyalty_points_used'], 280)
+        self.assertEqual(resp.data['loyalty_used'], '2800.00')
 
         self.loyalty.refresh_from_db()
-        # 280 consommés, puis 49 USD = 137 200 CDF ⇒ 137 points gagnés.
-        self.assertEqual(self.loyalty.current_points, 137)
+        # 2 800 consommés, puis 49 USD = 137 200 CDF ⇒ 1 372 de gain.
+        self.assertEqual(self.loyalty.balance, 1372)
 
 
 class RedemptionCeilingTests(_LoyaltyBaseTest):
     """
-    Les points ne soldent jamais toute une facture.
+    La cagnotte ne solde jamais toute une facture.
 
-    `max_redemption_percent` borne la part réglable en points pour qu'il reste
+    `max_redemption_percent` borne la part réglable pour qu'il reste
     toujours un montant à encaisser en monnaie. Le plafond porte sur le TOTAL de
     la facture et non sur le reste à payer : sinon des règlements successifs
     grignoteraient la part autorisée sans jamais la franchir en apparence.
@@ -863,8 +874,8 @@ class RedemptionCeilingTests(_LoyaltyBaseTest):
     def setUp(self):
         super().setUp()
         # De quoi solder trois fois la facture si rien ne l'en empêchait.
-        self.loyalty.current_points = 1000
-        self.loyalty.save(update_fields=['current_points'])
+        self.loyalty.balance = 10000
+        self.loyalty.save(update_fields=['balance'])
 
     def test_remise_a_la_creation_plafonnee_a_la_moitie(self):
         """Facture 2 000, plafond 50 % : au plus 1 000 de remise fidélité."""
@@ -880,7 +891,7 @@ class RedemptionCeilingTests(_LoyaltyBaseTest):
                 'quantity': '1',
                 'unit_price': '2000.00',
             }],
-            'points_used': 1000,
+            'loyalty_amount_used': 10000,
             'payments': [],
         }, format='json', **self._headers())
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
@@ -893,7 +904,7 @@ class RedemptionCeilingTests(_LoyaltyBaseTest):
         self.assertGreater(Decimal(resp.data['amount_due']), Decimal('0.00'))
 
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 900)
+        self.assertEqual(self.loyalty.balance, 9000)
 
     def test_au_plafond_maximal_il_reste_toujours_a_encaisser(self):
         """
@@ -916,7 +927,7 @@ class RedemptionCeilingTests(_LoyaltyBaseTest):
                 'quantity': '1',
                 'unit_price': '2000.00',
             }],
-            'points_used': 1000,
+            'loyalty_amount_used': 10000,
             'payments': [],
         }, format='json', **self._headers())
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
@@ -954,14 +965,14 @@ class RedemptionCeilingTests(_LoyaltyBaseTest):
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST, resp.content)
         self.assertIn('max_redemption_percent', resp.data)
 
-    def test_reglement_en_points_sur_facture_emise_est_plafonne(self):
+    def test_reglement_en_cagnotte_sur_facture_emise_est_plafonne(self):
         """Même règle depuis l'écran des règlements, sinon le POS se contourne."""
         sale_id = self._create_sale()
 
         self.client.force_authenticate(user=self.cashier_a)
         resp = self.client.post(
             f'/api/v1/sales/{sale_id}/add-payment/',
-            {'points_used': 1000}, format='json', **self._headers(),
+            {'loyalty_amount_used': 10000}, format='json', **self._headers(),
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
 
@@ -972,10 +983,10 @@ class RedemptionCeilingTests(_LoyaltyBaseTest):
 
     def test_la_remise_de_creation_consomme_l_enveloppe_du_reglement(self):
         """
-        Une facture déjà réduite de 50 % en points n'accepte plus de points.
+        Une facture déjà réduite de 50 % n'accepte plus de cagnotte.
 
         C'est le contournement que le plafond doit fermer : créer la vente avec
-        la remise maximale, puis solder le reste en points depuis la facture.
+        la remise maximale, puis solder le reste en cagnotte depuis la facture.
         """
         self.client.force_authenticate(user=self.cashier_a)
         resp = self.client.post('/api/v1/sales/', {
@@ -989,7 +1000,7 @@ class RedemptionCeilingTests(_LoyaltyBaseTest):
                 'quantity': '1',
                 'unit_price': '2000.00',
             }],
-            'points_used': 1000,
+            'loyalty_amount_used': 10000,
             'payments': [],
         }, format='json', **self._headers())
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
@@ -997,31 +1008,31 @@ class RedemptionCeilingTests(_LoyaltyBaseTest):
 
         resp = self.client.post(
             f'/api/v1/sales/{sale_id}/add-payment/',
-            {'points_used': 100}, format='json', **self._headers(),
+            {'loyalty_amount_used': 1000}, format='json', **self._headers(),
         )
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST, resp.content)
 
         sale = Sale.objects.get(pk=sale_id)
         self.assertEqual(sale.amount_paid, Decimal('0.00'))
         self.loyalty.refresh_from_db()
-        # Seuls les 100 points de la remise de création ont été consommés.
-        self.assertEqual(self.loyalty.current_points, 900)
+        # Seuls les 1 000 de la remise de création ont été consommés.
+        self.assertEqual(self.loyalty.balance, 9000)
 
     def test_reglements_successifs_ne_depassent_pas_le_plafond(self):
-        """Deux fois 50 points passent (= 50 %), le troisième est refusé."""
+        """Deux fois 500 passent (= 50 %), le troisième est refusé."""
         sale_id = self._create_sale()
 
         self.client.force_authenticate(user=self.cashier_a)
         for _ in range(2):
             resp = self.client.post(
                 f'/api/v1/sales/{sale_id}/add-payment/',
-                {'points_used': 50}, format='json', **self._headers(),
+                {'loyalty_amount_used': 500}, format='json', **self._headers(),
             )
             self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
 
         resp = self.client.post(
             f'/api/v1/sales/{sale_id}/add-payment/',
-            {'points_used': 50}, format='json', **self._headers(),
+            {'loyalty_amount_used': 500}, format='json', **self._headers(),
         )
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST, resp.content)
 
@@ -1033,14 +1044,14 @@ class RedemptionCeilingTests(_LoyaltyBaseTest):
         La dette globale n'est pas une facture : le plafond n'y a pas cours.
 
         Un client qui a déjà consommé sa marchandise peut solder ce qu'il doit
-        avec ses points ; il n'y a plus rien à encaisser en échange.
+        avec sa cagnotte ; il n'y a plus rien à encaisser en échange.
         """
         sale_id = self._create_sale()
 
         self.client.force_authenticate(user=self.manager)
         resp = self.client.post(
-            f'/api/v1/customers/{self.customer.id}/redeem-points/',
-            {'points': 200}, format='json', **self._headers(),
+            f'/api/v1/customers/{self.customer.id}/use-loyalty/',
+            {'amount': 2000}, format='json', **self._headers(),
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
 
@@ -1053,8 +1064,8 @@ class SecondaryCurrencyCeilingTests(_MultiCurrencyLoyaltyTest):
     """Le plafond se compose avec la conversion de devise sans dériver."""
 
     def test_plafond_applique_dans_la_devise_de_facture(self):
-        self.loyalty.current_points = 10000
-        self.loyalty.total_points_earned = 10000
+        self.loyalty.balance = 100000
+        self.loyalty.total_earned = 100000
         self.loyalty.save()
 
         self.client.force_authenticate(user=self.cashier_a)
@@ -1070,27 +1081,27 @@ class SecondaryCurrencyCeilingTests(_MultiCurrencyLoyaltyTest):
                 'quantity': '1',
                 'unit_price': '50.00',
             }],
-            'points_used': 10000,
+            'loyalty_amount_used': 100000,
             'payments': [],
         }, format='json', **self._headers())
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
 
-        # 50 % de 50 USD = 25 USD = 70 000 CDF, soit 7 000 points à 10 CDF.
+        # 50 % de 50 USD = 25 USD = 70 000 CDF de cagnotte.
         self.assertEqual(
             Decimal(resp.data['loyalty_redemption_amount']), Decimal('25.00')
         )
         self.assertEqual(Decimal(resp.data['total']), Decimal('25.00'))
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 3000)
+        self.assertEqual(self.loyalty.balance, 30000)
 
 
 class DegenerateExchangeRateTests(_MultiCurrencyLoyaltyTest):
     """
-    Un taux nul sur la vente ne doit pas faire disparaître les points en silence.
+    Un taux nul sur la vente ne doit pas faire disparaître la cagnotte en silence.
 
     `Sale.save()` passe par `CurrencyService.resolve` et ne peut pas en produire,
     mais une reprise de données ou une écriture SQL directe le peut. Multiplier
-    par zéro donnerait 0 point sans aucun signal.
+    par zéro ne créditerait rien, sans aucun signal.
     """
 
     def test_taux_nul_retombe_sur_le_taux_de_l_organisation(self):
@@ -1116,20 +1127,25 @@ class DegenerateExchangeRateTests(_MultiCurrencyLoyaltyTest):
         Sale.objects.filter(pk=sale.pk).update(exchange_rate=Decimal('0'))
         sale.refresh_from_db()
 
-        points = LoyaltyService.points_for_sale(sale, self.program)
+        credit = LoyaltyService.credit_for_sale(sale, self.program)
 
-        self.assertEqual(points, 140, "50 USD valent 140 000 CDF, soit 140 points.")
+        self.assertEqual(
+            credit, 1400, "50 USD valent 140 000 CDF, soit 1 400 de cagnotte.",
+        )
 
 
-class FractionalPointsTests(_MultiCurrencyLoyaltyTest):
+class FractionalCreditTests(_MultiCurrencyLoyaltyTest):
     """
-    Les fractions de point ne se perdent plus.
+    Les centimes de cagnotte ne se perdent pas.
 
     Cas réel rencontré en production : organisation en USD principal, barème à
     1 %. Une vente de 58 USD valait 0,58 point, tronqué à zéro ; une vente de
     396 USD en valait 3,96, tronqué à 3. Le compteur d'un marchand en devise
-    forte ne bougeait donc presque jamais, et il fallait dépenser 100 USD pour
-    voir un seul point apparaître.
+    forte ne bougeait donc presque jamais.
+
+    ⚠ LE DÉFAUT NE DISPARAÎT PAS AVEC LES POINTS : 1 % de 58 $ vaut 0,58 $, et
+    une cagnotte tronquée à l'unité ne bougerait pas davantage. Ces tests
+    gardent donc tout leur sens, au centime près.
     """
 
     def setUp(self):
@@ -1148,12 +1164,8 @@ class FractionalPointsTests(_MultiCurrencyLoyaltyTest):
         from django.core.cache import cache
         cache.clear()
 
-        self.program.points_calculation_type = (
-            LoyaltyProgram.PointsCalculationType.PERCENTAGE
-        )
-        self.program.points_percentage = Decimal('1.00')
-        self.program.point_value = Decimal('1.00')
-        self.program.min_points_to_redeem = 1
+        # 1 % de la facture, en USD : la cagnotte y vaut des dollars.
+        self.program.earn_percent = Decimal('1.00')
         self.program.save()
 
     def _sell(self, unit_price):
@@ -1181,15 +1193,15 @@ class FractionalPointsTests(_MultiCurrencyLoyaltyTest):
         resp = self._sell('58.00')
 
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, Decimal('0.58'))
-        self.assertEqual(resp.data['loyalty_points_earned'], 0.58)
+        self.assertEqual(self.loyalty.balance, Decimal('0.58'))
+        self.assertEqual(resp.data['loyalty_earned'], '0.58')
 
     def test_396_usd_ne_perd_plus_la_fraction(self):
         resp = self._sell('396.00')
 
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, Decimal('3.96'))
-        self.assertEqual(resp.data['loyalty_points_earned'], 3.96)
+        self.assertEqual(self.loyalty.balance, Decimal('3.96'))
+        self.assertEqual(resp.data['loyalty_earned'], '3.96')
 
     def test_les_fractions_s_additionnent(self):
         for _ in range(4):
@@ -1197,20 +1209,27 @@ class FractionalPointsTests(_MultiCurrencyLoyaltyTest):
 
         self.loyalty.refresh_from_db()
         # 4 x 0,58 = 2,32 - là où l'ancien calcul laissait le compteur à zéro.
-        self.assertEqual(self.loyalty.current_points, Decimal('2.32'))
-        self.assertEqual(self.loyalty.total_points_earned, Decimal('2.32'))
+        self.assertEqual(self.loyalty.balance, Decimal('2.32'))
+        self.assertEqual(self.loyalty.total_earned, Decimal('2.32'))
 
-    def test_un_solde_entier_reste_entier_a_l_affichage(self):
+    def test_un_montant_voyage_toujours_en_chaine_a_deux_decimales(self):
+        """
+        ⚠ CE TEST EXIGEAIT UN `int`. C'était la convention de `_points_out` :
+        « un solde entier reste un entier à l'écran, 3 pts et non 3.0 pts ».
+        La cagnotte est de l'argent, et tout montant de la plateforme voyage en
+        CHAÎNE à deux décimales - un solde en CDF à sept chiffres perd ses
+        unités dans un nombre JavaScript.
+        """
         resp = self._sell('100.00')
 
-        self.assertEqual(resp.data['loyalty_points_earned'], 1)
-        self.assertIsInstance(resp.data['loyalty_points_earned'], int)
+        self.assertEqual(resp.data['loyalty_earned'], '1.00')
+        self.assertIsInstance(resp.data['loyalty_earned'], str)
 
-    def test_le_solde_fractionnaire_est_utilisable(self):
-        """Ce qui est gagné doit pouvoir être dépensé, fraction comprise."""
+    def test_une_cagnotte_fractionnaire_est_utilisable(self):
+        """Ce qui est gagné doit pouvoir être dépensé, centimes compris."""
         self._sell('396.00')
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, Decimal('3.96'))
+        self.assertEqual(self.loyalty.balance, Decimal('3.96'))
 
         self.client.force_authenticate(user=self.cashier_a)
         resp = self.client.post('/api/v1/sales/', {
@@ -1224,7 +1243,7 @@ class FractionalPointsTests(_MultiCurrencyLoyaltyTest):
                 'quantity': '1',
                 'unit_price': '50.00',
             }],
-            'points_used': '3.96',
+            'loyalty_amount_used': '3.96',
             'payments': [{
                 'payment_method': str(self.payment_method.id),
                 'amount': '46.04',
@@ -1232,27 +1251,24 @@ class FractionalPointsTests(_MultiCurrencyLoyaltyTest):
         }, format='json', **self._headers())
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
 
-        # 3,96 points x 1 USD = 3,96 USD de remise sur 50.
+        # 3,96 USD de cagnotte en remise sur 50.
         self.assertEqual(
             Decimal(resp.data['loyalty_redemption_amount']), Decimal('3.96')
         )
         self.assertEqual(Decimal(resp.data['total']), Decimal('46.04'))
-        self.assertEqual(resp.data['loyalty_points_used'], 3.96)
+        self.assertEqual(resp.data['loyalty_used'], '3.96')
 
-    def test_le_bareme_par_tranches_garde_ses_paliers(self):
+    def test_le_pourcentage_ne_tronque_aucune_tranche(self):
         """
-        `FIXED_PER_AMOUNT` dit « X points pour CHAQUE Y dépensé » : une tranche
-        entamée ne compte pas. Le rendre continu relèverait tous les barèmes
-        existants sans que le marchand l'ait demandé.
-        """
-        self.program.points_calculation_type = (
-            LoyaltyProgram.PointsCalculationType.FIXED_PER_AMOUNT
-        )
-        self.program.points_per_unit = 1
-        self.program.amount_per_unit = Decimal('10.00')
-        self.program.save()
+        ⚠ CE TEST AFFIRMAIT L'INVERSE : il gardait les PALIERS du barème
+        `FIXED_PER_AMOUNT` (« X points pour CHAQUE Y dépensé », une tranche
+        entamée ne comptant pas). Ce barème a disparu avec les points - c'était
+        le réglage dont le marchand ne pouvait pas prévoir l'effet, et celui
+        qui faisait qu'un petit panier ne rapportait rien.
 
+        Le pourcentage est CONTINU : 1 % de 25 USD vaut 0,25 USD, et non zéro.
+        """
         self._sell('25.00')
 
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, Decimal('2.00'))
+        self.assertEqual(self.loyalty.balance, Decimal('0.25'))

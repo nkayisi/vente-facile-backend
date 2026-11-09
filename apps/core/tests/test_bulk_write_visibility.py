@@ -39,7 +39,7 @@ from apps.sales.tests._helpers import make_org_with_users
 from apps.settings.models import CustomerLoyalty, LoyaltyProgram
 
 
-class PointsDeFideliteTests(APITestCase):
+class CagnotteDeFideliteTests(APITestCase):
     """Le site qui a été pris en flagrant délit."""
 
     def setUp(self):
@@ -47,25 +47,25 @@ class PointsDeFideliteTests(APITestCase):
         self.__dict__.update(ctx)
         LoyaltyProgram.objects.create(
             organization=self.org, name='Fidélité', is_active=True,
-            point_value=Decimal('1.00'), min_points_to_redeem=10,
+            earn_percent=Decimal('1.00'),
         )
         self.client_ = Customer.objects.create(
             organization=self.org, name='Nelly', code='C1',
         )
         self.fidelite = CustomerLoyalty.objects.create(
             organization=self.org, customer=self.client_,
-            current_points=Decimal('100.00'),
+            balance=Decimal('100.00'),
         )
 
-    def test_gagner_des_points_fait_AVANCER_updated_at(self):
+    def test_crediter_la_cagnotte_fait_AVANCER_updated_at(self):
         avant = self.fidelite.updated_at
-        self.fidelite.add_points(Decimal('50.00'))
+        self.fidelite.credit(Decimal('50.00'))
 
         self.fidelite.refresh_from_db()
-        self.assertEqual(self.fidelite.current_points, Decimal('150.00'))
+        self.assertEqual(self.fidelite.balance, Decimal('150.00'))
         self.assertGreater(
             self.fidelite.updated_at, avant,
-            "Les points ont bougé sans que l'horodatage suive : la ligne est "
+            "La cagnotte a bougé sans que l'horodatage suive : la ligne est "
             "invisible au tirage, et le terminal servira éternellement l'ancien "
             "solde.",
         )
@@ -78,16 +78,16 @@ class PointsDeFideliteTests(APITestCase):
         le champ passerait encore si le curseur changeait de forme.
         """
         curseur = timezone.now()
-        self.fidelite.add_points(Decimal('50.00'))
+        self.fidelite.credit(Decimal('50.00'))
 
         visible = CustomerLoyalty.objects.filter(
             pk=self.fidelite.pk, updated_at__gt=curseur
         ).exists()
         self.assertTrue(visible, "La ligne ne repasserait jamais au tirage.")
 
-    def test_utiliser_des_points_fait_aussi_avancer(self):
+    def test_debiter_la_cagnotte_fait_aussi_avancer(self):
         avant = self.fidelite.updated_at
-        self.fidelite.redeem_points(Decimal('20.00'))
+        self.fidelite.debit(Decimal('20.00'))
 
         self.fidelite.refresh_from_db()
         self.assertGreater(self.fidelite.updated_at, avant)

@@ -23,12 +23,14 @@ from django.utils import timezone
 
 from apps.core.warehouse_scope import assert_warehouse_allowed_for_request
 
-from .models import Stock
+from .models import STOCK_OUT_MOVEMENT_TYPES, Stock
 
 #: Sorties dont les lots se consomment en FIFO.
-SORTIES_FIFO = [
-    'sale', 'damage', 'expired', 'transfer_out', 'adjustment_out', 'production_out',
-]
+#:
+#: Dérivée de `STOCK_OUT_MOVEMENT_TYPES`, et non recopiée : c'est la même
+#: question (« qu'est-ce qui sort du stock ? »), et les deux copies avaient déjà
+#: divergé sur `production_out`. Voir l'encadré de la source.
+SORTIES_FIFO = list(STOCK_OUT_MOVEMENT_TYPES)
 
 
 def create_stock_movement(serializer, *, organization, user, request=None, **extra):

@@ -9,7 +9,8 @@ from apps.products.models import Category
 from .models import (
     Warehouse, StockLocation, Stock, StockBatch, StockMovement,
     StockTransfer, StockTransferItem, StockAdjustment, StockAdjustmentItem,
-    InventorySession, InventoryCount, STOCK_IN_MOVEMENT_TYPES
+    InventorySession, InventoryCount,
+    STOCK_IN_MOVEMENT_TYPES, STOCK_OUT_MOVEMENT_TYPES,
 )
 
 
@@ -695,10 +696,36 @@ class StockMovementCreateSerializer(serializers.ModelSerializer):
 
         quantity = data['quantity']
 
-        # Les mouvements sortants doivent avoir une quantité négative
-        outgoing_types = ['sale', 'return_out', 'transfer_out', 'adjustment_out', 'damage', 'expired']
-        if movement_type in outgoing_types and quantity > 0:
+        # Les mouvements sortants doivent avoir une quantité négative.
+        #
+        # ⚠ LA LISTE VIENT DU MODÈLE, elle n'est plus recopiée ici : celle qui
+        #   vivait à cette ligne oubliait `production_out`, que `SORTIES_FIFO`
+        #   comptait pourtant comme une sortie. Voir l'encadré de
+        #   `STOCK_OUT_MOVEMENT_TYPES`.
+        if movement_type in STOCK_OUT_MOVEMENT_TYPES and quantity > 0:
             data['quantity'] = -abs(quantity)
+        elif movement_type in STOCK_IN_MOVEMENT_TYPES and quantity < 0:
+            # ┌──────────────────────────────────────────────────────────────────┐
+            # │ UNE ENTRÉE NÉGATIVE RETIRAIT DU STOCK, SANS UN MOT.             │
+            # │                                                                  │
+            # │ Le sens d'une SORTIE est une CONVENTION : l'écran envoie un      │
+            # │ nombre positif et le serveur le stocke négatif, d'où la          │
+            # │ normalisation juste au-dessus. Sur une ENTRÉE la convention est  │
+            # │ le positif : un négatif n'est donc pas un sens à corriger, c'est │
+            # │ une FAUTE DE SAISIE - et `create_stock_movement` l'aurait        │
+            # │ appliquée telle quelle, faisant d'un « achat » un retrait.       │
+            # │                                                                  │
+            # │ ⚠ ON REFUSE, ON NE PREND PAS LA VALEUR ABSOLUE : « -5 » peut     │
+            # │   vouloir dire cinq, ou cinquante frappés de travers. Deviner    │
+            # │   ferait entrer en rayon une quantité que personne n'a demandée. │
+            # │                                                                  │
+            # │ Trouvé en construisant l'approvisionnement de MASSE, où une      │
+            # │ ligne fautive devait être nommée : le défaut est antérieur et    │
+            # │ vaut pour le chemin article par article comme pour le journal.   │
+            # └──────────────────────────────────────────────────────────────────┘
+            raise serializers.ValidationError({
+                'quantity': "Une entrée de stock ne peut pas être négative."
+            })
 
         return data
 

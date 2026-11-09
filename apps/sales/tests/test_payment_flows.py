@@ -154,25 +154,25 @@ class LoyaltyRedemptionTests(_BaseSaleFlowTest):
             organization=self.org,
             name='Programme test',
             is_active=True,
-            point_value=Decimal('10.00'),       # 1 point = 10 CDF
-            min_points_to_redeem=10,
-            # 0% sur le total - on teste la redemption isolément, sans gain croisé.
-            points_calculation_type=LoyaltyProgram.PointsCalculationType.PERCENTAGE,
-            points_percentage=Decimal('0.00'),
+            # ⚠ 0,01 % ET NON ZÉRO : `earn_percent` est validé à 0,01 minimum,
+            # et un gain de 0,20 sur 2 000 reste négligeable devant les montants
+            # testés ici - ce qui préserve l'intention d'origine, « tester
+            # l'emploi de la cagnotte isolément, sans gain croisé ».
+            earn_percent=Decimal('0.01'),
             only_registered_customers=False,
         )
         self.loyalty = CustomerLoyalty.objects.create(
-            organization=self.org, customer=self.customer, current_points=100,
+            organization=self.org, customer=self.customer, balance=1000,
         )
 
-    def test_loyalty_points_reduce_sale_total(self):
-        """50 points × 10 CDF = 500 CDF déduits du total 2000 → total final 1500."""
+    def test_la_cagnotte_reduit_le_total_de_la_vente(self):
+        """500 de cagnotte déduits du total 2 000 → total final 1 500."""
         self.client.force_authenticate(user=self.cashier_a)
         resp = self.client.post(
             '/api/v1/sales/',
             self._base_sale_payload(
                 customer=str(self.customer.id),
-                points_used=50,
+                loyalty_amount_used=500,
                 payments=[{
                     'payment_method': str(self.payment_method.id),
                     'amount': '1500.00',
@@ -184,13 +184,13 @@ class LoyaltyRedemptionTests(_BaseSaleFlowTest):
         self.assertEqual(Decimal(resp.data['loyalty_redemption_amount']), Decimal('500.00'))
         self.assertEqual(Decimal(resp.data['total']), Decimal('1500.00'))
         self.assertEqual(resp.data['status'], 'completed')
-        # Solde points décrémenté
+        # Cagnotte débitée, puis recréditée du gain (0,01 % de 1 500 = 0,15).
         self.loyalty.refresh_from_db()
-        self.assertEqual(self.loyalty.current_points, 50)
+        self.assertEqual(self.loyalty.balance, Decimal('500.15'))
 
-    def test_loyalty_points_capped_by_redemption_ceiling(self):
-        """1000 points dispo, total 2000, plafond 70 % → 140 points utilisables."""
-        self.loyalty.current_points = 1000
+    def test_la_cagnotte_est_plafonnee_par_la_part_reglable(self):
+        """10 000 de cagnotte, total 2 000, plafond 70 % → 1 400 employables."""
+        self.loyalty.balance = 10000
         self.loyalty.save()
         # Au maximum autorisé : la borne dure de 70 % est ce qui mord désormais,
         # le total ne peut plus être le cap puisqu'il n'est jamais atteignable.
@@ -202,7 +202,7 @@ class LoyaltyRedemptionTests(_BaseSaleFlowTest):
             '/api/v1/sales/',
             self._base_sale_payload(
                 customer=str(self.customer.id),
-                points_used=1000,  # tentative d'utiliser tous
+                loyalty_amount_used=10000,  # tentative d'employer tout
                 payments=[{
                     'payment_method': str(self.payment_method.id),
                     'amount': '0.01',  # juste pour passer la validation paiement
@@ -211,12 +211,12 @@ class LoyaltyRedemptionTests(_BaseSaleFlowTest):
             format='json', **self._headers(),
         )
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
-        # 70 % de 2 000 = 1 400 CDF, soit 140 points à 10 CDF pièce.
+        # 70 % de 2 000 = 1 400 CDF.
         self.assertEqual(Decimal(resp.data['loyalty_redemption_amount']), Decimal('1400.00'))
         self.assertEqual(Decimal(resp.data['total']), Decimal('600.00'))
         self.loyalty.refresh_from_db()
-        # 1000 - 140 = 860 points restants
-        self.assertEqual(self.loyalty.current_points, 860)
+        # 10 000 - 1 400 = 8 600 ; la vente n'est pas soldée, rien n'est gagné.
+        self.assertEqual(self.loyalty.balance, 8600)
 
 
 class AddPaymentAndCancelTests(_BaseSaleFlowTest):
@@ -480,7 +480,7 @@ class LoyaltyAllowanceExposureTests(LoyaltyRedemptionTests):
             Decimal('500.00'),
         )
 
-    def test_allowance_shrinks_after_a_payment_in_points(self):
+    def test_l_enveloppe_se_reduit_apres_un_reglement_en_cagnotte(self):
         self.program.max_redemption_percent = Decimal('50.00')
         self.program.save(update_fields=['max_redemption_percent'])
 
@@ -488,13 +488,13 @@ class LoyaltyAllowanceExposureTests(LoyaltyRedemptionTests):
         self.client.force_authenticate(user=self.cashier_a)
         resp = self.client.post(
             f"/api/v1/sales/{sale['id']}/add-payment/",
-            {'points_used': '50'},   # 50 pts × 10 = 500
+            {'loyalty_amount_used': '500'},
             format='json', **self._headers(),
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
 
         # Le plafond porte sur le TOTAL (50 % de 2 000 = 1 000) et retranche ce
-        # qui a déjà été réglé en points : 1 000 - 500 = 500. Sans cette
+        # qui a déjà été réglé en cagnotte : 1 000 - 500 = 500. Sans cette
         # soustraction, deux règlements successifs dépasseraient la part
         # autorisée sans jamais la franchir en apparence.
         self.assertEqual(
@@ -526,12 +526,11 @@ class LoyaltyAllowanceExposureTests(LoyaltyRedemptionTests):
 
         sale = self._credit_sale()
         allowance = Decimal(self._detail(sale['id'])['loyalty_max_redeemable'])
-        points = allowance / self.program.point_value
 
         self.client.force_authenticate(user=self.cashier_a)
         resp = self.client.post(
             f"/api/v1/sales/{sale['id']}/add-payment/",
-            {'points_used': str(points)},
+            {'loyalty_amount_used': str(allowance)},
             format='json', **self._headers(),
         )
 

@@ -700,17 +700,24 @@ class SaleListSerializer(serializers.ModelSerializer):
         return obj.items.count()
 
 
-def _points_out(value):
+def _money_out(value):
     """
-    Points rendus au client HTTP en **nombre**, jamais en chaîne.
+    Montant de cagnotte rendu au client HTTP en **chaîne**, comme tout montant.
 
-    Un ``Decimal`` traverse le rendu JSON de DRF sous forme de chaîne selon le
-    contexte ; ces quatre champs sont lus directement par le reçu et le POS, qui
-    les comparent et les affichent. On fixe la forme ici une fois pour toutes.
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ IL S'APPELAIT `_points_out` ET IL RENDAIT UN NOMBRE.                    │
+    │                                                                          │
+    │ C'était cohérent avec `points_field` du temps des points. La cagnotte est │
+    │ de l'argent : elle suit la règle de `Sale.total` et de tous les montants  │
+    │ de la plateforme, parce qu'un solde en CDF atteint sept chiffres et qu'un │
+    │ nombre JavaScript y perd ses unités.                                     │
+    │                                                                          │
+    │ ⚠ Le changement de type JSON est sûr parce que les trois champs sont      │
+    │   RENOMMÉS dans le même lot : aucun lecteur ne survit sans avoir été      │
+    │   visité. Voir `money_field` dans `apps/settings/serializers.py`.         │
+    └──────────────────────────────────────────────────────────────────────────┘
     """
-    quantized = Decimal(value or 0).quantize(Decimal('0.01'))
-    # Un solde entier reste un entier à l'écran : « 3 pts », pas « 3.0 pts ».
-    return int(quantized) if quantized == quantized.to_integral_value() else float(quantized)
+    return str(Decimal(value or 0).quantize(Decimal('0.01')))
 
 
 class SaleCurrencyTotalSerializer(serializers.ModelSerializer):
@@ -742,9 +749,9 @@ class SaleDetailSerializer(serializers.ModelSerializer):
     payments = PaymentSerializer(many=True, read_only=True)
     unpacking_notices = serializers.SerializerMethodField()
 
-    loyalty_points_earned = serializers.SerializerMethodField()
-    loyalty_points_used = serializers.SerializerMethodField()
-    loyalty_points_balance = serializers.SerializerMethodField()
+    loyalty_earned = serializers.SerializerMethodField()
+    loyalty_used = serializers.SerializerMethodField()
+    loyalty_balance = serializers.SerializerMethodField()
     loyalty_program_active = serializers.SerializerMethodField()
     loyalty_max_redeemable = serializers.SerializerMethodField()
     # ⚠ Rendu seulement sur le DÉTAIL : la liste n'en a pas besoin, et une
@@ -767,8 +774,8 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             'sold_by', 'sold_by_name',
             'sale_date', 'due_date', 'is_pos', 'receipt_printed',
             'items', 'payments', 'unpacking_notices',
-            'loyalty_points_earned', 'loyalty_points_used',
-            'loyalty_points_balance', 'loyalty_program_active',
+            'loyalty_earned', 'loyalty_used',
+            'loyalty_balance', 'loyalty_program_active',
             'loyalty_max_redeemable',
             'created_at', 'updated_at'
         ]
@@ -833,12 +840,12 @@ class SaleDetailSerializer(serializers.ModelSerializer):
 
     # -- Fidélité -----------------------------------------------------------
     #
-    # Ces quatre champs existent pour que le reçu n'ait plus à rejouer le barème
-    # du programme. Le POS le faisait, avec la seule formule « pourcentage » en
-    # dur : sur un programme `fixed_per_amount` (le défaut), une vente de 5 000
-    # CDF imprimait 50 points quand la base en enregistrait 5. On ne recalcule
-    # donc rien ici, on lit le registre `LoyaltyTransaction`, qui est la seule
-    # trace de ce qui a réellement été crédité ou consommé.
+    # Ces champs existent pour que le reçu n'ait plus à rejouer le barème du
+    # programme. Le POS le faisait, et sur un barème par tranches - le défaut
+    # d'alors - une vente de 5 000 CDF imprimait dix fois ce que la base
+    # enregistrait. Le barème a disparu avec les points, le principe reste : on
+    # ne recalcule RIEN ici, on lit le registre `LoyaltyTransaction`, seule
+    # trace de ce qui a réellement été crédité ou débité.
 
     def _loyalty_rows(self, obj):
         """Lignes de fidélité de cette vente, chargées une seule fois."""
@@ -849,48 +856,48 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             cached = list(
                 LoyaltyTransaction.objects
                 .filter(sale=obj)
-                .values_list('transaction_type', 'points')
+                .values_list('transaction_type', 'amount')
             )
             obj._loyalty_rows_cache = cached
         return cached
 
-    def get_loyalty_points_earned(self, obj):
+    def get_loyalty_earned(self, obj):
         """
-        Points nets gagnés sur cette vente : les gains, moins leur annulation
-        éventuelle. Un reçu réimprimé après annulation ne doit pas annoncer des
-        points que le client n'a plus.
+        Cagnotte nette gagnée sur cette vente : les gains, moins leur annulation
+        éventuelle. Un reçu réimprimé après annulation ne doit pas annoncer une
+        cagnotte que le client n'a plus.
         """
         TxType = self._tx_types()
-        return _points_out(sum(
-            (points for kind, points in self._loyalty_rows(obj)
+        return _money_out(sum(
+            (montant for kind, montant in self._loyalty_rows(obj)
              if kind in (TxType.EARN, TxType.EARN_REVERSAL)),
             Decimal('0.00'),
         ))
 
-    def get_loyalty_points_used(self, obj):
+    def get_loyalty_used(self, obj):
         """
-        Points nets consommés, remise à la création et règlements ultérieurs
-        confondus. Retourné positif : c'est une quantité utilisée, le signe est
+        Cagnotte nette consommée, remise à la création et règlements ultérieurs
+        confondus. Retournée positive : c'est un montant utilisé, le signe est
         porté par le libellé du reçu.
         """
         TxType = self._tx_types()
         total = sum(
-            (points for kind, points in self._loyalty_rows(obj)
+            (montant for kind, montant in self._loyalty_rows(obj)
              if kind in (TxType.REDEEM, TxType.REDEEM_REVERSAL)),
             Decimal('0.00'),
         )
-        return _points_out(-total)
+        return _money_out(-total)
 
-    def get_loyalty_points_balance(self, obj):
-        """Solde du client après cette vente, 0 s'il n'a pas encore de compte."""
+    def get_loyalty_balance(self, obj):
+        """Cagnotte du client après cette vente, 0 s'il n'en a pas encore."""
         from apps.settings.models import CustomerLoyalty
 
         if not obj.customer_id:
-            return _points_out(Decimal('0.00'))
+            return _money_out(Decimal('0.00'))
         balance = CustomerLoyalty.objects.filter(
             organization_id=obj.organization_id, customer_id=obj.customer_id,
-        ).values_list('current_points', flat=True).first()
-        return _points_out(balance or Decimal('0.00'))
+        ).values_list('balance', flat=True).first()
+        return _money_out(balance or Decimal('0.00'))
 
     def get_loyalty_program_active(self, obj):
         """
@@ -903,14 +910,14 @@ class SaleDetailSerializer(serializers.ModelSerializer):
 
     def get_loyalty_max_redeemable(self, obj):
         """
-        Part de CETTE facture encore réglable en points, dans sa devise.
+        Part de CETTE facture encore réglable avec la cagnotte, dans sa devise.
 
         Exposé pour que l'interface n'ait pas à rejouer le plafond du programme.
         Elle proposait un « Maximum » borné par le seul reste à payer, que
         ``resolve_redemption`` refusait ensuite dès que
         ``max_redemption_percent`` était plus serré : le caissier lisait un
-        nombre de points utilisable, le saisissait, et se voyait répondre
-        « Points inutilisables ».
+        montant utilisable, le saisissait, et se voyait répondre
+        « Cagnotte inutilisable ».
 
         On appelle ici la fonction que ``apply_payment_to_sale`` applique
         lui-même, bornée par ``amount_due`` de la même façon : la règle n'existe
@@ -962,7 +969,90 @@ class SaleUpdateSerializer(SaleDetailSerializer):
         ]
 
 
-class SaleCreateSerializer(serializers.ModelSerializer):
+class CagnotteLegacyMixin:
+    """
+    Accepte `points_used` d'un terminal qui ignore encore la cagnotte.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ UNE OPÉRATION PEUT DORMIR DANS LA FILE D'UN TERMINAL.                   │
+    │                                                                          │
+    │ `sale.create` est un acte du journal, et son gestionnaire passe par CE   │
+    │ serializer (`apps/sync/handlers.py`) : un caissier qui encaisse hors     │
+    │ ligne la veille d'un déploiement pousse son corps APRÈS la bascule. Il   │
+    │ porte `points_used`, exprimé en POINTS. Le lire comme un montant le      │
+    │ sous-évaluerait d'un facteur `point_value` - le client aurait payé en    │
+    │ cagnotte bien moins que ce que le caissier lui a annoncé, et le ticket   │
+    │ qu'il tient dirait autre chose que la facture.                           │
+    │                                                                          │
+    │ On le multiplie donc par `legacy_point_value`, que la migration de       │
+    │ bascule a figé sur le programme. Le champ et ce mixin sont droppables    │
+    │ ensemble dès que le parc est à jour.                                     │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ⚠ SUR `sale.add_payment`, CE MIXIN NE PROTÈGE QUE LE CHEMIN HTTP, et il
+      fallait le dire : le gestionnaire du journal appelle
+      `apply_payment_to_sale` DIRECTEMENT, en lisant le payload clé par clé,
+      sans jamais construire `SalePaymentSerializer`. Un alias posé ici ne
+      l'atteint donc pas. Sans conséquence aujourd'hui - le terminal n'envoie
+      aucune cagnotte sur cet acte (`features/ventes/actes.ts` ne pose ni
+      `points_used` ni `loyalty_amount_used`), et le gestionnaire ne relaie
+      d'ailleurs ni l'une ni l'autre clé. ⚠ Le jour où un règlement en cagnotte
+      partira du comptoir, c'est le GESTIONNAIRE qu'il faudra câbler, et ce
+      mixin n'y suffira pas : il n'est là que pour un appel REST direct.
+
+    ⚠ UN TERMINAL À JOUR N'EMPRUNTE JAMAIS CE CHEMIN : la clé neuve l'emporte
+      toujours, même à zéro. Sans quoi un caissier qui RENONCE à la cagnotte
+      (0 envoyé explicitement) verrait resurgir un `points_used` d'un corps
+      recomposé.
+    """
+
+    CLE_LEGACY = 'points_used'
+
+    def to_internal_value(self, data):
+        legacy = None
+        if hasattr(data, 'get'):
+            brut = data.get(self.CLE_LEGACY)
+            neuf = data.get('loyalty_amount_used')
+            if brut not in (None, '') and neuf in (None, ''):
+                legacy = brut
+
+        attrs = super().to_internal_value(data)
+        if legacy is None:
+            return attrs
+
+        try:
+            montant = Decimal(str(legacy))
+        except (ArithmeticError, TypeError, ValueError):
+            return attrs
+        if montant <= 0:
+            return attrs
+
+        attrs['loyalty_amount_used'] = (montant * self._facteur_legacy()).quantize(
+            Decimal('0.01')
+        )
+        return attrs
+
+    def _facteur_legacy(self):
+        """Valeur d'un point avant la bascule, ou 1 si elle est inconnue."""
+        from apps.settings.models import LoyaltyProgram
+
+        request = self.context.get('request')
+        org_id = (
+            request.headers.get('X-Organization-ID')
+            if request is not None else None
+        )
+        if not org_id:
+            return Decimal('1.00')
+        valeur = (
+            LoyaltyProgram.objects
+            .filter(organization_id=org_id)
+            .values_list('legacy_point_value', flat=True)
+            .first()
+        )
+        return valeur if valeur and valeur > 0 else Decimal('1.00')
+
+
+class SaleCreateSerializer(CagnotteLegacyMixin, serializers.ModelSerializer):
     """
     Serializer pour la création de vente (POS).
     Gère la création des items et paiements en une seule requête.
@@ -970,11 +1060,15 @@ class SaleCreateSerializer(serializers.ModelSerializer):
     
     items = SaleItemCreateSerializer(many=True)
     payments = PaymentCreateSerializer(many=True, required=False)
-    # Décimal : le solde d'un client peut être fractionnaire (1 % d'un panier
-    # de 58 USD vaut 0,58 point), il doit pouvoir être dépensé tel quel.
-    points_used = serializers.DecimalField(
+    # Montant de cagnotte à employer sur cette vente, en devise PRINCIPALE.
+    # `points_used` reste accepté en alias : voir `CagnotteLegacyMixin`.
+    loyalty_amount_used = serializers.DecimalField(
         max_digits=15, decimal_places=2, required=False,
-        min_value=Decimal('0'), default=Decimal('0'), coerce_to_string=False,
+        min_value=Decimal('0'), default=Decimal('0'),
+    )
+    points_used = serializers.DecimalField(
+        max_digits=15, decimal_places=2, required=False, write_only=True,
+        min_value=Decimal('0'),
     )
     global_discount_amount = serializers.DecimalField(
         max_digits=15,
@@ -991,7 +1085,7 @@ class SaleCreateSerializer(serializers.ModelSerializer):
             'discount_percentage', 'global_discount_amount', 'currency', 'exchange_rate',
             'change_currency',
             'notes', 'internal_notes', 'due_date', 'is_pos',
-            'items', 'payments', 'points_used'
+            'items', 'payments', 'loyalty_amount_used', 'points_used',
         ]
 
     def __init__(self, *args, **kwargs):
@@ -1226,7 +1320,8 @@ class SaleCreateSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         items_data = validated_data.pop('items')
         payments_data = validated_data.pop('payments', [])
-        points_used = validated_data.pop('points_used', 0)
+        validated_data.pop('points_used', None)
+        cagnotte_demandee = validated_data.pop('loyalty_amount_used', 0) or 0
         global_discount_amount_input = validated_data.pop('global_discount_amount', Decimal('0')) or Decimal('0')
 
         # Générer la référence (le lock sur la dernière vente du jour évite la
@@ -1415,14 +1510,14 @@ class SaleCreateSerializer(serializers.ModelSerializer):
         # discount_amount = total de toutes les remises (articles + globale)
         sale.discount_amount = (items_discount_total + global_discount).quantize(TWO_PLACES)
 
-        # Points de fidélité : appliquer comme réduction effective AVANT le total.
-        # Cappés par le solde points du client, par la part de la facture que le
-        # programme autorise à régler en points, et par le total tentatif (pas de
-        # total négatif). Le plafond garantit qu'il reste toujours un montant à
+        # Cagnotte : appliquée comme réduction effective AVANT le total. Bornée
+        # par le solde du client, par la part de la facture que le programme
+        # autorise à régler en cagnotte, et par le total tentatif (pas de total
+        # négatif). Le plafond garantit qu'il reste toujours un montant à
         # encaisser en monnaie.
         loyalty_resolution = None
         sale.loyalty_redemption_amount = Decimal('0.00')
-        if points_used > 0 and sale.customer:
+        if cagnotte_demandee > 0 and sale.customer:
             from apps.settings.services import LoyaltyService
             tentative_total = (items_subtotal - sale.discount_amount + tax_total).quantize(TWO_PLACES)
             program = LoyaltyService.active_program(org)
@@ -1431,7 +1526,7 @@ class SaleCreateSerializer(serializers.ModelSerializer):
                 if program else Decimal('0.00')
             )
             loyalty_resolution = LoyaltyService.resolve_redemption(
-                sale.customer, org, points_used, max_redeemable,
+                sale.customer, org, cagnotte_demandee, max_redeemable,
                 target_currency=sale.currency,
             )
             if loyalty_resolution:
@@ -1539,32 +1634,32 @@ class SaleCreateSerializer(serializers.ModelSerializer):
                 ),
             )
 
-        # Persister la consommation de points et la transaction loyalty maintenant
-        # que la vente est sauvegardée (FK loyalty_transaction.sale → sale.id).
+        # Persister le débit de cagnotte et sa ligne de registre maintenant que
+        # la vente est sauvegardée (FK loyalty_transaction.sale → sale.id).
         from apps.settings.services import LoyaltyService
         if loyalty_resolution:
             LoyaltyService.persist_redemption(
                 sale, loyalty_resolution, user=self.context['request'].user,
             )
 
-        # Attribuer les points de fidélité si applicable
+        # Créditer la cagnotte si applicable
         if sale.status == 'completed' and sale.customer:
-            LoyaltyService.award_points_for_sale(
+            LoyaltyService.award_for_sale(
                 sale, user=self.context['request'].user,
             )
 
         return sale
 
 
-class SalePaymentSerializer(serializers.Serializer):
+class SalePaymentSerializer(CagnotteLegacyMixin, serializers.Serializer):
     """Serializer pour ajouter un paiement à une vente existante.
 
     ``amount`` = montant remis dans ``currency`` (compat historique). Un split
     multi-devise se fait via plusieurs appels ``add-payment`` successifs.
     ``change_currency`` : devise de la monnaie rendue si le règlement solde la vente.
-    ``points_used`` : points de fidélité à convertir en règlement sur cette
-    facture. Contrairement au POS (où la remise précède l'émission de la
-    facture), un règlement en points sur une facture DÉJÀ émise ne modifie pas
+    ``loyalty_amount_used`` : part de la cagnotte à convertir en règlement sur
+    cette facture. Contrairement au POS (où la remise précède l'émission de la
+    facture), un règlement en cagnotte sur une facture DÉJÀ émise ne modifie pas
     son total : il s'impute comme n'importe quel autre moyen de paiement.
     """
 
@@ -1572,11 +1667,15 @@ class SalePaymentSerializer(serializers.Serializer):
     amount = serializers.DecimalField(
         max_digits=15, decimal_places=2, required=False, default=Decimal('0.00'),
     )
-    # Décimal : le solde d'un client peut être fractionnaire (1 % d'un panier
-    # de 58 USD vaut 0,58 point), il doit pouvoir être dépensé tel quel.
-    points_used = serializers.DecimalField(
+    # Montant de cagnotte à employer sur cette vente, en devise PRINCIPALE.
+    # `points_used` reste accepté en alias : voir `CagnotteLegacyMixin`.
+    loyalty_amount_used = serializers.DecimalField(
         max_digits=15, decimal_places=2, required=False,
-        min_value=Decimal('0'), default=Decimal('0'), coerce_to_string=False,
+        min_value=Decimal('0'), default=Decimal('0'),
+    )
+    points_used = serializers.DecimalField(
+        max_digits=15, decimal_places=2, required=False, write_only=True,
+        min_value=Decimal('0'),
     )
     currency = serializers.CharField(max_length=3, required=False, allow_blank=True)
     exchange_rate = serializers.DecimalField(
@@ -1587,11 +1686,12 @@ class SalePaymentSerializer(serializers.Serializer):
     notes = serializers.CharField(required=False, allow_blank=True)
 
     def validate(self, attrs):
+        attrs.pop('points_used', None)
         amount = attrs.get('amount') or Decimal('0.00')
-        points = attrs.get('points_used') or 0
-        if amount <= 0 and points <= 0:
+        cagnotte = attrs.get('loyalty_amount_used') or 0
+        if amount <= 0 and cagnotte <= 0:
             raise serializers.ValidationError(
-                "Indiquez un montant ou un nombre de points à utiliser."
+                "Indiquez un montant à encaisser ou une part de cagnotte à utiliser."
             )
         if amount > 0 and not attrs.get('payment_method'):
             raise serializers.ValidationError(

@@ -83,6 +83,7 @@ class ContratDesPermissionsTests(APITestCase):
             'customer.record_payment': (CustomerViewSet, 'record_payment'),
             'customer.adjust_balance': (CustomerViewSet, 'adjust_balance'),
             'stock_movement.create': (StockMovementViewSet, 'create'),
+            'stock_movement.bulk_create': (StockMovementViewSet, 'bulk'),
             'stock.unpack': (StockViewSet, 'unpack'),
             'stock_transfer.create': (StockTransferViewSet, 'create'),
             'stock_transfer.approve': (StockTransferViewSet, 'approve'),

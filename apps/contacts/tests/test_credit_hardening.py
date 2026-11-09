@@ -406,17 +406,13 @@ class LoyaltySettlementTests(_CreditBaseTest):
 
         LoyaltyProgram.objects.create(
             organization=self.org, is_active=True,
-            points_calculation_type=LoyaltyProgram.PointsCalculationType.FIXED_PER_AMOUNT,
-            points_per_unit=1,
-            amount_per_unit=Decimal('1000.00'),
-            point_value=Decimal('10.00'),
-            min_points_to_redeem=10,
+            earn_percent=Decimal('1.00'),
         )
         self._create_sale()
         loyalty, _ = CustomerLoyalty.objects.get_or_create(
             organization=self.org, customer=self.customer,
         )
-        loyalty.add_points(50)
+        loyalty.credit(500)
 
         movements_before = CashMovement.objects.filter(
             organization=self.org, direction='in',
@@ -424,8 +420,8 @@ class LoyaltySettlementTests(_CreditBaseTest):
 
         self.client.force_authenticate(user=self.manager)
         resp = self.client.post(
-            f'/api/v1/customers/{self.customer.id}/redeem-points/',
-            {'points': '50'}, format='json', **self._headers(),
+            f'/api/v1/customers/{self.customer.id}/use-loyalty/',
+            {'amount': '500'}, format='json', **self._headers(),
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
 

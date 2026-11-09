@@ -544,7 +544,7 @@ def create_payment(sale, user, *, payment_method=None, payment_method_id=None,
 @transaction.atomic
 def get_loyalty_payment_method(organization):
     """
-    Moyen de paiement « points de fidélité » de l'organisation, créé au besoin.
+    Moyen de paiement « cagnotte fidélité » de l'organisation, créé au besoin.
 
     Ce n'est pas de l'argent physique : il est exclu des mouvements de caisse et
     du comptage de clôture de session.
@@ -555,7 +555,7 @@ def get_loyalty_payment_method(organization):
         organization=organization,
         method_type=PaymentMethod.MethodType.LOYALTY,
         defaults={
-            'name': 'Points de fidélité',
+            'name': 'Cagnotte fidélité',
             'code': 'LOYALTY',
             'is_active': True,
         },
@@ -568,7 +568,7 @@ def get_advance_payment_method(organization):
     """
     Moyen de paiement « avance client » de l'organisation, créé au besoin.
 
-    Comme les points de fidélité, ce n'est pas un encaissement : l'argent est
+    Comme la cagnotte de fidélité, ce n'est pas un encaissement : l'argent est
     entré au tiroir quand l'avance a été enregistrée. Il est donc exclu des
     mouvements de caisse, et le comptage de clôture (qui ne compte que
     ``method_type='cash'``) l'ignore déjà.
@@ -701,19 +701,19 @@ def register_sale_debt(sale, user, notes=''):
         if sale.warehouse:
             SaleStockService.apply_decrement(sale, user)
         from apps.settings.services import LoyaltyService
-        LoyaltyService.award_points_for_sale(sale, user=user)
+        LoyaltyService.award_for_sale(sale, user=user)
 
     return txn, consumed
 
 
 def remaining_loyalty_allowance(sale, program):
     """
-    Ce qu'il reste de la facture réglable en points, dans sa devise.
+    Ce qu'il reste de la facture réglable avec la cagnotte, dans sa devise.
 
     Le plafond porte sur le **total de la facture**, pas sur le reste à payer :
-    sinon deux règlements successifs en points (50 % de 100, puis 50 % des 50
+    sinon deux règlements successifs en cagnotte (50 % de 100, puis 50 % des 50
     restants) dépasseraient la part autorisée sans jamais la franchir en
-    apparence. On retranche donc tout ce qui a déjà été réglé en points, que ce
+    apparence. On retranche donc tout ce qui a déjà été réglé en cagnotte, que ce
     soit la remise posée à la création (``loyalty_redemption_amount``) ou les
     règlements ultérieurs portés par le moyen de paiement « fidélité ».
     """
@@ -737,7 +737,8 @@ def remaining_loyalty_allowance(sale, program):
 def apply_payment_to_sale(sale_id, user, *, payment_method_id=None,
                           tendered_amount=None, currency=None, exchange_rate=None,
                           change_currency=None, reference='', notes='',
-                          award_loyalty=True, points_used=0, receipt_number=None):
+                          award_loyalty=True, loyalty_amount_used=0,
+                          receipt_number=None):
     """
     Applique un règlement à une facture existante, de bout en bout.
 
@@ -794,33 +795,33 @@ def apply_payment_to_sale(sale_id, user, *, payment_method_id=None,
 
     payments = []
 
-    # 1) Règlement en points d'abord : il réduit le reste à payer en argent.
+    # 1) Règlement en cagnotte d'abord : il réduit le reste à payer en argent.
     loyalty_resolution = None
-    if points_used and points_used > 0 and sale.customer:
+    if loyalty_amount_used and loyalty_amount_used > 0 and sale.customer:
         from apps.settings.services import LoyaltyService
 
         program = LoyaltyService.active_program(sale.organization)
-        # Plafond : les points ne soldent jamais toute la facture. Borné aussi
-        # par le reste à payer, sinon un règlement en points dépasserait le dû.
+        # Plafond : la cagnotte ne solde jamais toute la facture. Borné aussi
+        # par le reste à payer, sinon un règlement en cagnotte dépasserait le dû.
         allowance = min(
             remaining_loyalty_allowance(sale, program), sale.amount_due,
         )
         loyalty_resolution = LoyaltyService.resolve_redemption(
-            sale.customer, sale.organization, points_used, allowance,
+            sale.customer, sale.organization, loyalty_amount_used, allowance,
             target_currency=sale.currency,
         )
         if loyalty_resolution is None:
             raise ValidationError(
-                "Points inutilisables : solde insuffisant, minimum non atteint, "
-                "part de la facture réglable en points déjà atteinte, "
-                "ou aucun programme de fidélité actif."
+                "Cagnotte inutilisable : solde insuffisant, part de la facture "
+                "réglable avec la cagnotte déjà atteinte, ou aucun programme de "
+                "fidélité actif."
             )
         payments.append(create_payment(
             sale, user,
             payment_method_id=get_loyalty_payment_method(sale.organization).id,
             tendered_amount=loyalty_resolution['amount'],
             currency=sale.currency,
-            notes=f"{loyalty_resolution['points']} points utilisés",
+            notes=f"Cagnotte utilisée : {loyalty_resolution['amount']} {sale.currency}",
         ))
 
     # 2) Puis le règlement en argent, s'il y en a un.
@@ -863,7 +864,7 @@ def apply_payment_to_sale(sale_id, user, *, payment_method_id=None,
 
     sale.save()
 
-    # Consommation effective des points, une fois la vente enregistrée.
+    # Débit effectif de la cagnotte, une fois la vente enregistrée.
     if loyalty_resolution:
         from apps.settings.services import LoyaltyService
         LoyaltyService.persist_redemption(
@@ -888,15 +889,15 @@ def apply_payment_to_sale(sale_id, user, *, payment_method_id=None,
 
         if award_loyalty and sale.customer:
             from apps.settings.services import LoyaltyService
-            LoyaltyService.award_points_for_sale(sale, user=user)
+            LoyaltyService.award_for_sale(sale, user=user)
 
-    # Caisse : dans la devise réellement remise. Un règlement en points n'est
+    # Caisse : dans la devise réellement remise. Un règlement en cagnotte n'est
     # pas de l'argent physique et ne doit pas entrer au tiroir.
     from apps.cashbook.services import (
         record_change, record_debt_collection_payment, record_sale_payment_income,
     )
     for p in applied_payments:
-        # Ni les points ni une avance déjà versée ne sont un encaissement :
+        # Ni la cagnotte ni une avance déjà versée ne sont un encaissement :
         # l'argent de l'avance est entré au tiroir quand elle a été enregistrée.
         if p.payment_method and p.payment_method.method_type in ('loyalty', 'advance'):
             continue

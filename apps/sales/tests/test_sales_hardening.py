@@ -228,14 +228,12 @@ class LoyaltyReversalTests(_BaseHardeningTest):
             organization=self.org,
             name='VIP',
             is_active=True,
-            points_per_unit=1,
-            amount_per_unit=Decimal('100.00'),
-            point_value=Decimal('1.00'),
+            earn_percent=Decimal('1.00'),
             only_registered_customers=True,
         )
 
     def test_cancel_reverses_loyalty_earn(self):
-        """Une vente complétée gagne des points ; son annulation les retire via EARN_REVERSAL."""
+        """Une vente complétée crédite la cagnotte ; l'annuler la reprend par EARN_REVERSAL."""
         self.client.force_authenticate(user=self.cashier_a)
         resp = self.client.post(
             '/api/v1/sales/',
@@ -251,10 +249,10 @@ class LoyaltyReversalTests(_BaseHardeningTest):
             transaction_type=LoyaltyTransaction.TransactionType.EARN,
         ).first()
         if earn is None:
-            self.skipTest("Programme de fidélité n'a pas attribué de points (config absente)")
-        points_awarded = earn.points
+            self.skipTest("Programme de fidélité n'a rien crédité (config absente)")
+        credite = earn.amount
         loyalty = earn.customer_loyalty
-        balance_before_cancel = loyalty.current_points
+        balance_before_cancel = loyalty.balance
 
         # Annuler la vente (manager pour bypasser la perm sold_by).
         self.client.force_authenticate(user=self.manager)
@@ -264,16 +262,16 @@ class LoyaltyReversalTests(_BaseHardeningTest):
         )
         self.assertEqual(cancel_resp.status_code, status.HTTP_200_OK, cancel_resp.content)
 
-        # Une ligne EARN_REVERSAL doit exister avec exactement -points_awarded.
+        # Une ligne EARN_REVERSAL doit exister avec exactement -credite.
         rev = LoyaltyTransaction.objects.filter(
             sale_id=sale_id,
             transaction_type=LoyaltyTransaction.TransactionType.EARN_REVERSAL,
         ).first()
         self.assertIsNotNone(rev, "Aucune ligne EARN_REVERSAL créée")
-        self.assertEqual(rev.points, -points_awarded)
+        self.assertEqual(rev.amount, -credite)
 
         loyalty.refresh_from_db()
-        self.assertEqual(loyalty.current_points, balance_before_cancel - points_awarded)
+        self.assertEqual(loyalty.balance, balance_before_cancel - credite)
 
     def test_cancel_reverse_is_idempotent(self):
         """Rappeler cancel sur une vente déjà annulée ne crée pas deux REVERSAL."""
@@ -314,9 +312,7 @@ class LoyaltyAwardIdempotenceTests(_BaseHardeningTest):
             organization=self.org,
             name='VIP',
             is_active=True,
-            points_per_unit=1,
-            amount_per_unit=Decimal('100.00'),
-            point_value=Decimal('1.00'),
+            earn_percent=Decimal('1.00'),
         )
 
     def test_duplicate_earn_blocked_by_unique_constraint(self):
@@ -344,7 +340,7 @@ class LoyaltyAwardIdempotenceTests(_BaseHardeningTest):
                 organization=sale.organization,
                 customer_loyalty=existing.customer_loyalty,
                 transaction_type=LoyaltyTransaction.TransactionType.EARN,
-                points=existing.points,
+                amount=existing.amount,
                 balance_after=existing.balance_after,
                 sale=sale,
                 description="Duplicate attempt",

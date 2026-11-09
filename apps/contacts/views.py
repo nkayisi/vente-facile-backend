@@ -10,7 +10,7 @@ from django.db.models import Sum, Count
 from decimal import Decimal, InvalidOperation
 from rest_framework.exceptions import ValidationError as DRFValidationError
 
-from apps.core.api_mixins import TenantViewSetMixin, AuditMixin
+from apps.core.api_mixins import TenantViewSetMixin, AuditMixin, ExportResponseMixin
 from apps.settings.currency_validation import valider_code_devise
 from apps.core.api_permissions import (
     IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission
@@ -24,7 +24,7 @@ from .serializers import (
     CustomerCreateSerializer, CustomerUpdateSerializer,
     CustomerTransactionSerializer,
     RecordPaymentSerializer, AdjustBalanceSerializer,
-    RedeemPointsToDebtSerializer,
+    UseLoyaltyOnDebtSerializer,
     SupplierListSerializer, SupplierDetailSerializer,
     SupplierCreateSerializer, SupplierUpdateSerializer,
     SupplierProductSerializer
@@ -35,7 +35,7 @@ from .serializers import (
 # CUSTOMER VIEWSET
 # =============================================================================
 
-class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
+class CustomerViewSet(ExportResponseMixin, TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     """
     ViewSet pour la gestion des clients.
     
@@ -77,7 +77,9 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         'record_payment': 'customers.edit',
         'record_advance': 'customers.edit',
         'adjust_balance': 'customers.edit',
-        'redeem_points_to_debt': 'customers.edit',
+        'use_loyalty_on_debt': 'customers.edit',
+        'report': 'customers.view',
+        'report_export': 'customers.view',
         'with_balance': 'customers.view',
         'debt_summary': 'customers.view',
         'search': 'customers.view',
@@ -103,10 +105,22 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         from apps.sales.models import Sale
         from apps.sales.serializers import SaleListSerializer
         
-        sales = Sale.objects.filter(
-            customer=customer,
-            is_deleted=False
-        ).select_related('sold_by').order_by('-sale_date')
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ UN CAISSIER LISAIT ICI LES VENTES DE SES COLLÈGUES.              │
+        # │                                                                  │
+        # │ `/sales/` les lui refuse (`sold_by=request.user` sans            │
+        # │ `sales.view_all`), et cette liste ne bornait RIEN. Les deux      │
+        # │ vivent sur la MÊME page de la fiche client : les laisser         │
+        # │ diverger ferait douter des deux chiffres. Le corps est partagé    │
+        # │ avec le rapport, pour qu'ils ne puissent plus se contredire.      │
+        # └──────────────────────────────────────────────────────────────────┘
+        from .customer_report import _ventes_du_client
+
+        sales = (
+            _ventes_du_client(customer, request, None, None)
+            .select_related('sold_by')
+            .order_by('-sale_date')
+        )
         
         page = self.paginate_queryset(sales)
         if page is not None:
@@ -115,6 +129,59 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         
         serializer = SaleListSerializer(sales, many=True)
         return Response(serializer.data)
+
+    @action(detail=True, methods=['get'])
+    def report(self, request, pk=None):
+        """
+        Le compte d'un client sur une PÉRIODE : achats, dette, cagnotte.
+
+        `date_from` et `date_to`, toutes deux en dates LOCALES et `date_to`
+        INCLUSIVE.
+        """
+        from .customer_report import build_customer_report
+
+        customer = self.get_object()
+        rapport = build_customer_report(
+            customer, request,
+            date_from=self._date_param(request, 'date_from'),
+            date_to=self._date_param(request, 'date_to'),
+        )
+        return Response(rapport)
+
+    @action(detail=True, methods=['get'], url_path='report/export')
+    def report_export(self, request, pk=None):
+        """Le même rapport, en PDF, en classeur ou en CSV."""
+        from .customer_report import build_customer_report, build_customer_report_spec
+
+        customer = self.get_object()
+        fmt = self.get_export_format(request)
+        rapport = build_customer_report(
+            customer, request,
+            date_from=self._date_param(request, 'date_from'),
+            date_to=self._date_param(request, 'date_to'),
+        )
+        spec = build_customer_report_spec(rapport, customer.organization)
+        base = (customer.code or str(customer.id))[:24]
+        return self.render_export(spec, f'rapport_client_{base}', fmt)
+
+    @staticmethod
+    def _date_param(request, nom):
+        """
+        Une date de requête, ou `None`.
+
+        ⚠ UNE DATE MALFORMÉE EST UN 400, PAS UN 500 : `fromisoformat` lève
+          `ValueError`, que DRF ne traduit pas. C'est le défaut déjà payé par
+          `_parse_date_range`.
+        """
+        from datetime import date
+
+        brut = (request.query_params.get(nom) or '').strip()
+        if not brut:
+            return None
+        try:
+            return date.fromisoformat(brut)
+        except ValueError:
+            raise DRFValidationError({nom: "Date attendue au format AAAA-MM-JJ."})
 
     @action(detail=True, methods=['get'])
     def transactions(self, request, pk=None):
@@ -248,23 +315,23 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
             **resultat,
         })
 
-    @action(detail=True, methods=['post'], url_path='redeem-points')
-    def redeem_points_to_debt(self, request, pk=None):
+    @action(detail=True, methods=['post'], url_path='use-loyalty')
+    def use_loyalty_on_debt(self, request, pk=None):
         """
-        Utilise les points de fidélité du client pour éponger sa dette.
+        Emploie la cagnotte de fidélité du client pour éponger sa dette.
 
-        Les points sont convertis en montant puis imputés sur les factures
-        ouvertes comme un règlement ordinaire. Aucun mouvement de caisse : ce
-        n'est pas de l'argent physique.
+        Le montant est imputé sur les factures ouvertes comme un règlement
+        ordinaire. Aucun mouvement de caisse : ce n'est pas de l'argent
+        physique.
         """
         from django.db import transaction as db_transaction
         from apps.contacts import services as contacts_services
         from apps.settings.services import LoyaltyService
 
         customer = self.get_object()
-        serializer = RedeemPointsToDebtSerializer(data=request.data)
+        serializer = UseLoyaltyOnDebtSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        points = serializer.validated_data['points']
+        demande = serializer.validated_data['amount']
 
         primary = CurrencyService.primary_code(customer.organization)
         outstanding = contacts_services.get_balance(customer, primary)
@@ -275,42 +342,42 @@ class CustomerViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
             )
 
         resolution = LoyaltyService.resolve_redemption(
-            customer, customer.organization, points, outstanding,
+            customer, customer.organization, demande, outstanding,
             target_currency=primary,
         )
         if resolution is None:
             return Response(
                 {'error': (
-                    "Points inutilisables : solde insuffisant, minimum non "
-                    "atteint, ou aucun programme de fidélité actif."
+                    "Cagnotte inutilisable : solde insuffisant, ou aucun "
+                    "programme de fidélité actif."
                 )},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         with db_transaction.atomic():
-            # Les points sont consommés UNE fois, ici ; le montant obtenu est
+            # La cagnotte est débitée UNE fois, ici ; le montant obtenu est
             # ensuite imputé sur les factures comme un règlement ordinaire.
-            LoyaltyService.consume_points(
+            LoyaltyService.consume(
                 customer.organization, resolution, user=request.user,
-                description=f"Points utilisés sur la dette de {customer.name}",
+                description=f"Cagnotte utilisée sur la dette de {customer.name}",
             )
             remaining, touched = self._settle_open_invoices(
                 customer, resolution['amount'], primary, request.user,
                 payment_method='loyalty',
-                notes=f"{resolution['points']} points de fidélité",
+                notes=f"Cagnotte fidélité : {resolution['amount']} {primary}",
             )
             if remaining > 0:
                 contacts_services.settle_debt(
                     customer, remaining,
                     currency=primary,
-                    notes=f"{resolution['points']} points de fidélité",
+                    notes=f"Cagnotte fidélité : {resolution['amount']} {primary}",
                     user=request.user,
                     payment_method='loyalty',
                 )
             customer.refresh_from_db()
 
         return Response({
-            'points_used': resolution['points'],
+            'loyalty_amount_used': str(resolution['amount_primary']),
             'amount': str(resolution['amount']),
             'currency': primary,
             'settled_invoices': touched,

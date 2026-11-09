@@ -13,19 +13,19 @@ from decimal import Decimal
 from apps.core.mixins import TenantQuerysetMixin
 from apps.core.api_permissions import IsTenantMember, HasActiveSubscription, HasPermission, DENY
 from apps.contacts.models import Customer
+from apps.core.exceptions import RefusMetier
 
 from .models import (
-    Currency, OrganizationCurrency, LoyaltyProgram, LoyaltyReward,
+    Currency, OrganizationCurrency, LoyaltyProgram,
     CustomerLoyalty, LoyaltyTransaction, OrganizationSettings
 )
 from .serializers import (
     CurrencySerializer, OrganizationCurrencySerializer,
     OrganizationCurrencyCreateSerializer, OrganizationCurrencyUpdateSerializer,
     LoyaltyProgramSerializer, LoyaltyProgramCreateUpdateSerializer,
-    LoyaltyRewardSerializer, LoyaltyRewardCreateSerializer,
     CustomerLoyaltySerializer, LoyaltyTransactionSerializer,
     OrganizationSettingsSerializer,
-    AdjustLoyaltyPointsSerializer, RedeemPointsSerializer,
+    AdjustLoyaltyBalanceSerializer,
     UpdateExchangeRateSerializer, CurrencyConversionSerializer
 )
 from .services import CurrencyService
@@ -222,13 +222,12 @@ class OrganizationCurrencyViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
 
 class LoyaltyProgramViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
     """
-    ViewSet for managing loyalty program.
-    Each organization has at most one loyalty program.
+    Le programme de fidélité d'une organisation (au plus un).
     """
     queryset = LoyaltyProgram.objects.all()
     serializer_class = LoyaltyProgramSerializer
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
-    
+
     action_permissions = {
         'list': '*',  # Accessible à tous les membres de l'organisation
         'retrieve': 'settings.view',
@@ -237,14 +236,14 @@ class LoyaltyProgramViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
         'partial_update': 'settings.manage',
         'destroy': 'settings.manage',
         'toggle': 'settings.manage',
-        'calculate_points': 'settings.view',
+        'simulate': 'settings.view',
     }
-    
+
     def get_serializer_class(self):
         if self.action in ['create', 'update', 'partial_update']:
             return LoyaltyProgramCreateUpdateSerializer
         return LoyaltyProgramSerializer
-    
+
     def list(self, request, *args, **kwargs):
         """Retourne le programme de fidélité de l'organisation (ou null)."""
         org = self.get_organization()
@@ -271,67 +270,42 @@ class LoyaltyProgramViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
         instance = self.get_object()
         instance.is_active = not instance.is_active
         instance.save()
-        
+
         return Response({
             'is_active': instance.is_active,
             'message': f"Programme de fidélité {'activé' if instance.is_active else 'désactivé'}."
         })
-    
+
     @action(detail=True, methods=['post'])
-    def calculate_points(self, request, pk=None):
-        """Calculer les points pour un montant donné."""
+    def simulate(self, request, pk=None):
+        """
+        Ce qu'une facture donnée rapporterait, et ce qu'elle laisse payer.
+
+        ⚠ UN APERÇU CHIFFRÉ VAUT MIEUX QU'UNE EXPLICATION. Elle remplace
+        `calculate_points`, qui ne rendait qu'un nombre de points dont le
+        marchand ne pouvait pas déduire la valeur. Les deux réglages se lisent
+        alors sur le même exemple : « sur 10 000 FC, le client gagne 200 FC et
+        peut en régler jusqu'à 5 000 FC ».
+        """
         instance = self.get_object()
-        amount = Decimal(request.data.get('amount', 0))
-        points = instance.calculate_points(amount)
-        
+        amount = Decimal(request.data.get('amount', 0) or 0)
+
         return Response({
             'amount': amount,
-            'points': points,
-            'is_active': instance.is_active
+            'earned': instance.credit_for(amount),
+            'max_redeemable': instance.max_redeemable_amount(amount),
+            'is_active': instance.is_active,
         })
-
-
-class LoyaltyRewardViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
-    """
-    ViewSet for managing loyalty rewards.
-    """
-    queryset = LoyaltyReward.objects.all()
-    serializer_class = LoyaltyRewardSerializer
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
-    
-    action_permissions = {
-        'list': 'settings.view',
-        'retrieve': 'settings.view',
-        'create': 'settings.manage',
-        'update': 'settings.manage',
-        'partial_update': 'settings.manage',
-        'destroy': 'settings.manage',
-    }
-    
-    def get_serializer_class(self):
-        if self.action == 'create':
-            return LoyaltyRewardCreateSerializer
-        return LoyaltyRewardSerializer
-    
-    def perform_create(self, serializer):
-        org = self.get_organization()
-        try:
-            program = LoyaltyProgram.objects.get(organization=org)
-        except LoyaltyProgram.DoesNotExist:
-            from rest_framework.exceptions import ValidationError
-            raise ValidationError("Aucun programme de fidélité configuré.")
-        
-        serializer.save(organization=org, loyalty_program=program)
 
 
 class CustomerLoyaltyViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
     """
-    ViewSet for managing customer loyalty accounts.
+    Les cagnottes de fidélité des clients.
     """
     queryset = CustomerLoyalty.objects.all()
     serializer_class = CustomerLoyaltySerializer
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
-    # Le seul usage réel est « le compte de CE client », interrogé avec
+    # Le seul usage réel est « la cagnotte de CE client », interrogée avec
     # `?customer=<uuid>` : une enveloppe de pagination n'apporte rien et faisait
     # échouer la lecture côté POS, qui attendait un tableau.
     pagination_class = None
@@ -339,40 +313,39 @@ class CustomerLoyaltyViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
     action_permissions = {
         'list': 'customers.view',
         'retrieve': 'customers.view',
-        'adjust_points': 'settings.manage',
-        'redeem': 'sales.create',
+        'adjust_balance': 'settings.manage',
         'transactions': 'customers.view',
-        # Une fiche de fidélité NAÎT avec son client et se modifie par les
-        # actions ci-dessus (`adjust_points`, `redeem`), jamais en écriture
-        # directe : un PATCH sur `current_points` ne laisserait aucune trace
-        # de transaction, et le solde du client cesserait d'être justifiable.
+        # Une cagnotte NAÎT avec son client et se modifie par l'action
+        # ci-dessus ou par une vente, jamais en écriture directe : un PATCH sur
+        # `balance` ne laisserait aucune trace de registre, et le solde du
+        # client cesserait d'être justifiable.
         'create': DENY,
         'update': DENY,
         'partial_update': DENY,
         'destroy': DENY,
     }
-    
+
     def get_queryset(self):
         qs = super().get_queryset()
-        
+
         # Filtrer par client
         customer_id = self.request.query_params.get('customer')
         if customer_id:
             qs = qs.filter(customer_id=customer_id)
-        
+
         return qs.select_related('customer')
-    
-    @action(detail=False, methods=['post'])
-    def adjust_points(self, request):
-        """Ajuster manuellement les points d'un client."""
-        serializer = AdjustLoyaltyPointsSerializer(data=request.data)
+
+    @action(detail=False, methods=['post'], url_path='adjust-balance')
+    def adjust_balance(self, request):
+        """Corrige manuellement la cagnotte d'un client."""
+        serializer = AdjustLoyaltyBalanceSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        
+
         org = self.get_organization()
         customer_id = serializer.validated_data['customer_id']
-        points = serializer.validated_data['points']
+        montant = serializer.validated_data['amount']
         description = serializer.validated_data.get('description', '')
-        
+
         try:
             customer = Customer.objects.get(id=customer_id, organization=org)
         except Customer.DoesNotExist:
@@ -380,123 +353,49 @@ class CustomerLoyaltyViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
                 {'error': "Client non trouvé."},
                 status=status.HTTP_404_NOT_FOUND
             )
-        
-        # Obtenir ou créer le compte de fidélité
-        loyalty, created = CustomerLoyalty.objects.get_or_create(
+
+        loyalty, _created = CustomerLoyalty.objects.get_or_create(
             organization=org,
             customer=customer
         )
-        
+
         with transaction.atomic():
-            if points > 0:
-                loyalty.add_points(points)
+            if montant > 0:
+                loyalty.credit(montant)
                 trans_type = LoyaltyTransaction.TransactionType.BONUS
             else:
-                # `redeem_points` verrouille la ligne et lève si le solde est
+                # `debit` verrouille la ligne et lève si le solde est
                 # insuffisant. L'ancien code faisait une lecture-modification-
-                # écriture non atomique et n'incrémentait jamais
-                # `total_points_redeemed`.
+                # écriture non atomique et n'incrémentait jamais `total_used`.
                 try:
-                    loyalty.redeem_points(abs(points))
-                except ValueError:
+                    loyalty.debit(abs(montant))
+                except RefusMetier as refus:
                     return Response(
-                        {'error': "Points insuffisants pour cet ajustement."},
+                        {'error': str(refus)},
                         status=status.HTTP_400_BAD_REQUEST
                     )
                 trans_type = LoyaltyTransaction.TransactionType.ADJUST
-            
-            # Créer la transaction
+
             LoyaltyTransaction.objects.create(
                 organization=org,
                 customer_loyalty=loyalty,
                 transaction_type=trans_type,
-                points=points,
-                balance_after=loyalty.current_points,
-                description=description or f"Ajustement manuel de {points:+d} points",
+                amount=montant,
+                balance_after=loyalty.balance,
+                description=description or f"Ajustement manuel de {montant:+.2f}",
                 created_by=request.user
-            )
-        
-        return Response(CustomerLoyaltySerializer(loyalty).data)
-    
-    @action(detail=True, methods=['post'])
-    def redeem(self, request, pk=None):
-        """Utiliser des points pour une récompense."""
-        loyalty = self.get_object()
-        serializer = RedeemPointsSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        
-        org = self.get_organization()
-        reward_id = serializer.validated_data.get('reward_id')
-        points = serializer.validated_data.get('points')
-        
-        if reward_id:
-            try:
-                reward = LoyaltyReward.objects.get(
-                    id=reward_id,
-                    organization=org,
-                    is_active=True
-                )
-                points = reward.points_required
-            except LoyaltyReward.DoesNotExist:
-                return Response(
-                    {'error': "Récompense non trouvée."},
-                    status=status.HTTP_404_NOT_FOUND
-                )
-        else:
-            reward = None
-        
-        if points > loyalty.current_points:
-            return Response(
-                {'error': f"Points insuffisants. Disponible: {loyalty.current_points}"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Le programme doit être ACTIF : sans ce filtre, on pouvait consommer
-        # des points sur un programme désactivé, alors que le chemin de vente
-        # l'interdit déjà.
-        program = LoyaltyProgram.objects.filter(
-            organization=org, is_active=True,
-        ).first()
-        if program is None:
-            return Response(
-                {'error': "Aucun programme de fidélité actif."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        if points < program.min_points_to_redeem:
-            return Response(
-                {'error': f"Minimum requis: {program.min_points_to_redeem} points."},
-                status=status.HTTP_400_BAD_REQUEST
             )
 
-        with transaction.atomic():
-            loyalty.redeem_points(points)
-            
-            LoyaltyTransaction.objects.create(
-                organization=org,
-                customer_loyalty=loyalty,
-                transaction_type=LoyaltyTransaction.TransactionType.REDEEM,
-                points=-points,
-                balance_after=loyalty.current_points,
-                reward=reward,
-                description=reward.name if reward else f"Utilisation de {points} points",
-                created_by=request.user
-            )
-        
-        return Response({
-            'success': True,
-            'points_redeemed': points,
-            'current_points': loyalty.current_points,
-            'reward': LoyaltyRewardSerializer(reward).data if reward else None
-        })
-    
+        return Response(CustomerLoyaltySerializer(loyalty).data)
+
     @action(detail=True, methods=['get'])
     def transactions(self, request, pk=None):
-        """Historique des transactions de fidélité d'un client."""
+        """Registre de cagnotte d'un client."""
         loyalty = self.get_object()
         transactions = LoyaltyTransaction.objects.filter(
             customer_loyalty=loyalty
         ).order_by('-created_at')[:50]
-        
+
         serializer = LoyaltyTransactionSerializer(transactions, many=True)
         return Response(serializer.data)
 

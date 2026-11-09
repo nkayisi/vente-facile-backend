@@ -171,7 +171,7 @@ GARDES_PAR_LA_REMISE_A_ZERO = [
     'sales.Register', 'sales.PaymentMethod',
     'contacts.Customer', 'contacts.Supplier', 'contacts.SupplierProduct',
     'cashbook.IncomeCategory', 'cashbook.ExpenseCategory',
-    'settings.LoyaltyProgram', 'settings.LoyaltyReward',
+    'settings.LoyaltyProgram',
     'settings.OrganizationCurrency', 'settings.OrganizationSettings',
     'organizations.Branch', 'organizations.OrganizationMembership',
 ]

@@ -16,6 +16,7 @@ from apps.core.api_mixins import (
     TenantViewSetMixin, AuditMixin, WarehouseScopedQuerysetMixin, ExportResponseMixin,
 )
 from rest_framework.exceptions import ValidationError as DRFValidationError
+from django.core.exceptions import ValidationError as DjangoValidationError
 from apps.core.warehouse_scope import (
     accessible_warehouse_ids,
     assert_warehouse_allowed_for_request,
@@ -502,6 +503,11 @@ class StockMovementViewSet(ExportResponseMixin, WarehouseScopedQuerysetMixin, Te
         'create': 'stock_movements.create',
         'export': 'stock_movements.view',
         'supplies_export': 'stock_movements.view',
+        # ⚠ LA FEUILLE EXIGE LE DROIT DE CRÉER, PAS CELUI DE LIRE. Elle ne sert
+        #   qu'à préparer une écriture : l'ouvrir à `stock.view` donnerait un
+        #   formulaire que son lecteur ne peut pas soumettre.
+        'supply_sheet': 'stock_movements.create',
+        'bulk': 'stock_movements.create',
         # Un mouvement de stock est une ÉCRITURE, au sens comptable : il se
         # contrepasse par un autre mouvement, il ne se rature pas. Le
         # modifier laisserait les `quantity_before`/`after` des mouvements
@@ -517,6 +523,87 @@ class StockMovementViewSet(ExportResponseMixin, WarehouseScopedQuerysetMixin, Te
         elif self.action == 'create':
             return StockMovementCreateSerializer
         return StockMovementDetailSerializer
+
+    @action(detail=False, methods=['get'], url_path='supply-sheet')
+    def supply_sheet(self, request):
+        """
+        La feuille d'un approvisionnement de masse, pré-remplie par périmètre.
+
+        `warehouse` (requis), `scope=all|category|product|low`, `categories=`,
+        `products=`, `search=`.
+        """
+        from .bulk_supply import build_supply_sheet
+
+        organization = self.get_organization()
+        entrepot = self._entrepot_demande(request, organization)
+
+        def liste(nom):
+            brut = request.query_params.get(nom, '')
+            return [v for v in (x.strip() for x in brut.split(',')) if v]
+
+        feuille = build_supply_sheet(
+            organization, entrepot,
+            scope=request.query_params.get('scope', 'all'),
+            categories=liste('categories'),
+            products=liste('products'),
+            search=(request.query_params.get('search') or '').strip() or None,
+        )
+        return Response(feuille)
+
+    @action(detail=False, methods=['post'], url_path='bulk')
+    def bulk(self, request):
+        """
+        Enregistre N entrées de stock d'un seul bloc.
+
+        Corps : `{warehouse, movement_type, notes, lines: [...]}`, chaque ligne
+        portant exactement les champs que `StockMovementCreateSerializer`
+        accepte déjà.
+        """
+        from .bulk_supply import create_bulk_supply
+
+        organization = self.get_organization()
+        entrepot = self._entrepot_demande(request, organization, source=request.data)
+
+        mouvements = create_bulk_supply(
+            organization=organization,
+            user=request.user,
+            warehouse=entrepot,
+            movement_type=request.data.get('movement_type'),
+            lines=request.data.get('lines') or [],
+            notes=(request.data.get('notes') or '').strip(),
+            request=request,
+        )
+        # Le DÉTAIL de chaque mouvement écrit, pas un simple compte : l'écran
+        # doit pouvoir annoncer ce qui est entré, rayon par rayon.
+        return Response(
+            {
+                'created': len(mouvements),
+                'movements': StockMovementListSerializer(mouvements, many=True).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    def _entrepot_demande(self, request, organization, source=None):
+        """
+        L'entrepôt visé, contrôlé contre le périmètre du demandeur.
+
+        ⚠ IL EST REQUIS, et « aucun entrepôt » n'est pas « tous les entrepôts » :
+          un approvisionnement entre quelque part. Le contrôle de périmètre vit
+          dans `create_bulk_supply` pour la POUSSÉE - la vue ET le journal y
+          passent - et ici pour la LECTURE de la feuille.
+        """
+        donnees = request.query_params if source is None else source
+        identifiant = donnees.get('warehouse')
+        if not identifiant:
+            raise DRFValidationError({'warehouse': "Indiquez l'entrepôt."})
+        assert_warehouse_allowed_for_request(request, identifiant)
+        try:
+            return Warehouse.objects.get(id=identifiant, organization=organization)
+        except (Warehouse.DoesNotExist, DjangoValidationError, ValueError, TypeError):
+            # ⚠ Un identifiant ILLISIBLE est un 400, pas un 500 : `get()` sur un
+            #   UUID malformé lève `DjangoValidationError`, que DRF ne traduit
+            #   pas. C'est le défaut déjà payé par `_parse_date_range`.
+            raise DRFValidationError({'warehouse': "Entrepôt introuvable."})
 
     @action(detail=False, methods=['get'], url_path='export')
     def export(self, request):

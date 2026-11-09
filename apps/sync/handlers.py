@@ -413,6 +413,48 @@ def stock_movement_create(ctx, payload):
     }
 
 
+@handler('stock_movement.bulk_create', permission='stock_movements.create')
+def stock_movement_bulk_create(ctx, payload):
+    """
+    Une LIVRAISON entière : N entrées de stock, d'un seul bloc.
+
+    ⚠ UN REFUS CONDAMNE TOUTE LA LIVRAISON, et c'est la contrepartie du `atomic`
+      unique de `create_bulk_supply` : la moitié d'un bon de livraison
+      enregistrée est pire que rien. Le message doit donc NOMMER la ligne, sinon
+      la quarantaine est illisible et le magasinier ressaisit tout - ce que
+      `_refuser_les_doublons` et les erreurs indexées font déjà.
+
+    ⚠ L'ENTREPÔT EST RÉSOLU ICI, PAS DANS LE SERVICE : celui-ci reçoit une
+      instance, parce que la vue en tient déjà une. Le périmètre, lui, est
+      vérifié DANS le service - la vue et le journal y passent tous deux.
+    """
+    from apps.inventory.bulk_supply import create_bulk_supply
+    from apps.inventory.models import Warehouse
+    from apps.inventory.serializers import StockMovementListSerializer
+
+    _require(payload, 'warehouse')
+    entrepot = _objet_de_lorg(Warehouse, ctx, payload['warehouse'], "L'entrepôt")
+
+    mouvements = create_bulk_supply(
+        organization=ctx.organization,
+        user=ctx.user,
+        warehouse=entrepot,
+        movement_type=payload.get('movement_type'),
+        lines=payload.get('lines') or [],
+        notes=(payload.get('notes') or '').strip(),
+        request=ctx.request,
+    )
+    return {
+        'server_ids': {
+            'stock_movements': [str(m.id) for m in mouvements],
+        },
+        'authoritative': {
+            'created': len(mouvements),
+            'movements': StockMovementListSerializer(mouvements, many=True).data,
+        },
+    }
+
+
 @handler('register_session.close', permission='sales.create')
 def register_session_close(ctx, payload):
     """

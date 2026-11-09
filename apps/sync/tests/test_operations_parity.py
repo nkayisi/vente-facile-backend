@@ -469,9 +469,9 @@ class RefusDeterministeTests(_OperationsBaseTest):
         with self.assertRaises(RefusMetier):
             ligne.save()
 
-        fidelite = CustomerLoyalty(current_points=Decimal('10'))
+        fidelite = CustomerLoyalty(balance=Decimal('10'))
         with self.assertRaises(RefusMetier):
-            fidelite.redeem_points(Decimal('500'), save=False)
+            fidelite.debit(Decimal('500'), save=False)
 
     def test_la_classification_nomme_le_refus_sans_ranger_toute_ValueError(self):
         """

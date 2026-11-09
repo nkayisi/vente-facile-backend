@@ -660,6 +660,16 @@ PULL_TABLES = (
     PullTable('suppliers', 'contacts.Supplier', soft_delete=True),
     PullTable('loyalty_programs', 'settings.LoyaltyProgram'),
     PullTable('customer_loyalty', 'settings.CustomerLoyalty'),
+    # ⚠ LE REGISTRE DE LA CAGNOTTE DESCEND, ET SON PREMIER TIRAGE PORTE TOUT
+    #   L'HISTORIQUE. Volume du même ordre que `customer_transactions`, déjà
+    #   tirée sans borne : une ligne par vente réglée. C'est le prix d'un
+    #   onglet « Cagnotte » qui se lit au comptoir, sans réseau - la fiche d'un
+    #   client ne peut pas exiger la 2G pour dire ce qu'il a gagné.
+    #
+    #   Table d'ORGANISATION : ni périmètre entrepôt, ni suppression douce, donc
+    #   son jeton de périmètre est constant et un magasinier qui reçoit un
+    #   second dépôt ne la re-tire pas.
+    PullTable('loyalty_transactions', 'settings.LoyaltyTransaction'),
 
     # -- caisse et ventes
     PullTable('registers', 'sales.Register', soft_delete=True, warehouse_path='warehouse_id'),
