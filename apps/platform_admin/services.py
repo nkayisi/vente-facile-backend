@@ -129,6 +129,11 @@ class PlatformPermissionService:
         'incidents.reconcile_payments',
         'metrics.view',
         'impersonation.start',
+        # Le support écrit les notes : c'est lui qui décroche.
+        'support_notes.view',
+        'support_notes.create',
+        # ⚠ PAS `exports.run` : un export emporte la liste de tous les marchands
+        # hors de l'application, ce qu'aucune consultation ne fait.
     })
 
     ROLE_PERMISSIONS = {

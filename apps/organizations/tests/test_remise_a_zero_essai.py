@@ -240,6 +240,9 @@ class ClassementDesModelesTests(APITestCase):
         # vu chez le marchand. Le marchand ne doit pas pouvoir l'effacer en
         # remettant son essai à zéro, et elle ne porte aucune opération.
         'platform_admin.ImpersonationSession',
+        # Les notes du support : même nature, une trace de l'éditeur que le
+        # marchand ne voit pas et ne doit pas pouvoir effacer.
+        'platform_admin.SupportNote',
     }
 
     def test_le_balayage_trouve_bien_des_modeles(self):

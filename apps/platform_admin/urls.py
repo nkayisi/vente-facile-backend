@@ -18,7 +18,10 @@ from .views import (
     AdminPlanViewSet,
     AdminPlatformAdminViewSet,
     AdminReconcilePaymentsView,
+    AdminSearchView,
+    AdminSubscriptionPaymentViewSet,
     AdminSubscriptionViewSet,
+    AdminSupportNoteViewSet,
     AdminUserViewSet,
 )
 
@@ -30,6 +33,8 @@ router.register(r'audit-log', AdminActionLogViewSet, basename='admin-audit-log')
 router.register(r'impersonation-sessions', AdminImpersonationSessionViewSet, basename='admin-impersonation-session')
 router.register(r'plans', AdminPlanViewSet, basename='admin-plan')
 router.register(r'subscriptions', AdminSubscriptionViewSet, basename='admin-subscription')
+router.register(r'subscription-payments', AdminSubscriptionPaymentViewSet, basename='admin-subscription-payment')
+router.register(r'support-notes', AdminSupportNoteViewSet, basename='admin-support-note')
 
 app_name = 'platform_admin'
 
@@ -37,6 +42,7 @@ urlpatterns = [
     path('me/', AdminMeView.as_view(), name='admin-me'),
     path('dashboard/', AdminDashboardView.as_view(), name='admin-dashboard'),
     path('metrics/', AdminMetricsView.as_view(), name='admin-metrics'),
+    path('search/', AdminSearchView.as_view(), name='admin-search'),
     path('incidents/', AdminIncidentsView.as_view(), name='admin-incidents'),
     path('incidents/reconcile/', AdminReconcilePaymentsView.as_view(), name='admin-incidents-reconcile'),
     path('app-release/', AdminAppReleaseView.as_view(), name='admin-app-release'),

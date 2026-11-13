@@ -29,12 +29,16 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.core.api_mixins import ExportableListMixin
 from apps.core.api_permissions import DENY
 from apps.organizations.models import Organization, OrganizationMembership
 from apps.subscriptions.models import GlobalConfig, Plan, Subscription, SubscriptionPayment
 from apps.users.models import User
 
-from .models import AdminActionLog, ImpersonationSession, PlatformAdminProfile, PlatformRole
+from . import exports as documents
+from .models import (
+    AdminActionLog, ImpersonationSession, PlatformAdminProfile, PlatformRole, SupportNote,
+)
 from .permissions import HasPlatformPermission, IsPlatformAdmin
 from .serializers import (
     AdminActionLogSerializer,
@@ -50,12 +54,14 @@ from .serializers import (
     AdminPlanSerializer,
     AdminReasonSerializer,
     AdminSubscriptionListSerializer,
+    AdminSubscriptionPaymentSerializer,
     AdminUserCreateSerializer,
     AdminUserDetailSerializer,
     AdminUserListSerializer,
     AdminUserUpdateSerializer,
     ImpersonationSessionSerializer,
     PlatformAdminProfileSerializer,
+    SupportNoteSerializer,
 )
 from .services import (
     AuditLogService,
@@ -325,7 +331,7 @@ class AdminReconcilePaymentsView(APIView):
 # ORGANIZATIONS
 # =============================================================================
 
-class AdminOrganizationViewSet(viewsets.ModelViewSet):
+class AdminOrganizationViewSet(ExportableListMixin, viewsets.ModelViewSet):
     """
     Admin management of all organizations on the platform.
 
@@ -348,9 +354,15 @@ class AdminOrganizationViewSet(viewsets.ModelViewSet):
         'partial_update': 'organizations.edit',
         'toggle_active': 'organizations.toggle_active',
         'activate_subscription': 'organizations.activate_subscription',
+        # Les fichiers emportent la liste de tous les marchands : droit à part.
+        'export': 'exports.run',
         # Fermé : voir la docstring de la classe.
         'create': DENY,
     }
+    export_basename = 'etablissements'
+
+    def build_export_spec(self, request, queryset):
+        return documents.organisations(request, queryset)
 
     def get_queryset(self):
         return (
@@ -474,7 +486,7 @@ class AdminOrganizationViewSet(viewsets.ModelViewSet):
 # USERS
 # =============================================================================
 
-class AdminUserViewSet(viewsets.ModelViewSet):
+class AdminUserViewSet(ExportableListMixin, viewsets.ModelViewSet):
     """Admin management of all platform users."""
     permission_classes = GARDES
     http_method_names = SANS_SUPPRESSION
@@ -493,7 +505,12 @@ class AdminUserViewSet(viewsets.ModelViewSet):
         'grant_role': 'platform_admins.manage',
         'revoke_role': 'platform_admins.manage',
         'impersonate': 'impersonation.start',
+        'export': 'exports.run',
     }
+    export_basename = 'comptes'
+
+    def build_export_spec(self, request, queryset):
+        return documents.comptes(request, queryset)
 
     def get_queryset(self):
         return (
@@ -717,7 +734,7 @@ class AdminActionLogFilter(django_filters.FilterSet):
         return queryset.filter(created_at__lt=self._borne(value + timedelta(days=1)))
 
 
-class AdminActionLogViewSet(viewsets.ReadOnlyModelViewSet):
+class AdminActionLogViewSet(ExportableListMixin, viewsets.ReadOnlyModelViewSet):
     """
     Le journal des actes d'administration. Lecture seule, et c'est sa nature :
     un journal qu'on peut corriger ne prouve plus rien.
@@ -730,10 +747,170 @@ class AdminActionLogViewSet(viewsets.ReadOnlyModelViewSet):
     action_permissions = {
         'list': 'audit_log.view',
         'retrieve': 'audit_log.view',
+        'export': 'exports.run',
     }
+    export_basename = 'journal_audit'
+
+    def build_export_spec(self, request, queryset):
+        return documents.journal(request, queryset)
 
     def get_queryset(self):
         return AdminActionLog.objects.select_related('actor').order_by('-created_at')
+
+
+# =============================================================================
+# NOTES DU SUPPORT
+# =============================================================================
+
+class AdminSupportNoteViewSet(viewsets.ModelViewSet):
+    """
+    Les notes du support sur un établissement (`?organization=`).
+
+    ⚠ ELLES NE SE SUPPRIMENT PAS (`DELETE` fermé) : une note effacée ne dit plus
+      à personne ce qu'on savait. Elles se corrigent - par leur AUTEUR seul - et
+      s'épinglent ou se désépinglent par quiconque peut en écrire.
+    """
+    permission_classes = GARDES
+    serializer_class = SupportNoteSerializer
+    http_method_names = SANS_SUPPRESSION
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['organization', 'is_pinned']
+    action_permissions = {
+        'list': 'support_notes.view',
+        'retrieve': 'support_notes.view',
+        'create': 'support_notes.create',
+        'partial_update': 'support_notes.create',
+    }
+
+    def get_queryset(self):
+        return SupportNote.objects.select_related('organization').order_by(
+            '-is_pinned', '-created_at'
+        )
+
+    def perform_create(self, serializer):
+        serializer.save(author=self.request.user, author_email=self.request.user.email)
+
+    def perform_update(self, serializer):
+        # ⚠ Le TEXTE n'appartient qu'à son auteur : corriger la note d'un autre
+        #   lui ferait dire ce qu'il n'a pas écrit, sous sa signature figée.
+        if 'body' in serializer.validated_data and serializer.instance.author_id != self.request.user.pk:
+            raise RefusAdministration("Seul son auteur corrige une note. Ajoutez-en une autre.")
+        serializer.save()
+
+
+# =============================================================================
+# PAIEMENTS D'ABONNEMENT
+# =============================================================================
+
+class AdminSubscriptionPaymentFilter(django_filters.FilterSet):
+    """⚠ Bornes LOCALES, `date_to` INCLUSIVE, comme le journal d'audit."""
+
+    date_from = django_filters.DateFilter(method='filter_date_from')
+    date_to = django_filters.DateFilter(method='filter_date_to')
+
+    class Meta:
+        model = SubscriptionPayment
+        fields = ['status', 'payment_method', 'organization', 'subscription']
+
+    def _borne(self, jour):
+        return timezone.make_aware(datetime.combine(jour, time.min))
+
+    def filter_date_from(self, queryset, name, value):
+        return queryset.filter(created_at__gte=self._borne(value))
+
+    def filter_date_to(self, queryset, name, value):
+        return queryset.filter(created_at__lt=self._borne(value + timedelta(days=1)))
+
+
+class AdminSubscriptionPaymentViewSet(ExportableListMixin, viewsets.ReadOnlyModelViewSet):
+    """
+    Tous les règlements d'abonnement de la plateforme, en lecture seule.
+
+    Ils ne se trouvaient jusqu'ici que sur la fiche d'un établissement, ou parmi
+    les incidents quand ils traînaient : personne ne pouvait répondre à « qu'a-t-on
+    encaissé ce mois-ci, et par quel moyen ». Un règlement ne se corrige pas d'ici :
+    il se rattrape par la réconciliation des incidents.
+    """
+    permission_classes = GARDES
+    serializer_class = AdminSubscriptionPaymentSerializer
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter, DjangoFilterBackend]
+    filterset_class = AdminSubscriptionPaymentFilter
+    search_fields = ['reference', 'external_transaction_id', 'organization__name']
+    ordering_fields = ['created_at', 'paid_at', 'amount']
+    ordering = ['-created_at']
+    action_permissions = {
+        'list': 'subscriptions.view',
+        'retrieve': 'subscriptions.view',
+        'export': 'exports.run',
+    }
+    export_basename = 'paiements_abonnement'
+
+    def get_queryset(self):
+        return SubscriptionPayment.objects.select_related(
+            'organization', 'subscription__plan'
+        )
+
+    def build_export_spec(self, request, queryset):
+        return documents.paiements(request, queryset)
+
+
+# =============================================================================
+# RECHERCHE GLOBALE
+# =============================================================================
+
+class AdminSearchView(APIView):
+    """
+    `GET /platform-admin/search/?q=` : établissements, comptes, paiements.
+
+    ⚠ CHAQUE GROUPE SUIT SA PERMISSION. La recherche s'ouvre à qui peut lire l'un
+      des trois domaines, et ne rend que ceux qu'il peut lire : un groupe rendu
+      vide se lirait « aucun résultat », un groupe absent dit « pas pour vous ».
+
+    ⚠ DEUX CARACTÈRES AU MOINS : en dessous, chaque frappe balaierait toutes les
+      tables de la plateforme pour une réponse qu'on ne lira pas.
+    """
+    permission_classes = GARDES
+    http_method_names = ['get', 'options', 'head']
+    action_permissions = {'get': ('organizations.view', 'users.view', 'subscriptions.view')}
+
+    LIMITE = 6
+
+    def get(self, request):
+        q = (request.query_params.get('q') or '').strip()
+        if len(q) < 2:
+            return Response({'q': q, 'organizations': None, 'users': None, 'payments': None})
+
+        droits = PlatformPermissionService.get_effective_permissions(request.user)
+        reponse = {'q': q, 'organizations': None, 'users': None, 'payments': None}
+
+        if 'organizations.view' in droits:
+            reponse['organizations'] = [
+                {'id': str(o.id), 'name': o.name, 'detail': ', '.join(p for p in [o.city, o.country] if p),
+                 'is_active': o.is_active}
+                for o in Organization.objects.filter(is_deleted=False).filter(
+                    Q(name__icontains=q) | Q(email__icontains=q) | Q(phone__icontains=q)
+                    | Q(slug__icontains=q)
+                ).order_by('name')[:self.LIMITE]
+            ]
+        if 'users.view' in droits:
+            reponse['users'] = [
+                {'id': str(u.id), 'name': u.full_name or u.email, 'detail': u.email,
+                 'is_active': u.is_active}
+                for u in User.objects.filter(
+                    Q(email__icontains=q) | Q(first_name__icontains=q)
+                    | Q(last_name__icontains=q) | Q(phone__icontains=q)
+                ).order_by('email')[:self.LIMITE]
+            ]
+        if 'subscriptions.view' in droits:
+            reponse['payments'] = [
+                {'id': str(p.id), 'name': p.reference or str(p.id),
+                 'detail': f'{p.organization.name} · {p.get_status_display()}',
+                 'organization': str(p.organization_id)}
+                for p in SubscriptionPayment.objects.select_related('organization').filter(
+                    Q(reference__icontains=q) | Q(external_transaction_id__icontains=q)
+                ).order_by('-created_at')[:self.LIMITE]
+            ]
+        return Response(reponse)
 
 
 # =============================================================================
@@ -916,7 +1093,7 @@ def _debut_local(jour):
     return timezone.make_aware(datetime.combine(jour, time.min))
 
 
-class AdminSubscriptionViewSet(viewsets.ModelViewSet):
+class AdminSubscriptionViewSet(ExportableListMixin, viewsets.ModelViewSet):
     """
     Admin management of all subscriptions on the platform.
     Supports listing, creating manually, extending and cancelling.
@@ -936,7 +1113,12 @@ class AdminSubscriptionViewSet(viewsets.ModelViewSet):
         'create': 'subscriptions.create',
         'extend': 'subscriptions.extend',
         'cancel': 'subscriptions.cancel',
+        'export': 'exports.run',
     }
+    export_basename = 'abonnements'
+
+    def build_export_spec(self, request, queryset):
+        return documents.abonnements(request, queryset)
 
     def get_queryset(self):
         return Subscription.objects.select_related('organization', 'plan').all()

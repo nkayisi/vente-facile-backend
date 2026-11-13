@@ -14,10 +14,14 @@ from rest_framework import serializers
 
 from apps.organizations.models import Organization
 from apps.settings.models import Currency
-from apps.subscriptions.models import GlobalConfig, Plan, PlanFeature, Subscription
+from apps.subscriptions.models import (
+    GlobalConfig, Plan, PlanFeature, Subscription, SubscriptionPayment,
+)
 from apps.users.models import User
 
-from .models import AdminActionLog, ImpersonationSession, PlatformAdminProfile, PlatformRole
+from .models import (
+    AdminActionLog, ImpersonationSession, PlatformAdminProfile, PlatformRole, SupportNote,
+)
 from .permissions_catalog import PLATFORM_PERMISSION_CATALOG
 
 
@@ -661,3 +665,76 @@ class AdminAppReleaseSerializer(serializers.ModelSerializer):
             setattr(instance, champ, valeur)
         instance.clean()
         return attrs
+
+
+# =============================================================================
+# NOTES DU SUPPORT
+# =============================================================================
+
+class SupportNoteSerializer(serializers.ModelSerializer):
+    """Une note du support sur un établissement, et qui peut la corriger."""
+
+    organization_name = serializers.CharField(source='organization.name', read_only=True)
+    #: Seul son AUTEUR corrige une note : la vue le refuse aux autres, l'écran
+    #: le sait d'avance plutôt que de proposer un bouton qui sera refusé.
+    peut_corriger = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SupportNote
+        fields = [
+            'id', 'organization', 'organization_name', 'author_email', 'body',
+            'is_pinned', 'peut_corriger', 'created_at', 'updated_at',
+        ]
+        read_only_fields = [
+            'id', 'organization_name', 'author_email', 'peut_corriger',
+            'created_at', 'updated_at',
+        ]
+
+    def get_peut_corriger(self, obj):
+        request = self.context.get('request')
+        return bool(request and obj.author_id and obj.author_id == request.user.pk)
+
+    def validate_body(self, value):
+        texte = (value or '').strip()
+        if not texte:
+            raise serializers.ValidationError("Une note vide ne dit rien.")
+        return texte
+
+    def validate_organization(self, value):
+        if value.is_deleted:
+            raise serializers.ValidationError("Établissement introuvable.")
+        return value
+
+    def validate(self, attrs):
+        # ⚠ L'établissement d'une note ne change pas : la déplacer la ferait lire
+        #   sur la fiche d'un autre marchand, sous la plume de quelqu'un qui ne
+        #   l'a pas écrite pour lui.
+        if self.instance is not None and 'organization' in attrs \
+                and attrs['organization'].pk != self.instance.organization_id:
+            raise serializers.ValidationError({'organization': "Une note ne change pas d'établissement."})
+        return attrs
+
+
+# =============================================================================
+# PAIEMENTS D'ABONNEMENT
+# =============================================================================
+
+class AdminSubscriptionPaymentSerializer(serializers.ModelSerializer):
+    """Un règlement d'abonnement, tel que l'éditeur le suit."""
+
+    organization_name = serializers.CharField(source='organization.name', read_only=True)
+    plan_name = serializers.CharField(source='subscription.plan.name', read_only=True, default=None)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    payment_method_display = serializers.CharField(
+        source='get_payment_method_display', read_only=True
+    )
+
+    class Meta:
+        model = SubscriptionPayment
+        fields = [
+            'id', 'organization', 'organization_name', 'subscription', 'plan_name',
+            'amount', 'currency', 'payment_method', 'payment_method_display',
+            'status', 'status_display', 'reference', 'external_transaction_id',
+            'paid_at', 'created_at',
+        ]
+        read_only_fields = fields

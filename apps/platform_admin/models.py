@@ -227,3 +227,45 @@ class ImpersonationSession(TimeStampedModel, UUIDModel):
     def is_live(self):
         """Ouverte, et pas encore échue. C'est la seule question que pose l'authentification."""
         return self.ended_at is None and self.expires_at > timezone.now()
+
+
+class SupportNote(TimeStampedModel, UUIDModel):
+    """
+    Ce que le support sait d'un établissement, et que le marchand ne voit pas.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ LE SUPPORT NE SE SOUVENAIT DE RIEN D'UN APPEL À L'AUTRE.                 │
+    │                                                                          │
+    │ « A payé par virement, en attente de rapprochement », « ne pas relancer  │
+    │ avant le 15 », « le gérant parle swahili » : tout cela vivait dans la    │
+    │ tête de qui avait décroché. Une note se lit sur la fiche de              │
+    │ l'établissement ; épinglée, elle passe en tête.                          │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ⚠ ELLE NE SE SUPPRIME PAS. Elle se corrige (par son auteur) ou se désépingle :
+      une note effacée ne dit plus à personne ce qu'on savait, ni qui le savait.
+
+    ⚠ JAMAIS EXPOSÉE AU MARCHAND, et elle survit à la remise à zéro de son essai
+      (`HORS_PERIMETRE` du test de classement) : c'est une trace de l'éditeur.
+    """
+
+    organization = models.ForeignKey(
+        'organizations.Organization', on_delete=models.CASCADE,
+        related_name='support_notes',
+    )
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
+        related_name='support_notes_written',
+    )
+    #: Figé à l'écriture : la note doit dire QUI l'a écrite même si le compte part.
+    author_email = models.CharField(max_length=254, blank=True)
+    body = models.TextField()
+    is_pinned = models.BooleanField(default=False, db_index=True)
+
+    class Meta:
+        db_table = 'platform_admin_support_notes'
+        ordering = ['-is_pinned', '-created_at']
+        indexes = [models.Index(fields=['organization', 'is_pinned', 'created_at'])]
+
+    def __str__(self):
+        return f'{self.organization_id} : {self.body[:40]}'

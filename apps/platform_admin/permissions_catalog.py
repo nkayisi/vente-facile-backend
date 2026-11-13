@@ -49,6 +49,12 @@ PLATFORM_PERMISSION_CATALOG = frozenset(
         "metrics.view",
         # Prise en main d'un compte, pour le support
         "impersonation.start",
+        # Notes du support sur un établissement (jamais visibles du marchand)
+        "support_notes.view",
+        "support_notes.create",
+        # Exporter une liste ou le journal : les fichiers portent les données de
+        # TOUS les marchands, d'où un droit à part, réservé au super-administrateur
+        "exports.run",
         # Arrêter celle d'un autre : réservé au super-administrateur
         "impersonation.end",
     }
