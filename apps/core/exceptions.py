@@ -34,7 +34,20 @@ class RefusMetier(ValueError):
     """
 
 
-class AbonnementRequis(APIException):
+class RefusAvecCorps(APIException):
+    """
+    Un refus dont le corps JSON est composé par l'exception elle-même.
+
+    ⚠ `api_exception_handler` le rend TEL QUEL (`payload`), sans passer par
+    `detail` : DRF convertirait sinon en chaînes les booléens et les nombres du
+    corps. `wait`, s'il est posé, devient l'en-tête `Retry-After`.
+    """
+
+    payload: dict = {}
+    wait = None
+
+
+class AbonnementRequis(RefusAvecCorps):
     """
     402 : l'abonnement ne couvre plus l'écriture.
 

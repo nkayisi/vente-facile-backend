@@ -20,6 +20,7 @@ from django.template.loader import render_to_string
 from apps.core.api_mixins import TenantViewSetMixin
 from apps.core.api_permissions import IsTenantMember, IsTenantAdmin, HasPermission
 from apps.core.adresse import adresse_client
+from .connexion import authentifier
 from .models import User, UserActivity
 from .serializers import (
     UserListSerializer, UserDetailSerializer,
@@ -332,12 +333,10 @@ class LoginView(APIView):
         serializer = LoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
-        email = serializer.validated_data['email']
-        password = serializer.validated_data['password']
-        
-        user = User.objects.filter(email=email).first()
-        
-        if not user or not user.check_password(password):
+        user = authentifier(
+            request, serializer.validated_data['email'], serializer.validated_data['password'],
+        )
+        if user is None:
             return Response(
                 {'error': 'Email ou mot de passe incorrect'},
                 status=status.HTTP_401_UNAUTHORIZED

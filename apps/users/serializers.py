@@ -316,15 +316,12 @@ class CustomTokenObtainPairSerializer(serializers.Serializer):
 
     def validate(self, attrs):
         from rest_framework_simplejwt.tokens import RefreshToken
-        from django.contrib.auth import authenticate
 
         from apps.platform_admin.services import est_admin_plateforme
 
-        user = authenticate(
-            request=self.context.get('request'),
-            email=attrs['email'],
-            password=attrs['password'],
-        )
+        from .connexion import authentifier
+
+        user = authentifier(self.context.get('request'), attrs['email'], attrs['password'])
 
         if not user:
             raise serializers.ValidationError('Email ou mot de passe incorrect.')

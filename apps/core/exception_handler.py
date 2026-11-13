@@ -16,13 +16,14 @@ Comportement :
 """
 
 import logging
+import math
 
 from django.db.models.deletion import ProtectedError
 from rest_framework.views import exception_handler as drf_exception_handler
 from rest_framework.response import Response
 from rest_framework import status
 
-from apps.core.exceptions import AbonnementRequis
+from apps.core.exceptions import RefusAvecCorps
 
 logger = logging.getLogger("apps.api")
 
@@ -33,8 +34,11 @@ def api_exception_handler(exc, context):
     # les booléens et les nombres. `is_blocked: True` sortirait `"True"`, et un
     # client qui le compare à `true` lirait un corps qui a l'air juste. Le
     # corps de ce refus est donc rendu brut, tel que l'exception l'a composé.
-    if isinstance(exc, AbonnementRequis):
-        return Response(exc.payload, status=exc.status_code)
+    if isinstance(exc, RefusAvecCorps):
+        reponse = Response(exc.payload, status=exc.status_code)
+        if exc.wait:
+            reponse["Retry-After"] = str(int(math.ceil(exc.wait)))
+        return reponse
 
     # Une suppression que la base refuse parce que la ligne est encore citée
     # ailleurs (`on_delete=PROTECT`) n'est pas une panne, c'est une règle : elle
