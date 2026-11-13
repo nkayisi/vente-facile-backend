@@ -159,6 +159,11 @@ class PullTable:
     #: `restrict_visibility_for_membership` : un CAISSIER est alors borné par
     #: créateur, sans aucun entrepôt - c'est la règle des dépenses.
     creator_field: str = None
+    #: Champ de l'AUTEUR quand la table se borne par PERMISSION, comme les ventes
+    #: (`sold_by`) et les devis (`created_by`) : un membre sans
+    #: `AUTHOR_VIEW_ALL` ne tire que les siens. Miroir de `SaleViewSet` et de
+    #: `QuotationViewSet`. Distinct de `creator_field`, qui suit le RÔLE.
+    author_field: str = None
     #: Règle de périmètre nommée, pour les deux tables qui n'en ont pas de
     #: simple : `'transfer'` (source OU destination) et `'cash_movement'`
     #: (vente, dépense, ou session). Les deux corps vivent dans
@@ -315,7 +320,47 @@ def _scope_to_org(queryset, table, organization):
     return queryset.filter(**{table.org_field: organization})
 
 
+#: La permission qui ouvre les ventes et les devis des collègues, au web comme ici.
+AUTHOR_VIEW_ALL = 'sales.view_all'
+
+
+def borne_par_auteur(table, membership) -> bool:
+    """
+    Ce membre ne tire-t-il QUE ses propres lignes de cette table ?
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ LE TERMINAL D'UN CAISSIER PORTAIT LES VENTES DE TOUS SES COLLÈGUES.     │
+    │                                                                          │
+    │ Le back-office borne un membre sans `sales.view_all` à ses ventes et à   │
+    │ ses devis ; le tirage ne bornait que par entrepôt. Chaque terminal de    │
+    │ caissier détenait donc, dans un SQLite non chiffré, les ventes de tout   │
+    │ son dépôt - clients, montants, dettes - que le web lui refusait.         │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ⚠ LA RÈGLE EST CELLE DE LA PERMISSION, comme au web : un caissier à qui le
+      marchand accorde `sales.view_all` voit les ventes de son dépôt.
+    """
+    if not table.author_field or membership is None:
+        return False
+    from apps.core.services import PermissionService
+    return AUTHOR_VIEW_ALL not in PermissionService.get_effective_permissions(membership)
+
+
 def _scope_to_warehouses(queryset, table, membership):
+    """
+    Le périmètre complet d'un membre : son entrepôt, puis, le cas échéant, l'auteur.
+
+    Tous les chemins du tirage passent par ici - la page, les pierres tombales, la
+    sonde `pull/changed/` et les décomptes du manifeste : une borne posée sur un
+    seul d'entre eux ferait annoncer « rien de neuf » sur une table amputée.
+    """
+    queryset = _scope_to_entrepots(queryset, table, membership)
+    if borne_par_auteur(table, membership):
+        queryset = queryset.filter(**{table.author_field: membership.user_id})
+    return queryset
+
+
+def _scope_to_entrepots(queryset, table, membership):
     """
     Borne la lecture au périmètre du membre, PAR LES MÊMES HELPERS QUE LES VUES.
 
@@ -410,6 +455,26 @@ def scope_token(table, membership):
     │ l'effacement dans `sync/pull.ts`.                                        │
     └──────────────────────────────────────────────────────────────────────────┘
     """
+    # ⚠ LA BORNE D'AUTEUR SUFFIXE LE JETON, ELLE NE CHANGE PAS SA RÈGLE.
+    #   Elle ne vaut que pour un membre borné : le gérant et le propriétaire
+    #   gardent leur jeton, sans quoi tout le parc re-tirerait ses ventes et ses
+    #   devis pour un périmètre qui n'a pas bougé. Un caissier, lui, voit son
+    #   jeton changer UNE fois : son terminal efface les ventes des collègues
+    #   qu'il détenait, et retire les siennes. Le jeton nomme l'AUTEUR : un
+    #   terminal partagé qui change de caissier ne garde pas les ventes du
+    #   précédent.
+    #   C'est aussi pourquoi `SCOPE_RULE_VERSION` ne bouge pas.
+    if borne_par_auteur(table, membership):
+        base = _jeton_entrepot(table, membership)
+        return blake2s(
+            f'{base}|auteur|{table.author_field}|{membership.user_id}'.encode('utf-8'),
+            digest_size=8,
+        ).hexdigest()
+    return _jeton_entrepot(table, membership)
+
+
+def _jeton_entrepot(table, membership):
+    """Le jeton du périmètre d'ENTREPÔT, tel qu'il était avant la borne d'auteur."""
     if not table.est_bornee or membership is None:
         return SCOPE_TOKEN_ORG
 
@@ -683,7 +748,8 @@ PULL_TABLES = (
     # ancienne sans entrepôt est visible au back-office. Sans lui ici, elle
     # était introuvable sur le terminal qui l'avait peut-être encaissée.
     PullTable('sales', 'sales.Sale', soft_delete=True, warehouse_path='warehouse_id',
-              warehouse_include_null=True, children=SALE_CHILDREN),
+              warehouse_include_null=True, author_field='sold_by',
+              children=SALE_CHILDREN),
     PullTable('stock_movements', 'inventory.StockMovement', warehouse_path='warehouse_id'),
 
     # -- retours et devis
@@ -704,8 +770,10 @@ PULL_TABLES = (
               # Miroir de `SaleReturnViewSet`, qui tolère le NULL lui aussi.
               warehouse_include_null=True,
               children=RETURN_CHILDREN),
+    # Bornés par AUTEUR, comme `QuotationViewSet` : un devis ne porte aucun
+    # entrepôt, et un caissier ne voit que les siens.
     PullTable('quotations', 'sales.Quotation', soft_delete=True,
-              children=QUOTATION_CHILDREN),
+              author_field='created_by', children=QUOTATION_CHILDREN),
 
     # -- opérations de stock
     #
