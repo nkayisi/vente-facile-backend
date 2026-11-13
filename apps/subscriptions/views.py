@@ -243,7 +243,13 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
         Seuls les administrateurs plateforme (is_staff) peuvent activer
         un abonnement via l'admin panel.
         """
-        if not request.user.is_staff:
+        from apps.platform_admin.services import PlatformPermissionService
+
+        # ⚠ Le droit d'ACTIVER, pas le simple accès à l'administration : sans
+        # cela, ce point d'entrée ouvrait au support ce que l'administration lui
+        # refuse (`subscriptions.create`).
+        admin_peut_activer = PlatformPermissionService.has(request.user, 'subscriptions.create')
+        if not admin_peut_activer:
             return Response(
                 {
                     'detail': (
@@ -257,7 +263,7 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
 
         # Vérifier que l'utilisateur est owner ou admin
         org_id = request.headers.get('X-Organization-ID')
-        if not request.user.is_staff:
+        if not admin_peut_activer:
             membership = request.user.memberships.filter(
                 organization_id=org_id, is_active=True
             ).first()

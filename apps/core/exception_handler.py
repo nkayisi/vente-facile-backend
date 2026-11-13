@@ -17,6 +17,7 @@ Comportement :
 
 import logging
 
+from django.db.models.deletion import ProtectedError
 from rest_framework.views import exception_handler as drf_exception_handler
 from rest_framework.response import Response
 from rest_framework import status
@@ -34,6 +35,19 @@ def api_exception_handler(exc, context):
     # corps de ce refus est donc rendu brut, tel que l'exception l'a composé.
     if isinstance(exc, AbonnementRequis):
         return Response(exc.payload, status=exc.status_code)
+
+    # Une suppression que la base refuse parce que la ligne est encore citée
+    # ailleurs (`on_delete=PROTECT`) n'est pas une panne, c'est une règle : elle
+    # rendait un 500 « erreur interne » à qui venait simplement de demander une
+    # chose impossible, sans lui dire laquelle.
+    if isinstance(exc, ProtectedError):
+        return Response(
+            {
+                "detail": "Cette ressource est encore utilisée ailleurs : elle ne peut pas être supprimée.",
+                "code": "protected_reference",
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
 
     response = drf_exception_handler(exc, context)
 

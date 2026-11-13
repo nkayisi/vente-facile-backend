@@ -289,6 +289,8 @@ class CustomTokenObtainPairSerializer(serializers.Serializer):
         from rest_framework_simplejwt.tokens import RefreshToken
         from django.contrib.auth import authenticate
 
+        from apps.platform_admin.services import est_admin_plateforme
+
         user = authenticate(
             request=self.context.get('request'),
             email=attrs['email'],
@@ -311,6 +313,10 @@ class CustomTokenObtainPairSerializer(serializers.Serializer):
                 'email': user.email,
                 'first_name': user.first_name,
                 'last_name': user.last_name,
-                'is_staff': user.is_staff,
+                # ⚠ « peut entrer dans l'administration », pas le booléen brut :
+                # `is_staff` se pose aussi depuis l'admin Django sans rôle, et le
+                # back-office routerait ce compte vers des écrans qui lui sont
+                # tous refusés. Le rôle lui-même se lit sur `/platform-admin/me/`.
+                'is_staff': est_admin_plateforme(user),
             },
         }

@@ -236,6 +236,10 @@ class ClassementDesModelesTests(APITestCase):
         'settings.Currency',
         # Images d'articles : elles suivent l'article, qui est gardé.
         'products.ProductImage',
+        # Les prises en main du support : une trace de l'ÉDITEUR sur ce qu'il a
+        # vu chez le marchand. Le marchand ne doit pas pouvoir l'effacer en
+        # remettant son essai à zéro, et elle ne porte aucune opération.
+        'platform_admin.ImpersonationSession',
     }
 
     def test_le_balayage_trouve_bien_des_modeles(self):

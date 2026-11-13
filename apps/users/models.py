@@ -115,6 +115,10 @@ class UserActivity(models.Model):
         DELETE = 'delete', 'Suppression'
         VIEW = 'view', 'Consultation'
         EXPORT = 'export', 'Export'
+        # Un administrateur de l'éditeur a regardé l'application comme ce
+        # marchand. Inscrit dans le journal de l'ORGANISATION, pas seulement dans
+        # celui de la plateforme : le marchand doit pouvoir le savoir.
+        IMPERSONATED = 'impersonated', 'Accès du support'
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(

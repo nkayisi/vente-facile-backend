@@ -331,9 +331,12 @@ class PorteWebTests(APITestCase):
         cache.clear()
         ctx = make_org_with_users()
         self.__dict__.update(ctx)
+        # ⚠ Un rôle, et non `is_staff` posé à la main : depuis les rôles de la
+        # plateforme, `is_staff` seul n'ouvre plus l'administration.
+        from apps.platform_admin.models import PlatformRole
+        from apps.platform_admin.services import PlatformAdminService
         self.staff = self.owner
-        self.staff.is_staff = True
-        self.staff.save(update_fields=['is_staff'])
+        PlatformAdminService.grant(self.staff, PlatformRole.SUPER_ADMIN, granted_by=None)
 
     def test_un_non_staff_est_refuse(self):
         self.client.force_authenticate(user=self.manager)

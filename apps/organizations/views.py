@@ -185,11 +185,19 @@ class OrganizationViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Retourne uniquement les organisations de l'utilisateur."""
-        return Organization.objects.filter(
+        qs = Organization.objects.filter(
             memberships__user=self.request.user,
             memberships__is_active=True,
             is_deleted=False
         ).distinct()
+        # ⚠ Sous une prise en main, le marchand n'a qu'UNE organisation : celle
+        # pour laquelle le support a pris la main. Le back-office ouvre la
+        # première de la liste ; sans ce filtre, il ouvrirait peut-être une autre
+        # boutique du même compte, que personne n'a demandé à voir.
+        jeton = getattr(self.request, 'auth', None)
+        if jeton is not None and hasattr(jeton, 'get') and jeton.get('imp'):
+            qs = qs.filter(pk=jeton.get('imp_org'))
+        return qs
 
     def get_serializer_class(self):
         if self.action == 'list':
