@@ -176,8 +176,9 @@ class ImpersonationSession(TimeStampedModel, UUIDModel):
     │ - Aucune écriture ne passe sous ce jeton (voir                           │
     │   `apps.core.authentication`) : on regarde, on ne vend pas au nom de     │
     │   quelqu'un.                                                             │
-    │ - Le journal de la plateforme ET celui de l'organisation la portent : le │
-    │   marchand doit pouvoir savoir que quelqu'un a regardé ses chiffres.     │
+    │ - Le journal de la plateforme ET celui de l'organisation la portent,     │
+    │   pour l'enquête. Le marchand n'en est PAS notifié (décision du          │
+    │   2026-11-13) : aucun écran ne lui montre cette trace.                   │
     └──────────────────────────────────────────────────────────────────────────┘
     """
 

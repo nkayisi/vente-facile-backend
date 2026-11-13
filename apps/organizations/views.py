@@ -19,6 +19,7 @@ from apps.core.api_permissions import (
 from apps.core.services import OrganizationService, PermissionService
 from apps.subscriptions.services import SubscriptionService
 from rest_framework.exceptions import ValidationError
+from apps.core.adresse import adresse_client
 from .models import Organization, OrganizationMembership, Branch, OrganizationInvitation
 from .serializers import (
     OrganizationListSerializer, OrganizationDetailSerializer,
@@ -1150,7 +1151,7 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             resource_type='user',
             resource_id=str(user.id),
             details={'event': 'password_reset_by_admin', 'target_user_id': str(user.id)},
-            ip_address=request.META.get('REMOTE_ADDR'),
+            ip_address=adresse_client(request),
             user_agent=request.META.get('HTTP_USER_AGENT', '')[:500],
         )
         return Response({'detail': 'Mot de passe réinitialisé avec succès.'})

@@ -25,7 +25,7 @@ class JournalTests(BaseAdminTest):
     def test_un_acte_refuse_n_ecrit_rien(self):
         """La ligne naît DANS la transaction de l'acte : un refus n'en laisse aucune."""
         avant = AdminActionLog.objects.count()
-        self.en(self.support).post(f'{BASE}/users/{self.super_admin.pk}/toggle_active/', {}, format='json')
+        self.en(self.support).post(f'{BASE}/users/{self.super_admin.pk}/toggle_active/', {'reason': 'Motif de test'}, format='json')
         self.assertEqual(AdminActionLog.objects.count(), avant)
 
     def test_la_porte_de_mise_a_jour_ne_journalise_que_ce_qui_change(self):

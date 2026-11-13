@@ -404,12 +404,19 @@ class AdminOrganizationViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def toggle_active(self, request, pk=None):
         """Activate or deactivate an organization."""
-        motif = AdminReasonSerializer(data=request.data)
+        cible = self.get_object()
+        motif = AdminReasonSerializer(data=request.data, requis=cible.is_active)
         motif.is_valid(raise_exception=True)
         with transaction.atomic():
-            org = Organization.objects.select_for_update().get(pk=self.get_object().pk)
+            org = Organization.objects.select_for_update().get(pk=cible.pk)
             org.is_active = not org.is_active
             org.save(update_fields=['is_active', 'updated_at'])
+            if not org.is_active:
+                # Un établissement suspendu ne se consulte plus, même par le support.
+                from .impersonation import fermer_sessions
+
+                fermer_sessions(organization=org, acteur=request.user,
+                                raison=motif.validated_data['reason'], request=request)
             AuditLogService.record(
                 actor=request.user, action=Action.TOGGLE_ACTIVE,
                 target_type=Cible.ORGANIZATION, target_id=org.pk, target_repr=org.name,
@@ -554,9 +561,9 @@ class AdminUserViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def toggle_active(self, request, pk=None):
         """Activate or deactivate a user."""
-        motif = AdminReasonSerializer(data=request.data)
-        motif.is_valid(raise_exception=True)
         cible = self.get_object()
+        motif = AdminReasonSerializer(data=request.data, requis=cible.is_active)
+        motif.is_valid(raise_exception=True)
         if cible.pk == request.user.pk:
             raise RefusAdministration("Vous ne pouvez pas vous désactiver vous-même.")
 
@@ -575,6 +582,13 @@ class AdminUserViewSet(viewsets.ModelViewSet):
                     "C'est le dernier super-administrateur actif : il ne peut pas être désactivé."
                 )
             user.is_active = not user.is_active
+            if not user.is_active:
+                # Un compte fermé ne regarde plus personne, et personne ne le regarde.
+                from .impersonation import fermer_sessions
+
+                raison = motif.validated_data['reason']
+                fermer_sessions(impersonator=user, acteur=request.user, raison=raison, request=request)
+                fermer_sessions(target_user=user, acteur=request.user, raison=raison, request=request)
             # ⚠ `updated_at` EXPLICITE. `User` n'hérite pas de `TimeStampedModel` :
             # un `update_fields=['is_active']` laissait l'horodatage où il était, et
             # la table `users` descend au tirage avec `is_active`. La désactivation
@@ -610,7 +624,7 @@ class AdminUserViewSet(viewsets.ModelViewSet):
     def revoke_role(self, request, pk=None):
         """Retire le rôle plateforme d'un compte."""
         user = self.get_object()
-        motif = AdminReasonSerializer(data=request.data)
+        motif = AdminReasonSerializer(data=request.data, requis=True)
         motif.is_valid(raise_exception=True)
         PlatformAdminService.revoke(
             user, revoked_by=request.user,
@@ -764,12 +778,43 @@ class AdminImpersonationSessionViewSet(viewsets.ReadOnlyModelViewSet):
     action_permissions = {
         'list': 'audit_log.view',
         'retrieve': 'audit_log.view',
+        'end': 'impersonation.end',
     }
 
     def get_queryset(self):
-        return ImpersonationSession.objects.select_related(
+        qs = ImpersonationSession.objects.select_related(
             'impersonator', 'target_user', 'organization',
         ).order_by('-started_at')
+        # « En cours » se lit à l'instant : une session échue sans fin écrite
+        # n'est plus en cours, même avant le balayage nocturne.
+        if self.request.query_params.get('en_cours') in ('1', 'true'):
+            qs = qs.filter(ended_at__isnull=True, expires_at__gt=timezone.now())
+        return qs
+
+    @action(detail=True, methods=['post'])
+    def end(self, request, pk=None):
+        """
+        Arrête la prise en main d'un autre administrateur.
+
+        Réservé au super-administrateur, motivé, et attribué à lui dans le
+        journal : c'est lui qui a décidé de couper l'accès.
+        """
+        from .impersonation import terminer
+
+        motif = AdminReasonSerializer(data=request.data, requis=True)
+        motif.is_valid(raise_exception=True)
+        session = self.get_object()
+        # ⚠ Une session ÉCHUE dont la fin n'est pas encore écrite ne se « révoque »
+        # pas : l'accès a cessé de lui-même, et le journal attribuerait sinon à ce
+        # super-administrateur une coupure qu'il n'a pas faite. Le balayage
+        # nocturne l'écrira `EXPIRED`.
+        if session.ended_at is not None or session.expires_at <= timezone.now():
+            raise RefusAdministration("Cette prise en main est déjà terminée.")
+        session = terminer(
+            session, motif=ImpersonationSession.EndReason.REVOKED, request=request,
+            acteur=request.user, raison=motif.validated_data['reason'],
+        )
+        return Response(ImpersonationSessionSerializer(session).data)
 
 
 # =============================================================================
@@ -996,7 +1041,7 @@ class AdminSubscriptionViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
         """Cancel a subscription."""
-        motif = AdminReasonSerializer(data=request.data)
+        motif = AdminReasonSerializer(data=request.data, requis=True)
         motif.is_valid(raise_exception=True)
         with transaction.atomic():
             subscription = (

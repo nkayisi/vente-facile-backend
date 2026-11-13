@@ -51,8 +51,16 @@ class UserDetailSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'email', 'date_joined', 'last_login']
 
     def get_organizations(self, obj):
-        """Retourne les organisations de l'utilisateur avec son rôle."""
+        """
+        Les organisations de l'utilisateur, avec son rôle.
+
+        ⚠ Sous une prise en main, la SEULE organisation consultée : le marchand
+        peut en tenir plusieurs, et le support n'a pris la main que sur une.
+        """
         memberships = obj.memberships.filter(is_active=True).select_related('organization')
+        org_prise = _organisation_de_la_prise_en_main(self.context.get('request'))
+        if org_prise:
+            memberships = memberships.filter(organization_id=org_prise)
         return [
             {
                 'id': str(m.organization.id),
@@ -62,6 +70,27 @@ class UserDetailSerializer(serializers.ModelSerializer):
             }
             for m in memberships
         ]
+
+    def to_representation(self, instance):
+        donnees = super().to_representation(instance)
+        org_prise = _organisation_de_la_prise_en_main(self.context.get('request'))
+        if org_prise and donnees.get('active_organization') != str(org_prise):
+            # L'organisation « active » du marchand peut être une autre : la
+            # montrer révélerait un établissement que la prise en main ne couvre pas.
+            visible = next(iter(donnees.get('organizations') or []), None)
+            donnees['active_organization'] = visible['id'] if visible else None
+            donnees['active_organization_name'] = visible['name'] if visible else None
+        return donnees
+
+
+def _organisation_de_la_prise_en_main(request):
+    """L'organisation d'un jeton de prise en main, ou `None` hors prise en main."""
+    jeton = getattr(request, 'auth', None)
+    if jeton is None or not hasattr(jeton, 'get') or not jeton.get('imp'):
+        return None
+    from apps.platform_admin.impersonation import CLAIM_ORG
+
+    return jeton.get(CLAIM_ORG)
 
 
 class UserCreateSerializer(serializers.ModelSerializer):

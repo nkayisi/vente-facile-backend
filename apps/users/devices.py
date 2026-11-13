@@ -26,11 +26,12 @@ from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from apps.core.adresse import adresse_client
 from apps.core.api_permissions import HasPermission, IsTenantMember, _get_membership, DENY
+from apps.core.throttles import ScopeParAdresse
 from apps.core.services import PermissionService
 from apps.organizations.models import Organization
 
@@ -136,13 +137,6 @@ def _enregistrer_jeton_push(device, donnees):
 
     if champs:
         device.save(update_fields=champs + ['updated_at'])
-
-
-def client_ip(request):
-    forwarded = request.META.get('HTTP_X_FORWARDED_FOR')
-    if forwarded:
-        return forwarded.split(',')[0].strip()
-    return request.META.get('REMOTE_ADDR')
 
 
 def enroll_device(user, organization, *, name, platform, model='', os_version='',
@@ -540,7 +534,7 @@ class DeviceEnrollView(APIView):
         device, raw_token = enroll_device(
             request.user,
             organization,
-            ip=client_ip(request),
+            ip=adresse_client(request),
             **serializer.validated_data,
         )
 
@@ -563,7 +557,7 @@ class DeviceSessionView(APIView):
     """
 
     permission_classes = [AllowAny]
-    throttle_classes = [ScopedRateThrottle]
+    throttle_classes = [ScopeParAdresse]
     throttle_scope = 'device_session'
 
     @extend_schema(
@@ -610,7 +604,7 @@ class DeviceSessionView(APIView):
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
-        device.touch(ip=client_ip(request))
+        device.touch(ip=adresse_client(request))
         _enregistrer_jeton_push(device, serializer.validated_data)
         return Response(build_session_payload(device.user, device.organization, device))
 

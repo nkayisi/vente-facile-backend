@@ -15,6 +15,7 @@ from django.db import transaction
 from django.utils import timezone
 from rest_framework.exceptions import APIException
 
+from apps.core.adresse import adresse_client
 from .models import AdminActionLog, PlatformAdminProfile, PlatformRole
 from .permissions_catalog import PLATFORM_PERMISSION_CATALOG
 
@@ -162,13 +163,6 @@ class PlatformPermissionService:
 # CE QU'IL A FAIT
 # =============================================================================
 
-def _client_ip(request):
-    if request is None:
-        return None
-    from apps.users.devices import client_ip
-    return client_ip(request)
-
-
 class AuditLogService:
     """L'unique écrivain du journal d'audit."""
 
@@ -192,7 +186,7 @@ class AuditLogService:
             before=before or {},
             after=after or {},
             reason=reason or '',
-            ip_address=_client_ip(request),
+            ip_address=adresse_client(request),
             user_agent=(request.META.get('HTTP_USER_AGENT', '') if request is not None else ''),
         )
 
@@ -347,4 +341,9 @@ class PlatformAdminService:
             target_id=user.pk, target_repr=user.email,
             before=avant, after=_instantane(profil), reason=reason, request=request,
         )
+        # ⚠ Le pouvoir retiré emporte les prises en main qu'il avait ouvertes :
+        # sans cela, le support garderait les minutes qui leur restent.
+        from .impersonation import fermer_sessions
+
+        fermer_sessions(impersonator=user, acteur=revoked_by, raison=reason, request=request)
         return profil

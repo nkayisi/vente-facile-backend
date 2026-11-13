@@ -365,7 +365,30 @@ class AdminGrantRoleSerializer(serializers.Serializer):
 
 
 class AdminReasonSerializer(serializers.Serializer):
+    """
+    Le motif d'un geste d'administration.
+
+    ⚠ `requis=True` pour les gestes qui ARRÊTENT quelqu'un : désactiver un
+    établissement ou un compte, annuler un abonnement, retirer un rôle. L'écran
+    l'exigeait seul : un appel direct à l'API passait sans motif, et le journal
+    d'audit gardait un geste lourd sans dire pourquoi.
+    """
+
+    LONGUEUR_MINIMALE = 5
+
     reason = serializers.CharField(required=False, allow_blank=True, default='', max_length=1000)
+
+    def __init__(self, *args, requis=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.requis = requis
+
+    def validate(self, attrs):
+        attrs['reason'] = attrs.get('reason', '').strip()
+        if self.requis and len(attrs['reason']) < self.LONGUEUR_MINIMALE:
+            raise serializers.ValidationError({
+                'reason': "Le motif est obligatoire pour ce geste : il est gardé au journal d'audit.",
+            })
+        return attrs
 
 
 # =============================================================================

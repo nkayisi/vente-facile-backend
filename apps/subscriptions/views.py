@@ -11,7 +11,6 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
-from rest_framework.throttling import AnonRateThrottle
 
 from apps.core.api_permissions import IsTenantMember, IsTenantOwner, HasPermission
 
@@ -37,9 +36,10 @@ from .moko_client import (
     MokoConfigurationError,
 )
 from .moko_pending import enqueue_pending_payment, remove_pending_payment
+from apps.core.throttles import AnonParAdresse
 
 
-class MokoCallbackThrottle(AnonRateThrottle):
+class MokoCallbackThrottle(AnonParAdresse):
     """Throttle dédié au webhook Moko (scope ``moko_callback``, 60/min/IP).
 
     Actif même en DEBUG car attaché directement à l'action via

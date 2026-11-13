@@ -16,6 +16,8 @@ traverse SANS AUCUNE différence. Seul un jeton portant la revendication `imp`
 │ à inventorier.                                                               │
 └──────────────────────────────────────────────────────────────────────────────┘
 """
+import re
+
 from rest_framework import exceptions
 from rest_framework.permissions import SAFE_METHODS
 from rest_framework_simplejwt.authentication import JWTAuthentication
@@ -26,6 +28,48 @@ ECRITURES_PERMISES = (
     '/api/v1/auth/logout/',
 )
 
+#: ┌────────────────────────────────────────────────────────────────────────┐
+#: │ LES ÉCRANS, PAS LA BASE (décision du 2026-11-13).                      │
+#: │                                                                        │
+#: │ Lecture seule ne suffisait pas : un GET lit aussi la synchronisation   │
+#: │ (toute la base de l'établissement, table par table), tous les exports │
+#: │ PDF et classeurs, l'historique de connexion du marchand (adresses IP,  │
+#: │ navigateurs) et ses appareils. Un support pouvait aspirer un           │
+#: │ établissement entier en vingt minutes. Il voit les écrans, et rien de  │
+#: │ ce qui sert à emporter des données ou à les recouper.                  │
+#: │                                                                        │
+#: │ ⚠ Une LISTE D'INTERDITS, et non une liste d'autorisés : les écrans     │
+#: │ appellent quelque cent cinquante routes de lecture, et chaque écran    │
+#: │ nouveau répondrait 403 au support sans que personne ne le voie. Le     │
+#: │ point faible d'une liste d'interdits - un export ajouté demain - est   │
+#: │ fermé par un test qui parcourt le routeur (`test_prise_en_main`).      │
+#: └────────────────────────────────────────────────────────────────────────┘
+INTERDITS = tuple(re.compile(motif) for motif in (
+    r'^/api/v1/sync/',
+    r'/[^/]*export[^/]*/',
+    r'^/api/v1/users/activities/',
+    r'^/api/v1/user-activities/',
+    r'^/api/v1/auth/devices/',
+))
+
+#: Les seules lectures permises SANS en-tête d'organisation. Les autres
+#: exigent celle de la prise en main : sans cette règle, une vue de niveau
+#: compte (notifications, profil) appelée sans en-tête lirait toutes les
+#: organisations du marchand.
+#:
+#: ⚠ Les deux CATALOGUES de la plateforme (devises, plans) y figurent : ils ne
+#: lisent aucune organisation, et le back-office les appelle sans en-tête. Les
+#: refuser rendait l'écran des réglages et celui de l'abonnement vides pendant
+#: une prise en main, relevé en parcourant les quarante écrans du tableau de bord.
+SANS_ORGANISATION = tuple(re.compile(motif) for motif in (
+    r'^/api/v1/users/me/$',
+    r'^/api/v1/organizations/',
+    r'^/api/v1/platform-admin/impersonation/end/$',
+    r'^/api/v1/auth/logout/$',
+    r'^/api/v1/settings/currencies/',
+    r'^/api/v1/plans/',
+))
+
 
 class EnPriseEnMain(exceptions.PermissionDenied):
     default_detail = (
@@ -33,6 +77,19 @@ class EnPriseEnMain(exceptions.PermissionDenied):
         "mais rien ne s'enregistre en son nom."
     )
     default_code = 'impersonation_read_only'
+
+
+class HorsDesEcrans(exceptions.PermissionDenied):
+    default_detail = (
+        "Prise en main : la synchronisation, les exports, l'historique de "
+        "connexion et les appareils du marchand ne sont pas consultables."
+    )
+    default_code = 'impersonation_forbidden'
+
+
+class OrganisationRequise(exceptions.PermissionDenied):
+    default_detail = "Prise en main : précisez l'organisation consultée."
+    default_code = 'impersonation_org_required'
 
 
 class ImpersonationAwareJWTAuthentication(JWTAuthentication):
@@ -53,15 +110,24 @@ class ImpersonationAwareJWTAuthentication(JWTAuthentication):
                 'La prise en main est terminée.', code='impersonation_ended',
             )
 
-        # 2. Lecture seule.
-        chemin = request.path
+        # 2. Lecture seule. `path_info` et non `path` : ce dernier porte le
+        #    préfixe de script quand l'application n'est pas servie à la racine.
+        chemin = request.path_info
         if request.method not in SAFE_METHODS and not chemin.endswith(ECRITURES_PERMISES):
             raise EnPriseEnMain()
 
-        # 3. Une seule organisation : celle pour laquelle la main a été prise.
+        # 3. Les écrans, pas la base.
+        if any(motif.search(chemin) for motif in INTERDITS):
+            raise HorsDesEcrans()
+
+        # 4. Une seule organisation : celle pour laquelle la main a été prise,
+        #    nommée explicitement hors des quelques routes de niveau compte.
         org = request.headers.get('X-Organization-ID')
-        if org and org != jeton.get(CLAIM_ORG):
-            raise exceptions.PermissionDenied(
-                "Cette prise en main ne porte que sur une organisation."
-            )
+        if org:
+            if org != jeton.get(CLAIM_ORG):
+                raise exceptions.PermissionDenied(
+                    "Cette prise en main ne porte que sur une organisation."
+                )
+        elif not any(motif.search(chemin) for motif in SANS_ORGANISATION):
+            raise OrganisationRequise()
         return resultat

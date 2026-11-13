@@ -49,5 +49,7 @@ PLATFORM_PERMISSION_CATALOG = frozenset(
         "metrics.view",
         # Prise en main d'un compte, pour le support
         "impersonation.start",
+        # Arrêter celle d'un autre : réservé au super-administrateur
+        "impersonation.end",
     }
 )

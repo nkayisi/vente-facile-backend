@@ -54,6 +54,9 @@ SOURCES = [SOURCE] + [
         #   qui fait sonner les téléphones ; un symbole mal nommé y survivrait à
         #   toute la suite et ne se verrait qu'au premier rappel d'un marchand.
         'apps.notifications.services',
+        # La purge nocturne des journaux importe ses modèles en différé : un nom
+        # faux n'y lèverait qu'à 03:30, dans un journal de Celery.
+        'apps.platform_admin.tasks',
     )
 ]
 
@@ -77,13 +80,33 @@ def imports_dans_les_corps():
             if not isinstance(noeud, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             for interne in ast.walk(noeud):
-                if isinstance(interne, ast.ImportFrom) and interne.module:
+                if isinstance(interne, ast.ImportFrom) and (interne.module or interne.level):
+                    module = _module_absolu(fichier, interne)
                     for alias in interne.names:
                         trouves.append(
-                            (fichier, noeud.name, interne.lineno,
-                             interne.module, alias.name)
+                            (fichier, noeud.name, interne.lineno, module, alias.name)
                         )
     return trouves
+
+
+def _module_absolu(fichier, noeud):
+    """
+    Le module qu'un `from … import` désigne, résolu comme Python le résout.
+
+    ⚠ `from .models import X` porte `module='models'` et `level=1` : le prendre
+    tel quel ferait chercher un module `models` à la racine, introuvable, et le
+    garde-fou crierait sur un import parfaitement juste. Un garde-fou qui crie
+    sur du code sain finit désactivé.
+    """
+    if not noeud.level:
+        return noeud.module
+    from django.conf import settings
+
+    parties = list(fichier.resolve().relative_to(Path(settings.BASE_DIR).resolve()).with_suffix('').parts)
+    paquet = parties[:-1]
+    if noeud.level > 1:
+        paquet = paquet[:-(noeud.level - 1)]
+    return '.'.join(paquet + ([noeud.module] if noeud.module else []))
 
 
 class ImportsDesHandlersTests(SimpleTestCase):

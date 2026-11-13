@@ -19,6 +19,7 @@ from django.template.loader import render_to_string
 
 from apps.core.api_mixins import TenantViewSetMixin
 from apps.core.api_permissions import IsTenantMember, IsTenantAdmin, HasPermission
+from apps.core.adresse import adresse_client
 from .models import User, UserActivity
 from .serializers import (
     UserListSerializer, UserDetailSerializer,
@@ -117,15 +118,16 @@ class UserViewSet(viewsets.ModelViewSet):
         """Retourne ou modifie le profil de l'utilisateur connecté."""
         user = request.user
         
+        contexte = {'request': request}
         if request.method == 'GET':
-            serializer = UserDetailSerializer(user)
+            serializer = UserDetailSerializer(user, context=contexte)
             return Response(serializer.data)
         
         serializer = UserUpdateSerializer(user, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
         
-        return Response(UserDetailSerializer(user).data)
+        return Response(UserDetailSerializer(user, context=contexte).data)
 
     @action(detail=False, methods=['get'], url_path='me/permissions')
     def permissions(self, request):
@@ -215,7 +217,7 @@ class UserViewSet(viewsets.ModelViewSet):
             user=user,
             action='update',
             resource_type='password',
-            ip_address=self._get_client_ip(request),
+            ip_address=adresse_client(request),
             user_agent=request.META.get('HTTP_USER_AGENT', '')
         )
         
@@ -235,13 +237,6 @@ class UserViewSet(viewsets.ModelViewSet):
         
         serializer = UserActivitySerializer(activities, many=True)
         return Response(serializer.data)
-
-    def _get_client_ip(self, request):
-        """Récupère l'IP du client."""
-        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-        if x_forwarded_for:
-            return x_forwarded_for.split(',')[0]
-        return request.META.get('REMOTE_ADDR')
 
 
 # =============================================================================
@@ -271,7 +266,7 @@ class RegisterView(APIView):
             action='create',
             resource_type='user',
             details={'method': 'registration'},
-            ip_address=self._get_client_ip(request),
+            ip_address=adresse_client(request),
             user_agent=request.META.get('HTTP_USER_AGENT', '')
         )
         
@@ -280,12 +275,6 @@ class RegisterView(APIView):
             'refresh': str(refresh),
             'user': UserDetailSerializer(user).data
         }, status=status.HTTP_201_CREATED)
-
-    def _get_client_ip(self, request):
-        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-        if x_forwarded_for:
-            return x_forwarded_for.split(',')[0]
-        return request.META.get('REMOTE_ADDR')
 
 
 class RegisterWithOrganizationView(APIView):
@@ -313,7 +302,7 @@ class RegisterWithOrganizationView(APIView):
             action='create',
             resource_type='user',
             details={'method': 'registration_with_organization'},
-            ip_address=self._get_client_ip(request),
+            ip_address=adresse_client(request),
             user_agent=request.META.get('HTTP_USER_AGENT', '')
         )
         
@@ -327,12 +316,6 @@ class RegisterWithOrganizationView(APIView):
                 'slug': user.active_organization.slug,
             } if user.active_organization else None
         }, status=status.HTTP_201_CREATED)
-
-    def _get_client_ip(self, request):
-        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-        if x_forwarded_for:
-            return x_forwarded_for.split(',')[0]
-        return request.META.get('REMOTE_ADDR')
 
 
 class LoginView(APIView):
@@ -379,7 +362,7 @@ class LoginView(APIView):
             organization=user.active_organization,
             action='login',
             resource_type='session',
-            ip_address=self._get_client_ip(request),
+            ip_address=adresse_client(request),
             user_agent=request.META.get('HTTP_USER_AGENT', '')
         )
         
@@ -388,12 +371,6 @@ class LoginView(APIView):
             'refresh': str(refresh),
             'user': UserDetailSerializer(user).data
         })
-
-    def _get_client_ip(self, request):
-        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-        if x_forwarded_for:
-            return x_forwarded_for.split(',')[0]
-        return request.META.get('REMOTE_ADDR')
 
 
 class LogoutView(APIView):
@@ -418,19 +395,13 @@ class LogoutView(APIView):
                 organization=request.user.active_organization,
                 action='logout',
                 resource_type='session',
-                ip_address=self._get_client_ip(request),
+                ip_address=adresse_client(request),
                 user_agent=request.META.get('HTTP_USER_AGENT', '')
             )
             
             return Response({'message': 'Déconnexion réussie'})
         except Exception:
             return Response({'message': 'Déconnexion réussie'})
-
-    def _get_client_ip(self, request):
-        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-        if x_forwarded_for:
-            return x_forwarded_for.split(',')[0]
-        return request.META.get('REMOTE_ADDR')
 
 
 class ResetPasswordRequestView(APIView):

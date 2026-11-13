@@ -282,8 +282,8 @@ REST_FRAMEWORK = {
     'PAGE_SIZE': 20,
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
     'DEFAULT_THROTTLE_CLASSES': [
-        'rest_framework.throttling.AnonRateThrottle',
-        'rest_framework.throttling.UserRateThrottle',
+        'apps.core.throttles.AnonParAdresse',
+        'apps.core.throttles.UserParAdresse',
     ] if not DEBUG else [],
     'DEFAULT_THROTTLE_RATES': {
         'anon': '100/hour',
@@ -476,6 +476,16 @@ PUBLIC_BACKEND_URL = config('PUBLIC_BACKEND_URL', default='http://127.0.0.1:8005
 # Secret partagé inclus en query param de l'URL de callback pour authentifier MOKO.
 # Si vide, la vérification est désactivée (à n'utiliser qu'en dev).
 MOKO_CALLBACK_SECRET = config('MOKO_CALLBACK_SECRET', default='')
+
+# --- Adresse de l'appelant (apps/core/adresse.py) ---------------------------
+# Nombre de proxys de confiance devant Django (Traefik, nginx…). Avec N proxys,
+# l'adresse du client est l'entrée au rang -N de X-Forwarded-For : les entrées
+# plus à gauche, le client les écrit lui-même. 0 en développement (aucun proxy).
+TRUSTED_PROXY_COUNT = config('TRUSTED_PROXY_COUNT', default=0 if DEBUG else 1, cast=int)
+REST_FRAMEWORK['NUM_PROXIES'] = TRUSTED_PROXY_COUNT
+# Secret partagé avec le serveur du back-office (Next) : lui seul peut attester
+# l'adresse du navigateur dans X-VF-Client-IP. Vide = en-tête ignoré.
+VF_EDGE_KEY = config('VF_EDGE_KEY', default='')
 
 
 # =============================================================================

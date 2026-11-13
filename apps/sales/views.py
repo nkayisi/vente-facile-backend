@@ -35,6 +35,7 @@ from apps.core.api_permissions import (
 from .filters import (
     QuotationFilter, RegisterSessionFilter, SaleFilter, SaleReturnFilter,
 )
+from apps.core.adresse import adresse_client
 from .models import (
     Register, RegisterSession, Sale, SaleItem, PaymentMethod, Payment,
     SaleReturn, SaleReturnItem, Quotation, QuotationItem
@@ -225,7 +226,7 @@ class RegisterSessionViewSet(
         try:
             session = close_register_session(
                 self.get_object(), request.user, serializer.validated_data,
-                ip=request.META.get('REMOTE_ADDR'),
+                ip=adresse_client(request),
                 agent=request.META.get('HTTP_USER_AGENT', '')[:500],
             )
         except NoteRequise as exc:

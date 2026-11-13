@@ -84,14 +84,14 @@ class CeQueFaitLeSupportTests(BaseAdminTest):
             with self.subTest(url=reponse.wsgi_request.path):
                 self.assertEqual(reponse.status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_il_reactive_une_organisation(self):
-        reponse = self.en(self.support).post(f'{ORGS}{self.org.pk}/toggle_active/', {}, format='json')
+    def test_il_desactive_une_organisation_avec_un_motif(self):
+        reponse = self.en(self.support).post(f'{ORGS}{self.org.pk}/toggle_active/', {'reason': 'Motif de test'}, format='json')
         self.assertEqual(reponse.status_code, status.HTTP_200_OK)
         self.org.refresh_from_db()
         self.assertFalse(self.org.is_active)
 
     def test_il_ne_desactive_pas_un_administrateur(self):
-        reponse = self.en(self.support).post(f'{USERS}{self.super_admin.pk}/toggle_active/', {}, format='json')
+        reponse = self.en(self.support).post(f'{USERS}{self.super_admin.pk}/toggle_active/', {'reason': 'Motif de test'}, format='json')
         self.assertEqual(reponse.status_code, status.HTTP_400_BAD_REQUEST)
         self.super_admin.refresh_from_db()
         self.assertTrue(self.super_admin.is_active)
@@ -147,7 +147,7 @@ class OctroiEtRetraitTests(BaseAdminTest):
 
     def test_personne_ne_modifie_son_propre_role(self):
         for url, corps in ((f'{USERS}{self.super_admin.pk}/grant_role/', {'role': 'support'}),
-                           (f'{USERS}{self.super_admin.pk}/revoke_role/', {})):
+                           (f'{USERS}{self.super_admin.pk}/revoke_role/', {'reason': 'Motif de test'})):
             with self.subTest(url=url):
                 self.assertEqual(
                     self.en(self.super_admin).post(url, corps, format='json').status_code,

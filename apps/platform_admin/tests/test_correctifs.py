@@ -145,9 +145,10 @@ class DesactivationVisibleAuTirageTests(BaseAdminTest):
 
     def test_on_ne_se_desactive_pas_soi_meme(self):
         reponse = self.en(self.super_admin).post(
-            f'{BASE}/users/{self.super_admin.pk}/toggle_active/', {}, format='json',
+            f'{BASE}/users/{self.super_admin.pk}/toggle_active/', {'reason': 'Motif de test'}, format='json',
         )
         self.assertEqual(reponse.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('vous-même', str(reponse.data))
 
 
 class AbonnementsTests(BaseAdminTest):
@@ -221,9 +222,9 @@ class AbonnementsTests(BaseAdminTest):
     def test_une_annulation_ne_se_rejoue_pas_et_ne_se_prolonge_pas(self):
         sub = Subscription.objects.get(organization=self.org, status='active')
         client = self.en(self.super_admin)
-        self.assertEqual(client.post(f'{self.URL}{sub.pk}/cancel/', {}, format='json').status_code,
+        self.assertEqual(client.post(f'{self.URL}{sub.pk}/cancel/', {'reason': 'Motif de test'}, format='json').status_code,
                          status.HTTP_200_OK)
-        self.assertEqual(client.post(f'{self.URL}{sub.pk}/cancel/', {}, format='json').status_code,
+        self.assertEqual(client.post(f'{self.URL}{sub.pk}/cancel/', {'reason': 'Motif de test'}, format='json').status_code,
                          status.HTTP_400_BAD_REQUEST)
         self.assertEqual(client.post(f'{self.URL}{sub.pk}/extend/', {'days': 5}, format='json').status_code,
                          status.HTTP_400_BAD_REQUEST)
