@@ -111,12 +111,15 @@ def _ecrire_mouvement(serializer, *, organization, user, request=None, **extra):
     from .models import STOCK_IN_MOVEMENT_TYPES
     from .packaging import PackagingService
     from .services import FIFOService
+    from .verrous import exiger_hors_inventaire
 
     data = serializer.validated_data
     if request is not None:
         assert_warehouse_allowed_for_request(request, data['warehouse'].id)
 
     produit = data['product']
+    # Le verrou d'inventaire, AVANT tout verrou de ligne : voir `verrous.py`.
+    exiger_hors_inventaire(organization, data['warehouse'].id, [produit.id])
     cout_catalogue = produit.cost_price if produit.cost_price else Decimal('0.00')
     stock, cree = Stock.objects.select_for_update().get_or_create(
         organization=organization,

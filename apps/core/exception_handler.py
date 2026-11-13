@@ -23,7 +23,7 @@ from rest_framework.views import exception_handler as drf_exception_handler
 from rest_framework.response import Response
 from rest_framework import status
 
-from apps.core.exceptions import RefusAvecCorps
+from apps.core.exceptions import RefusAvecCorps, RefusMetier
 
 logger = logging.getLogger("apps.api")
 
@@ -39,6 +39,21 @@ def api_exception_handler(exc, context):
         if exc.wait:
             reponse["Retry-After"] = str(int(math.ceil(exc.wait)))
         return reponse
+
+    # ┌──────────────────────────────────────────────────────────────────────┐
+    # │ UN REFUS MÉTIER EST UN 400, PAS UNE PANNE.                           │
+    # │                                                                      │
+    # │ `RefusMetier` hérite de `ValueError`, et aucun gestionnaire ne le    │
+    # │ rattrapait : une vue qui ne l'attrapait pas elle-même rendait 500,   │
+    # │ « erreur interne, nos équipes ont été notifiées », là où il fallait  │
+    # │ dire au marchand pourquoi on refuse. Le journal du terminal, lui, le │
+    # │ range déjà en `rejected` (`sync/operations.py::_classify`).          │
+    # └──────────────────────────────────────────────────────────────────────┘
+    if isinstance(exc, RefusMetier):
+        return Response(
+            {"detail": str(exc), "code": getattr(exc, "code", "refus_metier")},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     # Une suppression que la base refuse parce que la ligne est encore citée
     # ailleurs (`on_delete=PROTECT`) n'est pas une panne, c'est une règle : elle

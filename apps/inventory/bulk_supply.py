@@ -240,6 +240,7 @@ def create_bulk_supply(*, organization, user, warehouse, movement_type, lines,
     """
     from .serializers import StockMovementCreateSerializer
     from .stock_movements import create_stock_movement
+    from .verrous import refus, sessions_qui_verrouillent
 
     if movement_type not in STOCK_IN_MOVEMENT_TYPES:
         # ⚠ `movement_type` EST UNIQUE POUR TOUT L'ENVOI, et borné aux ENTRÉES :
@@ -290,9 +291,26 @@ def create_bulk_supply(*, organization, user, warehouse, movement_type, lines,
             context={'request': request, 'organization': organization},
         )
         if s.is_valid():
-            serializers_valides.append(s)
+            serializers_valides.append((index, s))
         else:
             erreurs[index] = s.errors
+
+    # ┌──────────────────────────────────────────────────────────────────────┐
+    # │ LE VERROU D'INVENTAIRE SE DIT SUR SA LIGNE, COMME TOUT AUTRE REFUS.  │
+    # │                                                                      │
+    # │ `create_stock_movement` le lèverait de toute façon, mais sans index :│
+    # │ le magasinier lirait « un inventaire est en cours » sous une feuille │
+    # │ de quarante lignes, sans savoir lesquelles retirer. On le relève     │
+    # │ donc ici, une seule lecture pour tout l'envoi.                       │
+    # └──────────────────────────────────────────────────────────────────────┘
+    verrous = sessions_qui_verrouillent(
+        organization, warehouse.id,
+        [s.validated_data['product'].id for _, s in serializers_valides],
+    )
+    for index, s in serializers_valides:
+        produit = s.validated_data['product'].id
+        if produit in verrous:
+            erreurs[index] = {'product': [str(refus(organization, {produit: verrous[produit]}))]}
 
     if erreurs:
         # ⚠ TOUTES LES ERREURS SONT COLLECTÉES, ET INDEXÉES PAR LIGNE. Lever à
@@ -303,7 +321,7 @@ def create_bulk_supply(*, organization, user, warehouse, movement_type, lines,
 
     mouvements = []
     with transaction.atomic():
-        for s in serializers_valides:
+        for _, s in serializers_valides:
             mouvements.append(create_stock_movement(
                 s, organization=organization, user=user, request=request,
             ))

@@ -439,8 +439,14 @@ def ship_transfer(transfer, user):
         raise TransitionRefusee("Ce transfert ne peut pas être expédié")
     
     from .packaging import PackagingService
+    from .verrous import exiger_hors_inventaire
 
     with transaction.atomic():
+        # Le rayon source ne se vide pas sous un comptage.
+        exiger_hors_inventaire(
+            transfer.organization, transfer.source_warehouse_id,
+            transfer.items.values_list('product_id', flat=True),
+        )
         # Déduire le stock de l'entrepôt source
         for item in transfer.items.select_related('product').all():
             product_cost = item.product.cost_price if item.product.cost_price else Decimal('0.00')
@@ -527,8 +533,14 @@ def receive_transfer(transfer, user, received_items=None):
     received_items = received_items or []
 
     from .packaging import PackagingService
+    from .verrous import exiger_hors_inventaire
 
     with transaction.atomic():
+        # Le rayon de destination ne se remplit pas sous un comptage.
+        exiger_hors_inventaire(
+            transfer.organization, transfer.destination_warehouse_id,
+            transfer.items.values_list('product_id', flat=True),
+        )
         for item in transfer.items.select_related('product').all():
             # Chercher la quantité reçue dans les données. Elle peut arriver
             # en contenants (« 3 cartons + 2 bouteilles ») : c'est la forme
@@ -694,9 +706,17 @@ def cancel_transfer(transfer, user):
     
     from .packaging import PackagingService
 
+    from .verrous import exiger_hors_inventaire
+
     with transaction.atomic():
         # Si déjà expédié, remettre le stock
         if transfer.status == 'in_transit':
+            # Remettre en rayon est un mouvement comme un autre : pas sous un
+            # comptage. Un transfert en brouillon, lui, s'annule toujours.
+            exiger_hors_inventaire(
+                transfer.organization, transfer.source_warehouse_id,
+                transfer.items.values_list('product_id', flat=True),
+            )
             for item in transfer.items.select_related('product').all():
                 product_cost = item.product.cost_price if item.product.cost_price else Decimal('0.00')
                 stock, created = Stock.objects.select_for_update().get_or_create(
@@ -767,7 +787,13 @@ def approve_adjustment(adjustment, user):
     
     from .packaging import PackagingService
 
+    from .verrous import exiger_hors_inventaire
+
     with transaction.atomic():
+        exiger_hors_inventaire(
+            adjustment.organization, adjustment.warehouse_id,
+            adjustment.items.values_list('product_id', flat=True),
+        )
         # Appliquer les ajustements
         for item in adjustment.items.select_related('product').all():
             product_cost = item.product.cost_price if item.product.cost_price else Decimal('0.00')
@@ -922,7 +948,12 @@ def unpack_stock(stock, user, packages=1):
     if factor is None:
         raise TransitionRefusee("Ce produit n'est pas vendu par conditionnement.")
 
+    from .verrous import exiger_hors_inventaire
+
     with transaction.atomic():
+        # Ouvrir un carton déplace des unités entre canaux : le comptage, qui
+        # relève les deux canaux, ne s'y retrouverait plus.
+        exiger_hors_inventaire(stock.organization, stock.warehouse_id, [stock.product_id])
         locked = Stock.objects.select_for_update().get(pk=stock.pk)
         _, loose = PackagingService.stored_split(locked, factor)
         opened, _movement = PackagingService.ensure_loose_available(

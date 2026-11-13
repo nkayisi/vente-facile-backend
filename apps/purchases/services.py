@@ -60,6 +60,10 @@ class GoodsReceiptStockService:
         warehouse = grn.warehouse
         org = grn.organization
 
+        # Une livraison ne se range pas dans un rayon en cours de comptage.
+        from apps.inventory.verrous import exiger_hors_inventaire
+        exiger_hors_inventaire(org, grn.warehouse_id, grn.items.values_list('product_id', flat=True))
+
         for item in grn.items.select_related('product', 'variant').all():
             if not item.quantity_accepted or item.quantity_accepted <= 0:
                 continue
@@ -480,6 +484,12 @@ def approuver_retour(purchase_return, user=None):
         raise TransitionReceptionRefusee(
             "Seuls les retours en brouillon peuvent être approuvés."
         )
+
+    from apps.inventory.verrous import exiger_hors_inventaire
+    exiger_hors_inventaire(
+        purchase_return.organization, purchase_return.warehouse_id,
+        purchase_return.items.values_list('product_id', flat=True),
+    )
 
     for item in purchase_return.items.select_related('product').all():
         stock = Stock.objects.select_for_update().filter(

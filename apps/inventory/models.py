@@ -927,7 +927,9 @@ class InventorySession(TenantSoftDeleteModel):
     
     notes = models.TextField(blank=True)
     
-    # Stock locking: when True, stock movements for targeted products are blocked
+    # Verrou : tant qu'il est posé, AUCUNE écriture de stock ne touche les articles
+    # visés dans ce dépôt (vente, saisie, transferts, ajustement, réceptions,
+    # retours). Le point d'entrée unique est `apps/inventory/verrous.py`.
     is_stock_locked = models.BooleanField(default=False)
     
     # Dates

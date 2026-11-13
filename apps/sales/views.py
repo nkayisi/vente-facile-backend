@@ -761,6 +761,28 @@ class SaleReturnViewSet(
             return SaleReturnCreateSerializer
         return SaleReturnDetailSerializer
 
+    def create(self, request, *args, **kwargs):
+        """
+        Crée le retour et rend son DÉTAIL (avec `id` et `reference`).
+
+        ⚠ SANS CET OVERRIDE, LE BACK-OFFICE NAVIGUAIT VERS `undefined`. DRF
+          répond avec le serializer d'ÉCRITURE, qui ne déclare pas `id` : le
+          dialogue de retour appelle `onCreated(reponse.data.id)`, et la fiche
+          de vente poussait `/dashboard/sales/returns/undefined`, un 404 juste
+          après un retour pourtant enregistré. Le défaut des quatre `create`
+          d'achat et de `POST /expenses/`, resté ouvert ici. Trouvé en
+          écrivant les tests du verrou d'inventaire (lot L8).
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        retour = serializer.instance
+        retour.refresh_from_db()
+        return Response(
+            SaleReturnDetailSerializer(retour, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
+
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
         """

@@ -242,8 +242,10 @@ def _classify(exc):
     if isinstance(exc, RefusMetier):
         # Déterministe par construction : le renvoyer le referait refuser à
         # l'identique, à chaque synchronisation, indéfiniment.
+        # Le code propre du refus voyage (`inventaire_en_cours`, …) : c'est
+        # lui qu'un écran lit pour dire quoi faire, pas la phrase.
         return SyncOperation.Verdict.REJECTED, {
-            'code': 'refus_metier', 'detail': str(exc),
+            'code': getattr(exc, 'code', 'refus_metier'), 'detail': str(exc),
         }
     if isinstance(exc, (ImportError, AttributeError, NameError)):
         # ┌──────────────────────────────────────────────────────────────────┐

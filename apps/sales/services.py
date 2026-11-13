@@ -295,6 +295,16 @@ class SaleStockService:
 
         org = sale.organization
 
+        # Remettre en rayon une vente annulée est un mouvement comme un autre :
+        # pas sous un comptage (décision du 2026-11-13). L'annulation entière
+        # est refusée, plutôt qu'une annulation sans remise en stock qui
+        # laisserait le rayon court de ce que le client a rendu.
+        from apps.inventory.verrous import exiger_hors_inventaire
+        exiger_hors_inventaire(
+            org, warehouse.id,
+            sale.items.filter(product__track_inventory=True).values_list('product_id', flat=True),
+        )
+
         for item in sale.items.select_related('product', 'variant').order_by('product_id'):
             if not item.product.track_inventory:
                 continue
@@ -380,6 +390,14 @@ class SaleStockService:
             return
 
         org = sale_return.organization
+
+        from apps.inventory.verrous import exiger_hors_inventaire
+        exiger_hors_inventaire(
+            org, warehouse.id,
+            sale_return.items.filter(
+                restock=True, original_item__product__track_inventory=True,
+            ).values_list('original_item__product_id', flat=True),
+        )
 
         items = (
             sale_return.items.filter(restock=True)
