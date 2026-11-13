@@ -3,6 +3,7 @@ Serializers DRF pour l'app Contacts (Customers & Suppliers).
 """
 from rest_framework import serializers
 from decimal import Decimal
+from .services import AJUSTEMENT_NUL, MOTIF_AJUSTEMENT_REQUIS
 from .models import Customer, CustomerTransaction, Supplier, SupplierProduct
 
 
@@ -229,14 +230,33 @@ class RecordPaymentSerializer(serializers.Serializer):
 
 
 class AdjustBalanceSerializer(serializers.Serializer):
-    """Serializer pour ajuster manuellement le solde client."""
+    """
+    Ajustement manuel du solde client.
+
+    ⚠ DEUX REFUS, que le terminal opposait seul à l'écran : un montant NUL (il ne
+      corrige rien, mais il alloue un numéro `AJU-` et imprime une pièce) et un
+      MOTIF vide (une écriture dont plus personne ne saura l'origine). Le
+      service les oppose aussi, pour le journal du terminal qui ne passe pas
+      par ce serializer.
+    """
 
     amount = serializers.DecimalField(max_digits=15, decimal_places=2)
     currency = serializers.CharField(max_length=3, required=False, allow_blank=True)
     exchange_rate = serializers.DecimalField(
         max_digits=20, decimal_places=12, required=False
     )
-    notes = serializers.CharField(required=False, allow_blank=True, default='')
+    notes = serializers.CharField(
+        required=True, allow_blank=False,
+        error_messages={
+            'required': MOTIF_AJUSTEMENT_REQUIS,
+            'blank': MOTIF_AJUSTEMENT_REQUIS,
+        },
+    )
+
+    def validate_amount(self, value):
+        if value == 0:
+            raise serializers.ValidationError(AJUSTEMENT_NUL)
+        return value
 
 
 class UseLoyaltyOnDebtSerializer(serializers.Serializer):

@@ -510,6 +510,11 @@ def record_payment(customer, amount, *, user, currency=None, exchange_rate=None,
     }
 
 
+#: Les deux refus d'un ajustement, partagés par le serializer et le service.
+AJUSTEMENT_NUL = "Un ajustement de zéro ne corrige rien."
+MOTIF_AJUSTEMENT_REQUIS = "Expliquez la correction : elle ne se devine pas."
+
+
 def adjust_customer_balance(customer, signed_amount, *, user, currency=None,
                             exchange_rate=None, notes='', receipt_number=None):
     """
@@ -523,10 +528,21 @@ def adjust_customer_balance(customer, signed_amount, *, user, currency=None,
     from apps.cashbook.services import record_customer_debt_payment
     from apps.core.numbering import PREFIX_ADJUSTMENT, allocate_document_number
 
+    from rest_framework.exceptions import ValidationError as DRFValidationError
+
+    # ⚠ AVANT toute écriture et toute allocation de numéro : un refus après
+    #   `allocate_document_number` laisserait un trou dans la série `AJU-`.
+    #   Le journal du terminal ne passe pas par le serializer : c'est ici que la
+    #   règle tient pour les deux surfaces.
+    if not (notes or '').strip():
+        raise DRFValidationError({'notes': MOTIF_AJUSTEMENT_REQUIS})
+
     currency, exchange_rate = CurrencyService.resolve(
         customer.organization, currency, exchange_rate, strict=True,
     )
     signed_amount = _quantize(signed_amount)
+    if signed_amount == 0:
+        raise DRFValidationError({'amount': AJUSTEMENT_NUL})
 
     with transaction.atomic():
         receipt_number = receipt_number or allocate_document_number(

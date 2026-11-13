@@ -686,9 +686,14 @@ class SaleListSerializer(serializers.ModelSerializer):
             'amount_paid', 'amount_due',
             'currency', 'exchange_rate', 'change_currency',
             'sold_by', 'sold_by_name',
-            'sale_date', 'due_date', 'items_count', 'is_pos'
+            # ⚠ `created_at` est l'ORDRE D'IMPUTATION d'un règlement client
+            #   (`open_credit_sales` trie dessus, le terminal aussi). Sans lui, le
+            #   back-office ne pouvait pas annoncer l'imputation qui aura lieu :
+            #   `sale_date` suit l'heure de l'acte et diffère pour une vente
+            #   poussée en retard par un terminal.
+            'sale_date', 'created_at', 'due_date', 'items_count', 'is_pos'
         ]
-        read_only_fields = ['id', 'reference', 'sale_date']
+        read_only_fields = ['id', 'reference', 'sale_date', 'created_at']
 
     def get_items_count(self, obj):
         # Utilise l'annotation `_items_count` posée par SaleViewSet.get_queryset
