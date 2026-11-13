@@ -124,10 +124,17 @@ services:
       - REDIS_URL=redis://redis:6379/1
     volumes:
       - ./media:/app/media
+    # ⚠ `service_healthy`, et pas seulement `service_started` : le service
+    # web MIGRE avant de répondre à son battement, donc un worker qui attend sa
+    # santé démarre sur un schéma à jour. Ce n'est qu'au `up` que compose lit
+    # cette condition ; au redémarrage d'un worker seul, c'est l'attente de
+    # `migrate --check` dans `entrypoint.sh` qui prend le relais.
     depends_on:
       db:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      backend:
         condition: service_healthy
     restart: unless-stopped
     mem_limit: 768m
@@ -180,7 +187,7 @@ services:
       redis:
         condition: service_healthy
       backend:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
     mem_limit: 256m
     networks:

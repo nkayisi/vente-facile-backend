@@ -34,3 +34,9 @@ RUN chmod +x /entrypoint.sh
 EXPOSE 8001
 
 ENTRYPOINT ["/entrypoint.sh"]
+
+# Le mode par défaut. `entrypoint.sh` lit son premier argument : `web` migre et
+# lance Gunicorn, `celery …` attend que le schéma soit à jour puis exécute la
+# commande, tout le reste est exécuté tel quel. Un `command:` de compose
+# remplace cette valeur, et c'est désormais ainsi que démarrent les workers.
+CMD ["web"]
