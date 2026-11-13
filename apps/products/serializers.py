@@ -640,12 +640,24 @@ class ProductCreateSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id']
 
+    def _organisation(self):
+        """
+        L'organisation où l'unicité se juge.
+
+        ⚠ En MODIFICATION, c'est celle de la fiche, pas l'en-tête : le journal du
+          terminal rejoue ce serializer, et une fiche ne change pas
+          d'établissement. L'en-tête ne sert qu'à la création.
+        """
+        if self.instance is not None:
+            return self.instance.organization_id
+        return self.context['request'].headers.get('X-Organization-ID')
+
     def validate_sku(self, value):
         """Vérifie l'unicité du SKU dans l'organisation."""
         if not value:
             return value
         
-        organization = self.context['request'].headers.get('X-Organization-ID')
+        organization = self._organisation()
         queryset = Product.objects.filter(
             organization_id=organization,
             sku=value,
@@ -664,7 +676,7 @@ class ProductCreateSerializer(serializers.ModelSerializer):
         if not value:
             return value
         
-        organization = self.context['request'].headers.get('X-Organization-ID')
+        organization = self._organisation()
         queryset = Product.objects.filter(
             organization_id=organization,
             barcode=value,

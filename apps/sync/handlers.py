@@ -1071,6 +1071,75 @@ def unit_update(ctx, payload):
     )
 
 
+@handler('product.update', permission='products.edit')
+def product_update(ctx, payload):
+    """
+    Modification d'un article, par le serializer du back-office (lot L12).
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ LE PÉRIMÈTRE ENTREPÔT EST CELUI DE LA VUE, ET IL SE DIT ICI.             │
+    │                                                                          │
+    │ `ProductViewSet.get_queryset` borne un `partial_update` aux articles     │
+    │ suivis dans un dépôt du membre (`filter_products_by_warehouse_ids`) :    │
+    │ un gérant de la boutique A ne retarife pas un article qui n'existe que   │
+    │ dans la boutique B. `_referentiel_update` ne connaît que l'organisation : │
+    │ sans ce filtre, le terminal ouvrirait ce que le back-office refuse.      │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    Aucun `updated_by` : `Product` n'a pas ce champ, et `AuditMixin` ne le pose
+    que si le modèle le porte.
+    """
+    from apps.core.warehouse_scope import (
+        accessible_warehouse_ids, filter_products_by_warehouse_ids,
+    )
+    from apps.products.models import Product
+    from apps.products.serializers import ProductDetailSerializer, ProductUpdateSerializer
+
+    identifiant = payload.pop('id', None)
+    if not identifiant:
+        raise OperationRejected(
+            "L'identifiant de l'article à modifier est absent.",
+            code='missing_fields',
+            details={'id': ['Ce champ est requis.']},
+        )
+    autorises = accessible_warehouse_ids(ctx.membership) if ctx.membership else None
+    produit = filter_products_by_warehouse_ids(
+        Product.objects.filter(organization=ctx.organization), autorises,
+    ).filter(id=identifiant).first()
+    if produit is None:
+        # ⚠ Introuvable et hors périmètre se confondent, comme le 404 de la vue :
+        #   distinguer les deux dirait qu'un article existe ailleurs.
+        raise OperationRejected("Cet article est introuvable.", code='not_found')
+
+    serializer = ProductUpdateSerializer(
+        produit, data=payload, partial=True, context={'request': ctx.request},
+    )
+    serializer.is_valid(raise_exception=True)
+    produit = serializer.save()
+    return {
+        'server_ids': {'product': str(produit.id)},
+        'authoritative': ProductDetailSerializer(produit).data,
+    }
+
+
+@handler('customer.update', permission='customers.edit')
+def customer_update(ctx, payload):
+    """
+    Modification d'un client, conditions de crédit comprises (lot L12).
+
+    `CustomerUpdateSerializer` est celui de `CustomerViewSet.partial_update` :
+    il vide la raison sociale et le numéro d'impôt d'un particulier, exactement
+    comme au back-office. Un client supprimé en douceur est introuvable
+    (`TenantSoftDeleteManager`), donc refusé, jamais réessayé.
+    """
+    from apps.contacts.models import Customer
+    from apps.contacts.serializers import CustomerDetailSerializer, CustomerUpdateSerializer
+    return _referentiel_update(
+        ctx, payload, Customer, CustomerUpdateSerializer, 'customer', 'Ce client',
+        lecture=CustomerDetailSerializer,
+    )
+
+
 # ------------------------------------------------------------------- livre de caisse
 
 

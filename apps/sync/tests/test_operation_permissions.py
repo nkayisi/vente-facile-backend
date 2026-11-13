@@ -122,6 +122,9 @@ class ContratDesPermissionsTests(APITestCase):
             'category.update': (CategoryViewSet, 'partial_update'),
             'brand.update': (BrandViewSet, 'partial_update'),
             'unit.update': (UnitViewSet, 'partial_update'),
+            # Lot L12 : modifier un article ou un client depuis le terminal.
+            'product.update': (ProductViewSet, 'partial_update'),
+            'customer.update': (CustomerViewSet, 'partial_update'),
             'expense.create': (ExpenseViewSet, 'create'),
             'expense.submit': (ExpenseViewSet, 'submit'),
             'expense.approve': (ExpenseViewSet, 'approve'),
