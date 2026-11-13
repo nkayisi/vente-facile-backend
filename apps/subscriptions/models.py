@@ -75,8 +75,16 @@ class Plan(TimeStampedModel, UUIDModel):
     
     sort_order = models.PositiveIntegerField(default=0)
 
-    #: Palier pour upgrade/downgrade (plus grand = offre plus riche). Anti-downgrade via Organization.subscription_floor_tier.
-    tier = models.PositiveIntegerField(default=1)
+    #: Anti-rétrogradation via `Organization.subscription_floor_tier`.
+    #: ⚠ L'essai est au palier 0 depuis le 2026-11-13 (`subscriptions/0020`).
+    tier = models.PositiveIntegerField(
+        default=1,
+        help_text=(
+            "Palier de l'offre (plus grand = plus riche), qui fonde "
+            "l'anti-rétrogradation. L'essai est au palier 0 : ce n'est "
+            "pas une offre."
+        ),
+    )
 
     class Meta:
         db_table = 'plans'
@@ -537,8 +545,9 @@ class GlobalConfig(models.Model):
         "0XX pour recevoir la nouvelle version »."
     )
 
+    #: Quatorze jours, ce que la page d'accueil promet (`subscriptions/0020`).
     trial_days = models.PositiveIntegerField(
-        default=15,
+        default=14,
         help_text="Nombre de jours de la période d'essai pour les nouveaux comptes"
     )
     grace_period_days = models.PositiveIntegerField(

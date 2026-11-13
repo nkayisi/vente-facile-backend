@@ -44,3 +44,12 @@ def valider_code_devise(value: str) -> str:
             f"La devise '{code}' n'est pas prise en charge."
         )
     return code
+
+
+#: Ce que lit le marchand quand une écriture voudrait changer sa devise
+#: principale. Elle se choisit à la création de l'établissement, et c'est tout.
+#: Partagé par la fiche de l'établissement et par les devises de l'établissement.
+PRINCIPALE_FIGEE = (
+    "La devise principale d'un établissement ne change pas après sa création. "
+    "Vous pouvez ajouter des devises secondaires, mais la principale reste fixe."
+)

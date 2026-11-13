@@ -585,7 +585,8 @@ class SubscriptionService:
                 max_monthly_transactions=500,
                 storage_limit_mb=100,
                 trial_days=trial_days,
-                tier=1,
+                # Palier 0 : un essai n'est pas une offre (`subscriptions/0020`).
+                tier=0,
                 is_active=True
             )
 

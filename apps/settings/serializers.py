@@ -5,6 +5,7 @@ from rest_framework import serializers
 from decimal import Decimal
 from drf_spectacular.utils import extend_schema_field
 from apps.core.bulk import bulk_update_rows
+from .currency_validation import PRINCIPALE_FIGEE
 from .models import (
     MAX_REDEMPTION_PERCENT_CEILING,
     Currency, OrganizationCurrency, LoyaltyProgram,
@@ -40,74 +41,113 @@ class OrganizationCurrencySerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'last_rate_update']
 
 
+def _organisation_de_la_requete(serializer):
+    """
+    L'établissement de l'EN-TÊTE, celui que la vue a résolu.
+
+    ⚠ JAMAIS `user.active_organization`. Elle ignore le tenant de la requête :
+      un gérant de deux boutiques qui ajoutait le dollar à la seconde, en-tête
+      compris, l'ajoutait à la première - et le contrôle de doublon se jugeait
+      lui aussi dans la mauvaise. C'est le défaut déjà corrigé sur le programme
+      de fidélité (`LoyaltyProgramViewSet.perform_create`).
+    """
+    vue = serializer.context.get('view')
+    return vue.get_organization() if vue is not None else None
+
+
 class OrganizationCurrencyCreateSerializer(serializers.ModelSerializer):
-    """Serializer for creating OrganizationCurrency."""
-    
+    """
+    Ajouter une devise à l'établissement.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ LA DEVISE PRINCIPALE SE CHANGEAIT PAR QUATRE PORTES, ET UNE SEULE ÉTAIT  │
+    │ FERMÉE (`set_primary`).                                                  │
+    │                                                                          │
+    │ Créer une devise avec `is_primary` rétrogradait l'ancienne principale    │
+    │ sans toucher `Organization.currency` : les deux autorités divergeaient,  │
+    │ les ventes nouvelles prenaient un code et l'affichage un autre, et toutes│
+    │ les ventes passées, au taux figé de l'ancienne principale, se lisaient   │
+    │ dans une monnaie qui n'était plus la leur. Une principale ne se pose     │
+    │ donc QUE si l'établissement n'en a aucune.                               │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
     class Meta:
         model = OrganizationCurrency
         fields = ['currency', 'is_primary', 'exchange_rate', 'is_active']
-    
+
     def validate(self, attrs):
-        organization = self.context['request'].user.active_organization
-        currency = attrs.get('currency')
-        
-        # Vérifier si cette devise existe déjà pour l'organisation
+        organization = _organisation_de_la_requete(self)
+        if organization is None:
+            raise serializers.ValidationError("Organisation introuvable pour cette requête.")
+
         if OrganizationCurrency.objects.filter(
             organization=organization,
-            currency=currency
+            currency=attrs.get('currency'),
         ).exists():
             raise serializers.ValidationError({
                 'currency': "Cette devise est déjà configurée pour votre établissement."
             })
-        
+
+        if attrs.get('is_primary') and OrganizationCurrency.objects.filter(
+            organization=organization, is_primary=True,
+        ).exists():
+            raise serializers.ValidationError({'is_primary': PRINCIPALE_FIGEE})
+
         return attrs
-    
+
     def create(self, validated_data):
-        organization = self.context['request'].user.active_organization
-        validated_data['organization'] = organization
-        
-        # Si c'est la devise principale, désactiver les autres devises principales
-        if validated_data.get('is_primary'):
-            # `bulk_update_rows` : rétrograder l'ancienne devise principale par
-            # un `update()` nu laissait sa ligne avec l'horodatage d'avant, donc
-            # INVISIBLE au tirage. Le terminal gardait DEUX devises principales,
-            # et c'est le taux de change qui décide de chaque montant au comptoir.
+        # L'établissement est posé par la vue (`perform_create`), depuis l'en-tête.
+        organization = validated_data.get('organization')
+        if organization is None:
+            raise serializers.ValidationError("Organisation introuvable pour cette requête.")
+
+        instance = super().create(validated_data)
+
+        # La PREMIÈRE principale d'un établissement qui n'en avait aucune : les
+        # deux autorités doivent dire la même chose dès la naissance.
+        if instance.is_primary and organization.currency != instance.currency.code:
+            from apps.organizations.models import Organization
             bulk_update_rows(
-                OrganizationCurrency.objects.filter(
-                    organization=organization,
-                    is_primary=True,
-                ),
-                is_primary=False,
+                Organization.objects.filter(pk=organization.pk),
+                currency=instance.currency.code,
             )
-        
-        return super().create(validated_data)
+        return instance
 
 
 class OrganizationCurrencyUpdateSerializer(serializers.ModelSerializer):
-    """Serializer for updating OrganizationCurrency."""
-    
+    """
+    Régler une devise de l'établissement : son taux, son activation.
+
+    ⚠ La principale ne se rétrograde pas, ne se désactive pas, et son taux vaut
+      1 par définition ; une secondaire ne devient pas principale. Ce sont les
+      deux dernières portes par lesquelles la devise principale changeait.
+    """
+
     class Meta:
         model = OrganizationCurrency
         fields = ['exchange_rate', 'is_active', 'is_primary']
-    
-    def update(self, instance, validated_data):
-        organization = instance.organization
-        
-        # Si on définit cette devise comme principale
-        if validated_data.get('is_primary') and not instance.is_primary:
-            # `bulk_update_rows` : rétrograder l'ancienne devise principale par
-            # un `update()` nu laissait sa ligne avec l'horodatage d'avant, donc
-            # INVISIBLE au tirage. Le terminal gardait DEUX devises principales,
-            # et c'est le taux de change qui décide de chaque montant au comptoir.
-            bulk_update_rows(
-                OrganizationCurrency.objects.filter(
-                    organization=organization,
-                    is_primary=True,
-                ),
-                is_primary=False,
-            )
-        
-        return super().update(instance, validated_data)
+
+    def validate(self, attrs):
+        instance = self.instance
+        if instance is None:
+            return attrs
+
+        if 'is_primary' in attrs and bool(attrs['is_primary']) != instance.is_primary:
+            raise serializers.ValidationError({'is_primary': PRINCIPALE_FIGEE})
+
+        if instance.is_primary:
+            if attrs.get('is_active') is False:
+                raise serializers.ValidationError({
+                    'is_active': "La devise principale ne se désactive pas : "
+                                 "c'est elle qui tient les prix et les soldes.",
+                })
+            taux = attrs.get('exchange_rate')
+            if taux is not None and Decimal(taux) != Decimal('1'):
+                raise serializers.ValidationError({
+                    'exchange_rate': "Le taux de la devise principale vaut toujours 1.",
+                })
+        return attrs
 
 
 class LoyaltyProgramSerializer(serializers.ModelSerializer):

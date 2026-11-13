@@ -3,7 +3,7 @@ Serializers DRF pour l'app Organizations.
 """
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
-from apps.settings.currency_validation import valider_code_devise
+from apps.settings.currency_validation import PRINCIPALE_FIGEE, valider_code_devise
 from .models import Organization, OrganizationMembership, Branch, OrganizationInvitation
 
 
@@ -184,22 +184,31 @@ class OrganizationUpdateSerializer(serializers.ModelSerializer):
         ]
 
     def validate_currency(self, value):
-        """Empêche une faute de frappe à trois lettres d'entrer en base.
-
-        ⚠ RELEVÉ, NON TRAITÉ : basculer la devise par `PATCH` est déjà cassé pour
-        une AUTRE raison. Cela écrit `Organization.currency`, que lit
-        `CurrencyService.primary_code`, sans toucher la ligne
-        `OrganizationCurrency` `is_primary`, que lisent `get_primary_currency` et
-        `get_display_info` : les deux autorités divergent alors, les ventes
-        nouvelles prennent le nouveau code au taux 1 pendant que l'affichage et
-        les décimales restent sur l'ancienne principale. Les deux clients
-        promettent d'ailleurs l'inverse - le web exclut `currency` de
-        `updateOrganizationSchema`, et l'écran d'inscription écrit « ne pourra
-        plus être modifiée après la création ». Le geste juste serait de passer ce
-        champ en lecture seule ici ; cela RETIRE une capacité, donc c'est un
-        arbitrage à part.
         """
-        return valider_code_devise(value)
+        La devise principale se choisit à la création, et ne change plus.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ UN `PATCH` LA CHANGEAIT, ET IL CASSAIT L'ÉTABLISSEMENT EN SILENCE.   │
+        │                                                                      │
+        │ Il écrivait `Organization.currency`, que lit                         │
+        │ `CurrencyService.primary_code`, sans toucher la ligne                │
+        │ `OrganizationCurrency` `is_primary`, que lisent                      │
+        │ `get_primary_currency` et `get_display_info` : les ventes nouvelles  │
+        │ prenaient le nouveau code au taux 1 pendant que l'affichage et les   │
+        │ décimales restaient sur l'ancienne principale. Les deux clients      │
+        │ promettaient déjà l'inverse (« ne pourra plus être modifiée après la │
+        │ création »).                                                         │
+        └──────────────────────────────────────────────────────────────────────┘
+
+        ⚠ RENVOYER LA MÊME DEVISE N'EST PAS UN REFUS : un formulaire qui renvoie
+          tout ce qu'il a lu ne doit pas échouer. Seul un CHANGEMENT est refusé,
+          et nommé, plutôt qu'ignoré en silence - un champ en lecture seule
+          rendrait 200, et le client croirait avoir changé de monnaie.
+        """
+        code = valider_code_devise(value)
+        if self.instance is not None and code != self.instance.currency:
+            raise serializers.ValidationError(PRINCIPALE_FIGEE)
+        return code
 
 
 # =============================================================================
