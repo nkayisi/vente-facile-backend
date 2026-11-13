@@ -226,7 +226,9 @@ class DocumentSequence(models.Model):
         on_delete=models.CASCADE,
         related_name='document_sequences',
     )
-    prefix = models.CharField(max_length=8)
+    #: Huit suffisaient aux séries annuelles (`RGL`) ; une série QUOTIDIENNE
+    #: porte le jour dans son préfixe (`INV-20261113`, douze caractères).
+    prefix = models.CharField(max_length=20)
     year = models.PositiveIntegerField()
     last_value = models.PositiveIntegerField(default=0)
 

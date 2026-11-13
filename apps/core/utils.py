@@ -30,7 +30,9 @@ class ReferenceGenerator:
         """Generate sale reference: VT-YYYYMMDD-XXXX"""
         from apps.sales.models import Sale
         
-        today = timezone.now()
+        # Le jour du MARCHAND : en UTC, la vente de 23 h 30 portait la date du
+        # lendemain, à Kinshasa.
+        today = timezone.localdate()
         prefix = f"VT-{today.strftime('%Y%m%d')}"
         
         # ┌──────────────────────────────────────────────────────────────────┐
@@ -90,95 +92,59 @@ class ReferenceGenerator:
 
     @staticmethod
     def generate_transfer_reference(organization):
-        """Generate stock transfer reference: TR-YYYYMMDD-XXXX"""
+        """Référence de transfert : TR-AAAAMMJJ-NNNN.
+
+        Rang tenu par une séquence verrouillée, au jour du MARCHAND : voir
+        `apps.core.numbering.allocate_daily_reference`.
+        """
+        from apps.core.numbering import PREFIX_TRANSFER, allocate_daily_reference
         from apps.inventory.models import StockTransfer
-        
-        today = timezone.now()
-        prefix = f"TR-{today.strftime('%Y%m%d')}"
-        
-        last = StockTransfer.objects.filter(
-            organization=organization,
-            reference__startswith=prefix
-        ).order_by('-reference').first()
-        
-        if last:
-            try:
-                num = int(last.reference.split('-')[-1]) + 1
-            except (ValueError, IndexError):
-                num = 1
-        else:
-            num = 1
-        
-        return f"{prefix}-{num:04d}"
+
+        return allocate_daily_reference(
+            organization, PREFIX_TRANSFER, StockTransfer, field='reference',
+        )
 
     @staticmethod
     def generate_adjustment_reference(organization):
-        """Generate stock adjustment reference: ADJ-YYYYMMDD-XXXX"""
+        """Référence d'ajustement : ADJ-AAAAMMJJ-NNNN.
+
+        Rang tenu par une séquence verrouillée, au jour du MARCHAND : voir
+        `apps.core.numbering.allocate_daily_reference`.
+        """
+        from apps.core.numbering import PREFIX_STOCK_ADJUSTMENT, allocate_daily_reference
         from apps.inventory.models import StockAdjustment
-        
-        today = timezone.now()
-        prefix = f"ADJ-{today.strftime('%Y%m%d')}"
-        
-        last = StockAdjustment.objects.filter(
-            organization=organization,
-            reference__startswith=prefix
-        ).order_by('-reference').first()
-        
-        if last:
-            try:
-                num = int(last.reference.split('-')[-1]) + 1
-            except (ValueError, IndexError):
-                num = 1
-        else:
-            num = 1
-        
-        return f"{prefix}-{num:04d}"
+
+        return allocate_daily_reference(
+            organization, PREFIX_STOCK_ADJUSTMENT, StockAdjustment, field='reference',
+        )
 
     @staticmethod
     def generate_batch_number(organization):
-        """Generate batch number: LOT-YYYYMMDD-XXXX"""
+        """Numéro de lot : LOT-AAAAMMJJ-NNNN.
+
+        Rang tenu par une séquence verrouillée, au jour du MARCHAND : voir
+        `apps.core.numbering.allocate_daily_reference`.
+        """
+        from apps.core.numbering import PREFIX_BATCH, allocate_daily_reference
         from apps.inventory.models import StockBatch
-        
-        today = timezone.now()
-        prefix = f"LOT-{today.strftime('%Y%m%d')}"
-        
-        last = StockBatch.objects.filter(
-            organization=organization,
-            batch_number__startswith=prefix
-        ).order_by('-batch_number').first()
-        
-        if last:
-            try:
-                num = int(last.batch_number.split('-')[-1]) + 1
-            except (ValueError, IndexError):
-                num = 1
-        else:
-            num = 1
-        
-        return f"{prefix}-{num:04d}"
+
+        return allocate_daily_reference(
+            organization, PREFIX_BATCH, StockBatch, field='batch_number',
+        )
 
     @staticmethod
     def generate_inventory_reference(organization):
-        """Generate inventory session reference: INV-YYYYMMDD-XXXX"""
+        """Référence d'inventaire : INV-AAAAMMJJ-NNNN.
+
+        Rang tenu par une séquence verrouillée, au jour du MARCHAND : voir
+        `apps.core.numbering.allocate_daily_reference`.
+        """
+        from apps.core.numbering import PREFIX_INVENTORY, allocate_daily_reference
         from apps.inventory.models import InventorySession
-        
-        today = timezone.now()
-        prefix = f"INV-{today.strftime('%Y%m%d')}"
-        
-        last = InventorySession.objects.filter(
-            organization=organization,
-            reference__startswith=prefix
-        ).order_by('-reference').first()
-        
-        if last:
-            try:
-                num = int(last.reference.split('-')[-1]) + 1
-            except (ValueError, IndexError):
-                num = 1
-        else:
-            num = 1
-        
-        return f"{prefix}-{num:04d}"
+
+        return allocate_daily_reference(
+            organization, PREFIX_INVENTORY, InventorySession, field='reference',
+        )
 
     @staticmethod
     def generate_customer_code(organization):
@@ -223,7 +189,9 @@ class ReferenceGenerator:
         """Generate expense reference: DEP-YYYYMMDD-XXXX"""
         from apps.cashbook.models import Expense
         
-        today = timezone.now()
+        # Le jour du MARCHAND : en UTC, la vente de 23 h 30 portait la date du
+        # lendemain, à Kinshasa.
+        today = timezone.localdate()
         prefix = f"DEP-{today.strftime('%Y%m%d')}"
         
         # ┌──────────────────────────────────────────────────────────────────┐
@@ -261,23 +229,14 @@ class ReferenceGenerator:
 
     @staticmethod
     def generate_cash_movement_reference(organization):
-        """Generate cash movement reference: MC-YYYYMMDD-XXXX"""
+        """Référence de mouvement de caisse : MC-AAAAMMJJ-NNNN.
+
+        Rang tenu par une séquence verrouillée, au jour du MARCHAND : voir
+        `apps.core.numbering.allocate_daily_reference`.
+        """
+        from apps.core.numbering import PREFIX_CASH_MOVEMENT, allocate_daily_reference
         from apps.cashbook.models import CashMovement
-        
-        today = timezone.now()
-        prefix = f"MC-{today.strftime('%Y%m%d')}"
-        
-        last = CashMovement.objects.filter(
-            organization=organization,
-            reference__startswith=prefix
-        ).order_by('-reference').first()
-        
-        if last:
-            try:
-                num = int(last.reference.split('-')[-1]) + 1
-            except (ValueError, IndexError):
-                num = 1
-        else:
-            num = 1
-        
-        return f"{prefix}-{num:04d}"
+
+        return allocate_daily_reference(
+            organization, PREFIX_CASH_MOVEMENT, CashMovement, field='reference',
+        )

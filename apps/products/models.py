@@ -167,8 +167,17 @@ class Brand(TenantSoftDeleteModel):
         return self.name
 
 
-class Unit(TenantModel):
-    """Units of measurement for products."""
+class Unit(TenantSoftDeleteModel):
+    """
+    Unité de mesure.
+
+    ⚠ SUPPRESSION DOUCE depuis le 2026-11-13 : une suppression SQL ne laissait
+    aucune pierre tombale au tirage, et l'unité survivait sur chaque terminal.
+    Les deux contraintes d'unicité ne portent que sur les unités VIVANTES, sans
+    quoi le nom d'une unité supprimée serait pris pour toujours.
+    """
+
+    objects = TenantSoftDeleteManager()
     
     name = models.CharField(max_length=50)
     symbol = models.CharField(max_length=10)
@@ -192,10 +201,12 @@ class Unit(TenantModel):
         constraints = [
             models.UniqueConstraint(
                 fields=['organization', 'symbol'],
+                condition=models.Q(is_deleted=False),
                 name='unique_unit_symbol_per_org'
             ),
             models.UniqueConstraint(
                 fields=['organization', 'name'],
+                condition=models.Q(is_deleted=False),
                 name='unique_unit_name_per_org'
             ),
         ]

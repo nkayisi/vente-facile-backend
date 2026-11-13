@@ -1346,7 +1346,9 @@ class SaleCreateSerializer(CagnotteLegacyMixin, serializers.ModelSerializer):
             # vente du jour pour l'org. C'est suffisant car ReferenceGenerator
             # lit le MAX.
             from django.utils import timezone as _tz
-            today_prefix = f"VT-{_tz.now().strftime('%Y%m%d')}"
+            # Le MÊME jour que `generate_sale_reference`, qui est local : en UTC,
+            # le verrou portait sur les ventes de la veille entre 23 h et minuit.
+            today_prefix = f"VT-{_tz.localdate().strftime('%Y%m%d')}"
             _ = list(
                 Sale.objects.select_for_update().filter(
                     organization=org, reference__startswith=today_prefix

@@ -19,7 +19,7 @@ terminal resté trois semaines dans le noir, et il doit tenir en une requête,
 parce que la connexion qui vient de revenir peut repartir.
 """
 from django.db import IntegrityError, transaction
-from django.db.models import Prefetch
+from django.db.models import Prefetch, Q
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema
 from rest_framework import serializers, status, viewsets
@@ -77,6 +77,9 @@ class DeviceEnrollSerializer(serializers.Serializer):
     model = serializers.CharField(max_length=120, required=False, allow_blank=True)
     os_version = serializers.CharField(max_length=40, required=False, allow_blank=True)
     app_version = serializers.CharField(max_length=40, required=False, allow_blank=True)
+    #: L'installation de l'application qui s'enrôle. Facultatif : un terminal
+    #: antérieur ne l'envoie pas, et s'enrôle comme avant.
+    installation_id = serializers.CharField(max_length=64, required=False, allow_blank=True)
 
 
 class DeviceSessionSerializer(serializers.Serializer):
@@ -139,16 +142,56 @@ def _enregistrer_jeton_push(device, donnees):
         device.save(update_fields=champs + ['updated_at'])
 
 
+def appareils_de_l_installation(user, organization, installation_id):
+    """
+    Les appareils ACTIFS déjà connus sur cette installation, qu'un nouvel
+    enrôlement remplace.
+
+    ⚠ MÊME COMPTE OU MÊME ÉTABLISSEMENT, jamais au-delà. L'identifiant vient du
+      client : sans cette borne, quiconque le connaîtrait pourrait révoquer les
+      appareils d'un autre établissement. Dans ces deux cas, le téléphone vient
+      d'effacer l'ancien jeton - changement de compte sur un terminal partagé,
+      ou changement d'établissement du même compte.
+    """
+    if not installation_id:
+        return Device.objects.none()
+    return Device.objects.filter(
+        Q(user=user) | Q(organization=organization),
+        installation_id=installation_id,
+        revoked_at__isnull=True,
+    )
+
+
+# Une seule transaction : l'ancien appareil n'est révoqué que si le nouveau naît.
+# La boucle de tirage du code reste en points de sauvegarde, comme avant.
+@transaction.atomic
 def enroll_device(user, organization, *, name, platform, model='', os_version='',
-                  app_version='', ip=None):
+                  app_version='', installation_id='', ip=None):
     """
     Crée le terminal et retourne `(device, raw_token)`.
 
     Le jeton brut n'existe qu'ici : seule son empreinte est stockée, et il n'est
     montré qu'une fois. Un terminal qui le perd se réenrôle, il ne le récupère
     pas.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ CHAQUE RECONNEXION LAISSAIT UN APPAREIL ACTIF DE PLUS.                   │
+    │                                                                          │
+    │ Un terminal qui se réenrôle - jetons refusés, changement de compte, de   │
+    │ boutique - a effacé l'ancien jeton : plus personne ne le détient, et     │
+    │ l'appareil restait pourtant actif, trente jours glissants, dans la liste │
+    │ du gérant. L'enrôlement révoque désormais ceux de la même installation.  │
+    │                                                                          │
+    │ ⚠ ON RÉVOQUE, ON NE RÉUTILISE PAS. Le `device_code` numérote les         │
+    │   documents imprimés : le reprendre ferait repartir une série à zéro sous│
+    │   un code déjà porté par des tickets dans la poche des clients. Le       │
+    │   nouvel appareil reçoit un code NEUF, comme avant.                      │
+    └──────────────────────────────────────────────────────────────────────────┘
     """
     raw_token = Device.generate_token()
+
+    for ancien in appareils_de_l_installation(user, organization, installation_id):
+        ancien.revoke(by=user)
 
     for attempt in range(CODE_ATTEMPTS):
         code = Device.generate_device_code()
@@ -162,6 +205,7 @@ def enroll_device(user, organization, *, name, platform, model='', os_version=''
                     model=model or '',
                     os_version=os_version or '',
                     app_version=app_version or '',
+                    installation_id=installation_id or '',
                     device_code=code,
                     token_hash=Device.hash_token(raw_token),
                     expires_at=Device.default_expiry(),

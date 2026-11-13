@@ -258,6 +258,14 @@ class Device(models.Model):
         related_name='revoked_devices'
     )
 
+    #: L'installation de l'application qui s'est enrôlée, fournie par le
+    #: terminal et conservée à la déconnexion. Un enrôlement suivant depuis la
+    #: même installation révoque celui-ci : voir `devices.enroll_device`.
+    #:
+    #: ⚠ JAMAIS dans un sérialiseur ni dans les colonnes tirées : il ne donne
+    #: accès à rien, mais le connaître permettrait de désigner un téléphone.
+    installation_id = models.CharField(max_length=64, blank=True, db_index=True)
+
     class Meta:
         db_table = 'user_devices'
         ordering = ['-last_seen_at', '-created_at']
@@ -321,6 +329,20 @@ class Device(models.Model):
     def is_usable(self):
         """Un appareil révoqué ou expiré n'ouvre plus de session."""
         return not self.is_revoked and not self.is_expired
+
+    def save(self, *args, **kwargs):
+        """
+        `updated_at` suit TOUJOURS, même sur un `save(update_fields=[...])`.
+
+        ⚠ `Device` n'hérite pas de `TimeStampedModel`, qui porte cette garantie
+        depuis le lot 6 : `revoke` et `touch` écrivaient donc leurs colonnes en
+        laissant l'horodatage figé. `devices` descend au tirage sur un curseur
+        `(updated_at, id)` : une révocation y restait INVISIBLE, définitivement.
+        """
+        champs = kwargs.get('update_fields')
+        if champs is not None and 'updated_at' not in champs:
+            kwargs['update_fields'] = list(champs) + ['updated_at']
+        super().save(*args, **kwargs)
 
     def touch(self, ip=None):
         """

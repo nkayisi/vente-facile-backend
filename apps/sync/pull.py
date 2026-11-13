@@ -638,7 +638,9 @@ PULL_TABLES = (
                       'revoked_at')),
 
     # -- référentiels du catalogue
-    PullTable('units', 'products.Unit'),
+    # Suppression douce depuis le 2026-11-13 : sans pierre tombale, une unité
+    # supprimée au back-office restait proposée au comptoir, pour toujours.
+    PullTable('units', 'products.Unit', soft_delete=True),
     PullTable('categories', 'products.Category', soft_delete=True),
     PullTable('brands', 'products.Brand', soft_delete=True),
     PullTable('warehouses', 'inventory.Warehouse', soft_delete=True, warehouse_path=''),

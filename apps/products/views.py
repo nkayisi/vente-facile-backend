@@ -6,6 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from rest_framework import viewsets, status, filters
+from rest_framework.exceptions import ValidationError
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
@@ -314,6 +315,44 @@ class UnitViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         'partial_update': 'products.edit',
         'destroy': 'products.delete',
     }
+
+    def perform_destroy(self, instance):
+        """
+        Supprime EN DOUCEUR une unité que plus rien n'emploie.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ UNE UNITÉ SUPPRIMÉE SURVIVAIT SUR CHAQUE TERMINAL, POUR TOUJOURS.   │
+        │                                                                      │
+        │ La suppression était SQL : aucune pierre tombale ne pouvait partir,  │
+        │ et l'unité restait listée et proposée à la création d'article au     │
+        │ comptoir. Désormais elle se supprime en douceur, et `units` descend  │
+        │ avec ses pierres tombales.                                           │
+        │                                                                      │
+        │ ⚠ ON REFUSE TANT QU'UN ARTICLE L'EMPLOIE. L'ancienne suppression     │
+        │   vidait `unit` des articles en silence (`SET_NULL`) ; une           │
+        │   suppression douce, elle, laisserait un article pointer vers une    │
+        │   unité que le terminal vient d'effacer : le comptoir afficherait    │
+        │   un prix sans unité. Le marchand change d'abord l'unité de ses      │
+        │   articles, et le message dit combien il y en a.                     │
+        └──────────────────────────────────────────────────────────────────────┘
+        """
+        articles = Product.objects.filter(
+            Q(unit=instance) | Q(packaging_unit=instance)
+        ).count()
+        derivees = Unit.objects.filter(base_unit=instance).exclude(pk=instance.pk).count()
+        if articles or derivees:
+            motifs = []
+            if articles:
+                motifs.append(f"{articles} article{'s' if articles > 1 else ''}")
+            if derivees:
+                motifs.append(f"{derivees} autre{'s' if derivees > 1 else ''} unité{'s' if derivees > 1 else ''}")
+            raise ValidationError({
+                'detail': (
+                    f"Cette unité sert encore à {' et '.join(motifs)} : "
+                    "remplacez-la avant de la supprimer."
+                ),
+            })
+        super().perform_destroy(instance)
 
 
 # =============================================================================

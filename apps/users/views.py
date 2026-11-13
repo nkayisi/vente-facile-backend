@@ -21,6 +21,7 @@ from apps.core.api_mixins import TenantViewSetMixin
 from apps.core.api_permissions import IsTenantMember, IsTenantAdmin, HasPermission, _get_membership
 from apps.core.adresse import adresse_client
 from .connexion import authentifier, exiger_un_etablissement_ouvert
+from .devices import resolve_device
 from .models import User, UserActivity
 from .serializers import (
     UserListSerializer, UserDetailSerializer,
@@ -382,6 +383,22 @@ class LogoutView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ L'APPAREIL SE RÉVOQUE AVANT TOUT LE RESTE, ET HORS DU `try`.     │
+        # │                                                                  │
+        # │ Un jeton de rafraîchissement déjà expiré fait lever `blacklist`, │
+        # │ et le `except` ci-dessous rend « Déconnexion réussie » : placé   │
+        # │ après, l'appareil serait resté ACTIF - trente jours glissants -  │
+        # │ sur un téléphone qui vient d'effacer sa clé.                     │
+        # │                                                                  │
+        # │ ⚠ ON NE RÉVOQUE QUE SES PROPRES APPAREILS : un jeton d'appareil  │
+        # │ glissé dans le corps ne doit pas permettre de déconnecter un     │
+        # │ collègue.                                                        │
+        # └──────────────────────────────────────────────────────────────────┘
+        appareil = resolve_device(request.data.get('device_token'))
+        if appareil is not None and appareil.user_id == request.user.pk:
+            appareil.revoke(by=request.user)
+
         try:
             refresh_token = request.data.get('refresh')
             if refresh_token:

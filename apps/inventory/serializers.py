@@ -1617,8 +1617,9 @@ class InventorySessionCreateSerializer(serializers.ModelSerializer):
         
         # Auto-generate name from date if not provided
         if not validated_data.get('name'):
-            now = timezone.now()
-            validated_data['name'] = f"Inventaire du {now.strftime('%d/%m/%Y')}"
+            # Le jour du MARCHAND : en UTC, un inventaire ouvert après 23 h à
+            # Kinshasa portait la date du lendemain dans son nom.
+            validated_data['name'] = f"Inventaire du {timezone.localdate():%d/%m/%Y}"
         
         session = InventorySession.objects.create(**validated_data)
         
