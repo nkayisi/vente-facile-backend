@@ -32,6 +32,19 @@ def _default_plan_currency():
     return Currency.objects.filter(code="USD", is_active=True).first()
 
 
+def peut_regler_abonnement(membership) -> bool:
+    """
+    Régler l'abonnement est réservé au propriétaire : `moko_initiate` est
+    `IsTenantOwner`. Le dire au client évite d'offrir à un caissier un bouton que
+    le serveur refusera une fois son numéro saisi.
+
+    ⚠ Point unique : le réveil du terminal (`subscription_payload`) et le statut
+    du back-office (`/subscriptions/status/`) le lisent tous deux, sans quoi les
+    deux surfaces finiraient par proposer le bouton à des rôles différents.
+    """
+    return bool(membership and membership.role == 'owner')
+
+
 class MokoActivationDeferred(Exception):
     """
     L'activation d'un paiement MOKO encaissé ne peut pas aboutir maintenant, mais

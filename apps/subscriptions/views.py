@@ -12,7 +12,8 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 
-from apps.core.api_permissions import IsTenantMember, IsTenantOwner, HasPermission
+from apps.core.api_permissions import IsTenantMember, IsTenantOwner, HasPermission, _get_membership
+from apps.core.services import PermissionService
 
 from .models import Plan, Subscription, SubscriptionPayment, Invoice
 from .serializers import (
@@ -24,7 +25,7 @@ from .serializers import (
     SubscriptionPaymentSerializer,
     InvoiceSerializer,
 )
-from .services import MokoActivationDeferred, SubscriptionService
+from .services import MokoActivationDeferred, SubscriptionService, peut_regler_abonnement
 from .moko_client import (
     initiate_payment_v2,
     get_payment_status_v2,
@@ -122,7 +123,8 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
     """
     permission_classes = [IsAuthenticated, IsTenantMember, HasPermission]
     action_permissions = {
-        'status': 'subscription.view',
+        # Le VERDICT se lit par tout membre ; le détail reste derrière `subscription.view`.
+        'status': '*',
         'current': 'subscription.view',
         'history': 'subscription.view',
         'payments': 'subscription.view',
@@ -146,8 +148,23 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
     @action(detail=False, methods=['get'])
     def status(self, request):
         """
-        Retourne le statut complet de l'abonnement de l'organisation.
+        Le statut de l'abonnement de l'organisation courante.
         Endpoint: GET /api/v1/subscriptions/status/
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ LE VERDICT SE LIT PAR TOUT MEMBRE.                                   │
+        │                                                                      │
+        │ Le back-office lit ce verdict à chaque page pour fermer le tableau   │
+        │ de bord d'un abonnement échu. Réservé à `subscription.view`, donc au │
+        │ seul propriétaire, il répondait 403 à un caissier : celui-ci ne      │
+        │ voyait jamais « bloqué », continuait de saisir pour se faire         │
+        │ refuser en 402, et chaque page journalisait une erreur client.       │
+        └──────────────────────────────────────────────────────────────────────┘
+
+        Le DÉTAIL (prix, plan complet, quotas) reste derrière `subscription.view`.
+        Sans ce droit on ne rend que ce qu'il faut pour se SAVOIR bloqué : le
+        nom du plan et s'il s'agit d'un essai, c'est-à-dire ce que le terminal
+        reçoit déjà par son réveil (`subscription_payload`), pour tous les rôles.
         """
         organization = self._get_organization(request)
         if not organization:
@@ -156,29 +173,33 @@ class SubscriptionViewSet(viewsets.GenericViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
 
+        membership = _get_membership(request)
+        voit_le_detail = 'subscription.view' in PermissionService.get_effective_permissions(membership)
         sub_status = SubscriptionService.get_subscription_status(organization)
+        subscription = sub_status.get('subscription')
 
-        # Sérialiser la réponse
         data = {
             'has_subscription': sub_status['has_subscription'],
             'is_active': sub_status['is_active'],
             'is_blocked': sub_status['is_blocked'],
             'status': sub_status['status'],
             'message': sub_status['message'],
+            'can_manage': peut_regler_abonnement(membership),
         }
-
-        subscription = sub_status.get('subscription')
         if subscription:
-            data['subscription'] = SubscriptionSerializer(subscription).data
-            data['plan'] = PlanSerializer(subscription.plan).data
             data['days_remaining'] = sub_status.get('days_remaining', 0)
             data['days_remaining_grace'] = sub_status.get('days_remaining_grace')
-        else:
-            data['subscription'] = None
-            data['plan'] = None
 
+        if not voit_le_detail:
+            data['subscription'] = (
+                {'plan_name': subscription.plan.name, 'is_trial': subscription.is_trial}
+                if subscription else None
+            )
+            return Response(data)
+
+        data['subscription'] = SubscriptionSerializer(subscription).data if subscription else None
+        data['plan'] = PlanSerializer(subscription.plan).data if subscription else None
         data['quotas'] = SubscriptionService.get_quota_snapshot(organization)
-
         return Response(data)
 
     @action(detail=False, methods=['get'])

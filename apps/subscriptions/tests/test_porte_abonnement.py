@@ -163,10 +163,9 @@ class SessionPorteLeVerdictTests(APITestCase):
     """
     Le verdict descend par la session d'APPAREIL, et c'est la seule voie.
 
-    `/subscriptions/status/` exige `subscription.view`, réservée au
-    propriétaire. Or un terminal est tenu par un CAISSIER : une porte adossée à
-    cet endpoint ne se fermerait jamais pour la population même qu'il faut
-    retenir.
+    Le terminal ne lit pas `/subscriptions/status/` : il a besoin du verdict
+    HORS LIGNE, donc de `access_until`, que seul son réveil lui donne. Et ce
+    réveil est la seule réponse mise en cache pour un démarrage à froid.
     """
 
     def setUp(self):
@@ -226,3 +225,67 @@ class SessionPorteLeVerdictTests(APITestCase):
         self.assertIsNone(bloc['access_until'])
         self.assertIs(bloc['is_blocked'], True)
         self.assertEqual(bloc['status'], 'none')
+
+
+@override_settings(DEBUG=False)
+class StatutLisibleParTousTests(APITestCase):
+    """
+    Le VERDICT d'abonnement se lit par tout membre ; son DÉTAIL par le seul
+    propriétaire.
+
+    Réservé à `subscription.view`, `/subscriptions/status/` répondait 403 à un
+    caissier : le back-office ne lui montrait jamais « bloqué », il continuait
+    de saisir pour se faire refuser en 402, et chaque page journalisait une
+    erreur client. Le rôle éprouvé est donc BORNÉ.
+    """
+
+    URL = '/api/v1/subscriptions/status/'
+
+    def setUp(self):
+        self.__dict__.update(make_org_with_users())
+        cache.clear()
+
+    def _lire(self, user):
+        self.client.force_authenticate(user=user)
+        return self.client.get(self.URL, HTTP_X_ORGANIZATION_ID=str(self.org.id))
+
+    def test_un_caissier_lit_le_verdict_sans_le_detail(self):
+        reponse = self._lire(self.cashier_a)
+        self.assertEqual(reponse.status_code, status.HTTP_200_OK, reponse.data)
+        self.assertFalse(reponse.data['is_blocked'])
+        self.assertFalse(reponse.data['can_manage'])
+        # Le nom du plan et l'essai, rien de plus : c'est ce que le terminal
+        # reçoit déjà de son réveil, pour tous les rôles.
+        self.assertEqual(set(reponse.data['subscription']), {'plan_name', 'is_trial'})
+        self.assertNotIn('quotas', reponse.data)
+        self.assertNotIn('plan', reponse.data)
+
+    def test_un_caissier_SE_SAIT_bloque(self):
+        """La raison d'être du lot : sans elle, le tableau de bord ne se fermait jamais pour lui."""
+        sub = Subscription.objects.get(organization=self.org)
+        sub.current_period_end = timezone.now() - timedelta(days=30)
+        sub.save(update_fields=['current_period_end', 'updated_at'])
+        SubscriptionService.invalidate_org_cache(self.org.id)
+        reponse = self._lire(self.cashier_a)
+        self.assertEqual(reponse.status_code, status.HTTP_200_OK, reponse.data)
+        self.assertTrue(reponse.data['is_blocked'])
+
+    def test_le_proprietaire_garde_tout_le_detail(self):
+        reponse = self._lire(self.owner)
+        self.assertEqual(reponse.status_code, status.HTTP_200_OK, reponse.data)
+        self.assertTrue(reponse.data['can_manage'])
+        self.assertIn('quotas', reponse.data)
+        self.assertIn('price', reponse.data['subscription'])
+
+    def test_le_detail_suit_la_PERMISSION_pas_le_role(self):
+        """
+        Un marchand peut accorder `subscription.view` à son gérant : il lit
+        alors le détail. Il ne peut pas pour autant régler, `moko_initiate`
+        restant réservé au propriétaire.
+        """
+        adhesion = self.manager.memberships.get(organization=self.org)
+        adhesion.extra_permissions = ['subscription.view']
+        adhesion.save(update_fields=['extra_permissions'])
+        reponse = self._lire(self.manager)
+        self.assertIn('quotas', reponse.data)
+        self.assertFalse(reponse.data['can_manage'])

@@ -223,7 +223,7 @@ def subscription_payload(organization, membership):
     from datetime import timedelta
 
     from apps.subscriptions.models import GlobalConfig
-    from apps.subscriptions.services import SubscriptionService
+    from apps.subscriptions.services import SubscriptionService, peut_regler_abonnement
 
     etat = SubscriptionService.get_subscription_status(organization)
     subscription = etat.get('subscription')
@@ -244,10 +244,7 @@ def subscription_payload(organization, membership):
         # qu'un autre : on renouvelle bien plus souvent qu'on ne change d'offre.
         'plan_id': str(subscription.plan_id) if subscription else None,
         'plan_name': subscription.plan.name if subscription else None,
-        # Régler l'abonnement est réservé au propriétaire (`moko_initiate` est
-        # `IsTenantOwner`). Le dire ici évite d'offrir à un caissier un bouton
-        # que le serveur refusera une fois son numéro saisi.
-        'can_manage': bool(membership and membership.role == 'owner'),
+        'can_manage': peut_regler_abonnement(membership),
     }
 
 
