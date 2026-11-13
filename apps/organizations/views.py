@@ -200,6 +200,20 @@ class OrganizationViewSet(viewsets.ModelViewSet):
             qs = qs.filter(pk=jeton.get('imp_org'))
         return qs
 
+    def get_object(self):
+        """
+        ⚠ La LISTE garde les établissements suspendus, avec leur `is_active` :
+        c'est ce qui permet au back-office d'afficher l'écran de suspension
+        plutôt qu'une page vide. Tout le reste - détail, modification, tableau
+        de bord, bascule - est refusé, comme dans le reste de l'API.
+        """
+        from apps.core.exceptions import EtablissementSuspendu
+
+        organisation = super().get_object()
+        if not organisation.is_active:
+            raise EtablissementSuspendu(organisation)
+        return organisation
+
     def get_serializer_class(self):
         if self.action == 'list':
             return OrganizationListSerializer

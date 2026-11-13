@@ -156,6 +156,11 @@ def demarrer(*, impersonator, target_user, organization, reason, request=None):
         raise RefusAdministration("On ne prend pas la main sur un administrateur de la plateforme.")
     if organization.is_deleted:
         raise RefusAdministration("Cette organisation n'existe plus.")
+    # Un établissement suspendu ne se consulte plus, même par le support : ses
+    # écrans répondraient tous « suspendu », et la suspension ferme déjà les
+    # prises en main en cours.
+    if not organization.is_active:
+        raise RefusAdministration("Cet établissement est suspendu : on n'y prend pas la main.")
     if not OrganizationMembership.objects.filter(
         user=target_user, organization=organization, is_active=True,
     ).exists():

@@ -30,6 +30,35 @@ from rest_framework import status as http_status
 DENY = '!closed'
 
 
+def exiger_etablissement_actif(request, membership):
+    """
+    Rend `membership`, ou lève `EtablissementSuspendu` si son établissement l'est.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ UN ÉTABLISSEMENT SUSPENDU NE SE LIT PLUS, NE S'ÉCRIT PLUS, NE SE TIRE   │
+    │ PLUS - SAUF LA POUSSÉE DU JOURNAL (décision du 2026-11-13).             │
+    │                                                                          │
+    │ Un terminal peut porter des ventes encaissées et imprimées, que le      │
+    │ serveur n'a pas encore reçues. Les refuser les perdrait : la suspension │
+    │ ne doit coûter au marchand aucune vente déjà faite. Une vue qui porte   │
+    │ `tolere_etablissement_suspendu = True` passe ; un test exige que ce     │
+    │ soit `SyncOperationsView`, et elle seule.                               │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    Appelée par les DEUX résolveurs d'appartenance (`_get_membership`, et
+    `warehouse_scope.membership_for_organization` pour les routes qui portent
+    l'organisation dans l'URL) : toute vue de l'établissement y passe.
+    """
+    if membership is None or membership.organization.is_active:
+        return membership
+    from apps.core.exceptions import EtablissementSuspendu
+
+    vue = (getattr(request, 'parser_context', None) or {}).get('view')
+    if getattr(vue, 'tolere_etablissement_suspendu', False):
+        return membership
+    raise EtablissementSuspendu(membership.organization)
+
+
 def _get_membership(request):
     """
     Membership actif de l'utilisateur pour l'organisation portée par l'en-tête.
@@ -58,7 +87,7 @@ def _get_membership(request):
             is_active=True
         ).select_related('organization').first()
         setattr(request, cache_key, membership)
-    return getattr(request, cache_key)
+    return exiger_etablissement_actif(request, getattr(request, cache_key))
 
 
 def has_perm_code(request, perm_code: str) -> bool:

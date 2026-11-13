@@ -319,7 +319,7 @@ class CustomTokenObtainPairSerializer(serializers.Serializer):
 
         from apps.platform_admin.services import est_admin_plateforme
 
-        from .connexion import authentifier
+        from .connexion import authentifier, exiger_un_etablissement_ouvert
 
         user = authentifier(self.context.get('request'), attrs['email'], attrs['password'])
 
@@ -328,6 +328,7 @@ class CustomTokenObtainPairSerializer(serializers.Serializer):
 
         if not user.is_active:
             raise serializers.ValidationError('Ce compte est désactivé.')
+        exiger_un_etablissement_ouvert(user)
 
         refresh = RefreshToken.for_user(user)
 

@@ -61,7 +61,9 @@ def membership_for_organization(request, organization):
             organization_id=org_id, is_active=True
         ).select_related('organization').first()
         setattr(request, cache_key, membership)
-    return getattr(request, cache_key)
+    from apps.core.api_permissions import exiger_etablissement_actif
+
+    return exiger_etablissement_actif(request, getattr(request, cache_key))
 
 
 def accessible_warehouse_ids(membership: OrganizationMembership) -> Optional[list[UUID]]:

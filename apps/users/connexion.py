@@ -34,7 +34,7 @@ from django.core.cache import cache
 from rest_framework import status
 
 from apps.core.adresse import adresse_client
-from apps.core.exceptions import RefusAvecCorps
+from apps.core.exceptions import EtablissementSuspendu, RefusAvecCorps
 
 SEUIL = 5
 DUREE_SECONDES = 15 * 60
@@ -124,3 +124,27 @@ def authentifier(request, email, mot_de_passe):
         return None
     cache.delete(cle_echecs)
     return user
+
+
+def exiger_un_etablissement_ouvert(user):
+    """
+    Lève `EtablissementSuspendu` si TOUS les établissements du compte sont suspendus.
+
+    ⚠ TOUS, et pas un seul : un gérant de deux boutiques dont l'une est suspendue
+    travaille dans l'autre, et le refuser à la porte l'empêcherait d'y entrer.
+    Le refus d'UNE boutique se fait plus loin, à chaque requête qui la vise.
+
+    Deux comptes passent toujours : un administrateur de la plateforme (son
+    accès ne vient d'aucun établissement), et un compte sans aucune adhésion
+    (il est en train de créer sa boutique).
+    """
+    from apps.platform_admin.services import est_admin_plateforme
+
+    if est_admin_plateforme(user):
+        return
+    etats = set(
+        user.memberships.filter(is_active=True, organization__is_deleted=False)
+        .values_list('organization__is_active', flat=True)
+    )
+    if etats and True not in etats:
+        raise EtablissementSuspendu()

@@ -18,9 +18,9 @@ from django.conf import settings
 from django.template.loader import render_to_string
 
 from apps.core.api_mixins import TenantViewSetMixin
-from apps.core.api_permissions import IsTenantMember, IsTenantAdmin, HasPermission
+from apps.core.api_permissions import IsTenantMember, IsTenantAdmin, HasPermission, _get_membership
 from apps.core.adresse import adresse_client
-from .connexion import authentifier
+from .connexion import authentifier, exiger_un_etablissement_ouvert
 from .models import User, UserActivity
 from .serializers import (
     UserListSerializer, UserDetailSerializer,
@@ -155,10 +155,8 @@ class UserViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        membership = request.user.memberships.filter(
-            organization_id=org_id,
-            is_active=True
-        ).first()
+        # Le résolveur unique : il refuse aussi un établissement suspendu.
+        membership = _get_membership(request)
         
         if not membership:
             return Response(
@@ -347,7 +345,9 @@ class LoginView(APIView):
                 {'error': 'Ce compte est désactivé'},
                 status=status.HTTP_401_UNAUTHORIZED
             )
-        
+        exiger_un_etablissement_ouvert(user)
+
+
         # Mettre à jour last_login
         user.last_login = timezone.now()
         user.save(update_fields=['last_login'])

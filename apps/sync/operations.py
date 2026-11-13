@@ -449,6 +449,10 @@ class SyncOperationsView(APIView):
     """
 
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription]
+    # ⚠ La SEULE vue qui passe un établissement suspendu : les ventes encaissées
+    # hors ligne doivent pouvoir arriver, sans quoi la suspension les perdrait.
+    # `test_suspension_etablissement` exige qu'il n'y en ait aucune autre.
+    tolere_etablissement_suspendu = True
 
     @extend_schema(
         summary="Rejouer un lot d'opérations",

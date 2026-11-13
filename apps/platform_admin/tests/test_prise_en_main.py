@@ -92,6 +92,14 @@ class OuvertureTests(_Base):
         ailleurs = Organization.objects.create(name='Ailleurs', slug='ailleurs')
         self.assertEqual(self.prendre_la_main(org=ailleurs).status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_on_ne_prend_pas_la_main_sur_un_etablissement_suspendu(self):
+        self.org.is_active = False
+        self.org.save(update_fields=['is_active', 'updated_at'])
+        reponse = self.prendre_la_main()
+        self.assertEqual(reponse.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('suspendu', str(reponse.data))
+        self.assertFalse(ImpersonationSession.objects.exists())
+
     def test_un_marchand_ne_prend_pas_la_main(self):
         self.assertEqual(self.prendre_la_main(par=self.owner).status_code, status.HTTP_403_FORBIDDEN)
 

@@ -97,3 +97,27 @@ class AbonnementRequis(RefusAvecCorps):
             'days_remaining': etat.get('days_remaining', 0),
         }
         super().__init__(message)
+
+
+class EtablissementSuspendu(RefusAvecCorps):
+    """
+    403 : Vente Facile a suspendu cet établissement.
+
+    ⚠ UN REFUS NOMMÉ, DISTINCT D'UN DROIT MANQUANT ET D'UN MOT DE PASSE ERRONÉ.
+    Un 403 générique enverrait le caissier chercher son gérant, et le gérant
+    chercher un rôle ; ni l'un ni l'autre n'y peut rien, seul le support le
+    peut. Le `code` est ce que le back-office et le terminal lisent pour
+    afficher l'écran de suspension plutôt qu'une erreur.
+    """
+
+    status_code = http_status.HTTP_403_FORBIDDEN
+    default_code = 'organization_suspended'
+    default_detail = "Cet établissement est suspendu par Vente Facile. Contactez le support."
+
+    def __init__(self, organisation=None):
+        self.payload = {
+            'detail': self.default_detail,
+            'code': self.default_code,
+            'organization': str(organisation.pk) if organisation is not None else None,
+        }
+        super().__init__(self.default_detail)
