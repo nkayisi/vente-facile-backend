@@ -172,6 +172,23 @@ class PullTable:
     #: Enfants remplacés en bloc avec leur parent. Réservé aux tables sans
     #: suppression douce, dont aucune suppression ne se propagerait autrement.
     children: tuple = field(default_factory=tuple)
+    #: Révision PROPRE à cette table, mêlée à son jeton de périmètre quand elle
+    #: est non nulle.
+    #:
+    #: ┌────────────────────────────────────────────────────────────────────┐
+    #: │ UN ENFANT AJOUTÉ NE DESCEND PAS POUR LES LIGNES DÉJÀ TIRÉES.       │
+    #: │                                                                    │
+    #: │ Les enfants voyagent DANS la page de leur parent. Un terminal en   │
+    #: │ service a déjà tiré ses sessions de caisse : leur `updated_at` est │
+    #: │ derrière son curseur, et leurs fonds par devise ne descendraient   │
+    #: │ qu'à la prochaine écriture de chaque session - c'est-à-dire jamais │
+    #: │ pour les sessions closes. Monter la révision change le jeton de    │
+    #: │ CETTE table seule : le terminal l'efface et la retire en entier.   │
+    #: │                                                                    │
+    #: │ ⚠ Pas `SCOPE_RULE_VERSION`, qui ferait re-tirer TOUT le parc (les  │
+    #: │ ventes comprises) pour un enfant ajouté à une petite table.        │
+    #: └────────────────────────────────────────────────────────────────────┘
+    revision: int = 0
 
     def get_model(self):
         app_label, model_name = self.model.split('.')
@@ -466,11 +483,19 @@ def scope_token(table, membership):
     #   C'est aussi pourquoi `SCOPE_RULE_VERSION` ne bouge pas.
     if borne_par_auteur(table, membership):
         base = _jeton_entrepot(table, membership)
-        return blake2s(
+        jeton = blake2s(
             f'{base}|auteur|{table.author_field}|{membership.user_id}'.encode('utf-8'),
             digest_size=8,
         ).hexdigest()
-    return _jeton_entrepot(table, membership)
+    else:
+        jeton = _jeton_entrepot(table, membership)
+    # ⚠ Une révision NULLE ne touche à rien : c'est ce qui garde le jeton de
+    #   toutes les autres tables tel qu'il était.
+    if table.revision:
+        jeton = blake2s(
+            f'{jeton}|revision|{table.revision}'.encode('utf-8'), digest_size=8,
+        ).hexdigest()
+    return jeton
 
 
 def _jeton_entrepot(table, membership):
@@ -663,6 +688,16 @@ INVENTORY_CHILDREN = (
 #: Lignes d'une réquisition. Elles descendent AVEC elle, comme les lignes de
 #: vente : `RequisitionItem` n'a pas de suppression douce, donc une ligne
 #: retirée resterait à jamais en base locale si elle descendait seule.
+#: Le fonds de caisse PAR DEVISE d'une session (lot L13). Imbriqué dans sa
+#: session : il n'est écrit qu'à l'ouverture et à la clôture, deux actes qui
+#: sauvegardent aussi la session, donc son `updated_at` la fait redescendre.
+#: Sans lui, le terminal ne pouvait ni proposer le fonds hérité d'une devise
+#: secondaire, ni compter cette devise dans l'attendu de clôture.
+SESSION_CHILDREN = (
+    PullChild(name='currency_balances', table='register_session_currency_balances',
+              model='sales.RegisterSessionCurrencyBalance', parent_field='session'),
+)
+
 REQUISITION_CHILDREN = (
     PullChild(name='items', table='requisition_items',
               model='purchases.RequisitionItem', parent_field='requisition'),
@@ -743,7 +778,8 @@ PULL_TABLES = (
     # `RegisterSessionViewSet` borne par `register__warehouse_id` : sans cette
     # ligne, tout terminal détenait les sessions de caisse de l'organisation.
     PullTable('register_sessions', 'sales.RegisterSession',
-              warehouse_path='register__warehouse_id'),
+              warehouse_path='register__warehouse_id',
+              children=SESSION_CHILDREN, revision=1),
     # ⚠ `warehouse_include_null` : `SaleViewSet` le porte, donc une vente
     # ancienne sans entrepôt est visible au back-office. Sans lui ici, elle
     # était introuvable sur le terminal qui l'avait peut-être encaissée.
