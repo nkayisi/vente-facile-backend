@@ -20,7 +20,7 @@ Exceptions métier communes.
 └──────────────────────────────────────────────────────────────────────────────┘
 """
 from rest_framework import status as http_status
-from rest_framework.exceptions import APIException
+from rest_framework.exceptions import APIException, AuthenticationFailed
 
 
 class RefusMetier(ValueError):
@@ -120,4 +120,49 @@ class EtablissementSuspendu(RefusAvecCorps):
             'code': self.default_code,
             'organization': str(organisation.pk) if organisation is not None else None,
         }
+        super().__init__(self.default_detail)
+
+
+class SessionFermee(RefusAvecCorps, AuthenticationFailed):
+    """
+    401 : la session a été coupée par une réinitialisation de mot de passe.
+
+    ⚠ UN CORPS QUI PORTE SON `code`. Un `AuthenticationFailed` ordinaire ne rend
+    que `{"detail": ...}` : le back-office ne pouvait donc pas distinguer cette
+    fermeture d'un jeton simplement expiré, et il réessayait avec le même jeton,
+    écran après écran, pendant trente minutes. Le `code` est ce que
+    `lib/auth/api-helper.ts` lit pour déconnecter la page au premier refus.
+
+    ⚠ ET UN `AuthenticationFailed` : c'est à ce titre que DRF pose l'en-tête
+    `WWW-Authenticate` et garde le statut 401, au lieu de le changer en 403.
+    """
+
+    status_code = http_status.HTTP_401_UNAUTHORIZED
+    default_code = 'session_revoked'
+    default_detail = "Votre session a été fermée par l'administration. Reconnectez-vous."
+
+    def __init__(self):
+        self.payload = {'detail': self.default_detail, 'code': self.default_code}
+        super().__init__(self.default_detail)
+
+
+class MotDePasseAChanger(RefusAvecCorps):
+    """
+    403 : le mot de passe a été posé par l'administration, et le titulaire ne l'a
+    pas encore remplacé.
+
+    ⚠ UN REFUS NOMMÉ, et non un 401 : la session est VALIDE, elle vient de naître
+    avec le mot de passe temporaire. Un 401 ferait rafraîchir puis déconnecter,
+    et le titulaire tournerait en rond entre la connexion et son refus. Le `code`
+    est ce que les deux clients lisent pour l'envoyer sur l'écran du changement.
+    """
+
+    status_code = http_status.HTTP_403_FORBIDDEN
+    default_code = 'password_change_required'
+    default_detail = (
+        "Votre mot de passe a été réinitialisé : choisissez-en un nouveau avant de continuer."
+    )
+
+    def __init__(self):
+        self.payload = {'detail': self.default_detail, 'code': self.default_code}
         super().__init__(self.default_detail)

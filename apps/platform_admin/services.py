@@ -119,6 +119,13 @@ class PlatformPermissionService:
         'organizations.toggle_active',
         'users.view',
         'users.toggle_active',
+        # ⚠ Contrepartie ASSUMÉE (décision du 2026-11-13) : le support connaît le
+        # mot de passe qu'il dicte, donc il peut se connecter en écriture, ce que
+        # la prise en main lui refuse. Le changement obligatoire à la prochaine
+        # connexion, le motif et le journal d'audit en sont les garde-fous. Un
+        # administrateur de la plateforme, lui, ne se réinitialise que par
+        # `platform_admins.manage` (`reinitialiser_mot_de_passe`).
+        'users.reset_password',
         'platform_admins.view',
         'plans.view',
         'subscriptions.view',
@@ -352,3 +359,103 @@ class PlatformAdminService:
 
         fermer_sessions(impersonator=user, acteur=revoked_by, raison=reason, request=request)
         return profil
+
+
+# =============================================================================
+# UN MOT DE PASSE OUBLIÉ
+# =============================================================================
+
+def reinitialiser_mot_de_passe(cible, mot_de_passe, *, acteur, motif, request=None):
+    """
+    Pose un mot de passe TEMPORAIRE, que le titulaire devra changer à sa prochaine
+    connexion, et coupe tout ce qui était ouvert sous l'ancien.
+
+    Rend `(sessions_fermees, terminaux_revoques)`.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ « TOUT COUPER » (décision du 2026-11-13), ET IL FAUT LES TROIS PIÈCES.   │
+    │                                                                          │
+    │ 1. Les jetons de RAFRAÎCHISSEMENT vont sur liste noire : le back-office  │
+    │    ne peut plus prolonger sa session.                                    │
+    │ 2. `sessions_revoked_at` tue les jetons d'ACCÈS déjà émis, qui vivraient │
+    │    sinon encore trente minutes (`apps.core.authentication`).             │
+    │ 3. Les TERMINAUX sont révoqués : un jeton d'appareil redonne des JWT     │
+    │    sans mot de passe, pendant trente jours. Révoquer n'efface RIEN sur   │
+    │    le téléphone : ses ventes en file partent au réenrôlement.            │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    ⚠ LE MOT DE PASSE N'EST ÉCRIT NULLE PART : ni au journal, ni dans la réponse,
+    ni dans un message d'erreur. Seule son empreinte atteint la base.
+    """
+    from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
+
+    from apps.users.models import Device, User, UserActivity
+
+    if cible.pk == getattr(acteur, 'pk', None):
+        raise RefusAdministration(
+            "C'est votre propre compte : changez votre mot de passe depuis votre profil."
+        )
+    if not cible.is_active:
+        raise RefusAdministration(
+            "Ce compte est désactivé : réactivez-le d'abord, puis réinitialisez son mot de passe."
+        )
+    # ⚠ Même garde que la désactivation : sans elle, le support poserait le mot
+    # de passe d'un super-administrateur, et entrerait avec ses pouvoirs.
+    est_admin = cible.is_superuser or profil_admin(cible) is not None
+    if est_admin and not PlatformPermissionService.has(acteur, 'platform_admins.manage'):
+        raise RefusAdministration(
+            "Ce compte administre la plateforme : seul un super-administrateur peut "
+            "réinitialiser son mot de passe."
+        )
+
+    maintenant = timezone.now()
+    with transaction.atomic():
+        user = User.objects.select_for_update().get(pk=cible.pk)
+        user.set_password(mot_de_passe)
+        user.must_change_password = True
+        user.sessions_revoked_at = maintenant
+        # ⚠ `updated_at` EXPLICITE : `User` n'hérite pas de `TimeStampedModel`.
+        user.save(update_fields=[
+            'password', 'must_change_password', 'sessions_revoked_at', 'updated_at',
+        ])
+
+        en_cours = list(
+            OutstandingToken.objects
+            .filter(user=user, expires_at__gt=maintenant, blacklistedtoken__isnull=True)
+        )
+        BlacklistedToken.objects.bulk_create(
+            [BlacklistedToken(token=jeton) for jeton in en_cours], ignore_conflicts=True,
+        )
+
+        terminaux = list(Device.objects.filter(user=user, revoked_at__isnull=True))
+        for terminal in terminaux:
+            terminal.revoke(by=acteur)
+
+        AuditLogService.record(
+            actor=acteur, action=AdminActionLog.Action.RESET_PASSWORD,
+            target_type=AdminActionLog.Target.USER,
+            target_id=user.pk, target_repr=user.email,
+            after={'sessions_fermees': len(en_cours), 'terminaux_revoques': len(terminaux)},
+            reason=motif, request=request,
+        )
+        # ⚠ « Tout couper » vaut aussi pour les prises en main que CE compte avait
+        # ouvertes : un jeton de prise en main échappe à `sessions_revoked_at`
+        # (`apps.core.authentication`), et un administrateur dont le mot de passe
+        # a fuité garderait sinon les minutes qui leur restent.
+        if est_admin:
+            from .impersonation import fermer_sessions
+
+            fermer_sessions(impersonator=user, acteur=acteur, raison=motif, request=request)
+        # Dans l'historique du TITULAIRE : c'est son mot de passe, et il doit
+        # pouvoir lire qu'on l'a changé pour lui.
+        UserActivity.objects.create(
+            user=user,
+            action=UserActivity.ActionType.UPDATE,
+            resource_type='password',
+            details={'method': 'admin_reset'},
+            ip_address=adresse_client(request),
+            user_agent=(request.META.get('HTTP_USER_AGENT', '') if request is not None else ''),
+        )
+    cible.must_change_password = True
+    cible.sessions_revoked_at = maintenant
+    return len(en_cours), len(terminaux)

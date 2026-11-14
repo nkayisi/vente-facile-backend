@@ -27,7 +27,6 @@ from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework_simplejwt.tokens import RefreshToken
 
 from apps.core.adresse import adresse_client
 from apps.core.api_permissions import HasPermission, IsTenantMember, _get_membership, DENY
@@ -35,6 +34,7 @@ from apps.core.throttles import ScopeParAdresse
 from apps.core.services import PermissionService
 from apps.organizations.models import Organization
 
+from .jetons import JetonDeSession
 from .models import Device
 
 # Nombre de tentatives d'attribution du code d'appareil. Une collision sur
@@ -470,7 +470,7 @@ def build_session_payload(user, organization, device=None):
         OrganizationSettingsSerializer,
     )
 
-    refresh = RefreshToken.for_user(user)
+    refresh = JetonDeSession.for_user(user)
 
     membership = user.memberships.filter(
         organization=organization, is_active=True

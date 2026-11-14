@@ -53,6 +53,7 @@ from .serializers import (
     AdminPlanCreateUpdateSerializer,
     AdminPlanSerializer,
     AdminReasonSerializer,
+    AdminResetPasswordSerializer,
     AdminSubscriptionListSerializer,
     AdminSubscriptionPaymentSerializer,
     AdminUserCreateSerializer,
@@ -70,6 +71,7 @@ from .services import (
     RefusAdministration,
     _comptes_capables_de_tout,
     profil_admin,
+    reinitialiser_mot_de_passe,
     role_de,
 )
 
@@ -502,6 +504,7 @@ class AdminUserViewSet(ExportableListMixin, viewsets.ModelViewSet):
         'create': 'users.create',
         'partial_update': 'users.edit',
         'toggle_active': 'users.toggle_active',
+        'reset_password': 'users.reset_password',
         'grant_role': 'platform_admins.manage',
         'revoke_role': 'platform_admins.manage',
         'impersonate': 'impersonation.start',
@@ -620,6 +623,28 @@ class AdminUserViewSet(ExportableListMixin, viewsets.ModelViewSet):
         return Response({
             'message': f"Utilisateur {'activé' if user.is_active else 'désactivé'}.",
             'is_active': user.is_active,
+        })
+
+    @action(detail=True, methods=['post'])
+    def reset_password(self, request, pk=None):
+        """
+        Pose un mot de passe temporaire, à changer à la prochaine connexion, et
+        ferme les sessions et les terminaux ouverts sous l'ancien.
+
+        ⚠ La réponse ne RENVOIE PAS le mot de passe : l'écran le tient déjà, et un
+        mot de passe qui voyage dans une réponse finit dans un journal de proxy.
+        """
+        cible = self.get_object()
+        serializer = AdminResetPasswordSerializer(data=request.data, cible=cible)
+        serializer.is_valid(raise_exception=True)
+        sessions, terminaux = reinitialiser_mot_de_passe(
+            cible, serializer.validated_data['password'],
+            acteur=request.user, motif=serializer.validated_data['reason'], request=request,
+        )
+        return Response({
+            'message': "Mot de passe réinitialisé. Il devra être changé à la prochaine connexion.",
+            'sessions_closed': sessions,
+            'devices_revoked': terminaux,
         })
 
     @action(detail=True, methods=['post'])

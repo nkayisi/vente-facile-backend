@@ -22,6 +22,7 @@ from apps.core.api_permissions import IsTenantMember, IsTenantAdmin, HasPermissi
 from apps.core.adresse import adresse_client
 from .connexion import authentifier, exiger_un_etablissement_ouvert
 from .devices import resolve_device
+from .jetons import JetonDeSession
 from .models import User, UserActivity
 from .serializers import (
     UserListSerializer, UserDetailSerializer,
@@ -210,6 +211,9 @@ class UserViewSet(viewsets.ModelViewSet):
         
         user = request.user
         user.set_password(serializer.validated_data['new_password'])
+        # Choisi par le titulaire : un mot de passe posé par l'administration
+        # cesse ici d'être « à changer », et toutes les routes se rouvrent.
+        user.must_change_password = False
         user.save()
         
         # Logger l'activité
@@ -258,7 +262,7 @@ class RegisterView(APIView):
         user = serializer.save()
         
         # Générer les tokens
-        refresh = RefreshToken.for_user(user)
+        refresh = JetonDeSession.for_user(user)
         
         # Logger l'activité
         UserActivity.objects.create(
@@ -293,7 +297,7 @@ class RegisterWithOrganizationView(APIView):
         user = serializer.save()
         
         # Générer les tokens
-        refresh = RefreshToken.for_user(user)
+        refresh = JetonDeSession.for_user(user)
         
         # Logger l'activité
         UserActivity.objects.create(
@@ -354,7 +358,7 @@ class LoginView(APIView):
         user.save(update_fields=['last_login'])
         
         # Générer les tokens
-        refresh = RefreshToken.for_user(user)
+        refresh = JetonDeSession.for_user(user)
         
         # Logger l'activité
         UserActivity.objects.create(
@@ -508,6 +512,8 @@ class ResetPasswordConfirmView(APIView):
             )
         
         user.set_password(new_password)
+        # Le lien par e-mail fait choisir le mot de passe par son titulaire.
+        user.must_change_password = False
         user.save()
         
         UserActivity.objects.create(

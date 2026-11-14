@@ -15,6 +15,25 @@ traverse SANS AUCUNE différence. Seul un jeton portant la revendication `imp`
 │ accepte un JWT. La règle devient « aucune écriture », et il n'y a plus rien  │
 │ à inventorier.                                                               │
 └──────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ ET DEUX RÈGLES POUR LES JETONS ORDINAIRES : CELLES D'UN MOT DE PASSE         │
+│ RÉINITIALISÉ PAR L'ADMINISTRATION (`reinitialiser_mot_de_passe`).            │
+│                                                                              │
+│ 1. Un jeton d'une session coupée est mort (401 `session_revoked`). Mettre    │
+│    les jetons de rafraîchissement sur liste noire ne coupait rien avant      │
+│    trente minutes ; un 401 fait escalader le terminal tout de suite          │
+│    (rafraîchissement refusé, appareil révoqué, mot de passe redemandé).      │
+│    « Coupée » se lit à la MARQUE du jeton, pas à son heure d'émission :      │
+│    voir `apps.users.jetons`, qui la pose et contrôle aussi le               │
+│    rafraîchissement.                                                         │
+│ 2. Tant que `must_change_password` est vrai, seul le changement lui-même     │
+│    passe (403 `password_change_required`). Les clients y conduisent          │
+│    d'office ; cette règle est ce qui rend le passage OBLIGATOIRE.            │
+│                                                                              │
+│ ⚠ Un jeton de prise en main n'y est pas soumis : le support regarde, et      │
+│ regarder un compte dont le mot de passe attend son changement est légitime.  │
+└──────────────────────────────────────────────────────────────────────────────┘
 """
 import re
 
@@ -71,6 +90,30 @@ SANS_ORGANISATION = tuple(re.compile(motif) for motif in (
 ))
 
 
+#: Ce qu'un compte au mot de passe à changer peut encore faire : le changer,
+#: savoir qui il est, et partir. `path_info`, comparé en entier.
+PERMIS_AVANT_CHANGEMENT = frozenset({
+    ('POST', '/api/v1/users/me/change-password/'),
+    ('GET', '/api/v1/users/me/'),
+    ('POST', '/api/v1/auth/logout/'),
+})
+
+
+def _regles_du_mot_de_passe(request, user, jeton):
+    """Les deux règles d'un mot de passe réinitialisé, pour un jeton ordinaire."""
+    from apps.users.jetons import session_ouverte
+
+    if not session_ouverte(user, jeton):
+        from .exceptions import SessionFermee
+
+        raise SessionFermee()
+    if getattr(user, 'must_change_password', False):
+        if (request.method, request.path_info) not in PERMIS_AVANT_CHANGEMENT:
+            from .exceptions import MotDePasseAChanger
+
+            raise MotDePasseAChanger()
+
+
 class EnPriseEnMain(exceptions.PermissionDenied):
     default_detail = (
         "Prise en main en lecture seule : vous voyez ce que voit le marchand, "
@@ -99,6 +142,7 @@ class ImpersonationAwareJWTAuthentication(JWTAuthentication):
             return None
         user, jeton = resultat
         if not jeton.get('imp'):
+            _regles_du_mot_de_passe(request, user, jeton)
             return resultat
 
         from apps.platform_admin.impersonation import CLAIM_ORG, CLAIM_SESSION, session_vivante

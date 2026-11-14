@@ -46,9 +46,12 @@ class UserDetailSerializer(serializers.ModelSerializer):
             'phone', 'avatar', 'is_active', 'is_email_verified',
             'active_organization', 'active_organization_name',
             'organizations', 'preferences',
-            'date_joined', 'last_login'
+            'date_joined', 'last_login',
+            # Lu par le terminal à la connexion (`/auth/login/`) : vrai, il conduit
+            # à l'écran du changement avant tout enrôlement.
+            'must_change_password',
         ]
-        read_only_fields = ['id', 'email', 'date_joined', 'last_login']
+        read_only_fields = ['id', 'email', 'date_joined', 'last_login', 'must_change_password']
 
     def get_organizations(self, obj):
         """
@@ -240,6 +243,13 @@ class ChangePasswordSerializer(serializers.Serializer):
             raise serializers.ValidationError({
                 'new_password_confirm': 'Les mots de passe ne correspondent pas.'
             })
+        # ⚠ Après une réinitialisation, l'« actuel » est le mot de passe dicté au
+        # téléphone : le garder reviendrait à garder un mot de passe que
+        # quelqu'un d'autre connaît.
+        if data['new_password'] == data['current_password']:
+            raise serializers.ValidationError({
+                'new_password': "Choisissez un mot de passe différent de l'actuel."
+            })
         return data
 
 
@@ -315,11 +325,10 @@ class CustomTokenObtainPairSerializer(serializers.Serializer):
     password = serializers.CharField(write_only=True)
 
     def validate(self, attrs):
-        from rest_framework_simplejwt.tokens import RefreshToken
-
         from apps.platform_admin.services import est_admin_plateforme
 
         from .connexion import authentifier, exiger_un_etablissement_ouvert
+        from .jetons import JetonDeSession
 
         user = authentifier(self.context.get('request'), attrs['email'], attrs['password'])
 
@@ -330,7 +339,7 @@ class CustomTokenObtainPairSerializer(serializers.Serializer):
             raise serializers.ValidationError('Ce compte est désactivé.')
         exiger_un_etablissement_ouvert(user)
 
-        refresh = RefreshToken.for_user(user)
+        refresh = JetonDeSession.for_user(user)
 
         return {
             'access': str(refresh.access_token),
@@ -340,6 +349,8 @@ class CustomTokenObtainPairSerializer(serializers.Serializer):
                 'email': user.email,
                 'first_name': user.first_name,
                 'last_name': user.last_name,
+                # Le back-office le range dans sa session et y conduit d'office.
+                'must_change_password': user.must_change_password,
                 # ⚠ « peut entrer dans l'administration », pas le booléen brut :
                 # `is_staff` se pose aussi depuis l'admin Django sans rôle, et le
                 # back-office routerait ce compte vers des écrans qui lui sont

@@ -155,6 +155,9 @@ class AdminOrganizationDetailSerializer(AdminOrganizationListSerializer):
                 'role': m.role,
                 'role_display': m.get_role_display(),
                 'is_active': m.is_active and m.user.is_active,
+                # Le COMPTE seul : une adhésion close n'empêche pas de réinitialiser
+                # un mot de passe, le compte peut servir dans un autre établissement.
+                'user_is_active': m.user.is_active,
                 'is_platform_admin': bool(
                     m.user.is_superuser or (profil is not None and profil.is_active)
                 ),
@@ -247,7 +250,10 @@ class AdminUserListSerializer(serializers.ModelSerializer):
             'platform_role', 'platform_role_display',
             'organizations_count', 'organizations',
             'date_joined', 'last_login',
+            # Le support le lit avant de rappeler : « il ne l'a pas encore changé ».
+            'must_change_password',
         ]
+        read_only_fields = ['must_change_password']
 
     def get_organizations_count(self, obj):
         annote = getattr(obj, 'nb_organisations', None)
@@ -352,6 +358,36 @@ class AdminUserUpdateSerializer(serializers.ModelSerializer):
         fields = ['first_name', 'last_name', 'phone']
 
 
+class AdminResetPasswordSerializer(serializers.Serializer):
+    """
+    Le mot de passe temporaire qu'on dicte au titulaire, et le motif du geste.
+
+    ⚠ VALIDÉ CONTRE LE COMPTE VISÉ (`validate_password(..., user=cible)`) : le
+    validateur de ressemblance compare au nom et à l'adresse du titulaire, pas à
+    ceux de l'administrateur qui le saisit.
+    """
+
+    password = serializers.CharField(write_only=True, trim_whitespace=False)
+    reason = serializers.CharField(required=False, allow_blank=True, default='', max_length=1000)
+
+    def __init__(self, *args, cible=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cible = cible
+
+    def validate_password(self, value):
+        try:
+            validate_password(value, user=self.cible)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(list(exc.messages))
+        return value
+
+    def validate_reason(self, value):
+        value = (value or '').strip()
+        if len(value) < AdminReasonSerializer.LONGUEUR_MINIMALE:
+            raise serializers.ValidationError(AdminReasonSerializer.MOTIF_OBLIGATOIRE)
+        return value
+
+
 class AdminGrantRoleSerializer(serializers.Serializer):
     role = serializers.ChoiceField(choices=PlatformRole.choices)
     extra_permissions = serializers.ListField(
@@ -379,6 +415,8 @@ class AdminReasonSerializer(serializers.Serializer):
     """
 
     LONGUEUR_MINIMALE = 5
+    #: Une seule phrase pour tous les gestes motivés, mot de passe compris.
+    MOTIF_OBLIGATOIRE = "Le motif est obligatoire pour ce geste : il est gardé au journal d'audit."
 
     reason = serializers.CharField(required=False, allow_blank=True, default='', max_length=1000)
 
@@ -389,9 +427,7 @@ class AdminReasonSerializer(serializers.Serializer):
     def validate(self, attrs):
         attrs['reason'] = attrs.get('reason', '').strip()
         if self.requis and len(attrs['reason']) < self.LONGUEUR_MINIMALE:
-            raise serializers.ValidationError({
-                'reason': "Le motif est obligatoire pour ce geste : il est gardé au journal d'audit.",
-            })
+            raise serializers.ValidationError({'reason': self.MOTIF_OBLIGATOIRE})
         return attrs
 
 

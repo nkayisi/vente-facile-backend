@@ -26,6 +26,8 @@ PLATFORM_PERMISSION_CATALOG = frozenset(
         "users.create",
         "users.edit",
         "users.toggle_active",
+        # Poser un mot de passe temporaire, à changer à la prochaine connexion
+        "users.reset_password",
         # Administrateurs de la plateforme
         "platform_admins.view",
         "platform_admins.manage",

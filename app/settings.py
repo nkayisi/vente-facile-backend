@@ -328,6 +328,9 @@ SIMPLE_JWT = {
     
     'AUTH_TOKEN_CLASSES': ('rest_framework_simplejwt.tokens.AccessToken',),
     'TOKEN_TYPE_CLAIM': 'token_type',
+    # Refuse le rafraîchissement d'une session coupée par une réinitialisation
+    # de mot de passe (`apps.users.jetons`).
+    'TOKEN_REFRESH_SERIALIZER': 'apps.users.jetons.RafraichissementSerializer',
 }
 
 # =============================================================================

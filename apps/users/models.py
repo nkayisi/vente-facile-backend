@@ -52,6 +52,24 @@ class User(AbstractBaseUser, PermissionsMixin):
     date_joined = models.DateTimeField(default=timezone.now)
     last_login = models.DateTimeField(null=True, blank=True)
 
+    # ┌──────────────────────────────────────────────────────────────────────┐
+    # │ UN MOT DE PASSE POSÉ PAR QUELQU'UN D'AUTRE SE CHANGE AVANT TOUT.     │
+    # │                                                                      │
+    # │ L'administration réinitialise un mot de passe oublié et le dicte au  │
+    # │ téléphone : celui qui l'a dicté le connaît. Tant que le titulaire ne │
+    # │ l'a pas remplacé, `apps.core.authentication` refuse toute route hors │
+    # │ du changement lui-même, et les deux clients l'y conduisent d'office. │
+    # │                                                                      │
+    # │ `sessions_revoked_at` : un jeton d'accès émis AVANT cet instant est  │
+    # │ mort. Mettre les jetons de rafraîchissement sur liste noire ne       │
+    # │ suffit pas : un jeton d'accès vit encore trente minutes après.       │
+    # │                                                                      │
+    # │ ⚠ Aucun des deux ne descend au tirage : `PullTable('users')`         │
+    # │ restreint ses colonnes, et un terminal n'a rien à en faire.          │
+    # └──────────────────────────────────────────────────────────────────────┘
+    must_change_password = models.BooleanField(default=False)
+    sessions_revoked_at = models.DateTimeField(null=True, blank=True)
+
     # Indispensable au TIRAGE : le curseur de `/sync/pull/` pagine sur
     # `(updated_at, id)`. Sans ce champ, la table ne peut pas descendre sur les
     # terminaux, et le nom d'un caissier n'y apparaîtrait jamais.

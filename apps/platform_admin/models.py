@@ -120,6 +120,7 @@ class AdminActionLog(TimeStampedModel, UUIDModel):
         RECONCILE_PAYMENTS = 'reconcile_payments', 'Réconciliation des paiements'
         IMPERSONATE_START = 'impersonate_start', 'Début de prise en main'
         IMPERSONATE_END = 'impersonate_end', 'Fin de prise en main'
+        RESET_PASSWORD = 'reset_password', 'Réinitialisation du mot de passe'
 
     class Target(models.TextChoices):
         ORGANIZATION = 'organization', 'Organisation'

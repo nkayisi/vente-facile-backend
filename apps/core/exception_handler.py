@@ -38,6 +38,10 @@ def api_exception_handler(exc, context):
         reponse = Response(exc.payload, status=exc.status_code)
         if exc.wait:
             reponse["Retry-After"] = str(int(math.ceil(exc.wait)))
+        # Un refus d'AUTHENTIFICATION (`SessionFermee`) : DRF a posé l'en-tête
+        # sur l'exception, et ce chemin court-circuite celui qui le recopie.
+        if getattr(exc, "auth_header", None):
+            reponse["WWW-Authenticate"] = exc.auth_header
         return reponse
 
     # ┌──────────────────────────────────────────────────────────────────────┐

@@ -296,6 +296,17 @@ def dispatch(ctx, operations):
     """
     results = []
     refused = set()
+    # ┌──────────────────────────────────────────────────────────────────────┐
+    # │ UNE DÉPENDANCE QUI ATTEND N'EST PAS UNE DÉPENDANCE REFUSÉE.          │
+    # │                                                                      │
+    # │ Seul un refus (`rejected`) condamne ce qui en dépend. Une dépendance │
+    # │ temporisée (`retry`) ou retenue (`blocked`) repartira : rejouer ce   │
+    # │ qui en dépend maintenant le ferait échouer sur une pièce introuvable │
+    # │ - une vente sur un client créé hors ligne dont la création vient     │
+    # │ d'être temporisée - et le REFUS, lui, serait définitif. Il hérite    │
+    # │ donc du verdict de sa dépendance, sans trace : il n'a pas été tenté. │
+    # └──────────────────────────────────────────────────────────────────────┘
+    en_attente = {}
 
     for op in sorted(operations, key=lambda o: o.get('seq', 0)):
         op_id = op.get('operation_id')
@@ -309,6 +320,20 @@ def dispatch(ctx, operations):
             continue
 
         depends = op.get('depends_on') or []
+        attendue = next((en_attente[dep] for dep in depends if dep in en_attente), None)
+        if attendue is not None and not any(dep in refused for dep in depends):
+            results.append({
+                'operation_id': op_id,
+                'verdict': attendue,
+                'server_ids': {},
+                'authoritative': None,
+                'errors': {
+                    'code': 'dependency_pending',
+                    'detail': "L'opération dont celle-ci dépend n'a pas encore abouti.",
+                },
+            })
+            en_attente[op_id] = attendue
+            continue
         if any(dep in refused for dep in depends):
             # Court-circuit : inutile d'essayer un règlement dont la vente vient
             # d'être refusée. Le client verra la cause en amont.
@@ -397,6 +422,8 @@ def dispatch(ctx, operations):
             error = json_safe(error)
             logger.warning('Opération %s (%s) : %s', op_id, kind, error)
 
+            if verdict in (SyncOperation.Verdict.RETRY, SyncOperation.Verdict.BLOCKED):
+                en_attente[op_id] = verdict
             if verdict != SyncOperation.Verdict.RETRY:
                 # Le point de sauvegarde a été défait : la trace s'écrit dans sa
                 # propre transaction, sinon elle emporterait le rejet avec elle.
@@ -416,7 +443,9 @@ def dispatch(ctx, operations):
                             'occurred_at': quand or timezone.now(),
                         },
                     )
-                refused.add(op_id)
+                # Un blocage n'est pas un refus : ce qui en dépend attend avec lui.
+                if verdict != SyncOperation.Verdict.BLOCKED:
+                    refused.add(op_id)
 
             results.append({
                 'operation_id': op_id,
