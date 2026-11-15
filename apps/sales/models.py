@@ -141,6 +141,14 @@ class RegisterSession(TenantModel):
                 condition=models.Q(status='open'),
                 name='unique_open_session_per_register',
             ),
+            # Une personne n'a qu'un tiroir ouvert à la fois : deux sessions
+            # ouvertes par le même caissier feraient deux Z dont aucun ne
+            # correspond à sa journée. Voir `SessionPersonnelleOuverte`.
+            models.UniqueConstraint(
+                fields=['organization', 'opened_by'],
+                condition=models.Q(status='open'),
+                name='unique_open_session_per_user',
+            ),
         ]
 
     def __str__(self):
@@ -1022,6 +1030,23 @@ class Quotation(TenantSoftDeleteModel):
         null=True,
         blank=True,
         related_name='source_quotation'
+    )
+
+    # ┌──────────────────────────────────────────────────────────────────────┐
+    # │ UN DEVIS APPARTIENT À UN ENTREPÔT.                                   │
+    # │                                                                      │
+    # │ Sans lui, le seul axe de périmètre d'un devis était son auteur : un  │
+    # │ gérant lisait les devis de toute l'organisation, et la case « Voir   │
+    # │ tout » d'un caissier lui aurait ouvert ceux des autres boutiques.    │
+    # │ NULL toléré : les devis anciens n'en ont pas, et restent visibles.   │
+    # │ Il est aussi l'entrepôt de la conversion, quand il est encore actif. │
+    # └──────────────────────────────────────────────────────────────────────┘
+    warehouse = models.ForeignKey(
+        'inventory.Warehouse',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='quotations',
     )
 
     objects = TenantSoftDeleteManager()

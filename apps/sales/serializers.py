@@ -2,7 +2,7 @@
 Serializers DRF pour l'app Sales (POS).
 """
 from rest_framework import serializers
-from rest_framework.exceptions import ValidationError as DRFValidationError
+from rest_framework.exceptions import ErrorDetail, ValidationError as DRFValidationError
 from decimal import Decimal
 from django.db import transaction
 from .models import (
@@ -12,7 +12,12 @@ from .models import (
     SaleCurrencyTotal,
 )
 from .sale_validation import max_sale_discount_percent
-from apps.core.warehouse_scope import accessible_warehouse_ids, get_membership_for_request
+from apps.core.warehouse_scope import (
+    entrepots_actionnables,
+    exiger_entrepot_actionnable,
+    exiger_entrepot_actionnable_requete,
+    get_membership_for_request,
+)
 
 
 # =============================================================================
@@ -1148,6 +1153,24 @@ class SaleCreateSerializer(CagnotteLegacyMixin, serializers.ModelSerializer):
                 'register': "Une caisse est obligatoire pour une vente POS."
             })
 
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ L'ENTREPÔT SE DÉDUIT DE LA CAISSE AVANT TOUT CONTRÔLE.           │
+        # │                                                                  │
+        # │ Il ne l'était qu'à l'enregistrement, APRÈS le contrôle de        │
+        # │ périmètre de la vue : un caissier qui ne l'envoyait pas lisait   │
+        # │ « Un entrepôt est requis pour votre compte », et le verrou        │
+        # │ d'inventaire comme le stock se vérifiaient sans entrepôt. Le      │
+        # │ contrôle vit ici, pour la vue comme pour le journal du terminal. │
+        # └──────────────────────────────────────────────────────────────────┘
+        if not warehouse and register is not None and register.warehouse_id:
+            warehouse = register.warehouse
+            data['warehouse'] = warehouse
+        requete = self.context.get('request')
+        if requete is not None:
+            exiger_entrepot_actionnable_requete(
+                requete, getattr(warehouse, 'id', None), allow_none=True,
+            )
+
         # Récupérer l'organisation
         organization_id = self.context['request'].headers.get('X-Organization-ID')
         from apps.organizations.models import Organization
@@ -1163,7 +1186,7 @@ class SaleCreateSerializer(CagnotteLegacyMixin, serializers.ModelSerializer):
         elif request:
             m = get_membership_for_request(request)
             if m:
-                scoped = accessible_warehouse_ids(m)
+                scoped = entrepots_actionnables(m)
                 if scoped is not None:
                     wh_filter = scoped
 
@@ -1333,7 +1356,6 @@ class SaleCreateSerializer(CagnotteLegacyMixin, serializers.ModelSerializer):
         # race condition entre deux requêtes simultanées qui tireraient le même
         # MAX et produiraient une référence en doublon).
         from apps.core.utils import ReferenceGenerator
-        from apps.core.api_permissions import is_manager_or_above
         organization = self.context['request'].headers.get('X-Organization-ID')
         from apps.organizations.models import Organization
         org = Organization.objects.get(id=organization)
@@ -1377,10 +1399,24 @@ class SaleCreateSerializer(CagnotteLegacyMixin, serializers.ModelSerializer):
                                 "Veuillez ouvrir une session avant d'encaisser."
                 })
 
-            # Auditabilité : un cashier ne peut pas utiliser la session d'un autre
-            if session.opened_by_id != request.user.id and not is_manager_or_above(request):
+            # ┌──────────────────────────────────────────────────────────────┐
+            # │ ON NE VEND QUE DANS SA PROPRE SESSION, QUEL QUE SOIT LE RÔLE.│
+            # │                                                              │
+            # │ Un gérant pouvait vendre dans la session d'un caissier : ses │
+            # │ ventes entraient dans un tiroir qu'il ne comptait pas, et le │
+            # │ Z du caissier annonçait un excédent qu'il n'avait pas        │
+            # │ encaissé. Une session se CLÔTURE par tout membre de          │
+            # │ l'entrepôt ; elle ne sert à VENDRE qu'à celui qui l'a        │
+            # │ ouverte. Les autres ouvrent la leur, sur une autre caisse.   │
+            # └──────────────────────────────────────────────────────────────┘
+            if session.opened_by_id != request.user.id:
+                qui = session.opened_by.full_name if session.opened_by else "un autre utilisateur"
                 raise serializers.ValidationError({
-                    'register': "Cette session a été ouverte par un autre utilisateur."
+                    'register': ErrorDetail(
+                        f"Cette caisse est tenue par {qui} : on ne vend que dans sa "
+                        "propre session. Ouvrez la vôtre sur une autre caisse.",
+                        code='session_d_un_autre',
+                    )
                 })
 
             validated_data['session'] = session
@@ -1896,14 +1932,12 @@ class SaleReturnCreateSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         if request and original_sale is not None:
             m = get_membership_for_request(request)
-            if m:
-                allowed_ids = accessible_warehouse_ids(m)
-                if allowed_ids is not None:
-                    sale_wh_id = original_sale.warehouse_id
-                    if sale_wh_id is not None and sale_wh_id not in allowed_ids:
-                        raise serializers.ValidationError({
-                            'original_sale': "Cette vente n'est pas dans votre périmètre d'entrepôts."
-                        })
+            # Un retour remet de la marchandise en rayon : c'est une ACTION dans
+            # l'entrepôt de la vente, qui doit être affecté ET actif.
+            if m and original_sale.warehouse_id is not None:
+                exiger_entrepot_actionnable(
+                    m, original_sale.warehouse_id, champ='original_sale',
+                )
 
         return data
 
@@ -1990,12 +2024,14 @@ class QuotationListSerializer(serializers.ModelSerializer):
     
     customer_name = serializers.CharField(source='customer.name', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
+    warehouse_name = serializers.CharField(source='warehouse.name', read_only=True, default=None)
     items_count = serializers.SerializerMethodField()
     
     class Meta:
         model = Quotation
         fields = [
             'id', 'reference', 'customer', 'customer_name',
+            'warehouse', 'warehouse_name',
             'status', 'status_display',
             'subtotal', 'total', 'valid_until',
             'items_count', 'created_at'
@@ -2011,12 +2047,14 @@ class QuotationDetailSerializer(serializers.ModelSerializer):
     
     customer_name = serializers.CharField(source='customer.name', read_only=True)
     created_by_name = serializers.CharField(source='created_by.full_name', read_only=True)
+    warehouse_name = serializers.CharField(source='warehouse.name', read_only=True, default=None)
     items = QuotationItemSerializer(many=True, read_only=True)
     
     class Meta:
         model = Quotation
         fields = [
             'id', 'reference', 'customer', 'customer_name',
+            'warehouse', 'warehouse_name',
             'status', 'subtotal', 'tax_amount', 'discount_amount', 'total',
             'valid_until', 'notes', 'terms',
             'created_by', 'created_by_name',
@@ -2024,6 +2062,26 @@ class QuotationDetailSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'reference', 'created_at', 'updated_at']
+
+
+def entrepot_de_devis_par_defaut(membre):
+    """
+    L'entrepôt qui s'impose sans être choisi, ou `None`.
+
+    Un membre borné qui n'agit que dans UN entrepôt actif : celui-là. Le
+    propriétaire : l'entrepôt principal actif. Entre plusieurs dépôts, on ne
+    devine RIEN : deviner rattacherait le devis à la mauvaise boutique.
+    """
+    from apps.inventory.models import Warehouse
+
+    ids = entrepots_actionnables(membre)
+    actifs = Warehouse.objects.filter(
+        organization_id=membre.organization_id, is_deleted=False, is_active=True,
+    )
+    if ids is None:
+        return actifs.filter(is_default=True).first()
+    candidats = list(actifs.filter(id__in=ids)[:2])
+    return candidats[0] if len(candidats) == 1 else None
 
 
 class QuotationCreateSerializer(serializers.ModelSerializer):
@@ -2034,13 +2092,31 @@ class QuotationCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Quotation
         fields = [
-            'customer', 'valid_until', 'notes', 'terms', 'items'
+            'customer', 'warehouse', 'valid_until', 'notes', 'terms', 'items'
         ]
+        extra_kwargs = {'warehouse': {'required': False, 'allow_null': True}}
 
     def validate_items(self, value):
         if not value:
             raise serializers.ValidationError("Au moins un article est requis.")
         return value
+
+    def validate(self, data):
+        """
+        L'entrepôt d'un devis : celui qu'on désigne, sinon celui qui s'impose.
+
+        ⚠ Toléré ABSENT : un devis créé par un terminal antérieur n'en porte
+        pas, et le mettre en quarantaine pour cela serait pire que le laisser
+        sans entrepôt (il reste alors visible, comme les devis anciens).
+        """
+        requete = self.context.get('request')
+        membre = get_membership_for_request(requete) if requete is not None else None
+        entrepot = data.get('warehouse')
+        if entrepot is not None:
+            exiger_entrepot_actionnable(membre, entrepot.id)
+        elif membre is not None:
+            data['warehouse'] = entrepot_de_devis_par_defaut(membre)
+        return data
 
     def create(self, validated_data):
         items_data = validated_data.pop('items')

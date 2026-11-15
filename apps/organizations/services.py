@@ -44,13 +44,13 @@ def assurer_entrepot_du_membre(membership) -> bool:
     ne trouve plus de membre sans entrepôt.
 
     ⚠ LE PROPRIÉTAIRE EST ÉPARGNÉ, et ce n'est pas un détail : son accès vient
-    de son RÔLE, `accessible_warehouse_ids` rendant `None` pour lui. Lui poser
+    de son RÔLE, `entrepots_lisibles` rendant `None` pour lui. Lui poser
     une affectation le ferait passer de « tous les dépôts » à « celui-là », et
     on rétrécirait son périmètre en croyant l'élargir.
 
     ⚠ ON NE COMPTE QUE LES ENTREPÔTS VIVANTS. Un membre dont le seul dépôt est
     supprimé a bien une affectation, et aucun accès : c'est le cas que
-    `accessible_warehouse_ids` écarte par son `is_deleted=False`, et il doit
+    `entrepots_affectes` écarte par son `is_deleted=False`, et il doit
     être rattrapé ici comme une absence.
     """
     from apps.organizations.models import OrganizationMembership

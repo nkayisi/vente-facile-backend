@@ -1,9 +1,41 @@
 """
-Périmètre entrepôt par membership : helpers réutilisables pour filtres API.
+Périmètre entrepôt d'un membre : ce qu'il peut LIRE, ce qu'il peut FAIRE.
 
-Convention :
-- role ``owner`` : accès à tous les entrepôts de l'organisation (pas de filtre warehouse).
-- autres rôles : entrepôts listés via M2M ``assigned_warehouses`` ; liste vide = aucun accès aux données scoped.
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ DEUX PÉRIMÈTRES, ET CHAQUE APPEL DIT LEQUEL IL EMPLOIE.                     │
+│                                                                              │
+│ Par défaut un membre est ISOLÉ dans ses entrepôts affectés : il lit et il    │
+│ agit là, nulle part ailleurs. Le propriétaire peut, membre par membre,       │
+│ cocher « Consulter tous les entrepôts » (`consult_all_warehouses`) : ce      │
+│ membre LIT alors tout, partout et quel qu'en soit l'auteur, mais il n'AGIT   │
+│ toujours que dans ses entrepôts.                                             │
+│                                                                              │
+│ Une seule fonction ne pouvait pas porter les deux. Chaque filtre prend donc  │
+│ une `nature` OBLIGATOIRE (`LECTURE` ou `ACTION`) : un appel qui l'oublie     │
+│ lève `TypeError`, et un garde-fou AST refuse qu'on en ajoute un sans elle.   │
+│ Le défaut d'un site mal classé n'est pas symétrique - un site de lecture     │
+│ mis en action prive un membre d'une donnée, un site d'action mis en lecture  │
+│ le laisse agir ailleurs - et c'est pourquoi on ne laisse aucun défaut.       │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ L'AUTEUR SUIT UNE PERMISSION, PAS UN RÔLE.                                  │
+│                                                                              │
+│ Voir le travail de ses collègues - ventes, dépenses, caisse, retours, devis  │
+│ - tient à `sales.view_all`, que le gérant et le magasinier ont par leur rôle │
+│ et qu'un caissier reçoit par la case « Voir tout ». La règle précédente      │
+│ bornait « le caissier » par son RÔLE sur la caisse et les dépenses, et par   │
+│ la PERMISSION sur les ventes : la case n'ouvrait donc que la moitié de ce    │
+│ qu'elle promettait.                                                          │
+│                                                                              │
+│ ⚠ ET L'AUTEUR NE FRANCHIT JAMAIS LES ENTREPÔTS. Un membre borné par auteur   │
+│ voit ses propres lignes DANS SES ENTREPÔTS, plus celles qui n'en ont aucun   │
+│ (un mouvement de caisse poussé après la clôture du tiroir n'obtient jamais   │
+│ de session) : les cacher le ferait ressaisir ce qu'il a déjà saisi.          │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+Convention des listes : `None` = aucune restriction (propriétaire, ou case
+« consulter tous » en lecture) ; `[]` = aucun accès, partout `.none()`.
 """
 from __future__ import annotations
 
@@ -11,9 +43,18 @@ from typing import Optional
 from uuid import UUID
 
 from django.db.models import Q, QuerySet
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import ErrorDetail, ValidationError
 
 from apps.organizations.models import OrganizationMembership
+
+LECTURE = 'lecture'
+ACTION = 'action'
+NATURES = (LECTURE, ACTION)
+
+#: La permission qui ouvre le travail des collègues, dans ses entrepôts.
+PERMISSION_VOIR_TOUT = 'sales.view_all'
+
+_SAFE_METHODS = ('GET', 'HEAD', 'OPTIONS')
 
 
 def get_membership_for_request(request):
@@ -22,13 +63,8 @@ def get_membership_for_request(request):
 
     Délègue au résolveur unique de ``api_permissions``, qui mémoïse sur l'objet
     ``request``. Cette fonction émettait auparavant sa propre requête, à chacun
-    de ses 37 sites d'appel, alors que `IsTenantMember` venait de résoudre
+    de ses sites d'appel, alors que `IsTenantMember` venait de résoudre
     exactement le même membership quelques lignes plus haut.
-
-    Elle portait aussi un ``prefetch_related("assigned_warehouses")`` qui n'a
-    jamais servi : `accessible_warehouse_ids` filtrait ensuite le manager M2M,
-    et un ``.filter()`` court-circuite le cache de prefetch. Le préchargement
-    était donc payé puis jeté, à chaque appel.
     """
     from apps.core.api_permissions import _get_membership
 
@@ -41,11 +77,8 @@ def membership_for_organization(request, organization):
 
     `_get_membership` dépend de `X-Organization-ID`. Or le tableau de bord
     d'organisation porte son identifiant dans l'URL, et le back-office
-    n'envoie PAS cet en-tête sur ce chemin (vérifié :
-    `getDashboardStats` ne pose que `Authorization`). Sans cette porte, le
-    membership est `None`, `restrict_visibility_for_membership` rend le
-    queryset INTACT, et le périmètre ne s'applique jamais - tout en faisant
-    passer un test qui, lui, envoie l'en-tête.
+    n'envoie PAS cet en-tête sur ce chemin. Sans cette porte, le membership est
+    `None` et le périmètre ne s'applique jamais.
 
     Mémoïsé sous la MÊME clé que `_get_membership` : deux chemins vers la même
     identité ne doivent pas pouvoir répondre différemment.
@@ -66,87 +99,170 @@ def membership_for_organization(request, organization):
     return exiger_etablissement_actif(request, getattr(request, cache_key))
 
 
-def accessible_warehouse_ids(membership: OrganizationMembership) -> Optional[list[UUID]]:
-    """
-    Retourne ``None`` si pas de restriction (owner), sinon liste d'UUID d'entrepôts.
+# ─── La nature d'une requête ──────────────────────────────────────────────────
 
-    Le résultat est mémoïsé sur l'instance de membership. Comme celle-ci est
-    elle-même mémoïsée sur la requête, la liste n'est lue qu'une fois par
-    requête HTTP, là où `reports/summary` la relisait six fois.
+def nature_de_la_requete(request) -> str:
     """
-    if membership.role == OrganizationMembership.Role.OWNER:
-        return None
-    cached = getattr(membership, "_accessible_warehouse_ids", None)
+    LECTURE pour une méthode sûre, ACTION pour le reste, avec deux exceptions
+    que la VUE déclare :
+
+    - ``actions_de_lecture`` : un POST qui ne fait que lire (ex. marquer un
+      ticket imprimé, qui réimprime ce qu'on a le droit de lire) ;
+    - ``actions_preparatoires`` : un GET qui prépare une écriture (ex. la
+      feuille d'approvisionnement) - elle ne doit montrer que ce qu'on pourra
+      réellement saisir.
+    """
+    contexte = getattr(request, 'parser_context', None) or {}
+    vue = contexte.get('view')
+    action = getattr(vue, 'action', None)
+    if action:
+        if action in getattr(vue, 'actions_de_lecture', ()):
+            return LECTURE
+        if action in getattr(vue, 'actions_preparatoires', ()):
+            return ACTION
+    return LECTURE if getattr(request, 'method', 'GET') in _SAFE_METHODS else ACTION
+
+
+def _verifier_nature(nature):
+    if nature not in NATURES:
+        raise ValueError(f"nature inconnue : {nature!r} (attendu {NATURES})")
+
+
+# ─── Les deux périmètres ──────────────────────────────────────────────────────
+
+def _est_proprietaire(membership) -> bool:
+    return membership.role == OrganizationMembership.Role.OWNER
+
+
+def consulte_tout(membership) -> bool:
+    """La case « Consulter tous les entrepôts », accordée par le propriétaire."""
+    return bool(getattr(membership, 'consult_all_warehouses', False))
+
+
+def entrepots_affectes(membership) -> list[UUID]:
+    """
+    Les entrepôts affectés, non supprimés, INACTIFS COMPRIS.
+
+    Un entrepôt désactivé reste lisible (on relit son passé) et reste dans le
+    périmètre d'action (une dette d'une vente faite là s'encaisse toujours) :
+    ce qui le ferme aux opérations, c'est `exiger_entrepot_actionnable`, pas
+    sa disparition des listes.
+
+    Mémoïsé sur l'instance de membership, elle-même mémoïsée sur la requête.
+    """
+    cached = getattr(membership, '_entrepots_affectes', None)
     if cached is None:
         cached = list(
             membership.assigned_warehouses.filter(is_deleted=False).values_list(
-                "id", flat=True
+                'id', flat=True
             )
         )
-        membership._accessible_warehouse_ids = cached
+        membership._entrepots_affectes = cached
     return cached
 
 
-def restrict_visibility_for_membership(
-    queryset: QuerySet,
-    membership: Optional[OrganizationMembership],
-    *,
-    warehouse_field: str,
-    creator_field: str,
-    include_null_warehouse: bool = False,
-) -> QuerySet:
-    """Visibilité par rôle pour les données financières/opérationnelles.
+def entrepots_lisibles(membership) -> Optional[list[UUID]]:
+    """`None` pour le propriétaire et pour la case ; sinon les affectés."""
+    if _est_proprietaire(membership) or consulte_tout(membership):
+        return None
+    return entrepots_affectes(membership)
 
-    - ``owner`` : voit tout (aucun filtre).
-    - ``cashier`` : voit uniquement ses propres enregistrements
-      (``creator_field == membership.user``), partout dans l'application.
-    - ``manager`` / ``stock_keeper`` : périmètre entrepôt (``assigned_warehouses``)
-      via ``warehouse_field``. Par défaut, les enregistrements sans entrepôt
-      (``NULL``) ne leur sont pas visibles (réservés au owner) - passer
-      ``include_null_warehouse=True`` pour les inclure (ex. ventes legacy).
+
+def entrepots_actionnables(membership) -> Optional[list[UUID]]:
+    """`None` pour le propriétaire ; sinon les affectés. La case n'y change rien."""
+    if _est_proprietaire(membership):
+        return None
+    return entrepots_affectes(membership)
+
+
+def entrepots_du_perimetre(membership, nature: str) -> Optional[list[UUID]]:
+    _verifier_nature(nature)
+    if nature == LECTURE:
+        return entrepots_lisibles(membership)
+    return entrepots_actionnables(membership)
+
+
+def permissions_effectives(membership) -> frozenset[str]:
+    """Rôle + `extra_permissions`, mémoïsé sur le membership."""
+    cached = getattr(membership, '_permissions_effectives', None)
+    if cached is None:
+        from apps.core.services import PermissionService
+
+        cached = frozenset(PermissionService.get_effective_permissions(membership))
+        membership._permissions_effectives = cached
+    return cached
+
+
+def est_borne_par_auteur(membership, nature: str) -> bool:
     """
+    Le membre ne voit-il, ou ne touche-t-il, que SES propres lignes ?
+
+    Faux pour le propriétaire ; faux en LECTURE pour la case « consulter
+    tous » (elle ouvre tous les auteurs) ; sinon, faux seulement avec
+    `sales.view_all`.
+    """
+    _verifier_nature(nature)
+    if membership is None or _est_proprietaire(membership):
+        return False
+    if nature == LECTURE and consulte_tout(membership):
+        return False
+    return PERMISSION_VOIR_TOUT not in permissions_effectives(membership)
+
+
+def empreinte_perimetre(membership) -> str:
+    """
+    L'empreinte de tout ce qui décide du périmètre d'un membre.
+
+    Elle change dès que le rôle, la case, une permission effective, une
+    affectation ou l'état d'un entrepôt affecté change. Un client qui la voit
+    bouger relit ses droits ; le terminal retire ses tables.
+    """
+    import hashlib
+
     if membership is None:
-        return queryset
-    role = membership.role
-    if role == OrganizationMembership.Role.OWNER:
-        return queryset
-    if role == OrganizationMembership.Role.CASHIER:
-        return queryset.filter(**{creator_field: membership.user})
-    return filter_queryset_by_related_warehouse(
-        queryset, membership, warehouse_field, include_null=include_null_warehouse
+        return ''
+    affectes = sorted(
+        f'{wid}:{int(actif)}'
+        for wid, actif in membership.assigned_warehouses.filter(
+            is_deleted=False
+        ).values_list('id', 'is_active')
     )
+    morceaux = [
+        membership.role,
+        '1' if consulte_tout(membership) else '0',
+        ','.join(sorted(permissions_effectives(membership))),
+        ','.join(affectes),
+    ]
+    return hashlib.blake2s('|'.join(morceaux).encode(), digest_size=8).hexdigest()
 
 
-def restrict_visibility_for_request(
-    queryset: QuerySet,
-    request,
-    *,
-    warehouse_field: str,
-    creator_field: str,
-    include_null_warehouse: bool = False,
-) -> QuerySet:
-    """Variante basée sur la requête (résout le membership via X-Organization-ID)."""
-    return restrict_visibility_for_membership(
-        queryset,
-        get_membership_for_request(request),
-        warehouse_field=warehouse_field,
-        creator_field=creator_field,
-        include_null_warehouse=include_null_warehouse,
-    )
+# ─── Les filtres : un corps chacun, une nature obligatoire ─────────────────────
+
+def _borner_entrepot(queryset, ids, field, *, include_null):
+    if ids is None:
+        return queryset
+    if not ids:
+        return queryset.none()
+    condition = Q(**{f'{field}__in': ids})
+    if include_null:
+        condition |= Q(**{f'{field}__isnull': True})
+    return queryset.filter(condition)
 
 
 def filter_queryset_by_warehouse_ids(
     queryset: QuerySet,
     membership: OrganizationMembership,
-    warehouse_field: str = "warehouse_id",
+    warehouse_field: str = 'warehouse_id',
+    *,
+    nature: str,
 ) -> QuerySet:
-    """Filtre un queryset sur un champ FK warehouse si le membership est restreint."""
-    ids = accessible_warehouse_ids(membership)
-    if ids is None:
-        return queryset
-    if not ids:
-        return queryset.none()
-    return queryset.filter(**{f"{warehouse_field}__in": ids})
+    """Filtre direct sur un champ d'entrepôt, dans le périmètre de `nature`."""
+    return _borner_entrepot(
+        queryset,
+        entrepots_du_perimetre(membership, nature),
+        warehouse_field,
+        include_null=False,
+    )
 
 
 def filter_queryset_by_related_warehouse(
@@ -155,31 +271,87 @@ def filter_queryset_by_related_warehouse(
     warehouse_field: str,
     *,
     include_null: bool = False,
+    nature: str,
 ) -> QuerySet:
-    """Filtre via une relation indirecte (ex. ``original_sale__warehouse_id``,
-    ``register__warehouse_id``, ``sale__warehouse_id``).
-
-    Si ``include_null`` est ``True``, les lignes dont la relation est ``NULL``
-    restent visibles (utile pour mouvements de caisse non liés à une vente).
     """
-    ids = accessible_warehouse_ids(membership)
-    if ids is None:
+    Filtre via une relation (``original_sale__warehouse_id``,
+    ``register__warehouse_id``…). ``include_null`` garde les lignes dont la
+    relation est vide (ventes anciennes sans entrepôt).
+    """
+    return _borner_entrepot(
+        queryset,
+        entrepots_du_perimetre(membership, nature),
+        warehouse_field,
+        include_null=include_null,
+    )
+
+
+def borner_visibilite(
+    queryset: QuerySet,
+    membership: Optional[OrganizationMembership],
+    *,
+    nature: str,
+    warehouse_field: Optional[str],
+    author_field: Optional[str],
+    include_null_warehouse: bool = False,
+) -> QuerySet:
+    """
+    Le périmètre complet d'une donnée qui a un AUTEUR : entrepôt, puis auteur.
+
+    - ``warehouse_field`` ``None`` : la donnée n'a pas d'entrepôt (devis
+      anciens) ; seul l'auteur borne.
+    - Un membre borné par auteur voit ses propres lignes sans entrepôt même
+      quand ``include_null_warehouse`` est faux (voir l'en-tête du module).
+    """
+    if membership is None:
         return queryset
-    if not ids:
-        return queryset.none()
-    if include_null:
-        return queryset.filter(
-            Q(**{f"{warehouse_field}__in": ids})
-            | Q(**{f"{warehouse_field}__isnull": True})
+    borne = bool(author_field) and est_borne_par_auteur(membership, nature)
+    if warehouse_field:
+        queryset = _borner_entrepot(
+            queryset,
+            entrepots_du_perimetre(membership, nature),
+            warehouse_field,
+            include_null=include_null_warehouse or borne,
         )
-    return queryset.filter(**{f"{warehouse_field}__in": ids})
+    if borne:
+        # L'identifiant, pas l'objet : `membership.user` coûterait une requête.
+        queryset = queryset.filter(**{author_field: membership.user_id})
+    return queryset
+
+
+def borner_visibilite_requete(
+    queryset: QuerySet,
+    request,
+    *,
+    warehouse_field: Optional[str],
+    author_field: Optional[str],
+    include_null_warehouse: bool = False,
+    nature: Optional[str] = None,
+) -> QuerySet:
+    """`borner_visibilite`, nature déduite de la requête sauf si elle est imposée."""
+    return borner_visibilite(
+        queryset,
+        get_membership_for_request(request),
+        nature=nature or nature_de_la_requete(request),
+        warehouse_field=warehouse_field,
+        author_field=author_field,
+        include_null_warehouse=include_null_warehouse,
+    )
 
 
 def filter_stock_transfer_queryset(
-    queryset: QuerySet, membership: OrganizationMembership
+    queryset: QuerySet, membership: OrganizationMembership, *, nature: str
 ) -> QuerySet:
-    """Transferts où source ou destination est dans le périmètre."""
-    ids = accessible_warehouse_ids(membership)
+    """
+    Transferts où la source OU la destination est dans le périmètre.
+
+    ⚠ Le OU est la traduction juste de « un transfert relie deux dépôts » : le
+    borner sur la seule source cacherait au magasinier de destination ce qu'on
+    lui expédie, sur la seule destination ce que l'expéditeur a envoyé. Qui
+    peut faire QUOI sur un transfert (expédier côté source, recevoir côté
+    destination) est tranché par `exiger_cote_du_transfert`.
+    """
+    ids = entrepots_du_perimetre(membership, nature)
     if ids is None:
         return queryset
     if not ids:
@@ -190,70 +362,36 @@ def filter_stock_transfer_queryset(
 
 
 def filter_product_queryset(
-    queryset: QuerySet, membership: Optional[OrganizationMembership]
+    queryset: QuerySet,
+    membership: Optional[OrganizationMembership],
+    *,
+    nature: str,
 ) -> QuerySet:
     """
     Le périmètre d'un ARTICLE : il se dérive de ses lignes de stock.
 
-    ┌──────────────────────────────────────────────────────────────────────────┐
-    │ LA RÈGLE VIVAIT DANS `products/views.py`, DONC LE TERMINAL NE POUVAIT   │
-    │ PAS LA MIROITER.                                                         │
-    │                                                                          │
-    │ `ProductViewSet` la portait sous le nom `_filter_products_by_membership_ │
-    │ warehouses`, privée à son module : le back-office bornait donc son       │
-    │ catalogue par entrepôt depuis toujours, et le terminal montrait tout. Un │
-    │ marchand qui compare les deux surfaces y lit une incohérence, et c'est   │
-    │ T5 du retour de test.                                                    │
-    │                                                                          │
-    │ Elle est ici pour la même raison que ses deux voisines : une règle de    │
-    │ périmètre écrite à deux endroits finit par donner deux périmètres.       │
-    └──────────────────────────────────────────────────────────────────────────┘
+    ⚠ UN ARTICLE NON SUIVI RESTE VISIBLE DE TOUS : un service n'a de ligne de
+    stock dans AUCUN entrepôt, l'écarter le rendrait invendable partout.
 
-    ⚠ UN ARTICLE NON SUIVI RESTE VISIBLE DE TOUS, et ce n'est pas une
-    tolérance : un service, une prestation, un emballage interne n'a de ligne
-    de stock dans AUCUN entrepôt. L'écarter le rendrait invendable partout.
-
-    ⚠ `distinct()` EST OBLIGATOIRE. La condition traverse une relation inverse
-    (un article porte une ligne de stock PAR entrepôt) : sans elle, un article
-    stocké dans deux dépôts accessibles sort DEUX FOIS. Le filtre indirect
-    ordinaire (`filter_queryset_by_related_warehouse`) n'en a pas besoin, ses
-    chemins étant tous des clés étrangères directes.
-
-    ┌──────────────────────────────────────────────────────────────────────────┐
-    │ ⚠ NE PAS S'EN SERVIR POUR BORNER `products` AU TIRAGE. MESURÉ.          │
-    │                                                                          │
-    │ Le tirage pagine sur un curseur `(updated_at, id)`, et le périmètre      │
-    │ s'applique AVANT lui. Or `Stock.save()` ne touche PAS                     │
-    │ `product.updated_at`, et aucun signal ne le fait : un article            │
-    │ nouvellement stocké dans mon dépôt deviendrait éligible avec un          │
-    │ horodatage ANTÉRIEUR au point de reprise, donc il ne descendrait JAMAIS. │
-    │ Un magasinier recevrait une marchandise qui n'apparaîtrait pas sur son   │
-    │ terminal, et la sonde `pull/changed/` répondrait « rien de neuf ».       │
-    │                                                                          │
-    │ Et même avec cette écriture en plus, narrower le tirage ne SUFFIRAIT     │
-    │ pas : un article qui SORT du périmètre n'émet aucune pierre tombale -    │
-    │ il n'est pas supprimé - et resterait en base locale indéfiniment. Le     │
-    │ filtre de LECTURE est donc nécessaire de toute façon, et il est          │
-    │ suffisant : toutes les lignes sont là, on choisit ce qu'on montre.       │
-    └──────────────────────────────────────────────────────────────────────────┘
+    ⚠ NE PAS S'EN SERVIR POUR BORNER `products` AU TIRAGE. Le tirage pagine sur
+    `(updated_at, id)` et `Stock.save()` ne touche pas `product.updated_at` :
+    un article nouvellement stocké deviendrait éligible derrière le point de
+    reprise et ne descendrait jamais.
     """
+    if membership is None:
+        return queryset
     return filter_products_by_warehouse_ids(
-        queryset, accessible_warehouse_ids(membership)
+        queryset, entrepots_du_perimetre(membership, nature)
     )
 
 
 def filter_products_by_warehouse_ids(queryset: QuerySet, ids) -> QuerySet:
     """
-    La règle elle-même, sur des identifiants DÉJÀ résolus.
+    La règle sur des identifiants DÉJÀ résolus. `None` : aucune restriction ;
+    `[]` : seuls les articles non suivis.
 
-    Deux formes, et il faut les deux : `ProductViewSet` resserre encore le
-    périmètre du rôle avec son paramètre `?warehouse=`, donc il tient déjà sa
-    liste ; le reste du dépôt part d'une appartenance, comme les deux filtres
-    voisins. Un seul corps, deux portes.
-
-    `None` vaut « aucune restriction » (le propriétaire) ; `[]` vaut « aucun
-    accès », et ne laisse alors passer que les articles non suivis - exactement
-    ce que le back-office rend à un membre sans affectation.
+    ⚠ `distinct()` EST OBLIGATOIRE : la condition traverse une relation
+    inverse, et un article stocké dans deux dépôts sortirait deux fois.
     """
     if ids is None:
         return queryset
@@ -263,148 +401,225 @@ def filter_products_by_warehouse_ids(queryset: QuerySet, ids) -> QuerySet:
 
 
 def filter_cash_movement_queryset(
-    queryset: QuerySet, membership: Optional[OrganizationMembership]
+    queryset: QuerySet,
+    membership: Optional[OrganizationMembership],
+    *,
+    nature: str,
 ) -> QuerySet:
     """
-    Le périmètre d'un mouvement de caisse : il se DÉRIVE, par trois chemins.
+    Le périmètre d'un mouvement de caisse : il se DÉRIVE, par trois chemins
+    (la vente, la dépense, la session et son comptoir), et il est STRICT.
 
-    ┌──────────────────────────────────────────────────────────────────────────┐
-    │ IL Y AVAIT DEUX RÈGLES, ET ELLES DONNAIENT DEUX SOLDES.                 │
-    │                                                                          │
-    │ `CashMovementViewSet` bornait STRICTEMENT (les trois jointures, rien     │
-    │ d'autre) ; `reports/_scope_cash_movements` TOLÉRAIT en plus les          │
-    │ mouvements rattachés à rien. Le même gérant lisait donc un solde au      │
-    │ Livre de caisse et un AUTRE au tableau de bord, sur deux écrans voisins  │
-    │ du même back-office, le même jour.                                       │
-    │                                                                          │
-    │ Le strict l'emporte, et c'est la règle déjà posée pour les dépenses : un │
-    │ apport sans tiroir est une opération d'ÉTABLISSEMENT, au même titre      │
-    │ qu'un loyer, et elle reste au propriétaire. La tolérance faisait         │
-    │ apparaître le même apport chez chaque gérant.                            │
-    └──────────────────────────────────────────────────────────────────────────┘
+    Un apport sans tiroir est une opération d'ÉTABLISSEMENT, au même titre
+    qu'un loyer : il reste au propriétaire et à la case « consulter tous ».
+    Seule exception, celle de l'en-tête : un membre borné par auteur voit ses
+    PROPRES mouvements rattachés à rien.
     """
     if membership is None:
         return queryset
-    if membership.role == OrganizationMembership.Role.OWNER:
-        return queryset
-    if membership.role == OrganizationMembership.Role.CASHIER:
-        # Sa visibilité est par CRÉATEUR, partout : c'est la règle de
-        # `restrict_visibility_for_membership`, et le serveur ne lui oppose
-        # aucun entrepôt sur cette table.
-        return queryset.filter(created_by=membership.user)
-    ids = accessible_warehouse_ids(membership)
-    if not ids:
-        return queryset.none()
-    return queryset.filter(
-        Q(sale__warehouse_id__in=ids)
-        | Q(expense__warehouse_id__in=ids)
-        | Q(session__register__warehouse_id__in=ids)
-    )
-
-
-def assert_warehouse_allowed_for_membership(membership, warehouse_id, *, allow_none: bool = False):
-    """
-    Vérifie que `warehouse_id` est dans le périmètre de ce membership.
-
-    Le corps de la règle vit ICI ; la variante `_for_request` n'en est que la
-    porte d'entrée. Deux corps finiraient par diverger, et une règle de
-    périmètre qui diverge est un écran qui affiche les chiffres d'un dépôt sous
-    le nom d'un autre.
-    """
-    if warehouse_id is None:
-        if allow_none:
-            if membership and membership.role != OrganizationMembership.Role.OWNER:
-                raise ValidationError(
-                    {"warehouse": "Un entrepôt est requis pour votre compte."}
-                )
-            return
-        raise ValidationError({"warehouse": "Entrepôt requis."})
-
-    if not membership:
-        raise ValidationError({"detail": "Organisation requise."})
-
-    # ⚠ L'IDENTIFIANT SE LIT AVANT LE RÔLE, ET NON L'INVERSE.
-    #
-    # Cette garde était placée APRÈS la sortie du propriétaire : pour lui,
-    # `?warehouse=oops` traversait la validation, atteignait
-    # `qs.filter(warehouse_id='oops')` et remontait en 500. Un gérant, lui,
-    # recevait un 400 correct - le même paramètre, deux réponses, selon le
-    # rôle de qui le tape. Une saisie fautive se refuse, elle ne ressemble pas
-    # à une panne.
-    try:
-        wid = warehouse_id if isinstance(warehouse_id, UUID) else UUID(str(warehouse_id))
-    except (TypeError, ValueError):
-        # Un identifiant illisible est REFUSÉ, jamais ignoré : l'ignorer rendrait
-        # les chiffres de tout le périmètre sous une étiquette d'entrepôt.
-        raise ValidationError({"warehouse": "Entrepôt inconnu."})
-
-    ids = accessible_warehouse_ids(membership)
-    if ids is None:
-        return
-    if wid not in ids:
-        raise ValidationError(
-            {"warehouse": "Entrepôt non autorisé pour votre compte."}
+    ids = entrepots_du_perimetre(membership, nature)
+    borne = est_borne_par_auteur(membership, nature)
+    if ids is not None:
+        if not ids:
+            return queryset.none()
+        dans_mes_entrepots = (
+            Q(sale__warehouse_id__in=ids)
+            | Q(expense__warehouse_id__in=ids)
+            | Q(session__register__warehouse_id__in=ids)
         )
+        if borne:
+            dans_mes_entrepots |= Q(
+                sale__isnull=True, expense__isnull=True, session__isnull=True
+            )
+        queryset = queryset.filter(dans_mes_entrepots)
+    if borne:
+        queryset = queryset.filter(created_by_id=membership.user_id)
+    return queryset
 
 
-def assert_warehouse_allowed_for_request(
-    request,
+# ─── Les assertions ───────────────────────────────────────────────────────────
+
+def _lire_identifiant(warehouse_id, champ):
+    # ⚠ L'IDENTIFIANT SE LIT AVANT LE RÔLE : un `?warehouse=oops` rendait 500 à
+    # un propriétaire et 400 à un gérant. Une saisie fautive se refuse.
+    try:
+        return warehouse_id if isinstance(warehouse_id, UUID) else UUID(str(warehouse_id))
+    except (TypeError, ValueError):
+        raise ValidationError({champ: 'Entrepôt inconnu.'})
+
+
+def exiger_entrepot_lisible(membership, warehouse_id, *, champ: str = 'warehouse'):
+    """
+    Le membre peut-il LIRE cet entrepôt ? Sert aux filtres volontaires.
+
+    Un identifiant hors périmètre LÈVE, il ne rend jamais un ensemble vide :
+    zéro ligne se lirait « rien à signaler » là où la vérité est « vous n'avez
+    pas le droit de regarder ».
+    """
+    if warehouse_id in (None, ''):
+        return
+    if not membership:
+        raise ValidationError({'detail': 'Organisation requise.'})
+    wid = _lire_identifiant(warehouse_id, champ)
+    ids = entrepots_lisibles(membership)
+    if ids is not None and wid not in ids:
+        raise ValidationError({champ: 'Entrepôt non autorisé pour votre compte.'})
+
+
+def _entrepot_de_lorganisation(membership, wid):
+    """`(nom, actif)` de l'entrepôt, mémoïsé : une livraison de masse en vise un seul."""
+    cache = getattr(membership, '_entrepots_vus', None)
+    if cache is None:
+        cache = {}
+        membership._entrepots_vus = cache
+    if wid not in cache:
+        from apps.inventory.models import Warehouse
+
+        cache[wid] = Warehouse.objects.filter(
+            id=wid, organization_id=membership.organization_id, is_deleted=False
+        ).values_list('name', 'is_active').first()
+    return cache[wid]
+
+
+def exiger_entrepot_actionnable(
+    membership,
     warehouse_id,
     *,
     allow_none: bool = False,
+    champ: str = 'warehouse',
+    exiger_actif: bool = True,
 ):
     """
-    Vérifie que ``warehouse_id`` est dans le périmètre du membership courant.
-    ``warehouse_id`` peut être None si ``allow_none`` (ex. legacy réservé owner - éviter si possible).
+    Le membre peut-il AGIR dans cet entrepôt ?
+
+    Quatre refus, et chacun dit ce qui bloque :
+
+    - entrepôt d'une autre organisation, supprimé ou inconnu ;
+    - entrepôt DÉSACTIVÉ (`entrepot_inactif`) : fermé à toute opération ;
+    - entrepôt seulement LISIBLE (`consultation_seule`) : la case « consulter
+      tous » ouvre la lecture, jamais l'action ;
+    - entrepôt hors périmètre.
+
+    ``exiger_actif=False`` : la SEULE exception de la règle, l'encaissement
+    d'une dette sur une vente faite dans un entrepôt désactivé.
     """
-    return assert_warehouse_allowed_for_membership(
-        get_membership_for_request(request), warehouse_id, allow_none=allow_none
+    if warehouse_id in (None, ''):
+        if allow_none:
+            if membership and not _est_proprietaire(membership):
+                raise ValidationError({champ: 'Un entrepôt est requis pour votre compte.'})
+            return
+        raise ValidationError({champ: 'Entrepôt requis.'})
+    if not membership:
+        raise ValidationError({'detail': 'Organisation requise.'})
+
+    wid = _lire_identifiant(warehouse_id, champ)
+    trouve = _entrepot_de_lorganisation(membership, wid)
+    if trouve is None:
+        raise ValidationError({champ: 'Entrepôt inconnu.'})
+    nom, actif = trouve
+
+    ids = entrepots_actionnables(membership)
+    if ids is not None and wid not in ids:
+        lisibles = entrepots_lisibles(membership)
+        if lisibles is None or wid in lisibles:
+            raise ValidationError({champ: ErrorDetail(
+                f"Consultation seule : l'entrepôt « {nom} » ne vous est pas assigné.",
+                code='consultation_seule',
+            )})
+        raise ValidationError({champ: 'Entrepôt non autorisé pour votre compte.'})
+
+    if exiger_actif and not actif:
+        raise ValidationError({champ: ErrorDetail(
+            f"L'entrepôt « {nom} » est désactivé : aucune opération n'y est possible.",
+            code='entrepot_inactif',
+        )})
+
+
+def exiger_entrepot_actionnable_requete(request, warehouse_id, **options):
+    """Variante basée sur la requête."""
+    return exiger_entrepot_actionnable(
+        get_membership_for_request(request), warehouse_id, **options
     )
 
 
-def membership_targets_q(membership):
+def exiger_entrepot_lisible_requete(request, warehouse_id, **options):
+    """Variante basée sur la requête."""
+    return exiger_entrepot_lisible(
+        get_membership_for_request(request), warehouse_id, **options
+    )
+
+
+def exiger_entrepot_de_destination(membership, warehouse_id, *, champ='destination_warehouse'):
+    """
+    La DESTINATION d'un transfert : tout entrepôt ACTIF de l'organisation.
+
+    On expédie depuis SES entrepôts vers n'importe lequel : la boutique qui
+    attend sa marchandise n'est pas affectée au magasinier du dépôt central.
+    Ce que l'expéditeur obtient n'est pas un accès à la destination : il voit
+    son transfert, pas le stock de la boutique.
+    """
+    if warehouse_id in (None, ''):
+        raise ValidationError({champ: 'Entrepôt requis.'})
+    if not membership:
+        raise ValidationError({'detail': 'Organisation requise.'})
+    wid = _lire_identifiant(warehouse_id, champ)
+    trouve = _entrepot_de_lorganisation(membership, wid)
+    if trouve is None:
+        raise ValidationError({champ: 'Entrepôt inconnu.'})
+    nom, actif = trouve
+    if not actif:
+        raise ValidationError({champ: ErrorDetail(
+            f"L'entrepôt « {nom} » est désactivé : il ne peut pas recevoir de transfert.",
+            code='entrepot_inactif',
+        )})
+
+
+def exiger_cote_du_transfert(membership, transfert, cote: str):
+    """
+    Qui peut faire quoi sur un transfert : approuver, expédier et annuler
+    appartiennent à la SOURCE ; recevoir appartient à la DESTINATION.
+
+    Partagé par la vue et par le journal du terminal : écrit deux fois, il
+    avait dérivé, et un terminal pouvait recevoir le transfert de n'importe
+    quel entrepôt de l'organisation.
+    """
+    if cote == 'source':
+        exiger_entrepot_actionnable(
+            membership, transfert.source_warehouse_id, champ='source_warehouse'
+        )
+    elif cote == 'destination':
+        exiger_entrepot_actionnable(
+            membership, transfert.destination_warehouse_id, champ='destination_warehouse'
+        )
+    else:  # pragma: no cover - garde de programmation
+        raise ValueError(f'côté inconnu : {cote!r}')
+
+
+# ─── Les membres qu'on peut viser ─────────────────────────────────────────────
+
+def membership_targets_q(membership, *, nature: str = LECTURE):
     """
     Le prédicat SQL des membres que `membership` a le droit de viser.
 
-    ┌──────────────────────────────────────────────────────────────────────────┐
-    │ UN SEUL PRÉDICAT, DEUX EMPLOIS : LE SÉLECTEUR ET LA VALIDATION.         │
-    │                                                                          │
-    │ `build_team_payload` s'en sert pour ne PROPOSER que des cibles           │
-    │ recevables, `assert_user_allowed_for_membership` pour REFUSER les        │
-    │ autres. Écrits séparément, ils ont divergé : le roster rendait tous les  │
-    │ membres de l'organisation pendant que la validation en refusait la       │
-    │ moitié, et le marchand recevait un 400 sur un nom que l'application      │
-    │ venait de lui proposer.                                                  │
-    └──────────────────────────────────────────────────────────────────────────┘
+    Un seul prédicat, deux emplois : le sélecteur (`build_team_payload`) et la
+    validation (`assert_user_allowed_for_membership`). Écrits séparément, ils
+    avaient divergé.
 
-    Rend ``None`` quand aucune borne ne s'applique (owner : tout le monde).
+    Rend ``None`` quand aucune borne ne s'applique (propriétaire, case).
     """
     if membership is None:
         return Q(pk__in=[])
-    if membership.role == OrganizationMembership.Role.CASHIER:
-        # Lui-même, et lui seul : sa visibilité est par créateur, partout.
-        # Ses deux appelants sortent avant d'arriver ici - l'un avec un message
-        # propre, l'autre avec un roster fermé - mais une fonction de périmètre
-        # qui répondrait « aucune borne » à un caissier serait un piège posé
-        # pour son troisième appelant.
+    if est_borne_par_auteur(membership, nature):
+        # Lui-même, et lui seul : il ne voit que son propre travail.
         return Q(user_id=membership.user_id)
 
-    ids = accessible_warehouse_ids(membership)
+    ids = entrepots_du_perimetre(membership, nature)
     if ids is None:
         return None
 
-    # ⚠ LE PROPRIÉTAIRE EST TOUJOURS VISABLE, et ce n'est pas une faveur.
-    #
-    # Il n'a AUCUN `assigned_warehouses` - c'est son RÔLE qui lui donne tout,
-    # ce qu'`accessible_warehouse_ids` encode en rendant `None` - si bien
-    # qu'une intersection sur le seul M2M le rejetait systématiquement. La
-    # clause porte donc sur le rôle : en SQL, c'est la seule forme de
-    # « aucune restriction », et une cible sans restriction partage tous les
-    # entrepôts, donc les miens.
-    #
-    # ⚠ `ids == []` (rôle borné sans affectation) laisse `self | owner` : la
-    # troisième clause ne retient personne, et c'est juste - ce membre ne
-    # partage aucun dépôt avec quiconque.
+    # ⚠ LE PROPRIÉTAIRE EST TOUJOURS VISABLE : il n'a aucune affectation - c'est
+    # son rôle qui lui donne tout - et une intersection sur le seul M2M le
+    # rejetterait systématiquement.
     return (
         Q(user_id=membership.user_id)
         | Q(role=OrganizationMembership.Role.OWNER)
@@ -414,79 +629,41 @@ def membership_targets_q(membership):
 
 def assert_user_allowed_for_membership(membership, user_id):
     """
-    Le demandeur a-t-il le droit de VISER cet utilisateur ?
+    Le demandeur a-t-il le droit de VISER cet utilisateur dans un filtre ?
 
-    - `cashier` : lui-même, et lui seul.
-    - `manager` / `stock_keeper` : un membre partageant au moins un de ses
-      entrepôts, le propriétaire, ou lui-même.
-    - `owner` : n'importe quel membre actif de l'organisation.
+    ⚠ CE QUI PROTÈGE N'EST PAS CETTE BORNE, C'EST LA COMPOSITION : le filtre
+    volontaire est toujours superposé au périmètre de lecture. Viser le
+    propriétaire ne montre donc que « son activité DANS MES entrepôts ».
 
-    ┌──────────────────────────────────────────────────────────────────────────┐
-    │ VISER LE PROPRIÉTAIRE NE MONTRE RIEN DE NEUF, ET C'EST MESURÉ.          │
-    │                                                                          │
-    │ Le filtre volontaire est TOUJOURS superposé au périmètre du rôle -       │
-    │ `_vouloir` dans les rapports, `borner_ventes` au tableau de bord, et     │
-    │ `user_activity` lui-même passe par `_scope_sales`. Un gérant qui vise    │
-    │ le propriétaire ne lit donc que « son activité DANS MES entrepôts »,     │
-    │ c'est-à-dire un sous-ensemble de ce que ce gérant voit déjà en agrégat.  │
-    │ Ce qui est neuf, c'est la DÉCOMPOSITION par auteur de lignes qu'il       │
-    │ additionne déjà - et elle vaut pour n'importe quel collègue.             │
-    │                                                                          │
-    │ Le refuser, en revanche, avait un coût réel : les deux clients           │
-    │ proposent le propriétaire dans leur sélecteur (il est « partout »,       │
-    │ le croiser avec un dépôt le ferait disparaître de sa propre liste),      │
-    │ donc le marchand choisissait un nom et recevait un 400.                  │
-    │                                                                          │
-    │ ⚠ CE QUI PROTÈGE N'EST PAS CETTE BORNE, C'EST LA COMPOSITION. Le jour    │
-    │ où un endpoint filtrerait par `user` sans composer un `_scope_*`, la     │
-    │ garantie disparaîtrait. C'est cela que le test épingle.                  │
-    └──────────────────────────────────────────────────────────────────────────┘
-
-    ┌──────────────────────────────────────────────────────────────────────────┐
-    │ UN IDENTIFIANT HORS PÉRIMÈTRE LÈVE, IL NE REND JAMAIS UN ENSEMBLE VIDE. │
-    │                                                                          │
-    │ Rendre zéro ligne ferait lire « ce caissier n'a rien vendu » là où la    │
-    │ vérité est « vous n'avez pas le droit de le regarder ». Le marchand      │
-    │ n'aurait aucun moyen de distinguer les deux.                             │
-    └──────────────────────────────────────────────────────────────────────────┘
+    ⚠ UN IDENTIFIANT HORS PÉRIMÈTRE LÈVE, IL NE REND JAMAIS UN ENSEMBLE VIDE.
     """
     if user_id is None:
         return
     if not membership:
-        raise ValidationError({"detail": "Organisation requise."})
+        raise ValidationError({'detail': 'Organisation requise.'})
 
     try:
         uid = user_id if isinstance(user_id, UUID) else UUID(str(user_id))
     except (TypeError, ValueError):
-        raise ValidationError({"user": "Utilisateur inconnu."})
+        raise ValidationError({'user': 'Utilisateur inconnu.'})
 
     if uid == membership.user_id:
         return
 
-    if membership.role == OrganizationMembership.Role.CASHIER:
+    if est_borne_par_auteur(membership, LECTURE):
         raise ValidationError(
-            {"user": "Vous ne pouvez consulter que vos propres données."}
+            {'user': 'Vous ne pouvez consulter que vos propres données.'}
         )
 
     cible = OrganizationMembership.objects.filter(
         organization_id=membership.organization_id, user_id=uid, is_active=True
     ).first()
     if cible is None:
-        # ┌──────────────────────────────────────────────────────────────────┐
-        # │ UN MEMBRE INTROUVABLE N'EST PAS NOTRE AFFAIRE, ET C'EST MESURÉ. │
-        # │                                                                  │
-        # │ `user_activity` répond 404 sur un identifiant inconnu, et ce     │
-        # │ contrat est publié : les deux clients en tirent leur message.    │
-        # │ Lever ici le devancerait d'un 400, et le test qui l'épingle est  │
-        # │ tombé au premier passage de la suite.                            │
-        # │                                                                  │
-        # │ Laisser passer ne coûte rien : le filtre ne trouvera aucune      │
-        # │ ligne. Et cela ne renseigne personne - un magasinier reçoit déjà │
-        # │ la liste complète de l'équipe par sa session.                    │
-        # └──────────────────────────────────────────────────────────────────┘
+        # Un membre introuvable n'est pas notre affaire : `user_activity`
+        # répond 404, contrat publié dont les deux clients tirent leur message.
         return
 
-    cibles = membership_targets_q(membership)
+    cibles = membership_targets_q(membership, nature=LECTURE)
     if cibles is None:
         return
 
@@ -496,9 +673,7 @@ def assert_user_allowed_for_membership(membership, user_id):
         user_id=uid,
         is_active=True,
     ).exists():
-        raise ValidationError(
-            {"user": "Utilisateur hors de votre périmètre."}
-        )
+        raise ValidationError({'user': 'Utilisateur hors de votre périmètre.'})
 
 
 def assert_user_allowed_for_request(request, user_id):

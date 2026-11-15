@@ -58,12 +58,13 @@ from rest_framework.views import APIView
 
 from apps.core.api_permissions import IsTenantMember, _get_membership
 from apps.core.warehouse_scope import (
-    accessible_warehouse_ids,
+    LECTURE,
+    borner_visibilite,
+    empreinte_perimetre,
+    entrepots_lisibles,
+    est_borne_par_auteur,
     filter_cash_movement_queryset,
-    filter_queryset_by_related_warehouse,
-    filter_queryset_by_warehouse_ids,
     filter_stock_transfer_queryset,
-    restrict_visibility_for_membership,
 )
 
 # Plafond par page. Ce n'est plus une troncature : au-delà, `has_more` invite le
@@ -156,13 +157,8 @@ class PullTable:
     #: anciennes sans dépôt sont visibles au web, elles doivent l'être ici.
     warehouse_include_null: bool = False
     #: Champ de l'auteur, quand la visibilité de la table en dépend. Miroir de
-    #: `restrict_visibility_for_membership` : un CAISSIER est alors borné par
-    #: créateur, sans aucun entrepôt - c'est la règle des dépenses.
-    creator_field: str = None
-    #: Champ de l'AUTEUR quand la table se borne par PERMISSION, comme les ventes
-    #: (`sold_by`) et les devis (`created_by`) : un membre sans
-    #: `AUTHOR_VIEW_ALL` ne tire que les siens. Miroir de `SaleViewSet` et de
-    #: `QuotationViewSet`. Distinct de `creator_field`, qui suit le RÔLE.
+    #: `author_scope_field` du viewset : un membre sans `sales.view_all` ne
+    #: tire que ses propres lignes (voir `borne_par_auteur`).
     author_field: str = None
     #: Règle de périmètre nommée, pour les deux tables qui n'en ont pas de
     #: simple : `'transfer'` (source OU destination) et `'cash_movement'`
@@ -337,100 +333,59 @@ def _scope_to_org(queryset, table, organization):
     return queryset.filter(**{table.org_field: organization})
 
 
-#: La permission qui ouvre les ventes et les devis des collègues, au web comme ici.
-AUTHOR_VIEW_ALL = 'sales.view_all'
-
-
 def borne_par_auteur(table, membership) -> bool:
     """
     Ce membre ne tire-t-il QUE ses propres lignes de cette table ?
 
-    ┌──────────────────────────────────────────────────────────────────────────┐
-    │ LE TERMINAL D'UN CAISSIER PORTAIT LES VENTES DE TOUS SES COLLÈGUES.     │
-    │                                                                          │
-    │ Le back-office borne un membre sans `sales.view_all` à ses ventes et à   │
-    │ ses devis ; le tirage ne bornait que par entrepôt. Chaque terminal de    │
-    │ caissier détenait donc, dans un SQLite non chiffré, les ventes de tout   │
-    │ son dépôt - clients, montants, dettes - que le web lui refusait.         │
-    └──────────────────────────────────────────────────────────────────────────┘
-
-    ⚠ LA RÈGLE EST CELLE DE LA PERMISSION, comme au web : un caissier à qui le
-      marchand accorde `sales.view_all` voit les ventes de son dépôt.
+    La règle est celle des vues (`est_borne_par_auteur`, en LECTURE) : un
+    membre sans `sales.view_all` ne voit que son travail, la case « consulter
+    tous les entrepôts » ouvre tous les auteurs. Le tirage portait sa propre
+    copie de la règle, limitée aux ventes et aux devis : un caissier détenait
+    sur son terminal les dépenses de ses collègues que le back-office lui
+    refusait.
     """
     if not table.author_field or membership is None:
         return False
-    from apps.core.services import PermissionService
-    return AUTHOR_VIEW_ALL not in PermissionService.get_effective_permissions(membership)
+    return est_borne_par_auteur(membership, LECTURE)
 
 
 def _scope_to_warehouses(queryset, table, membership):
     """
-    Le périmètre complet d'un membre : son entrepôt, puis, le cas échéant, l'auteur.
+    Le périmètre de LECTURE d'un membre sur cette table, par les mêmes corps
+    que les vues : entrepôt, puis auteur.
 
-    Tous les chemins du tirage passent par ici - la page, les pierres tombales, la
-    sonde `pull/changed/` et les décomptes du manifeste : une borne posée sur un
-    seul d'entre eux ferait annoncer « rien de neuf » sur une table amputée.
-    """
-    queryset = _scope_to_entrepots(queryset, table, membership)
-    if borne_par_auteur(table, membership):
-        queryset = queryset.filter(**{table.author_field: membership.user_id})
-    return queryset
+    Tous les chemins du tirage passent par ici - la page, les pierres tombales,
+    la sonde `pull/changed/` et les décomptes du manifeste : une borne posée sur
+    un seul d'entre eux ferait annoncer « rien de neuf » sur une table amputée.
 
-
-def _scope_to_entrepots(queryset, table, membership):
-    """
-    Borne la lecture au périmètre du membre, PAR LES MÊMES HELPERS QUE LES VUES.
-
-    ┌──────────────────────────────────────────────────────────────────────────┐
-    │ CE CORPS ÉTAIT UNE TROISIÈME ÉCRITURE DU PÉRIMÈTRE, ET IL DIVERGEAIT.   │
-    │                                                                          │
-    │ Trois écarts, tous silencieux, tous mesurés :                            │
-    │                                                                          │
-    │ 1. Il lisait `assigned_warehouses` SANS `is_deleted=False` : un membre   │
-    │    dont le seul dépôt est supprimé se retrouvait borné à un dépôt mort,  │
-    │    donc à zéro ligne, là où le web lui rendait `.none()` par un autre    │
-    │    chemin. Deux vides, deux causes, aucune lisible.                      │
-    │ 2. Il ignorait la tolérance NULL : une vente ancienne sans entrepôt      │
-    │    était visible au back-office et INTROUVABLE sur le terminal qui       │
-    │    l'avait peut-être encaissée.                                          │
-    │ 3. Il n'avait aucune branche de rôle : `expenses` et `cash_movements`    │
-    │    descendaient EN ENTIER, y compris les opérations d'établissement      │
-    │    qu'aucune surface ne montre à un rôle borné.                          │
-    │                                                                          │
-    │ ⚠ « Aucun entrepôt assigné » rend désormais `.none()`, comme les douze   │
-    │ sites du web. Le commentaire qui vivait ici (« le web fait le même       │
-    │ choix ») était FAUX : le tirage était le seul des trois à ne pas borner, │
-    │ et un membre mal configuré détenait toute l'organisation dans un SQLite  │
-    │ non chiffré. L'écran du terminal, lui, disait déjà « Aucun entrepôt ne   │
-    │ vous est assigné ».                                                      │
-    └──────────────────────────────────────────────────────────────────────────┘
+    ⚠ « Aucun entrepôt assigné » rend `.none()`, comme toutes les vues : un
+    membre mal configuré ne détient pas l'organisation dans un SQLite non
+    chiffré.
     """
     if membership is None:
         return queryset
 
     if table.scope == 'transfer':
-        return filter_stock_transfer_queryset(queryset, membership)
+        return filter_stock_transfer_queryset(queryset, membership, nature=LECTURE)
     if table.scope == 'cash_movement':
-        return filter_cash_movement_queryset(queryset, membership)
-    if table.warehouse_path is None:
+        return filter_cash_movement_queryset(queryset, membership, nature=LECTURE)
+    if table.warehouse_path is None and not table.author_field:
         return queryset
 
-    if table.creator_field:
-        return restrict_visibility_for_membership(
-            queryset,
-            membership,
-            warehouse_field=table.warehouse_path,
-            creator_field=table.creator_field,
-            include_null_warehouse=table.warehouse_include_null,
-        )
-    if table.warehouse_path == '':
+    if table.warehouse_path is None:
+        champ_entrepot = None
+    elif table.warehouse_path == '':
         # La table EST l'entrepôt : on borne sur son propre identifiant.
-        return filter_queryset_by_warehouse_ids(queryset, membership, 'id')
-    return filter_queryset_by_related_warehouse(
+        champ_entrepot = 'id'
+    else:
+        champ_entrepot = table.warehouse_path
+    return borner_visibilite(
         queryset,
         membership,
-        table.warehouse_path,
-        include_null=table.warehouse_include_null,
+        nature=LECTURE,
+        warehouse_field=champ_entrepot,
+        author_field=table.author_field,
+        include_null_warehouse=table.warehouse_include_null,
     )
 
 
@@ -506,12 +461,19 @@ def _jeton_entrepot(table, membership):
     # `None` (propriétaire : aucune restriction) et `[]` (aucun accès) sont deux
     # situations OPPOSÉES : les écrire pareil donnerait le même jeton, donc
     # aucune reprise, au moment exact où le périmètre bascule de l'un à l'autre.
-    ids = accessible_warehouse_ids(membership)
+    # ⚠ LE PÉRIMÈTRE DE LECTURE : la case « consulter tous les entrepôts »
+    # fait passer `portee` à « tous », donc le jeton change de lui-même quand
+    # le propriétaire la coche ou la décoche, et le terminal retire ses tables.
+    ids = entrepots_lisibles(membership)
     portee = 'tous' if ids is None else ','.join(sorted(str(i) for i in ids))
+    # ⚠ `None` est écrit EN DUR là où vivait `creator_field` : le retirer de la
+    # chaîne aurait changé le jeton de TOUTES les tables bornées, donc fait
+    # re-tirer tout le parc pour des règles inchangées. Les tables dont la
+    # règle change le doivent à leur `revision`.
     brut = (
         f'{SCOPE_RULE_VERSION}|{membership.role}|{portee}'
         f'|{table.warehouse_path}|{table.warehouse_include_null}'
-        f'|{table.creator_field}|{table.scope}'
+        f'|None|{table.scope}'
     )
     return blake2s(brut.encode('utf-8'), digest_size=8).hexdigest()
 
@@ -712,7 +674,12 @@ PULL_TABLES = (
     PullTable('organization_settings', 'settings.OrganizationSettings'),
     PullTable('currencies', 'settings.Currency', org_field=None),
     PullTable('organization_currencies', 'settings.OrganizationCurrency'),
-    PullTable('memberships', 'organizations.OrganizationMembership'),
+    # ⚠ COLONNES FIGÉES : un terminal ancien insère les colonnes du manifeste
+    # sans les connaître. `consult_all_warehouses` y ferait échouer le tirage
+    # de la table. Le périmètre s'applique au SERVEUR, le terminal n'en a pas
+    # besoin en colonne : il le lit dans sa charge de réveil.
+    PullTable('memberships', 'organizations.OrganizationMembership',
+              fields=('id', 'created_at', 'updated_at', 'user_id', 'organization_id', 'role', 'is_active', 'invited_by_id', 'joined_at', 'extra_permissions')),
 
     # -- les gens
     #
@@ -804,12 +771,17 @@ PULL_TABLES = (
     PullTable('sale_returns', 'sales.SaleReturn', soft_delete=True,
               warehouse_path='original_sale__warehouse_id',
               # Miroir de `SaleReturnViewSet`, qui tolère le NULL lui aussi.
-              warehouse_include_null=True,
-              children=RETURN_CHILDREN),
-    # Bornés par AUTEUR, comme `QuotationViewSet` : un devis ne porte aucun
-    # entrepôt, et un caissier ne voit que les siens.
+              warehouse_include_null=True, author_field='created_by',
+              children=RETURN_CHILDREN, revision=1),
+    # Bornés par ENTREPÔT puis par AUTEUR, comme `QuotationViewSet`. Un devis
+    # porte désormais son entrepôt : sans lui, « Voir tout » ne pouvait pas le
+    # borner aux entrepôts du membre, et un gérant lisait les devis de toute
+    # l'organisation. ⚠ Colonnes FIGÉES : `warehouse_id` n'est pas exposé (un
+    # terminal ancien échouerait à l'insérer) ; il borne au serveur.
     PullTable('quotations', 'sales.Quotation', soft_delete=True,
-              author_field='created_by', children=QUOTATION_CHILDREN),
+              fields=('id', 'created_at', 'updated_at', 'organization_id', 'is_deleted', 'deleted_at', 'reference', 'customer_id', 'status', 'subtotal', 'tax_amount', 'discount_amount', 'total', 'valid_until', 'notes', 'terms', 'created_by_id', 'converted_sale_id'),
+              warehouse_path='warehouse_id', warehouse_include_null=True,
+              author_field='created_by', children=QUOTATION_CHILDREN, revision=1),
 
     # -- opérations de stock
     #
@@ -837,12 +809,13 @@ PULL_TABLES = (
     # -- livre de caisse
     PullTable('income_categories', 'cashbook.IncomeCategory'),
     PullTable('expense_categories', 'cashbook.ExpenseCategory'),
-    # Les deux tables que le tirage descendait EN ENTIER, opérations
-    # d'établissement comprises. `creator_field` porte la branche caissier
-    # de `restrict_visibility_for_membership`, exactement comme la vue.
+    # Bornées par entrepôt PUIS par auteur (la permission `sales.view_all`),
+    # comme `ExpenseViewSet` et `CashMovementViewSet`. Révision 1 : la règle
+    # d'auteur suivait le RÔLE, elle suit désormais la permission et la case.
     PullTable('expenses', 'cashbook.Expense',
-              warehouse_path='warehouse_id', creator_field='created_by'),
-    PullTable('cash_movements', 'cashbook.CashMovement', scope='cash_movement'),
+              warehouse_path='warehouse_id', author_field='created_by', revision=1),
+    PullTable('cash_movements', 'cashbook.CashMovement', scope='cash_movement',
+              revision=1),
 )
 
 PULL_TABLES_BY_NAME = {table.name: table for table in PULL_TABLES}
@@ -1084,6 +1057,11 @@ class SyncChangedTablesView(APIView):
             'tables': len(PULL_TABLES),
             'server_time': timezone.now().isoformat(),
             'schema_version': PULL_SCHEMA_VERSION,
+            # ⚠ La sonde ne voit pas un PÉRIMÈTRE qui change : une table dont le
+            #   périmètre s'élargit n'a « rien de neuf ». Cette empreinte dit au
+            #   terminal de relire son manifeste (donc ses jetons) et ses droits,
+            #   même sous le plancher de cinq minutes.
+            'perimetre_version': empreinte_perimetre(membership),
         })
 
 

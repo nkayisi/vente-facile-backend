@@ -120,6 +120,13 @@ def resolve_conversion_warehouse(quotation, explicite=None, autorises=None):
         if trouve:
             return trouve
 
+    # L'entrepôt du devis, quand il est encore actif et dans le périmètre : le
+    # client a vu un prix et une disponibilité de CE dépôt.
+    if quotation.warehouse_id and (autorises is None or quotation.warehouse_id in autorises):
+        trouve = base.filter(id=quotation.warehouse_id).first()
+        if trouve:
+            return trouve
+
     if autorises is not None:
         base = base.filter(id__in=autorises)
     return base.filter(is_default=True).first() or base.first()

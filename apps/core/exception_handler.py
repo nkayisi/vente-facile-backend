@@ -23,7 +23,9 @@ from rest_framework.views import exception_handler as drf_exception_handler
 from rest_framework.response import Response
 from rest_framework import status
 
-from apps.core.exceptions import RefusAvecCorps, RefusMetier
+from rest_framework.exceptions import ValidationError as DRFValidationError
+
+from apps.core.exceptions import RefusAvecCorps, RefusMetier, code_remarquable
 
 logger = logging.getLogger("apps.api")
 
@@ -75,6 +77,12 @@ def api_exception_handler(exc, context):
     response = drf_exception_handler(exc, context)
 
     if response is not None:
+        # Le code d'un refus de périmètre remonte au premier niveau, à côté des
+        # erreurs de champ : voir `CODES_REMARQUABLES`.
+        if isinstance(exc, DRFValidationError) and isinstance(response.data, dict):
+            code = code_remarquable(exc)
+            if code and 'code' not in response.data:
+                response.data['code'] = code
         return response
 
     # Exception non gérée par DRF → 500. On logue avec le contexte de la vue

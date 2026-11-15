@@ -436,11 +436,11 @@ def create_expense(serializer, *, organization, user, request=None,
     │ ``IntegrityError``, donc un verdict ``rejected``.                        │
     └──────────────────────────────────────────────────────────────────────────┘
     """
-    from apps.core.warehouse_scope import assert_warehouse_allowed_for_request
+    from apps.core.warehouse_scope import exiger_entrepot_actionnable_requete
 
     entrepot = serializer.validated_data.get('warehouse')
     if request is not None and entrepot is not None:
-        assert_warehouse_allowed_for_request(request, entrepot.id, allow_none=True)
+        exiger_entrepot_actionnable_requete(request, entrepot.id, allow_none=True)
 
     devise, taux = resolve_currency_rate(
         organization,

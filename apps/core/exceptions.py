@@ -166,3 +166,77 @@ class MotDePasseAChanger(RefusAvecCorps):
     def __init__(self):
         self.payload = {'detail': self.default_detail, 'code': self.default_code}
         super().__init__(self.default_detail)
+
+
+class ConsultationSeule(RefusAvecCorps):
+    """
+    403 : la pièce relève d'un entrepôt que le membre peut LIRE, pas toucher.
+
+    ⚠ JAMAIS UN 404. Un membre qui consulte tous les entrepôts ouvre une vente
+    d'une autre boutique, appuie sur « Encaisser » : « introuvable » sur la
+    pièce qu'il a sous les yeux le ferait chercher une panne. Le `code` est ce
+    que les clients lisent pour dire « consultation seule ».
+    """
+
+    status_code = http_status.HTTP_403_FORBIDDEN
+    default_code = 'consultation_seule'
+    default_detail = (
+        "Consultation seule : cette pièce relève d'un entrepôt qui ne vous est pas assigné."
+    )
+
+    def __init__(self):
+        self.payload = {'detail': self.default_detail, 'code': self.default_code}
+        super().__init__(self.default_detail)
+
+
+class StockInsuffisant(RefusMetier):
+    """
+    Une sortie dépasserait le stock disponible.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ LE STOCK NÉGATIF N'EXISTE PLUS, ET CE REFUS EN EST LA FORME UNIQUE.     │
+    │                                                                          │
+    │ Une sortie manuelle ou une expédition au-delà du stock tombait sur la    │
+    │ `ValidationError` Django de `Stock.save()`, qui n'est pas une erreur     │
+    │ DRF : 500 au back-office, `retry` sans fin au journal. Ce refus est      │
+    │ déterministe : 400 `{detail, code}`, verdict `rejected`.                 │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
+    code = 'stock_insuffisant'
+
+
+# ┌──────────────────────────────────────────────────────────────────────────────┐
+# │ UN CODE DE CHAMP NE QUITTE PAS LE SERVEUR, SAUF CEUX-LÀ.                    │
+# │                                                                              │
+# │ DRF garde le `code` d'une erreur de champ en mémoire et le JETTE au rendu   │
+# │ JSON : le client reçoit `{"register": "Cette caisse est tenue par…"}`, une  │
+# │ phrase, et rien sur quoi réagir. Ces codes-là appellent un geste précis     │
+# │ (relire ses droits, ouvrir sa propre session, choisir un autre entrepôt) :  │
+# │ ils remontent au premier niveau, `{"code": …}`, comme un `RefusMetier`.     │
+# └──────────────────────────────────────────────────────────────────────────────┘
+CODES_REMARQUABLES = (
+    'consultation_seule',
+    'entrepot_inactif',
+    'session_d_un_autre',
+    'stock_insuffisant',
+)
+
+
+def code_remarquable(exc):
+    """Le premier code remarquable porté par une `ValidationError`, ou `None`."""
+    codes = exc.get_codes() if hasattr(exc, 'get_codes') else None
+
+    def chercher(noeud):
+        if isinstance(noeud, str):
+            return noeud if noeud in CODES_REMARQUABLES else None
+        if isinstance(noeud, dict):
+            noeud = list(noeud.values())
+        if isinstance(noeud, (list, tuple)):
+            for enfant in noeud:
+                trouve = chercher(enfant)
+                if trouve:
+                    return trouve
+        return None
+
+    return chercher(codes)

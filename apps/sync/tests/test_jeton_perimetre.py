@@ -52,7 +52,7 @@ class JetonDePerimetreTests(APITestCase):
 
     def test_le_jeton_ne_bouge_pas_sans_raison(self):
         avant = scope_token(self._table('sales'), self.gerant)
-        self.gerant._accessible_warehouse_ids = None  # force la relecture
+        self.gerant._entrepots_affectes = None  # force la relecture
         self.assertEqual(scope_token(self._table('sales'), self.gerant), avant)
 
     # -- ce qui DOIT bouger -------------------------------------------------
@@ -65,7 +65,7 @@ class JetonDePerimetreTests(APITestCase):
         """
         avant = scope_token(self._table('sales'), self.gerant)
         self.gerant.assigned_warehouses.add(self.wh_b)
-        self.gerant._accessible_warehouse_ids = None
+        self.gerant._entrepots_affectes = None
         self.assertNotEqual(scope_token(self._table('sales'), self.gerant), avant)
 
     def test_deux_roles_n_ont_pas_le_meme_jeton(self):
@@ -83,7 +83,7 @@ class JetonDePerimetreTests(APITestCase):
         """
         avant = scope_token(self._table('sales'), self.gerant)
         self.gerant.assigned_warehouses.clear()
-        self.gerant._accessible_warehouse_ids = None
+        self.gerant._entrepots_affectes = None
         apres = scope_token(self._table('sales'), self.gerant)
         self.assertNotEqual(apres, avant)
         self.assertNotEqual(apres, scope_token(self._table('sales'), self.proprio))

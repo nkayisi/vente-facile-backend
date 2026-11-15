@@ -166,7 +166,7 @@ class TirageEtVueTests(APITestCase):
         configuré détenait toute l'organisation dans un SQLite non chiffré.
         """
         self.membership.assigned_warehouses.clear()
-        self.membership._accessible_warehouse_ids = None
+        self.membership._entrepots_affectes = None
         for nom in ('sales', 'expenses', 'cash_movements', 'stock_transfers'):
             with self.subTest(table=nom):
                 self.assertEqual(self._tirage(nom), set())
@@ -174,7 +174,7 @@ class TirageEtVueTests(APITestCase):
     def test_le_catalogue_reste_INTACT_pour_un_membre_sans_entrepot(self):
         """Le contrôle : on borne ce qui dépend d'un dépôt, pas le reste."""
         self.membership.assigned_warehouses.clear()
-        self.membership._accessible_warehouse_ids = None
+        self.membership._entrepots_affectes = None
         lignes, _, _ = read_page(
             PULL_TABLES_BY_NAME['payment_methods'], self.org, self.membership, None, 500
         )

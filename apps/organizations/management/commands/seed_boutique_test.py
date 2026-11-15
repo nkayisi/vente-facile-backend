@@ -6,7 +6,7 @@ Monte une boutique de test complète, avec un compte par rôle.
 │                                                                              │
 │ La moitié des défauts de périmètre de ce dépôt a échappé aux contrôles       │
 │ précédents pour UNE raison : ils étaient faits en `owner`, pour qui          │
-│ `accessible_warehouse_ids` sort en amont et la moitié du code de périmètre   │
+│ `entrepots_lisibles` sort en amont et la moitié du code de périmètre         │
 │ n'est jamais exécutée. Les données de développement ne portent d'ailleurs    │
 │ aucun `manager`, aucun `stock_keeper`, aucun compte sans entrepôt, et une    │
 │ seule devise.                                                                │

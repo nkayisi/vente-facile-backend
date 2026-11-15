@@ -379,11 +379,14 @@ def build_team_payload(organization, membership):
     part à chaque réveil. Les identifiants d'entrepôt voyagent nus, leurs noms
     descendant déjà par la table `warehouses` du tirage.
     """
-    from apps.core.warehouse_scope import membership_targets_q
+    from apps.core.warehouse_scope import LECTURE, est_borne_par_auteur, membership_targets_q
     from apps.inventory.models import Warehouse
     from apps.organizations.models import OrganizationMembership
 
-    if membership is None or membership.role == OrganizationMembership.Role.CASHIER:
+    # ⚠ FERMÉE PAR L'AUTEUR, PLUS PAR LE RÔLE : un caissier qui ne voit que son
+    #   propre travail n'a personne à choisir ; un caissier à qui l'on a coché
+    #   « Voir tout » voit ses collègues, donc doit pouvoir les nommer.
+    if membership is None or est_borne_par_auteur(membership, LECTURE):
         return {'visible': False, 'truncated': False, 'members': []}
 
     # DEUX requêtes, constantes quel que soit l'effectif. Un
@@ -476,14 +479,19 @@ def build_session_payload(user, organization, device=None):
         organization=organization, is_active=True
     ).first()
 
+    from apps.core.warehouse_scope import empreinte_perimetre
+
     permissions, role, warehouses = [], None, []
+    consulte_tout, perimetre_version = False, ''
     if membership:
         role = membership.role
         permissions = PermissionService.get_effective_permissions(membership)
         warehouses = [
-            {'id': str(w.id), 'name': w.name}
+            {'id': str(w.id), 'name': w.name, 'is_active': w.is_active}
             for w in membership.assigned_warehouses.filter(is_deleted=False)
         ]
+        consulte_tout = membership.consult_all_warehouses
+        perimetre_version = empreinte_perimetre(membership)
 
     team = build_team_payload(organization, membership)
 
@@ -516,6 +524,11 @@ def build_session_payload(user, organization, device=None):
             'role': role,
             'permissions': permissions,
             'assigned_warehouses': warehouses,
+            # ⚠ Deux champs NOUVEAUX : un terminal ancien les ignore, et c'est
+            #   sans danger - le serveur borne de toute façon. Le terminal à jour
+            #   en tire ses filtres et sa fraîcheur.
+            'consult_all_warehouses': consulte_tout,
+            'perimetre_version': perimetre_version,
         },
         # Sœur de `membership`, et non dedans : `membership` décrit le PORTEUR,
         # `team` décrit l'organisation.

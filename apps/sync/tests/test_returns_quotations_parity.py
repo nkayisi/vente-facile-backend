@@ -275,6 +275,10 @@ class RetourEnRolBorneTests(_BaseTest):
     def setUp(self):
         super().setUp()
         # Le gérant est le rôle le plus faible qui porte `sale_returns.create`.
+        # ⚠ Il vend ici : la session doit être la SIENNE, on ne vend que dans
+        #   sa propre session, quel que soit le rôle.
+        self.session.opened_by = self.manager
+        self.session.save(update_fields=['opened_by'])
         self.client.force_authenticate(user=self.manager)
 
     def _vente_due(self):

@@ -7,7 +7,18 @@ elle existerait en double et rediverger ne serait qu'une question de temps.
 
 C'est tout l'objet du lot : il n'y a plus qu'un chemin d'écriture.
 """
-from apps.core.warehouse_scope import assert_warehouse_allowed_for_request
+from apps.core.warehouse_scope import (
+    ACTION,
+    LECTURE,
+    borner_visibilite,
+    entrepots_actionnables,
+    exiger_cote_du_transfert,
+    exiger_entrepot_actionnable,
+    exiger_entrepot_actionnable_requete,
+    exiger_entrepot_de_destination,
+    filter_cash_movement_queryset,
+    filter_stock_transfer_queryset,
+)
 
 from .operations import OperationRejected, handler
 
@@ -71,15 +82,12 @@ def sale_create(ctx, payload):
     local_id = payload.pop('id', None)
     reference = payload.pop('reference', None)
 
+    # Le périmètre d'entrepôt est contrôlé par `SaleCreateSerializer.validate`,
+    # APRÈS avoir déduit l'entrepôt de la caisse : la vue et le journal y
+    # passent tous deux, et un contrôle de plus ici le ferait avant la
+    # déduction, donc refuser une vente de comptoir légitime.
     serializer = SaleCreateSerializer(data=payload, context={'request': ctx.request})
     serializer.is_valid(raise_exception=True)
-
-    # Le périmètre d'entrepôt se revalide ici comme dans la vue : le serializer
-    # expose `warehouse`, donc un terminal pourrait en soumettre un interdit.
-    warehouse = serializer.validated_data.get('warehouse')
-    assert_warehouse_allowed_for_request(
-        ctx.request, getattr(warehouse, 'id', None), allow_none=True
-    )
 
     extra = {}
     if local_id:
@@ -114,6 +122,8 @@ def sale_add_payment(ctx, payload):
     from apps.sales.serializers import SaleDetailSerializer
     from apps.sales.services import apply_payment_to_sale
 
+    from apps.core.api_permissions import is_manager_or_above
+
     _require(payload, 'sale')
 
     sale_id = payload.pop('sale')
@@ -121,6 +131,20 @@ def sale_add_payment(ctx, payload):
         raise OperationRejected(
             "Cette vente n'existe pas dans cet établissement.",
             code='sale_not_found',
+        )
+    # Le périmètre de `SaleViewSet.add_payment`. ⚠ `exiger_actif=False` : une
+    # dette d'une vente faite dans un entrepôt désactivé s'encaisse toujours,
+    # c'est la seule exception de la règle.
+    vente = _objet_actionnable(
+        Sale, ctx, sale_id, 'Cette vente',
+        borner=_borne_par(ctx, 'warehouse_id', include_null=True),
+        entrepot_de=lambda v: v.warehouse_id,
+        exiger_actif=False,
+    )
+    if vente.sold_by_id != ctx.user.id and not is_manager_or_above(ctx.request):
+        raise OperationRejected(
+            "Vous ne pouvez ajouter un paiement qu'à vos propres ventes.",
+            code='not_own_sale',
         )
 
     sale, payment = apply_payment_to_sale(
@@ -166,11 +190,15 @@ def sale_cancel(ctx, payload):
     from apps.sales.services import AnnulationRefusee, cancel_sale
 
     _require(payload, 'sale')
-    sale = Sale.objects.filter(
-        id=payload['sale'], organization=ctx.organization
-    ).first()
-    if sale is None:
+    if not Sale.objects.filter(id=payload['sale'], organization=ctx.organization).exists():
         raise OperationRejected("Cette vente n'existe pas.", code='sale_not_found')
+    # L'annulation remet du stock en rayon : l'entrepôt doit être à soi, et actif.
+    # « On n'annule que ses propres ventes » reste tranché par `cancel_sale`.
+    sale = _objet_actionnable(
+        Sale, ctx, payload['sale'], 'Cette vente',
+        borner=_borne_par(ctx, 'warehouse_id', include_null=True),
+        entrepot_de=lambda v: v.warehouse_id,
+    )
 
     try:
         cancel_sale(
@@ -219,7 +247,8 @@ def register_session_open(ctx, payload):
     service, qui les compose dans le même ordre qu'à la clôture.
     """
     from apps.sales.register_sessions import (
-        CaisseIntrouvable, SessionDejaOuverte, open_register_session,
+        CaisseIntrouvable, SessionDejaOuverte, SessionPersonnelleOuverte,
+        open_register_session,
     )
     from apps.sales.serializers import RegisterSessionDetailSerializer
 
@@ -239,6 +268,8 @@ def register_session_open(ctx, payload):
         raise OperationRejected(str(e), code='register_not_found')
     except SessionDejaOuverte as e:
         raise OperationRejected(str(e), code='session_already_open')
+    except SessionPersonnelleOuverte as e:
+        raise OperationRejected(str(e), code='session_personnelle_ouverte')
 
     return {
         'server_ids': {'session': str(session.id)},
@@ -528,6 +559,55 @@ def _objet_de_lorg(modele, ctx, identifiant, quoi):
     return objet
 
 
+def _objet_actionnable(
+    modele, ctx, identifiant, quoi, *, borner, entrepot_de, exiger_actif=True,
+):
+    """
+    Un objet de l'organisation que le membre peut TOUCHER, ou un refus nommé.
+
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │ LE JOURNAL NE BORNAIT LES TRANSITIONS QUE PAR ORGANISATION.          │
+    │                                                                      │
+    │ `_objet_de_lorg` seul laissait un terminal expédier, recevoir,       │
+    │ approuver ou annuler une pièce de n'importe quel entrepôt : le       │
+    │ back-office refusait ce que le journal appliquait. On borne ici par  │
+    │ le MÊME corps que la vue (`borner(qs, nature)`), en ACTION.          │
+    └──────────────────────────────────────────────────────────────────────┘
+
+    ``entrepot_de(objet)`` rend l'entrepôt de la pièce : il doit être ACTIF
+    (sauf ``exiger_actif=False``, l'encaissement d'une dette). Une pièce que le
+    membre peut LIRE sans pouvoir la toucher est refusée `consultation_seule`,
+    jamais « introuvable » : il l'a sous les yeux.
+    """
+    base = modele.objects.filter(organization=ctx.organization)
+    objet = borner(base, ACTION).filter(id=identifiant).first()
+    if objet is None:
+        if borner(base, LECTURE).filter(id=identifiant).exists():
+            raise OperationRejected(
+                f"Consultation seule : {quoi[0].lower()}{quoi[1:]} relève d'un entrepôt "
+                "qui ne vous est pas assigné.",
+                code='consultation_seule',
+            )
+        raise OperationRejected(f"{quoi} introuvable.", code='not_found')
+    entrepot = entrepot_de(objet)
+    if entrepot:
+        exiger_entrepot_actionnable(
+            ctx.membership, entrepot, champ='warehouse', exiger_actif=exiger_actif,
+        )
+    return objet
+
+
+def _borne_par(ctx, warehouse_field, *, author_field=None, include_null=False):
+    """Le `borner` d'une pièce, miroir de `WarehouseScopedQuerysetMixin`."""
+    def borner(qs, nature):
+        return borner_visibilite(
+            qs, ctx.membership, nature=nature,
+            warehouse_field=warehouse_field, author_field=author_field,
+            include_null_warehouse=include_null,
+        )
+    return borner
+
+
 @handler('stock.unpack', permission='stock_movements.create')
 def stock_unpack(ctx, payload):
     """
@@ -538,8 +618,11 @@ def stock_unpack(ctx, payload):
     from apps.inventory.services import unpack_stock
 
     _require(payload, 'stock')
-    stock = _objet_de_lorg(Stock, ctx, payload['stock'], 'Cette ligne de stock')
-    assert_warehouse_allowed_for_request(ctx.request, stock.warehouse_id)
+    stock = _objet_actionnable(
+        Stock, ctx, payload['stock'], 'Cette ligne de stock',
+        borner=_borne_par(ctx, 'warehouse_id'),
+        entrepot_de=lambda r: r.warehouse_id,
+    )
 
     resultat = _refus_si_impossible(
         unpack_stock, stock, ctx.user, payload.get('packages', 1),
@@ -566,14 +649,17 @@ def stock_transfer_create(ctx, payload):
     )
     serializer.is_valid(raise_exception=True)
 
-    # Les DEUX entrepôts sont contrôlés, comme dans `perform_create` : un
-    # magasinier ne doit pas pouvoir sortir du stock d'un dépôt qu'il ne voit
-    # pas, ni s'en faire livrer.
-    for cle in ('source_warehouse', 'destination_warehouse'):
-        assert_warehouse_allowed_for_request(
-            ctx.request, getattr(serializer.validated_data.get(cle), 'id', None),
-            allow_none=True,
-        )
+    # Comme `perform_create` : la SOURCE est à soi (on ne sort pas le stock
+    # d'un dépôt qui ne nous est pas affecté), la DESTINATION est tout entrepôt
+    # actif de l'organisation (on approvisionne une boutique sans y travailler).
+    va = serializer.validated_data
+    exiger_entrepot_actionnable(
+        ctx.membership, getattr(va.get('source_warehouse'), 'id', None),
+        champ='source_warehouse',
+    )
+    exiger_entrepot_de_destination(
+        ctx.membership, getattr(va.get('destination_warehouse'), 'id', None),
+    )
 
     transfert = _sauver_avec_audit(ctx, serializer, local_id)
     return {
@@ -582,14 +668,25 @@ def stock_transfer_create(ctx, payload):
     }
 
 
-def _transition_transfert(ctx, payload, fonction, **extra):
+def _transition_transfert(ctx, payload, fonction, cote, **extra):
+    """
+    Une transition de transfert, sur le BON côté : approuver, expédier et
+    annuler appartiennent à la source, recevoir à la destination. Le même
+    contrôle vit dans `StockTransferViewSet._transition`.
+    """
     from apps.inventory.models import StockTransfer
     from apps.inventory.serializers import StockTransferDetailSerializer
 
     _require(payload, 'transfer')
-    transfert = _objet_de_lorg(
+    transfert = _objet_actionnable(
         StockTransfer, ctx, payload['transfer'], 'Ce transfert',
+        borner=lambda qs, nature: filter_stock_transfer_queryset(
+            qs, ctx.membership, nature=nature,
+        ) if ctx.membership else qs,
+        # Le côté est contrôlé juste après : il porte aussi l'entrepôt actif.
+        entrepot_de=lambda t: None,
     )
+    exiger_cote_du_transfert(ctx.membership, transfert, cote)
     _refus_si_impossible(fonction, transfert, ctx.user, **extra)
     transfert.refresh_from_db()
     return {
@@ -601,13 +698,13 @@ def _transition_transfert(ctx, payload, fonction, **extra):
 @handler('stock_transfer.approve', permission='stock_transfers.ship')
 def stock_transfer_approve(ctx, payload):
     from apps.inventory.services import approve_transfer
-    return _transition_transfert(ctx, payload, approve_transfer)
+    return _transition_transfert(ctx, payload, approve_transfer, 'source')
 
 
 @handler('stock_transfer.ship', permission='stock_transfers.ship')
 def stock_transfer_ship(ctx, payload):
     from apps.inventory.services import ship_transfer
-    return _transition_transfert(ctx, payload, ship_transfer)
+    return _transition_transfert(ctx, payload, ship_transfer, 'source')
 
 
 @handler('stock_transfer.receive', permission='stock_transfers.receive')
@@ -618,14 +715,15 @@ def stock_transfer_receive(ctx, payload):
     """
     from apps.inventory.services import receive_transfer
     return _transition_transfert(
-        ctx, payload, receive_transfer, received_items=payload.get('items') or [],
+        ctx, payload, receive_transfer, 'destination',
+        received_items=payload.get('items') or [],
     )
 
 
 @handler('stock_transfer.cancel', permission='stock_transfers.cancel')
 def stock_transfer_cancel(ctx, payload):
     from apps.inventory.services import cancel_transfer
-    return _transition_transfert(ctx, payload, cancel_transfer)
+    return _transition_transfert(ctx, payload, cancel_transfer, 'source')
 
 
 @handler('stock_adjustment.create', permission='stock_adjustments.create')
@@ -639,10 +737,8 @@ def stock_adjustment_create(ctx, payload):
         data=payload, context={'request': ctx.request}
     )
     serializer.is_valid(raise_exception=True)
-    assert_warehouse_allowed_for_request(
-        ctx.request,
-        getattr(serializer.validated_data.get('warehouse'), 'id', None),
-        allow_none=True,
+    exiger_entrepot_actionnable_requete(
+        ctx.request, getattr(serializer.validated_data.get('warehouse'), 'id', None),
     )
 
     ajustement = _sauver_avec_audit(ctx, serializer, local_id)
@@ -657,10 +753,11 @@ def _transition_ajustement(ctx, payload, fonction):
     from apps.inventory.serializers import StockAdjustmentDetailSerializer
 
     _require(payload, 'adjustment')
-    ajustement = _objet_de_lorg(
+    ajustement = _objet_actionnable(
         StockAdjustment, ctx, payload['adjustment'], 'Cet ajustement',
+        borner=_borne_par(ctx, 'warehouse_id'),
+        entrepot_de=lambda a: a.warehouse_id,
     )
-    assert_warehouse_allowed_for_request(ctx.request, ajustement.warehouse_id)
     _refus_si_impossible(fonction, ajustement, ctx.user)
     ajustement.refresh_from_db()
     return {
@@ -731,7 +828,15 @@ def _transition_retour(ctx, payload, fonction):
     from apps.sales.serializers import SaleReturnDetailSerializer
 
     _require(payload, 'sale_return')
-    retour = _objet_de_lorg(SaleReturn, ctx, payload['sale_return'], 'Ce retour')
+    # Le périmètre de `SaleReturnViewSet` : l'entrepôt de la vente d'origine,
+    # puis l'auteur. Approuver remet de la marchandise en rayon.
+    retour = _objet_actionnable(
+        SaleReturn, ctx, payload['sale_return'], 'Ce retour',
+        borner=_borne_par(
+            ctx, 'original_sale__warehouse_id', author_field='created_by', include_null=True,
+        ),
+        entrepot_de=lambda r: r.original_sale.warehouse_id,
+    )
     _refus_vente(fonction, retour, ctx.user)
     retour.refresh_from_db()
     return {
@@ -778,7 +883,6 @@ def quotation_convert(ctx, payload):
     artificiellement créditeur au règlement suivant - c'est le défaut que la
     session 2026-08-24 a corrigé, et il ne doit pas revenir par cette porte.
     """
-    from apps.core.warehouse_scope import accessible_warehouse_ids
     from apps.sales.models import Quotation
     from apps.sales.serializers import QuotationDetailSerializer
     from apps.sales.returns_quotations import (
@@ -786,14 +890,21 @@ def quotation_convert(ctx, payload):
     )
 
     _require(payload, 'quotation')
-    devis = _objet_de_lorg(Quotation, ctx, payload['quotation'], 'Ce devis')
+    # Le périmètre de `QuotationViewSet` : entrepôt du devis, puis auteur.
+    # Son entrepôt n'est pas exigé actif ici : la conversion vise celui que
+    # `resolve_conversion_warehouse` retient, contrôlé juste en dessous.
+    devis = _objet_actionnable(
+        Quotation, ctx, payload['quotation'], 'Ce devis',
+        borner=_borne_par(ctx, 'warehouse_id', author_field='created_by', include_null=True),
+        entrepot_de=lambda d: None,
+    )
 
     explicite = payload.get('warehouse')
     if explicite:
-        assert_warehouse_allowed_for_request(ctx.request, explicite)
+        exiger_entrepot_actionnable_requete(ctx.request, explicite)
 
     membership = _membership_du_contexte(ctx)
-    autorises = accessible_warehouse_ids(membership) if membership else None
+    autorises = entrepots_actionnables(membership) if membership else None
     warehouse = resolve_conversion_warehouse(devis, explicite, autorises)
 
     vente = _refus_vente(
@@ -824,10 +935,16 @@ def _transition_inventaire(ctx, payload, fonction, serialiser=True, **extra):
     from apps.inventory.serializers import InventorySessionDetailSerializer
 
     _require(payload, 'session')
-    session = _objet_de_lorg(
+    # ⚠ L'entrepôt n'est PAS exigé actif : annuler un inventaire est ce qui
+    #   permet de fermer l'entrepôt, et un inventaire en cours y interdit la
+    #   désactivation, donc la session d'un entrepôt inactif ne se fait que
+    #   lever, jamais avancer (le service refuse les autres transitions).
+    session = _objet_actionnable(
         InventorySession, ctx, payload['session'], "Cette session d'inventaire",
+        borner=_borne_par(ctx, 'warehouse_id'),
+        entrepot_de=lambda s: s.warehouse_id,
+        exiger_actif=False,
     )
-    assert_warehouse_allowed_for_request(ctx.request, session.warehouse_id)
 
     resultat = _refus_si_impossible(fonction, session, ctx.user, **extra)
     session.refresh_from_db()
@@ -850,10 +967,8 @@ def inventory_session_create(ctx, payload):
         data=payload, context={'request': ctx.request}
     )
     serializer.is_valid(raise_exception=True)
-    assert_warehouse_allowed_for_request(
-        ctx.request,
-        getattr(serializer.validated_data.get('warehouse'), 'id', None),
-        allow_none=True,
+    exiger_entrepot_actionnable_requete(
+        ctx.request, getattr(serializer.validated_data.get('warehouse'), 'id', None),
     )
 
     session = _sauver_avec_audit(ctx, serializer, local_id)
@@ -1089,9 +1204,7 @@ def product_update(ctx, payload):
     Aucun `updated_by` : `Product` n'a pas ce champ, et `AuditMixin` ne le pose
     que si le modèle le porte.
     """
-    from apps.core.warehouse_scope import (
-        accessible_warehouse_ids, filter_products_by_warehouse_ids,
-    )
+    from apps.core.warehouse_scope import filter_products_by_warehouse_ids
     from apps.products.models import Product
     from apps.products.serializers import ProductDetailSerializer, ProductUpdateSerializer
 
@@ -1102,7 +1215,7 @@ def product_update(ctx, payload):
             code='missing_fields',
             details={'id': ['Ce champ est requis.']},
         )
-    autorises = accessible_warehouse_ids(ctx.membership) if ctx.membership else None
+    autorises = entrepots_actionnables(ctx.membership) if ctx.membership else None
     produit = filter_products_by_warehouse_ids(
         Product.objects.filter(organization=ctx.organization), autorises,
     ).filter(id=identifiant).first()
@@ -1235,7 +1348,12 @@ def _transition_depense(ctx, payload, fonction, *args, **kwargs):
     from apps.cashbook.serializers import ExpenseDetailSerializer
 
     _require(payload, 'expense')
-    depense = _objet_de_lorg(Expense, ctx, payload['expense'], 'Cette dépense')
+    # Le périmètre d'`ExpenseViewSet` : entrepôt, puis auteur.
+    depense = _objet_actionnable(
+        Expense, ctx, payload['expense'], 'Cette dépense',
+        borner=_borne_par(ctx, 'warehouse_id', author_field='created_by'),
+        entrepot_de=lambda d: d.warehouse_id,
+    )
     _refus_si_impossible_cashbook(fonction, depense, *args, **kwargs)
     depense.refresh_from_db()
     return {
@@ -1294,8 +1412,13 @@ def cash_movement_cancel(ctx, payload):
     from apps.cashbook.services import cancel_cash_movement
 
     _require(payload, 'movement')
-    mouvement = _objet_de_lorg(
+    # Le périmètre de `CashMovementViewSet`, par le même corps.
+    mouvement = _objet_actionnable(
         CashMovement, ctx, payload['movement'], 'Ce mouvement de caisse',
+        borner=lambda qs, nature: filter_cash_movement_queryset(
+            qs, ctx.membership, nature=nature,
+        ),
+        entrepot_de=_entrepot_du_mouvement,
     )
     _refus_si_impossible_cashbook(
         cancel_cash_movement, mouvement, ctx.user, payload.get('reason', ''),
@@ -1305,6 +1428,17 @@ def cash_movement_cancel(ctx, payload):
         'server_ids': {'cash_movement': str(mouvement.id)},
         'authoritative': CashMovementDetailSerializer(mouvement).data,
     }
+
+
+def _entrepot_du_mouvement(mouvement):
+    """L'entrepôt d'un mouvement de caisse, par les trois chemins de son périmètre."""
+    if mouvement.sale_id:
+        return mouvement.sale.warehouse_id
+    if mouvement.expense_id:
+        return mouvement.expense.warehouse_id
+    if mouvement.session_id:
+        return mouvement.session.register.warehouse_id
+    return None
 
 
 def _categorie_de_caisse(ctx, payload, ecriture, lecture):
@@ -1446,7 +1580,7 @@ def requisition_create(ctx, payload):
     depot = _objet_de_lorg(Warehouse, ctx, donnees['warehouse'], 'Entrepôt')
     # Le périmètre, par le MÊME chemin que la vue et que les autres actes de
     # stock : un refus LÈVE, il ne rend jamais un ensemble vide.
-    assert_warehouse_allowed_for_request(ctx.request, str(depot.id))
+    exiger_entrepot_actionnable_requete(ctx.request, str(depot.id))
 
     try:
         requisition = create_requisition(
@@ -1485,8 +1619,10 @@ def _transition_requisition(ctx, payload, action):
     from apps.purchases.serializers import RequisitionSerializer
     from apps.purchases.services import RequisitionRefusee, transition_requisition
 
-    requisition = _objet_de_lorg(
-        Requisition, ctx, payload.get('requisition'), 'Réquisition'
+    requisition = _objet_actionnable(
+        Requisition, ctx, payload.get('requisition'), 'Réquisition',
+        borner=_borne_par(ctx, 'warehouse_id'),
+        entrepot_de=lambda r: r.warehouse_id,
     )
     try:
         transition_requisition(

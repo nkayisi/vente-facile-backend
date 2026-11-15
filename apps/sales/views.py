@@ -21,10 +21,10 @@ from apps.core.api_mixins import (
     describe_filters,
 )
 from apps.core.warehouse_scope import (
-    accessible_warehouse_ids,
-    assert_warehouse_allowed_for_request,
+    ACTION,
+    entrepots_actionnables,
+    exiger_entrepot_actionnable_requete,
     filter_queryset_by_related_warehouse,
-    filter_queryset_by_warehouse_ids,
     get_membership_for_request,
 )
 from apps.core.api_permissions import (
@@ -168,7 +168,8 @@ class RegisterSessionViewSet(
         cette arithmétique garantit que les deux surfaces la font pareil.
         """
         from .register_sessions import (
-            CaisseIntrouvable, SessionDejaOuverte, open_register_session,
+            CaisseIntrouvable, SessionDejaOuverte, SessionPersonnelleOuverte,
+            open_register_session,
         )
 
         serializer = RegisterSessionOpenSerializer(data=request.data)
@@ -190,6 +191,11 @@ class RegisterSessionViewSet(
             # message sur cette phrase exacte.
             return Response(
                 {'error': 'Une session est déjà ouverte sur cette caisse'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except SessionPersonnelleOuverte as e:
+            return Response(
+                {'error': str(e), 'code': 'session_personnelle_ouverte'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -256,6 +262,8 @@ class RegisterSessionViewSet(
                 membership,
                 'register__warehouse_id',
                 include_null=False,
+                # ACTION : c'est la session sur laquelle le comptoir va vendre.
+                nature=ACTION,
             )
         session = session_qs.first()
 
@@ -345,6 +353,10 @@ class SaleViewSet(
     # restent visibles aux non-owner pour ne pas masquer l'historique.
     warehouse_scope_field = 'warehouse_id'
     warehouse_scope_include_null = True
+    # Un membre sans `sales.view_all` ne voit et ne touche que ses ventes.
+    author_scope_field = 'sold_by'
+    # Marquer un ticket imprimé, c'est réimprimer ce qu'on a le droit de LIRE.
+    actions_de_lecture = ('mark_receipt_printed',)
     
     action_permissions = {
         'list': 'sales.view',
@@ -425,9 +437,11 @@ class SaleViewSet(
         serializer.is_valid(raise_exception=True)
         # Le serializer expose ``warehouse`` ; on revalide le périmètre ici
         # pour bloquer toute tentative de soumettre un entrepôt non autorisé.
-        wh = serializer.validated_data.get('warehouse')
-        wh_id = getattr(wh, 'id', None) if wh is not None else None
-        assert_warehouse_allowed_for_request(request, wh_id, allow_none=True)
+        # ⚠ L'ENTREPÔT N'EST PLUS CONTRÔLÉ ICI. Il l'était AVANT que le
+        # sérialiseur l'ait déduit de la caisse, si bien qu'une vente de
+        # comptoir sans entrepôt explicite était refusée (« Un entrepôt est
+        # requis ») à un non-propriétaire. `SaleCreateSerializer.validate`
+        # le déduit puis le contrôle, pour la vue comme pour le journal.
         sale = serializer.save()
         sale.refresh_from_db()
         detail_serializer = SaleDetailSerializer(sale)
@@ -480,11 +494,6 @@ class SaleViewSet(
                 'items__product__packaging_unit', 'items__variant',
                 'payments__payment_method', 'payments__received_by',
             )
-
-        # Restriction par caissier : un cashier ne voit que ses propres ventes.
-        # Owner et manager ont `sales.view_all` et voient tout.
-        if not has_perm_code(self.request, 'sales.view_all'):
-            queryset = queryset.filter(sold_by=self.request.user)
 
         # Filtres de date
         date_from = self.request.query_params.get('date_from')
@@ -739,6 +748,7 @@ class SaleReturnViewSet(
 
     warehouse_scope_field = 'original_sale__warehouse_id'
     warehouse_scope_include_null = True
+    author_scope_field = 'created_by'
     
     action_permissions = {
         'list': 'sale_returns.view',
@@ -812,7 +822,9 @@ class SaleReturnViewSet(
 # QUOTATION VIEWSET
 # =============================================================================
 
-class QuotationViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
+class QuotationViewSet(
+    WarehouseScopedQuerysetMixin, TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet,
+):
     """
     ViewSet pour la gestion des devis.
     
@@ -833,7 +845,7 @@ class QuotationViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
     search_fields = ['reference', 'customer__name']
     ordering = ['-created_at']
     
-    select_related_fields = ['customer', 'created_by', 'converted_sale']
+    select_related_fields = ['customer', 'created_by', 'converted_sale', 'warehouse']
     prefetch_related_fields = [
         'items', 'items__product',
         'items__product__unit', 'items__product__packaging_unit',
@@ -850,27 +862,17 @@ class QuotationViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         'send': 'sales.create',
     }
 
-    def get_queryset(self):
-        """
-        Un devis n'a pas d'entrepôt : le périmètre y passe par son AUTEUR.
-
-        ┌──────────────────────────────────────────────────────────────────┐
-        │ CE VIEWSET N'AVAIT AUCUN PÉRIMÈTRE DE RÔLE.                     │
-        │                                                                  │
-        │ Ni mixin d'entrepôt, ni borne sur le créateur : un caissier      │
-        │ lisait les devis de toute l'organisation, quand le même caissier  │
-        │ ne voit que ses propres VENTES. Deux écrans voisins disaient deux │
-        │ choses du même périmètre.                                        │
-        │                                                                  │
-        │ `Quotation` ne porte pas de `warehouse` (ni au serveur, ni en     │
-        │ base locale), donc le seul axe disponible est `created_by`, et    │
-        │ c'est `sales.view_all` qui l'ouvre - la même clé que les ventes.  │
-        └──────────────────────────────────────────────────────────────────┘
-        """
-        queryset = super().get_queryset()
-        if not has_perm_code(self.request, 'sales.view_all'):
-            queryset = queryset.filter(created_by=self.request.user)
-        return queryset
+    # ┌──────────────────────────────────────────────────────────────────────┐
+    # │ UN DEVIS PORTE SON ENTREPÔT, ET IL EST BORNÉ COMME UNE VENTE.        │
+    # │                                                                      │
+    # │ Sans entrepôt, le seul axe était l'auteur : un gérant lisait les     │
+    # │ devis de TOUTE l'organisation, et la case « Voir tout » d'un         │
+    # │ caissier lui aurait ouvert ceux des autres boutiques. Les devis      │
+    # │ anciens, sans entrepôt, restent visibles (`include_null`).           │
+    # └──────────────────────────────────────────────────────────────────────┘
+    warehouse_scope_field = 'warehouse_id'
+    warehouse_scope_include_null = True
+    author_scope_field = 'created_by'
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -894,11 +896,11 @@ class QuotationViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
 
         quotation = self.get_object()
         membership = get_membership_for_request(request)
-        autorises = accessible_warehouse_ids(membership) if membership else None
+        autorises = entrepots_actionnables(membership) if membership else None
 
         explicite = request.data.get('warehouse') if hasattr(request, 'data') else None
         if explicite:
-            assert_warehouse_allowed_for_request(request, explicite)
+            exiger_entrepot_actionnable_requete(request, explicite)
 
         warehouse = resolve_conversion_warehouse(quotation, explicite, autorises)
 

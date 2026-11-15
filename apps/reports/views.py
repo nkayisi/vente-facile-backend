@@ -31,10 +31,12 @@ from apps.core.mixins import TenantQuerysetMixin
 from apps.core.api_mixins import ActionPaginationMixin, ExportResponseMixin
 from apps.core.api_permissions import IsTenantMember, HasActiveSubscription, HasPermission
 from apps.core.warehouse_scope import (
-    accessible_warehouse_ids,
+    LECTURE,
+    borner_visibilite,
+    entrepots_lisibles,
     assert_user_allowed_for_request,
     filter_cash_movement_queryset,
-    assert_warehouse_allowed_for_request,
+    exiger_entrepot_lisible_requete,
     get_membership_for_request,
 )
 from apps.organizations.models import OrganizationMembership
@@ -185,33 +187,39 @@ class StatisticsViewSet(ExportResponseMixin, ActionPaginationMixin,
     }
     
     def _accessible_warehouse_ids(self, request):
-        """Renvoie ``None`` (owner = tout) ou la liste des UUID autorisés.
+        """Renvoie ``None`` (tout) ou les entrepôts que le membre peut LIRE.
 
-        Utilisé pour scoper toutes les statistiques au périmètre du membre.
+        Un rapport est une lecture : la case « consulter tous les entrepôts »
+        l'ouvre à toute l'organisation.
         """
         membership = get_membership_for_request(request)
         if not membership:
             return None
-        return accessible_warehouse_ids(membership)
+        return entrepots_lisibles(membership)
 
-    def _is_cashier(self, request):
-        """True si le membre courant est un caissier (visibilité = ses données)."""
-        membership = get_membership_for_request(request)
-        return (
-            membership is not None
-            and membership.role == OrganizationMembership.Role.CASHIER
-        )
-
-    def _apply_creator_scope(self, qs, request, creator_field):
-        """Restreint aux enregistrements créés par l'utilisateur si caissier.
-
-        Garantit que les KPIs/rapports d'un caissier n'agrègent que ses propres
-        données (ventes, dépenses, mouvements), conformément à la visibilité
-        par rôle. Sans effet pour owner/gérant/magasinier.
+    def _borner(self, qs, request, *, warehouse_field, author_field, include_null=False):
         """
-        if self._is_cashier(request):
-            return qs.filter(**{creator_field: request.user})
-        return qs
+        Le périmètre de LECTURE, par le corps partagé avec les vues et le tirage.
+
+        ┌──────────────────────────────────────────────────────────────────┐
+        │ « AUCUN ENTREPÔT » RENDAIT ICI LES LIGNES SANS ENTREPÔT.         │
+        │                                                                  │
+        │ Les listes rendent `.none()` à un membre sans affectation ; les  │
+        │ rapports lui montraient les ventes anciennes sans entrepôt, et   │
+        │ le même membre lisait deux choses de son périmètre. Et l'auteur  │
+        │ se décidait sur le RÔLE « caissier », là où les ventes le        │
+        │ décident sur `sales.view_all` : la case « Voir tout » n'ouvrait   │
+        │ pas les rapports.                                                │
+        └──────────────────────────────────────────────────────────────────┘
+        """
+        return borner_visibilite(
+            qs,
+            get_membership_for_request(request),
+            nature=LECTURE,
+            warehouse_field=warehouse_field,
+            author_field=author_field,
+            include_null_warehouse=include_null,
+        )
 
     def _perimetre_voulu(self, request):
         """
@@ -238,7 +246,7 @@ class StatisticsViewSet(ExportResponseMixin, ActionPaginationMixin,
             wid = request.query_params.get('warehouse') or None
             uid = request.query_params.get('user') or None
             if wid:
-                assert_warehouse_allowed_for_request(request, wid)
+                exiger_entrepot_lisible_requete(request, wid)
             if uid:
                 assert_user_allowed_for_request(request, uid)
             cache = (wid, uid)
@@ -268,48 +276,32 @@ class StatisticsViewSet(ExportResponseMixin, ActionPaginationMixin,
         return qs
 
     def _scope_sales(self, qs, request):
-        """Applique le filtre warehouse aux ventes (+ créateur si caissier)."""
-        qs = self._apply_creator_scope(qs, request, 'sold_by')
-        wh_ids = self._accessible_warehouse_ids(request)
-        if wh_ids is None:
-            pass
-        elif not wh_ids:
-            qs = qs.filter(warehouse__isnull=True)
-        else:
-            qs = qs.filter(Q(warehouse_id__in=wh_ids) | Q(warehouse__isnull=True))
+        """Les ventes lisibles (ventes anciennes sans entrepôt comprises)."""
+        qs = self._borner(
+            qs, request, warehouse_field='warehouse_id', author_field='sold_by',
+            include_null=True,
+        )
         return self._vouloir(
             qs, request, warehouse_field='warehouse_id', user_field='sold_by_id'
         )
 
     def _scope_sale_items(self, qs, request):
-        """Applique le filtre warehouse aux items de vente via ``sale``."""
-        qs = self._apply_creator_scope(qs, request, 'sale__sold_by')
-        wh_ids = self._accessible_warehouse_ids(request)
-        if wh_ids is None:
-            pass
-        elif not wh_ids:
-            qs = qs.filter(sale__warehouse__isnull=True)
-        else:
-            qs = qs.filter(
-                Q(sale__warehouse_id__in=wh_ids) | Q(sale__warehouse__isnull=True)
-            )
+        """Les lignes de vente lisibles, par leur vente."""
+        qs = self._borner(
+            qs, request, warehouse_field='sale__warehouse_id',
+            author_field='sale__sold_by', include_null=True,
+        )
         return self._vouloir(
             qs, request,
             warehouse_field='sale__warehouse_id', user_field='sale__sold_by_id',
         )
 
     def _scope_payments(self, qs, request):
-        """Applique le filtre warehouse aux paiements via ``sale``."""
-        qs = self._apply_creator_scope(qs, request, 'sale__sold_by')
-        wh_ids = self._accessible_warehouse_ids(request)
-        if wh_ids is None:
-            pass
-        elif not wh_ids:
-            qs = qs.filter(sale__warehouse__isnull=True)
-        else:
-            qs = qs.filter(
-                Q(sale__warehouse_id__in=wh_ids) | Q(sale__warehouse__isnull=True)
-            )
+        """Les règlements lisibles, par leur vente."""
+        qs = self._borner(
+            qs, request, warehouse_field='sale__warehouse_id',
+            author_field='sale__sold_by', include_null=True,
+        )
         return self._vouloir(
             qs, request,
             warehouse_field='sale__warehouse_id', user_field='sale__sold_by_id',
@@ -332,7 +324,9 @@ class StatisticsViewSet(ExportResponseMixin, ActionPaginationMixin,
         │ sans entrepôt.                                                    │
         └──────────────────────────────────────────────────────────────────┘
         """
-        qs = filter_cash_movement_queryset(qs, get_membership_for_request(request))
+        qs = filter_cash_movement_queryset(
+            qs, get_membership_for_request(request), nature=LECTURE
+        )
         # Le filtre VOLONTAIRE, lui, reste sans clause `isnull` : un apport sans
         # pièce apparaîtrait sinon sous chaque dépôt, et la somme des dépôts
         # dépasserait le total du tiroir.
@@ -348,60 +342,40 @@ class StatisticsViewSet(ExportResponseMixin, ActionPaginationMixin,
         return qs
 
     def _scope_expenses(self, qs, request):
-        """Applique le filtre warehouse aux dépenses (+ créateur si caissier)."""
-        if self._is_cashier(request):
-            qs = qs.filter(created_by=request.user)
-        else:
-            wh_ids = self._accessible_warehouse_ids(request)
-            if wh_ids is None:
-                pass
-            elif not wh_ids:
-                qs = qs.filter(warehouse__isnull=True)
-            else:
-                qs = qs.filter(
-                    Q(warehouse_id__in=wh_ids) | Q(warehouse__isnull=True)
-                )
+        """
+        Les dépenses lisibles, STRICTES comme `ExpenseViewSet`.
+
+        Une dépense sans entrepôt (loyer, salaires) est une charge
+        d'ÉTABLISSEMENT : elle reste au propriétaire et à la case
+        « consulter tous ». La tolérance qui vivait ici la montrait à chaque
+        gérant, et le rapport contredisait la liste des dépenses.
+        """
+        qs = self._borner(
+            qs, request, warehouse_field='warehouse_id', author_field='created_by'
+        )
         return self._vouloir(
             qs, request, warehouse_field='warehouse_id', user_field='created_by_id'
         )
 
     def _scope_stocks(self, qs, request):
-        """Applique le filtre warehouse aux stocks (warehouse strict)."""
-        wh_ids = self._accessible_warehouse_ids(request)
-        if wh_ids is None:
-            pass
-        elif not wh_ids:
-            return qs.none()
-        else:
-            qs = qs.filter(warehouse_id__in=wh_ids)
-        # `user_field=None` : un stock est un ÉTAT, pas un acte. L'utilisateur
-        # voulu y est ignoré, jamais traduit en `.none()`.
+        """Les rayons lisibles. Un stock est un ÉTAT : il n'a pas d'auteur."""
+        qs = self._borner(qs, request, warehouse_field='warehouse_id', author_field=None)
+        # `user_field=None` : l'utilisateur voulu est ignoré, jamais traduit en
+        # `.none()`.
         return self._vouloir(
             qs, request, warehouse_field='warehouse_id', user_field=None
         )
 
     def _scope_stock_batches(self, qs, request):
-        """Applique le filtre warehouse aux lots de stock (warehouse strict)."""
-        wh_ids = self._accessible_warehouse_ids(request)
-        if wh_ids is None:
-            pass
-        elif not wh_ids:
-            return qs.none()
-        else:
-            qs = qs.filter(warehouse_id__in=wh_ids)
+        """Les lots lisibles."""
+        qs = self._borner(qs, request, warehouse_field='warehouse_id', author_field=None)
         return self._vouloir(
             qs, request, warehouse_field='warehouse_id', user_field=None
         )
 
     def _scope_stock_movements(self, qs, request):
-        """Applique le filtre warehouse aux mouvements de stock."""
-        wh_ids = self._accessible_warehouse_ids(request)
-        if wh_ids is None:
-            pass
-        elif not wh_ids:
-            return qs.none()
-        else:
-            qs = qs.filter(warehouse_id__in=wh_ids)
+        """Les mouvements de stock lisibles."""
+        qs = self._borner(qs, request, warehouse_field='warehouse_id', author_field=None)
         return self._vouloir(
             qs, request, warehouse_field='warehouse_id', user_field='created_by_id'
         )

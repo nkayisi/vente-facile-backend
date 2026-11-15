@@ -20,6 +20,7 @@ from django.template.loader import render_to_string
 from apps.core.api_mixins import TenantViewSetMixin
 from apps.core.api_permissions import IsTenantMember, IsTenantAdmin, HasPermission, _get_membership
 from apps.core.adresse import adresse_client
+from apps.core.warehouse_scope import empreinte_perimetre
 from .connexion import authentifier, exiger_un_etablissement_ouvert
 from .devices import resolve_device
 from .jetons import JetonDeSession
@@ -192,12 +193,21 @@ class UserViewSet(viewsets.ModelViewSet):
             # caissier verrait un sélecteur qui ne lui propose qu'un choix.
             #
             # ⚠ Vide pour un PROPRIÉTAIRE, et c'est ce qui le rend « partout » :
-            # `accessible_warehouse_ids` rend `None` pour lui. Le client doit
-            # lire `role` avec, jamais la longueur de cette liste seule.
+            # `entrepots_lisibles` rend `None` pour lui. Le client doit lire
+            # `role` avec, jamais la longueur de cette liste seule.
+            #
+            # `is_active` voyage avec : un entrepôt désactivé reste affecté (on
+            # relit son passé) mais il est fermé à toute opération, et le client
+            # doit pouvoir le dire au lieu de proposer un geste refusé.
             'assigned_warehouses': [
-                {'id': str(w.id), 'name': w.name}
+                {'id': str(w.id), 'name': w.name, 'is_active': w.is_active}
                 for w in membership.assigned_warehouses.filter(is_deleted=False)
             ],
+            # La case « Consulter tous les entrepôts » : LIRE partout, AGIR chez soi.
+            'consult_all_warehouses': membership.consult_all_warehouses,
+            # L'empreinte du périmètre : une valeur qui change dit au client de
+            # relire ses droits (une affectation, la case, une permission).
+            'perimetre_version': empreinte_perimetre(membership),
         })
 
     @action(detail=False, methods=['post'], url_path='me/change-password')

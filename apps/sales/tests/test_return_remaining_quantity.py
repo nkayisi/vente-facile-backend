@@ -47,8 +47,12 @@ class QuantiteRestanteTests(APITestCase):
             organization=self.org, name='Client', code='C1', phone='09',
             credit_limit=Decimal('0'),
         )
+        # ⚠ La session est celle du GÉRANT, qui vend ici : on ne vend que dans
+        #   sa propre session, quel que soit le rôle. Elle était ouverte par le
+        #   propriétaire, ce qui ne passait que par l'exception du gérant,
+        #   retirée le 2026-11-14.
         RegisterSession.objects.create(
-            organization=self.org, register=self.register, opened_by=self.owner,
+            organization=self.org, register=self.register, opened_by=self.manager,
             opening_balance=Decimal('0'), status='open',
         )
         # `sale_returns.create` est porté par le gérant : c'est le rôle le plus

@@ -52,7 +52,7 @@ from apps.core.api_permissions import (
     _get_membership,
 )
 from apps.core.clock import horloge_de_l_acte
-from apps.core.exceptions import RefusMetier
+from apps.core.exceptions import RefusMetier, code_remarquable
 
 from .models import SyncOperation
 
@@ -228,7 +228,11 @@ def _classify(exc):
     if isinstance(exc, (DRFValidationError, DjangoValidationError)):
         detail = getattr(exc, 'detail', None) or getattr(exc, 'message_dict', None) \
             or getattr(exc, 'messages', None) or str(exc)
-        return SyncOperation.Verdict.REJECTED, {'code': 'invalid', 'errors': detail}
+        # Un refus de périmètre garde son code : c'est lui que l'écran
+        # « Opérations à corriger » lit pour dire quoi faire.
+        return SyncOperation.Verdict.REJECTED, {
+            'code': code_remarquable(exc) or 'invalid', 'errors': detail,
+        }
     if isinstance(exc, (DRFPermissionDenied, PermissionDenied)):
         return SyncOperation.Verdict.BLOCKED, {
             'code': 'forbidden', 'detail': str(exc),
@@ -549,8 +553,13 @@ class SyncOperationsView(APIView):
         if device is not None:
             device.touch()
 
+        from apps.core.warehouse_scope import empreinte_perimetre
+
         return Response({
             'batch_id': request.data.get('batch_id'),
             'server_time': timezone.now().isoformat(),
             'results': results,
+            # Même rôle que dans `pull/changed/` : un refus `consultation_seule`
+            # ou `entrepot_inactif` vient souvent d'un périmètre qui a bougé.
+            'perimetre_version': empreinte_perimetre(membership),
         })

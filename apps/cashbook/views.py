@@ -16,6 +16,7 @@ from apps.core.api_mixins import (
     AuditMixin,
     ExportResponseMixin,
     WarehouseAssertCreateMixin,
+    WarehouseScopedQuerysetMixin,
 )
 from apps.core.report_params import (
     format_day,
@@ -26,10 +27,9 @@ from apps.core.report_params import (
 )
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from apps.core.warehouse_scope import (
-    accessible_warehouse_ids,
     filter_cash_movement_queryset,
     get_membership_for_request,
-    restrict_visibility_for_request,
+    nature_de_la_requete,
 )
 from apps.core.api_permissions import IsTenantMember, HasPermission
 
@@ -162,6 +162,7 @@ class ExpenseCategoryViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
 
 class ExpenseViewSet(
     WarehouseAssertCreateMixin,
+    WarehouseScopedQuerysetMixin,
     TenantViewSetMixin,
     AuditMixin,
     viewsets.ModelViewSet,
@@ -189,20 +190,22 @@ class ExpenseViewSet(
     select_related_fields = ['category', 'warehouse', 'payment_method', 'created_by', 'approved_by']
 
     # ┌──────────────────────────────────────────────────────────────────────┐
-    # │ DEUX ATTRIBUTS MORTS VIVAIENT ICI, ET ILS DISAIENT LE CONTRAIRE DU   │
-    # │ COMPORTEMENT.                                                        │
+    # │ LA VISIBILITÉ PASSE PAR LE MIXIN, COMME PARTOUT AILLEURS.            │
     # │                                                                      │
-    # │ `warehouse_scope_field` et `warehouse_scope_include_null = True` sont │
-    # │ lus par `WarehouseScopedQuerysetMixin`, dont cette vue N'HÉRITE PAS.  │
-    # │ Ils n'ont donc jamais rien fait, et ils annonçaient l'inverse de la   │
-    # │ règle réelle : `get_queryset` appelle                                 │
-    # │ `restrict_visibility_for_request` SANS `include_null_warehouse`, donc │
-    # │ les dépenses d'établissement (loyer, salaires) restent au             │
-    # │ propriétaire. Le fichier se contredisait à deux endroits.             │
+    # │ Cette vue appelait `restrict_visibility_for_request`, qui bornait le │
+    # │ caissier par son RÔLE et oubliait le périmètre d'ACTION : un membre  │
+    # │ qui consulte tous les entrepôts aurait pu approuver la dépense d'un  │
+    # │ dépôt qui ne lui est pas affecté. Le mixin lit en LECTURE, agit en   │
+    # │ ACTION, et borne l'auteur par `sales.view_all`.                      │
     # │                                                                      │
-    # │ Les deux attributs d'ÉCRITURE, eux, sont bien lus par                 │
-    # │ `WarehouseAssertCreateMixin` : une dépense peut naître sans dépôt.    │
+    # │ ⚠ STRICTE sur l'entrepôt : une dépense d'établissement (loyer,       │
+    # │ salaires) reste au propriétaire et à la case « consulter tous ». Un  │
+    # │ membre borné par auteur voit toutefois les SIENNES sans entrepôt.    │
     # └──────────────────────────────────────────────────────────────────────┘
+    warehouse_scope_field = 'warehouse_id'
+    warehouse_scope_include_null = False
+    author_scope_field = 'created_by'
+
     warehouse_write_required = False
     warehouse_write_allow_none = True
 
@@ -232,19 +235,6 @@ class ExpenseViewSet(
 
     def get_queryset(self):
         queryset = super().get_queryset()
-
-        # Visibilité par rôle :
-        # - owner : toutes les dépenses ;
-        # - caissier : uniquement ses propres dépenses (created_by), partout ;
-        # - gérant / magasinier : dépenses de leurs entrepôts assignés. Les
-        #   dépenses « org-level » sans entrepôt (loyer, salaires...) restent
-        #   réservées au owner (include_null_warehouse=False).
-        queryset = restrict_visibility_for_request(
-            queryset,
-            self.request,
-            warehouse_field='warehouse_id',
-            creator_field='created_by',
-        )
 
         # Filtres de date
         date_from = self.request.query_params.get('date_from')
@@ -398,7 +388,7 @@ class ExpenseViewSet(
         │                                                                      │
         │ Elle réimplémentait une TROISIÈME variante du périmètre -            │
         │ `Q(warehouse_id__in=…) | Q(warehouse__isnull=True)` - là où          │
-        │ `get_queryset` applique `restrict_visibility_for_request` avec sa    │
+        │ `get_queryset` appliquait `restrict_visibility_for_request` et sa    │
         │ portée par CRÉATEUR. Deux conséquences, toutes deux silencieuses :   │
         │                                                                      │
         │ - un CAISSIER a `cashbook.view`, et cette action lui est ouverte :   │
@@ -528,7 +518,9 @@ class CashMovementViewSet(ExportResponseMixin, TenantViewSetMixin,
         vit désormais dans `apps.core.warehouse_scope`, que les deux appellent.
         """
         return filter_cash_movement_queryset(
-            queryset, get_membership_for_request(self.request)
+            queryset,
+            get_membership_for_request(self.request),
+            nature=nature_de_la_requete(self.request),
         )
 
     # ------------------------------------------------------------------

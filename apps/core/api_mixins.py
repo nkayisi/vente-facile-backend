@@ -48,7 +48,7 @@ class TenantViewSetMixin:
         """
         from apps.core.warehouse_scope import (
             assert_user_allowed_for_membership,
-            assert_warehouse_allowed_for_membership,
+            exiger_entrepot_lisible,
             get_membership_for_request,
         )
 
@@ -60,8 +60,11 @@ class TenantViewSetMixin:
         if membership is not None:
             params = self.request.query_params
             entrepot = params.get('warehouse')
+            # ⚠ LECTURE, même sous une méthode d'écriture : un filtre ne fait
+            # que restreindre ce qu'on regarde. La case « consulter tous » doit
+            # pouvoir viser n'importe quel entrepôt dans un filtre.
             if entrepot and self._filtre_declare('warehouse'):
-                assert_warehouse_allowed_for_membership(membership, entrepot)
+                exiger_entrepot_lisible(membership, entrepot)
             utilisateur = params.get('user')
             if utilisateur and self._filtre_declare('user'):
                 assert_user_allowed_for_membership(membership, utilisateur)
@@ -180,37 +183,89 @@ class TenantViewSetMixin:
 
 class WarehouseScopedQuerysetMixin:
     """
-    Restreint le queryset aux entrepôts assignés au membership (non-owner).
+    Restreint le queryset au périmètre du membre, en LECTURE ou en ACTION.
 
-    - ``warehouse_scope_field`` : champ direct ou relation Django pour filtrer
-      (ex. ``warehouse_id``, ``id``, ``register__warehouse_id``,
-      ``original_sale__warehouse_id``).
-    - ``warehouse_scope_include_null`` : si ``True``, les lignes avec la
-      relation à ``NULL`` restent visibles (utile pour les mouvements de
-      caisse non rattachés à une vente).
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ LE SEUL AIGUILLAGE DU DÉPÔT ENTRE LIRE ET AGIR.                         │
+    │                                                                          │
+    │ Une méthode sûre lit dans le périmètre de LECTURE (la case « consulter   │
+    │ tous les entrepôts » l'ouvre à toute l'organisation) ; toute autre       │
+    │ méthode agit dans le périmètre d'ACTION (les seuls entrepôts affectés).  │
+    │ Comme un PATCH, un DELETE ou un POST d'action passe par                  │
+    │ `get_queryset → get_object`, chaque écriture d'un ViewSet borné est      │
+    │ couverte ici, sans code au cas par cas.                                  │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    - ``warehouse_scope_field`` : champ direct ou relation (``warehouse_id``,
+      ``id``, ``register__warehouse_id``, ``original_sale__warehouse_id``).
+      ``None`` : la donnée ne porte aucun entrepôt, seul l'auteur borne.
+    - ``warehouse_scope_include_null`` : garde les lignes sans entrepôt.
+    - ``author_scope_field`` : l'auteur d'une ligne (``sold_by``,
+      ``created_by``, ``opened_by``). Un membre sans `sales.view_all` ne voit
+      et ne touche que les siennes.
+    - ``actions_de_lecture`` / ``actions_preparatoires`` : voir
+      `nature_de_la_requete`.
     """
 
     warehouse_scope_field = 'warehouse_id'
     warehouse_scope_include_null = False
+    author_scope_field = None
+    actions_de_lecture = ()
+    actions_preparatoires = ()
 
-    def _filter_queryset_by_membership_warehouses(self, queryset):
+    def _borner_au_perimetre(self, queryset, nature):
         from apps.core.warehouse_scope import (
+            borner_visibilite,
             get_membership_for_request,
-            filter_queryset_by_related_warehouse,
         )
 
         membership = get_membership_for_request(self.request)
         if not membership:
             return queryset
-        field = getattr(self, 'warehouse_scope_field', 'warehouse_id')
-        include_null = getattr(self, 'warehouse_scope_include_null', False)
-        return filter_queryset_by_related_warehouse(
-            queryset, membership, field, include_null=include_null
+        return borner_visibilite(
+            queryset,
+            membership,
+            nature=nature,
+            warehouse_field=getattr(self, 'warehouse_scope_field', 'warehouse_id'),
+            author_field=getattr(self, 'author_scope_field', None),
+            include_null_warehouse=getattr(self, 'warehouse_scope_include_null', False),
         )
 
     def get_queryset(self):
+        from apps.core.warehouse_scope import nature_de_la_requete
+
         queryset = super().get_queryset()
-        return self._filter_queryset_by_membership_warehouses(queryset)
+        return self._borner_au_perimetre(queryset, nature_de_la_requete(self.request))
+
+    def get_object(self):
+        """
+        Un objet qu'on peut LIRE mais pas toucher répond 403, jamais 404.
+
+        ⚠ Sans cette distinction, un membre qui consulte tous les entrepôts
+        ouvre une vente d'un autre dépôt, appuie sur « Encaisser » et lit
+        « introuvable » sur la pièce qu'il a sous les yeux.
+        """
+        from django.http import Http404
+
+        from apps.core.exceptions import ConsultationSeule
+        from apps.core.warehouse_scope import ACTION, LECTURE, nature_de_la_requete
+
+        try:
+            return super().get_object()
+        except Http404:
+            if nature_de_la_requete(self.request) != ACTION:
+                raise
+            cle = self.lookup_url_kwarg or self.lookup_field
+            valeur = self.kwargs.get(cle)
+            if valeur is None:
+                raise
+            base = super(WarehouseScopedQuerysetMixin, self).get_queryset()
+            lisible = self._borner_au_perimetre(base, LECTURE).filter(
+                **{self.lookup_field: valeur}
+            ).exists()
+            if lisible:
+                raise ConsultationSeule()
+            raise
 
 
 class WarehouseAssertCreateMixin:
@@ -232,17 +287,18 @@ class WarehouseAssertCreateMixin:
     warehouse_write_allow_none = False
 
     def _assert_warehouse_on_save(self, serializer):
-        from apps.core.warehouse_scope import assert_warehouse_allowed_for_request
+        from apps.core.warehouse_scope import exiger_entrepot_actionnable_requete
 
         field = getattr(self, 'warehouse_write_field', 'warehouse')
         wh = serializer.validated_data.get(field)
         if wh is None and not getattr(self, 'warehouse_write_required', True):
             return
         wh_id = getattr(wh, 'id', None) if wh is not None else None
-        assert_warehouse_allowed_for_request(
+        exiger_entrepot_actionnable_requete(
             self.request,
             wh_id,
             allow_none=getattr(self, 'warehouse_write_allow_none', False),
+            champ=field,
         )
 
     def perform_create(self, serializer):

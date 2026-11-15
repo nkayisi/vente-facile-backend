@@ -136,6 +136,23 @@ class OrganizationMembership(TimeStampedModel, UUIDModel):
         help_text="Permissions additionnelles accordées à cet utilisateur en plus de celles de son rôle."
     )
 
+    # ┌──────────────────────────────────────────────────────────────────────┐
+    # │ « CONSULTER TOUS LES ENTREPÔTS » : LIRE PARTOUT, AGIR CHEZ SOI.      │
+    # │                                                                      │
+    # │ Accordée par le PROPRIÉTAIRE seul, membre par membre. Le membre lit  │
+    # │ alors toutes les données de tous les entrepôts, quel qu'en soit      │
+    # │ l'auteur, mais il ne vend, n'encaisse, ne transfère et n'ajuste que  │
+    # │ dans ses entrepôts affectés. Sans elle, il est isolé dans ceux-ci.   │
+    # │ La règle vit dans `apps.core.warehouse_scope`.                       │
+    # └──────────────────────────────────────────────────────────────────────┘
+    consult_all_warehouses = models.BooleanField(
+        default=False,
+        help_text=(
+            "Le membre consulte les données de tous les entrepôts, et n'agit "
+            "que dans ses entrepôts affectés. Accordé par le propriétaire."
+        ),
+    )
+
     class Meta:
         db_table = 'organization_memberships'
         unique_together = ['user', 'organization']

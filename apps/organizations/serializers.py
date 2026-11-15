@@ -251,9 +251,12 @@ class OrganizationMembershipSerializer(serializers.ModelSerializer):
             'role', 'role_display', 'is_active',
             'invited_by', 'invited_by_name', 'joined_at',
             'warehouse_access', 'assigned_warehouses',
+            'consult_all_warehouses',
             'extra_permissions', 'role_permissions', 'effective_permissions',
         ]
-        read_only_fields = ['id', 'joined_at']
+        # ⚠ `consult_all_warehouses` en LECTURE ici : il ne s'écrit que par
+        #   `MembershipUpdateSerializer`, et par le seul propriétaire.
+        read_only_fields = ['id', 'joined_at', 'consult_all_warehouses']
 
     def get_warehouse_access(self, obj):
         if obj.role == OrganizationMembership.Role.OWNER:
@@ -265,6 +268,7 @@ class OrganizationMembershipSerializer(serializers.ModelSerializer):
             return []
         qs = obj.assigned_warehouses.filter(is_deleted=False).order_by('name')
         return AssignedWarehouseMiniSerializer(qs, many=True).data
+
 
     def get_role_permissions(self, obj):
         from apps.core.services import PermissionService
@@ -355,6 +359,9 @@ class MembershipUpdateSerializer(serializers.Serializer):
         required=False,
         allow_empty=True,
     )
+    #: « Consulter tous les entrepôts » : écrite par le PROPRIÉTAIRE seul, ce
+    #: que la vue contrôle (le serializer ne connaît pas le demandeur).
+    consult_all_warehouses = serializers.BooleanField(required=False)
 
     def validate_extra_permissions(self, value):
         if value is None:

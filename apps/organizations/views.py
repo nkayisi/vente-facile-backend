@@ -16,7 +16,9 @@ from apps.core.api_permissions import (
     IsTenantMember, IsTenantAdmin, IsTenantOwner, IsTenantManager,
     HasActiveSubscription, HasPermission, _get_membership
 )
-from apps.core.services import OrganizationService, PermissionService
+from apps.core.services import (
+    OrganizationService, PermissionService, refuser_permissions_hors_portee,
+)
 from apps.subscriptions.services import SubscriptionService
 from rest_framework.exceptions import ValidationError
 from apps.core.adresse import adresse_client
@@ -62,19 +64,25 @@ def _cle_de_perimetre(membership, entrepot_voulu, utilisateur_voulu):
     """
     from hashlib import blake2s
 
-    from apps.core.warehouse_scope import accessible_warehouse_ids
+    from apps.core.warehouse_scope import empreinte_perimetre, entrepots_lisibles
 
     role = membership.role if membership else 'anonyme'
-    ids = accessible_warehouse_ids(membership) if membership else []
+    ids = entrepots_lisibles(membership) if membership else []
     # `None` (aucune restriction) et `[]` (aucun accès) sont deux situations
     # opposées : les écrire pareil ferait servir la réponse du propriétaire à
     # un membre qui n'a droit à rien.
     portee = 'tous' if ids is None else ','.join(sorted(str(i) for i in ids))
-    # Le caissier est borné par son identité, jamais par ses entrepôts : sans
-    # elle dans la clé, deux caissiers du même dépôt partageraient un total.
+    # Un membre borné par AUTEUR l'est par son identité : sans elle dans la
+    # clé, deux caissiers du même dépôt partageraient un total.
     qui = str(membership.user_id) if membership else ''
+    # L'empreinte porte la case « consulter tous » et les permissions : sans
+    # elle, cocher « Voir tout » servirait 60 s le total d'avant.
+    empreinte = empreinte_perimetre(membership) if membership else ''
 
-    brut = f"{role}|{portee}|{qui}|{entrepot_voulu or ''}|{utilisateur_voulu or ''}"
+    brut = (
+        f"{role}|{portee}|{qui}|{empreinte}"
+        f"|{entrepot_voulu or ''}|{utilisateur_voulu or ''}"
+    )
     return blake2s(brut.encode('utf-8'), digest_size=8).hexdigest()
 
 
@@ -383,11 +391,12 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         from apps.cashbook.services import primary_sum
         from apps.settings.services import CurrencyService
         from apps.core.warehouse_scope import (
+            LECTURE,
             assert_user_allowed_for_membership,
-            assert_warehouse_allowed_for_membership,
+            borner_visibilite,
+            exiger_entrepot_lisible,
             filter_queryset_by_warehouse_ids,
             membership_for_organization,
-            restrict_visibility_for_membership,
         )
 
         organization = self.get_object()
@@ -398,7 +407,7 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         # │                                                                  │
         # │ `getDashboardStats` du back-office ne pose que `Authorization` : │
         # │ sans `X-Organization-ID`, `_get_membership` rend `None`, et      │
-        # │ `restrict_visibility_for_membership(qs, None, ...)` rend le      │
+        # │ `borner_visibilite(qs, None, ...)` rend le                       │
         # │ queryset INTACT. Brancher le helper habituel laisserait donc ce  │
         # │ tableau de bord ouvert à tous, tout en faisant passer un test    │
         # │ qui, lui, envoie l'en-tête.                                      │
@@ -419,16 +428,17 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         # Refuser, jamais ignorer : un entrepôt hors périmètre retiré en silence
         # rendrait un écran qui affiche « Entrepôt B » au-dessus des chiffres de A.
         if entrepot_voulu:
-            assert_warehouse_allowed_for_membership(membership, entrepot_voulu)
+            exiger_entrepot_lisible(membership, entrepot_voulu)
         assert_user_allowed_for_membership(membership, utilisateur_voulu)
 
         def borner_ventes(queryset):
             """Périmètre du rôle, puis filtre volontaire. Dans cet ordre."""
-            queryset = restrict_visibility_for_membership(
+            queryset = borner_visibilite(
                 queryset,
                 membership,
+                nature=LECTURE,
                 warehouse_field='warehouse_id',
-                creator_field='sold_by',
+                author_field='sold_by',
                 # Même tolérance que `SaleViewSet` pour les ventes anciennes sans
                 # entrepôt, donc mêmes chiffres des deux côtés.
                 include_null_warehouse=True,
@@ -448,7 +458,9 @@ class OrganizationViewSet(viewsets.ModelViewSet):
             Rendre `.none()` ferait lire « aucun stock » parce qu'un filtre
             d'un autre écran a traîné, ce qui se lit comme une perte de données.
             """
-            queryset = filter_queryset_by_warehouse_ids(queryset, membership)
+            queryset = filter_queryset_by_warehouse_ids(
+                queryset, membership, nature=LECTURE
+            )
             if entrepot_voulu:
                 queryset = queryset.filter(warehouse_id=entrepot_voulu)
             return queryset
@@ -1062,6 +1074,7 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         is_active = serializer.validated_data.get('is_active', membership.is_active)
         warehouse_ids = serializer.validated_data.get('warehouse_ids')
         extra_permissions = serializer.validated_data.get('extra_permissions')
+        consulte_tout = serializer.validated_data.get('consult_all_warehouses')
         
         # Vérifier la hiérarchie pour le rôle actuel ET le nouveau rôle
         current_membership = _get_membership(request)
@@ -1085,6 +1098,27 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
                     {'detail': f"Vous n'avez pas la permission d'attribuer le rôle '{dict(OrganizationMembership.Role.choices).get(new_role, new_role)}'."},
                     status=status.HTTP_403_FORBIDDEN
                 )
+
+        # ⚠ LA CASE AU SEUL PROPRIÉTAIRE : elle ouvre la lecture de TOUS les
+        #   entrepôts, c'est-à-dire précisément ce que l'isolation ferme. Un
+        #   gérant qui pourrait la cocher se l'ouvrirait par un subordonné.
+        if (
+            consulte_tout is not None
+            and consulte_tout != membership.consult_all_warehouses
+            and current_membership.role != OrganizationMembership.Role.OWNER
+        ):
+            return Response(
+                {
+                    'detail': "Seul le propriétaire peut ouvrir ou fermer la "
+                              "consultation de tous les entrepôts.",
+                    'code': 'reserve_au_proprietaire',
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if extra_permissions is not None:
+            refuser_permissions_hors_portee(
+                current_membership, membership, extra_permissions,
+            )
         
         PermissionService.remove_all_permissions(membership.user, membership.organization)
         
@@ -1092,6 +1126,8 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         membership.is_active = is_active
         if extra_permissions is not None:
             membership.extra_permissions = extra_permissions
+        if consulte_tout is not None:
+            membership.consult_all_warehouses = consulte_tout
         membership.save()
         
         if is_active:
@@ -1219,6 +1255,9 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         
         serializer = MembershipPermissionsSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        refuser_permissions_hors_portee(
+            current_membership, membership, serializer.validated_data['extra_permissions'],
+        )
         
         membership.extra_permissions = serializer.validated_data['extra_permissions']
         membership.save(update_fields=['extra_permissions', 'updated_at'])

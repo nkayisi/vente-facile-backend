@@ -71,7 +71,11 @@ class RevisionDeJetonTests(APITestCase):
         )
 
     def test_les_autres_tables_gardent_leur_jeton(self):
-        for nom in ('sales', 'stocks', 'registers', 'cash_movements', 'products'):
+        # ⚠ `cash_movements` n'est plus de la liste : sa règle d'auteur a changé
+        #   le 2026-11-14 (la permission et non le rôle), et il porte sa propre
+        #   révision. La liste exacte des tables révisées est tenue par
+        #   `apps/core/tests/test_perimetre_lecture_action.py`.
+        for nom in ('sales', 'stocks', 'registers', 'products'):
             with self.subTest(table=nom):
                 table = PULL_TABLES_BY_NAME[nom]
                 self.assertFalse(table.revision)

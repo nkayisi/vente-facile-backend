@@ -56,48 +56,38 @@ def _ventes_du_client(customer, request, debut, fin):
     Les ventes du client, dans le périmètre du demandeur.
 
     ┌──────────────────────────────────────────────────────────────────────────┐
-    │ LES DEUX PIÈCES SONT CELLES DE `/sales/`, ET C'EST TOUT L'ENJEU.         │
+    │ LE PÉRIMÈTRE EST CELUI DE `/sales/`, PAR LE MÊME CORPS.                 │
     │                                                                          │
-    │ `SaleViewSet` applique exactement deux choses : le périmètre ENTREPÔT    │
-    │ (`WarehouseScopedQuerysetMixin`, `warehouse_scope_field='warehouse_id'`, │
-    │ `include_null=True`) et une borne par CRÉATEUR quand le demandeur n'a    │
-    │ pas `sales.view_all`. On les reprend toutes deux, telles quelles.        │
-    │                                                                          │
-    │ ⚠ ET SURTOUT PAS `restrict_visibility_for_request` : elle exprime la     │
-    │   même intention par le RÔLE et non par la PERMISSION, et les deux       │
-    │   divergent sur un cas réel - un caissier à qui le marchand accorde      │
-    │   `sales.view_all` par `extra_permissions`. `/sales/` lui montre alors   │
-    │   les ventes de son dépôt ; la fonction par rôle continue de le borner   │
-    │   à ses propres ventes. Les deux listes vivent sur la MÊME page de la    │
-    │   fiche client : la divergence s'y lirait comme deux chiffres            │
-    │   contradictoires. Elle ne borne pas non plus un caissier par entrepôt,  │
-    │   là que `/sales/` le fait.                                              │
+    │ `SaleViewSet` borne par ENTREPÔT (ventes anciennes sans entrepôt         │
+    │ comprises) puis par AUTEUR quand le demandeur n'a pas `sales.view_all`.  │
+    │ Les deux listes vivent sur la MÊME page de la fiche client : écrites     │
+    │ séparément, elles s'y liraient comme deux chiffres contradictoires.      │
+    │ `borner_visibilite` est ce corps unique, et il suit la PERMISSION, pas   │
+    │ le rôle : un caissier à qui le marchand accorde « Voir tout » voit les   │
+    │ ventes de ses collègues, dans ses entrepôts.                             │
     └──────────────────────────────────────────────────────────────────────────┘
 
     C'est le correctif adjacent de ce lot : `CustomerViewSet.sales` ne bornait
     RIEN. Le corps est partagé pour que la liste et le rapport ne puissent plus
     se contredire.
     """
-    from apps.core.api_permissions import has_perm_code
-    from apps.core.warehouse_scope import (
-        filter_queryset_by_related_warehouse,
-        get_membership_for_request,
-    )
+    from apps.core.warehouse_scope import LECTURE, borner_visibilite_requete
     from apps.sales.models import Sale
 
     qs = Sale.objects.filter(customer=customer, is_deleted=False)
 
-    membership = get_membership_for_request(request)
-    if membership:
-        qs = filter_queryset_by_related_warehouse(
-            qs, membership, 'warehouse_id',
-            # ⚠ `include_null=True`, comme `SaleViewSet` : les ventes anciennes
-            #   n'ont pas d'entrepôt, et les exclure ferait disparaître du
-            #   rapport ce que la liste au-dessus montre.
-            include_null=True,
-        )
-    if not has_perm_code(request, 'sales.view_all'):
-        qs = qs.filter(sold_by=request.user)
+    # Le périmètre de `SaleViewSet`, par le même corps : entrepôt, puis auteur
+    # (`sales.view_all`, ou la case « consulter tous les entrepôts »).
+    qs = borner_visibilite_requete(
+        qs, request,
+        nature=LECTURE,
+        warehouse_field='warehouse_id',
+        author_field='sold_by',
+        # ⚠ `include_null=True`, comme `SaleViewSet` : les ventes anciennes
+        #   n'ont pas d'entrepôt, et les exclure ferait disparaître du rapport
+        #   ce que la liste au-dessus montre.
+        include_null_warehouse=True,
+    )
 
     if debut:
         qs = qs.filter(sale_date__gte=debut)

@@ -242,6 +242,50 @@ class OrganizationService:
                 user.save(update_fields=['active_organization'])
 
 
+#: Permissions que seul le PROPRIÉTAIRE porte, par son rôle, et qui ne
+#: s'accordent jamais par `extra_permissions`. Créer ou supprimer un entrepôt
+#: décide du périmètre de TOUS les membres : un gérant qui se l'accorderait, ou
+#: l'accorderait à un caissier, ouvrirait ce que la règle d'isolation ferme.
+PERMISSIONS_RESERVEES_PROPRIETAIRE = frozenset({
+    'warehouses.create',
+    'warehouses.delete',
+})
+
+
+def refuser_permissions_hors_portee(demandeur, cible, demandees):
+    """
+    Lève `ValidationError` si `demandeur` accorde à `cible` ce qu'il n'a pas.
+
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │ ON N'ACCORDE QUE CE QU'ON POSSÈDE.                                   │
+    │                                                                      │
+    │ Un gérant pouvait cocher, sur un caissier, n'importe quelle          │
+    │ permission du catalogue - créer ou supprimer un entrepôt comprise.   │
+    │ Deux règles, et elles ne portent que sur les AJOUTS : retirer reste  │
+    │ libre, et une permission que la cible tenait déjà (accordée par le   │
+    │ propriétaire) n'empêche pas le gérant d'enregistrer le reste.        │
+    └──────────────────────────────────────────────────────────────────────┘
+    """
+    from rest_framework.exceptions import ValidationError
+
+    ajouts = set(demandees or []) - set(cible.extra_permissions or [])
+    reservees = sorted(ajouts & PERMISSIONS_RESERVEES_PROPRIETAIRE)
+    if reservees:
+        raise ValidationError({'extra_permissions': (
+            "Réservées au propriétaire, elles ne s'accordent pas : "
+            + ', '.join(reservees) + '.'
+        )})
+    if demandeur.role == demandeur.Role.OWNER:
+        return
+    possedees = set(PermissionService.get_effective_permissions(demandeur))
+    hors_portee = sorted(ajouts - possedees)
+    if hors_portee:
+        raise ValidationError({'extra_permissions': (
+            "Vous ne pouvez accorder que des permissions que vous avez vous-même : "
+            + ', '.join(hors_portee) + '.'
+        )})
+
+
 class PermissionService:
     """
     Service de gestion des permissions basé sur les rôles.
@@ -378,6 +422,12 @@ class PermissionService:
             'customers.view',
             # Livre de caisse (lecture seule)
             'cashbook.view',
+            # ⚠ « Voir le travail de ses collègues, dans ses entrepôts » : le
+            # magasinier lit d'office ce que son équipe a fait dans SON dépôt,
+            # comme le gérant. Le code garde son nom historique (`sales.`),
+            # mais il porte aussi les dépenses, la caisse, les retours et les
+            # devis - voir `apps.core.warehouse_scope`.
+            'sales.view_all',
             # Dashboard
             'dashboard.view',
         ],

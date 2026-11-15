@@ -25,11 +25,7 @@ from .filters import (
     GoodsReceiptFilter, PurchaseOrderFilter, PurchaseReturnFilter,
     SupplierPaymentFilter,
 )
-from apps.core.warehouse_scope import (
-    accessible_warehouse_ids,
-    assert_warehouse_allowed_for_request,
-    get_membership_for_request,
-)
+from apps.core.warehouse_scope import exiger_entrepot_actionnable_requete
 from apps.contacts import supplier_debt
 from apps.core.api_permissions import (
     DENY,
@@ -237,23 +233,12 @@ class PurchaseOrderViewSet(
     @action(detail=False, methods=['get'])
     def pending(self, request):
         """Retourne les commandes en attente de réception avec pagination."""
-        organization = self.get_organization()
-        
-        pos = PurchaseOrder.objects.filter(
-            organization=organization,
+        # ⚠ LE PÉRIMÈTRE DE LA LISTE, PAS UNE COPIE. Cette action réécrivait la
+        #   borne à la main, et « aucun entrepôt assigné » y rendait les seules
+        #   commandes sans entrepôt là où la liste ne rend rien.
+        pos = self.filter_queryset(self.get_queryset()).filter(
             status__in=['sent', 'confirmed', 'partially_received'],
-            is_deleted=False
         ).select_related('supplier').order_by('expected_date')
-
-        # Restreindre au périmètre du membre
-        membership = get_membership_for_request(request)
-        if membership:
-            allowed_ids = accessible_warehouse_ids(membership)
-            if allowed_ids is not None:
-                from django.db.models import Q
-                pos = pos.filter(
-                    Q(warehouse_id__in=allowed_ids) | Q(warehouse__isnull=True)
-                )
         
         page = self.paginate_queryset(pos)
         if page is not None:
@@ -836,9 +821,12 @@ class RequisitionViewSet(
     #   deux surfaces disaient deux choses du même périmètre.
     #
     # ⚠ PAS de `WarehouseAssertCreateMixin` : `create()` appelle déjà
-    #   `assert_warehouse_allowed_for_request` plus bas, et l'ajouter ferait
+    #   `exiger_entrepot_actionnable_requete` plus bas, et l'ajouter ferait
     #   deux contrôles du même geste.
     warehouse_scope_field = 'warehouse_id'
+    # La proposition est un GET, mais elle prépare une demande : elle ne vaut
+    # que pour un entrepôt où le membre peut AGIR.
+    actions_preparatoires = ('proposer',)
 
     action_permissions = {
         'list': 'requisitions.view',
@@ -889,7 +877,7 @@ class RequisitionViewSet(
             )
         # Le périmètre, par le même chemin que partout : un refus LÈVE, il ne
         # rend jamais un ensemble vide.
-        assert_warehouse_allowed_for_request(request, wid)
+        exiger_entrepot_actionnable_requete(request, wid)
         depot = Warehouse.objects.filter(organization=org, id=wid).first()
         if depot is None:
             return Response(
@@ -925,7 +913,7 @@ class RequisitionViewSet(
         donnees = entree.validated_data
 
         org = self.get_organization()
-        assert_warehouse_allowed_for_request(request, str(donnees['warehouse']))
+        exiger_entrepot_actionnable_requete(request, str(donnees['warehouse']))
         depot = Warehouse.objects.filter(
             organization=org, id=donnees['warehouse']
         ).first()

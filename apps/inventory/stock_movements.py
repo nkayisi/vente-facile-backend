@@ -21,7 +21,7 @@ from decimal import Decimal
 from django.db import transaction
 from django.utils import timezone
 
-from apps.core.warehouse_scope import assert_warehouse_allowed_for_request
+from apps.core.warehouse_scope import exiger_entrepot_actionnable_requete
 
 from .models import STOCK_OUT_MOVEMENT_TYPES, Stock
 
@@ -115,7 +115,7 @@ def _ecrire_mouvement(serializer, *, organization, user, request=None, **extra):
 
     data = serializer.validated_data
     if request is not None:
-        assert_warehouse_allowed_for_request(request, data['warehouse'].id)
+        exiger_entrepot_actionnable_requete(request, data['warehouse'].id)
 
     produit = data['product']
     # Le verrou d'inventaire, AVANT tout verrou de ligne : voir `verrous.py`.

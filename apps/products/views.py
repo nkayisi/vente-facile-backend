@@ -23,11 +23,14 @@ from apps.core.api_mixins import (
     TenantViewSetMixin,
 )
 from apps.core.warehouse_scope import (
-    accessible_warehouse_ids,
-    assert_warehouse_allowed_for_request,
+    LECTURE,
+    entrepots_du_perimetre,
+    entrepots_lisibles,
+    exiger_entrepot_lisible_requete,
     filter_products_by_warehouse_ids,
     filter_queryset_by_warehouse_ids,
     get_membership_for_request,
+    nature_de_la_requete,
 )
 from apps.core.api_permissions import (
     IsTenantMember, HasActiveSubscription, TenantObjectPermission, HasPermission
@@ -163,7 +166,7 @@ class CategoryViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
 
         membership = get_membership_for_request(self.request)
         if warehouse_id:
-            assert_warehouse_allowed_for_request(self.request, warehouse_id)
+            exiger_entrepot_lisible_requete(self.request, warehouse_id)
             stock_qs = Stock.objects.filter(
                 product__organization=organization,
                 product__category_id=OuterRef('pk'),
@@ -172,7 +175,7 @@ class CategoryViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
                 product__is_deleted=False,
             )
         else:
-            wh_ids = accessible_warehouse_ids(membership) if membership else None
+            wh_ids = entrepots_lisibles(membership) if membership else None
             stock_qs = Stock.objects.filter(
                 product__organization=organization,
                 product__category_id=OuterRef('pk'),
@@ -192,7 +195,7 @@ class CategoryViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         category = self.get_object()
 
         m = get_membership_for_request(request)
-        wh_ids = accessible_warehouse_ids(m) if m else None
+        wh_ids = entrepots_lisibles(m) if m else None
 
         base_qs = Product.objects.filter(
             organization=category.organization,
@@ -502,12 +505,19 @@ class ProductViewSet(ExportableListMixin, TenantViewSetMixin, AuditMixin,
                 'stocks__warehouse', 'stocks__location',
             )
 
+        # Lire un article et le modifier ne relèvent pas du même périmètre :
+        # la case « consulter tous les entrepôts » ouvre la lecture, jamais la
+        # modification d'un article qui n'est stocké que dans un autre dépôt.
         m = get_membership_for_request(self.request)
-        wh_ids = accessible_warehouse_ids(m) if m else None
+        wh_ids = (
+            entrepots_du_perimetre(m, nature_de_la_requete(self.request)) if m else None
+        )
         warehouse_param = self.request.query_params.get('warehouse')
         effective_wh_ids = wh_ids
         if warehouse_param:
-            assert_warehouse_allowed_for_request(self.request, warehouse_param)
+            # Le stock d'un entrepôt se LIT : un membre « consulter tous » voit
+            # la disponibilité des autres dépôts depuis le comptoir.
+            exiger_entrepot_lisible_requete(self.request, warehouse_param)
             effective_wh_ids = [warehouse_param]
 
         action = getattr(self, 'action', None)
@@ -561,7 +571,9 @@ class ProductViewSet(ExportableListMixin, TenantViewSetMixin, AuditMixin,
         stocks = product.stocks.select_related('warehouse', 'location').all()
         m = get_membership_for_request(request)
         if m:
-            stocks = filter_queryset_by_warehouse_ids(stocks, m, 'warehouse_id')
+            stocks = filter_queryset_by_warehouse_ids(
+                stocks, m, 'warehouse_id', nature=LECTURE,
+            )
         
         data = [
             {
@@ -584,7 +596,7 @@ class ProductViewSet(ExportableListMixin, TenantViewSetMixin, AuditMixin,
         """Retourne les produits en stock bas avec pagination."""
         organization = self.get_organization()
         m = get_membership_for_request(request)
-        wh_ids = accessible_warehouse_ids(m) if m else None
+        wh_ids = entrepots_lisibles(m) if m else None
 
         products_qs = Product.objects.filter(
             organization=organization,

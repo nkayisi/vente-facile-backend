@@ -94,7 +94,26 @@ class JetonTests(_Base):
         self.assertNotEqual(self._jeton('cashier_a', 'sales'), self._jeton('cashier_b', 'sales'))
 
     def test_qui_n_est_pas_borne_garde_son_jeton(self):
-        # Les devis ne sont bornés par aucun entrepôt : sans borne d'auteur,
-        # leur jeton reste celui d'une table d'organisation, donc INCHANGÉ.
-        self.assertEqual(self._jeton('manager', 'quotations'), SCOPE_TOKEN_ORG)
-        self.assertEqual(self._jeton('owner', 'quotations'), SCOPE_TOKEN_ORG)
+        # Sans borne d'auteur, le jeton est celui de l'ENTREPÔT, sans suffixe.
+        # ⚠ Les devis portent désormais leur entrepôt (2026-11-14) : leur jeton
+        #   n'est plus celui d'une table d'organisation, et leur révision le
+        #   change une fois pour tout le parc. Ce qui doit rester vrai, c'est
+        #   qu'aucun auteur n'y est nommé pour qui voit le travail des autres.
+        from hashlib import blake2s
+
+        from apps.sync.pull import _jeton_entrepot
+
+        table = PULL_TABLES_BY_NAME['quotations']
+        for qui in ('manager', 'owner'):
+            with self.subTest(qui):
+                adhesion = self._adhesion(qui)
+                attendu = blake2s(
+                    f'{_jeton_entrepot(table, adhesion)}|revision|{table.revision}'.encode(),
+                    digest_size=8,
+                ).hexdigest()
+                self.assertEqual(self._jeton(qui, 'quotations'), attendu)
+        # Et les ventes, qui n'ont pas de révision, gardent leur jeton d'entrepôt.
+        self.assertEqual(
+            self._jeton('manager', 'sales'),
+            _jeton_entrepot(PULL_TABLES_BY_NAME['sales'], self._adhesion('manager')),
+        )

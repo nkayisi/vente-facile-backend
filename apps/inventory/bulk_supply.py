@@ -33,7 +33,7 @@ from decimal import Decimal
 from django.db import transaction
 from rest_framework import serializers
 
-from apps.core.warehouse_scope import assert_warehouse_allowed_for_request
+from apps.core.warehouse_scope import exiger_entrepot_actionnable_requete
 
 from .models import STOCK_IN_MOVEMENT_TYPES, Stock
 from .packaging import PackagingService
@@ -252,7 +252,7 @@ def create_bulk_supply(*, organization, user, warehouse, movement_type, lines,
         })
 
     if request is not None:
-        assert_warehouse_allowed_for_request(request, warehouse.id)
+        exiger_entrepot_actionnable_requete(request, warehouse.id)
 
     # ⚠ UNE LIGNE À QUANTITÉ NULLE EST IGNORÉE, PAS REFUSÉE. Une feuille
     #   pré-remplie de quarante articles dont on n'en reçoit que douze est le cas

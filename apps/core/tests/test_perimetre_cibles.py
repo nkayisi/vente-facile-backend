@@ -165,7 +165,7 @@ class CiblesDuPerimetreTests(TestCase):
         et compterait deux fois contre le plafond de deux cents.
         """
         self.gerant_a.assigned_warehouses.add(self.depot_b)
-        self.gerant_a._accessible_warehouse_ids = None
+        self.gerant_a._entrepots_affectes = None
         polyvalent = OrganizationMembership.objects.create(
             user=_u('poly@t.test', 'Poly'), organization=self.org,
             role=OrganizationMembership.Role.CASHIER, is_active=True,

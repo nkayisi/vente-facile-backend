@@ -18,11 +18,16 @@ from apps.core.api_mixins import (
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from django.core.exceptions import ValidationError as DjangoValidationError
 from apps.core.warehouse_scope import (
-    accessible_warehouse_ids,
-    assert_warehouse_allowed_for_request,
+    LECTURE,
+    entrepots_lisibles,
+    exiger_cote_du_transfert,
+    exiger_entrepot_actionnable_requete,
+    exiger_entrepot_de_destination,
+    exiger_entrepot_lisible_requete,
     filter_queryset_by_warehouse_ids,
     filter_stock_transfer_queryset,
     get_membership_for_request,
+    nature_de_la_requete,
 )
 from apps.core.api_permissions import (
     DENY,
@@ -163,14 +168,14 @@ class StockLocationViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, vie
     }
 
     def perform_create(self, serializer):
-        assert_warehouse_allowed_for_request(
+        exiger_entrepot_actionnable_requete(
             self.request, serializer.validated_data['warehouse'].id
         )
         super().perform_create(serializer)
 
     def perform_update(self, serializer):
         if 'warehouse' in serializer.validated_data:
-            assert_warehouse_allowed_for_request(
+            exiger_entrepot_actionnable_requete(
                 self.request, serializer.validated_data['warehouse'].id
             )
         super().perform_update(serializer)
@@ -178,7 +183,7 @@ class StockLocationViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, vie
     @action(detail=False, methods=['get'], url_path='by-warehouse/(?P<warehouse_id>[^/.]+)')
     def by_warehouse(self, request, warehouse_id=None):
         """Retourne tous les emplacements actifs d'un entrepôt."""
-        assert_warehouse_allowed_for_request(request, warehouse_id)
+        exiger_entrepot_lisible_requete(request, warehouse_id)
         organization = self.get_organization()
         locations = StockLocation.objects.filter(
             organization=organization,
@@ -317,7 +322,9 @@ class StockViewSet(ExportResponseMixin, WarehouseScopedQuerysetMixin, TenantView
         ).select_related('warehouse', 'location')
         m = get_membership_for_request(request)
         if m:
-            stocks = filter_queryset_by_warehouse_ids(stocks, m, 'warehouse_id')
+            stocks = filter_queryset_by_warehouse_ids(
+                stocks, m, 'warehouse_id', nature=LECTURE,
+            )
         
         page = self.paginate_queryset(stocks)
         if page is not None:
@@ -331,7 +338,7 @@ class StockViewSet(ExportResponseMixin, WarehouseScopedQuerysetMixin, TenantView
     def by_warehouse(self, request, warehouse_id=None):
         """Retourne tout le stock d'un entrepôt."""
         organization = self.get_organization()
-        assert_warehouse_allowed_for_request(request, warehouse_id)
+        exiger_entrepot_lisible_requete(request, warehouse_id)
         stocks = Stock.objects.filter(
             organization=organization,
             warehouse_id=warehouse_id
@@ -359,7 +366,9 @@ class StockViewSet(ExportResponseMixin, WarehouseScopedQuerysetMixin, TenantView
         )
         m = get_membership_for_request(request)
         if m:
-            stocks = filter_queryset_by_warehouse_ids(stocks, m, 'warehouse_id')
+            stocks = filter_queryset_by_warehouse_ids(
+                stocks, m, 'warehouse_id', nature=LECTURE,
+            )
         
         page = self.paginate_queryset(stocks)
         if page is not None:
@@ -385,7 +394,9 @@ class StockViewSet(ExportResponseMixin, WarehouseScopedQuerysetMixin, TenantView
         ).select_related('product', 'product__unit', 'warehouse').order_by('expiry_date')
         m = get_membership_for_request(request)
         if m:
-            batches = filter_queryset_by_warehouse_ids(batches, m, 'warehouse_id')
+            batches = filter_queryset_by_warehouse_ids(
+                batches, m, 'warehouse_id', nature=LECTURE,
+            )
         
         page = self.paginate_queryset(batches)
         if page is not None:
@@ -409,12 +420,14 @@ class StockViewSet(ExportResponseMixin, WarehouseScopedQuerysetMixin, TenantView
         ).select_related('product', 'product__unit', 'warehouse', 'variant')
         
         if warehouse_id:
-            assert_warehouse_allowed_for_request(request, warehouse_id)
+            exiger_entrepot_lisible_requete(request, warehouse_id)
             batches = batches.filter(warehouse_id=warehouse_id)
         else:
             m = get_membership_for_request(request)
             if m:
-                batches = filter_queryset_by_warehouse_ids(batches, m, 'warehouse_id')
+                batches = filter_queryset_by_warehouse_ids(
+                    batches, m, 'warehouse_id', nature=LECTURE,
+                )
         
         if not include_empty:
             batches = batches.filter(quantity__gt=0)
@@ -453,7 +466,13 @@ class StockBatchViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, viewse
     
     queryset = StockBatch.objects.all()
     serializer_class = StockBatchSerializer
-    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription]
+    # ⚠ `HasPermission` MANQUAIT : tout membre lisait les lots, caissier compris,
+    #   quand les mêmes lots servis par `StockViewSet` exigent `stock.view`.
+    permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
+    action_permissions = {
+        'list': 'stock.view',
+        'retrieve': 'stock.view',
+    }
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['warehouse', 'product']
     search_fields = ['batch_number', 'product__name']
@@ -516,6 +535,10 @@ class StockMovementViewSet(ExportResponseMixin, WarehouseScopedQuerysetMixin, Te
         'partial_update': DENY,
         'destroy': DENY,
     }
+
+    # La feuille est un GET, mais elle prépare une écriture : elle ne propose
+    # que les entrepôts où le membre peut AGIR.
+    actions_preparatoires = ('supply_sheet',)
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -596,7 +619,7 @@ class StockMovementViewSet(ExportResponseMixin, WarehouseScopedQuerysetMixin, Te
         identifiant = donnees.get('warehouse')
         if not identifiant:
             raise DRFValidationError({'warehouse': "Indiquez l'entrepôt."})
-        assert_warehouse_allowed_for_request(request, identifiant)
+        exiger_entrepot_actionnable_requete(request, identifiant)
         try:
             return Warehouse.objects.get(id=identifiant, organization=organization)
         except (Warehouse.DoesNotExist, DjangoValidationError, ValueError, TypeError):
@@ -713,10 +736,16 @@ class TransitionActionMixin:
     #: publié - le changer casserait le back-office en silence.
     transition_serializer = None
 
-    def _transition(self, fonction, serialiser=False, **extra):
+    def _transition(self, fonction, serialiser=False, cote=None, **extra):
         from .services import TransitionRefusee
+        objet = self.get_object()
+        if cote is not None:
+            # Approuver, expédier et annuler appartiennent à la SOURCE ;
+            # recevoir appartient à la DESTINATION. Le même contrôle vit dans
+            # le journal du terminal (`_transition_transfert`).
+            exiger_cote_du_transfert(get_membership_for_request(self.request), objet, cote)
         try:
-            resultat = fonction(self.get_object(), self.request.user, **extra)
+            resultat = fonction(objet, self.request.user, **extra)
         except TransitionRefusee as exc:
             return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         if serialiser and self.transition_serializer is not None:
@@ -765,13 +794,26 @@ class StockTransferViewSet(TransitionActionMixin, TenantViewSetMixin, AuditMixin
         qs = super().get_queryset()
         m = get_membership_for_request(self.request)
         if m:
-            qs = filter_stock_transfer_queryset(qs, m)
+            qs = filter_stock_transfer_queryset(
+                qs, m, nature=nature_de_la_requete(self.request),
+            )
         return qs
 
     def perform_create(self, serializer):
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ LA SOURCE EST À SOI, LA DESTINATION EST À TOUS.                  │
+        # │                                                                  │
+        # │ Les deux côtés devaient être affectés au membre : un magasinier  │
+        # │ du dépôt central ne pouvait pas approvisionner une boutique. On  │
+        # │ expédie depuis SES entrepôts vers n'importe quel entrepôt actif. │
+        # └──────────────────────────────────────────────────────────────────┘
         va = serializer.validated_data
-        assert_warehouse_allowed_for_request(self.request, va['source_warehouse'].id)
-        assert_warehouse_allowed_for_request(self.request, va['destination_warehouse'].id)
+        exiger_entrepot_actionnable_requete(
+            self.request, va['source_warehouse'].id, champ='source_warehouse',
+        )
+        exiger_entrepot_de_destination(
+            get_membership_for_request(self.request), va['destination_warehouse'].id,
+        )
         super().perform_create(serializer)
 
     def get_serializer_class(self):
@@ -790,27 +832,28 @@ class StockTransferViewSet(TransitionActionMixin, TenantViewSetMixin, AuditMixin
     def approve(self, request, pk=None):
         """Approuve un transfert en attente."""
         from .services import approve_transfer
-        return self._transition(approve_transfer)
+        return self._transition(approve_transfer, cote='source')
 
     @action(detail=True, methods=['post'])
     def ship(self, request, pk=None):
         """Marque un transfert comme expédié et déduit le stock source."""
         from .services import ship_transfer
-        return self._transition(ship_transfer)
+        return self._transition(ship_transfer, cote='source')
 
     @action(detail=True, methods=['post'])
     def receive(self, request, pk=None):
         """Marque un transfert comme reçu et ajoute le stock destination."""
         from .services import receive_transfer
         return self._transition(
-            receive_transfer, received_items=request.data.get('items', []),
+            receive_transfer, cote='destination',
+            received_items=request.data.get('items', []),
         )
 
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
         """Annule un transfert."""
         from .services import cancel_transfer
-        return self._transition(cancel_transfer)
+        return self._transition(cancel_transfer, cote='source')
 
 
 
@@ -848,14 +891,14 @@ class StockAdjustmentViewSet(TransitionActionMixin, WarehouseScopedQuerysetMixin
     }
 
     def perform_create(self, serializer):
-        assert_warehouse_allowed_for_request(
+        exiger_entrepot_actionnable_requete(
             self.request, serializer.validated_data['warehouse'].id
         )
         super().perform_create(serializer)
 
     def perform_update(self, serializer):
         if 'warehouse' in serializer.validated_data:
-            assert_warehouse_allowed_for_request(
+            exiger_entrepot_actionnable_requete(
                 self.request, serializer.validated_data['warehouse'].id
             )
         super().perform_update(serializer)
@@ -944,7 +987,7 @@ class InventorySessionViewSet(ExportResponseMixin, TransitionActionMixin,
     }
 
     def perform_create(self, serializer):
-        assert_warehouse_allowed_for_request(
+        exiger_entrepot_actionnable_requete(
             self.request, serializer.validated_data['warehouse'].id
         )
         super().perform_create(serializer)
@@ -1098,7 +1141,7 @@ class InventorySessionViewSet(ExportResponseMixin, TransitionActionMixin,
         """
         organization = self.get_organization()
         m = get_membership_for_request(request)
-        wh_scope = accessible_warehouse_ids(m) if m else None
+        wh_scope = entrepots_lisibles(m) if m else None
         if wh_scope is not None and not wh_scope:
             return Response({
                 'locked_product_ids': [],

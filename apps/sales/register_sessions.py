@@ -52,6 +52,29 @@ class SessionDejaOuverte(TransitionRefusee):
         )
 
 
+class SessionPersonnelleOuverte(TransitionRefusee):
+    """
+    Le membre a DÉJÀ une session ouverte, sur une autre caisse.
+
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │ UNE PERSONNE, UN TIROIR À LA FOIS.                                   │
+    │                                                                      │
+    │ Rien n'empêchait un caissier d'ouvrir une session sur deux caisses : │
+    │ chacune comptait alors une partie de sa journée, et aucun des deux Z │
+    │ ne correspondait à ce qu'il avait encaissé. Le refus nomme l'autre   │
+    │ caisse : c'est elle qu'il faut clôturer d'abord.                     │
+    └──────────────────────────────────────────────────────────────────────┘
+    """
+
+    def __init__(self, session):
+        self.session = session
+        super().__init__(
+            f"Vous avez déjà une session ouverte sur {session.register.name}, "
+            f"depuis le {session.opened_at:%d/%m à %H:%M}. Clôturez-la avant "
+            "d'en ouvrir une autre."
+        )
+
+
 class NoteRequise(TransitionRefusee):
     """
     Écart constaté sans explication.
@@ -290,7 +313,10 @@ def open_register_session(
     from django.db import IntegrityError, transaction
 
     from apps.core.warehouse_scope import (
-        filter_queryset_by_warehouse_ids, get_membership_for_request,
+        ACTION,
+        exiger_entrepot_actionnable,
+        filter_queryset_by_warehouse_ids,
+        get_membership_for_request,
     )
 
     from .models import Register, RegisterSession, RegisterSessionCurrencyBalance
@@ -298,15 +324,20 @@ def open_register_session(
     caisses = Register.objects.filter(
         id=register_id, organization=organization, is_active=True
     )
-    if request is not None:
-        membership = get_membership_for_request(request)
-        if membership:
-            caisses = filter_queryset_by_warehouse_ids(
-                caisses, membership, 'warehouse_id'
-            )
+    membership = get_membership_for_request(request) if request is not None else None
+    if membership:
+        # ACTION : on ouvre une caisse pour y vendre. La case « consulter
+        # tous les entrepôts » ne donne pas un tiroir dans un autre dépôt.
+        caisses = filter_queryset_by_warehouse_ids(
+            caisses, membership, 'warehouse_id', nature=ACTION,
+        )
     caisse = caisses.first()
     if caisse is None:
         raise CaisseIntrouvable("Caisse non trouvée ou inactive")
+    if membership and caisse.warehouse_id:
+        # Un entrepôt désactivé est fermé à toute opération, propriétaire
+        # compris : le refus le nomme.
+        exiger_entrepot_actionnable(membership, caisse.warehouse_id, champ='register')
 
     principale = organization.currency or 'CDF'
     try:
@@ -323,6 +354,11 @@ def open_register_session(
                 if session_id and str(ouverte.id) == str(session_id):
                     return ouverte
                 raise SessionDejaOuverte(ouverte)
+
+            # Une personne, un tiroir : sa session ouverte AILLEURS bloque.
+            ailleurs = _session_ouverte_du_membre(organization, user, verrou=True)
+            if ailleurs is not None:
+                raise SessionPersonnelleOuverte(ailleurs)
 
             # Le fonds d'ouverture, hérité PAR DEVISE de la dernière clôture.
             herite = {}
@@ -374,12 +410,28 @@ def open_register_session(
                     opening_balance=montant,
                 )
     except IntegrityError:
-        # Filet de la contrainte d'unicité : une autre requête a gagné la course.
+        # Filet des deux contraintes d'unicité : une autre requête a gagné la
+        # course, sur cette caisse ou pour ce membre.
         ouverte = RegisterSession.objects.filter(
             register=caisse, status='open'
-        ).first()
+        ).select_related('register', 'opened_by').first()
         if ouverte is not None:
             raise SessionDejaOuverte(ouverte)
+        ailleurs = _session_ouverte_du_membre(organization, user)
+        if ailleurs is not None:
+            raise SessionPersonnelleOuverte(ailleurs)
         raise
 
     return session
+
+
+def _session_ouverte_du_membre(organization, user, *, verrou=False):
+    """La session ouverte de ce membre dans cet établissement, ou `None`."""
+    from .models import RegisterSession
+
+    qs = RegisterSession.objects.filter(
+        organization=organization, opened_by=user, status='open',
+    )
+    if verrou:
+        qs = qs.select_for_update()
+    return qs.select_related('register').order_by('opened_at').first()
