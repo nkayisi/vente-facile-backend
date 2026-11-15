@@ -480,6 +480,7 @@ def build_session_payload(user, organization, device=None):
     ).first()
 
     from apps.core.warehouse_scope import empreinte_perimetre
+    from apps.inventory.entrepots import annuaire
 
     permissions, role, warehouses = [], None, []
     consulte_tout, perimetre_version = False, ''
@@ -533,6 +534,16 @@ def build_session_payload(user, organization, device=None):
         # Sœur de `membership`, et non dedans : `membership` décrit le PORTEUR,
         # `team` décrit l'organisation.
         'team': team,
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ L'ANNUAIRE DES ENTREPÔTS, POUR CHOISIR OÙ LIVRER, HORS LIGNE.    │
+        # │                                                                  │
+        # │ La destination d'un transfert est tout entrepôt actif, y compris │
+        # │ ceux que le tirage ne descend pas sur ce terminal (il n'a que     │
+        # │ les siens). Des NOMS seuls : ni adresse, ni stock.               │
+        # │ ⚠ PAS une table tirée : une table nouvelle au manifeste ferait   │
+        # │ échouer le tirage des terminaux anciens, qui l'ignorent ici.     │
+        # └──────────────────────────────────────────────────────────────────┘
+        'warehouse_directory': annuaire(organization),
         'settings': (
             OrganizationSettingsSerializer(settings_row).data if settings_row else None
         ),

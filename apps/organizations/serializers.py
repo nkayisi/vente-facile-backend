@@ -299,7 +299,8 @@ class MembershipCreateSerializer(serializers.Serializer):
         )
 
         validate_membership_warehouse_ids(
-            attrs['role'], attrs['warehouse_ids'], org
+            attrs['role'], attrs['warehouse_ids'], org,
+            demandeur=self.context.get('demandeur'),
         )
         return attrs
 
@@ -337,7 +338,8 @@ class MemberCreateWithUserSerializer(serializers.Serializer):
         )
 
         validate_membership_warehouse_ids(
-            attrs['role'], attrs['warehouse_ids'], org
+            attrs['role'], attrs['warehouse_ids'], org,
+            demandeur=self.context.get('demandeur'),
         )
         return attrs
 
@@ -388,7 +390,14 @@ class MembershipUpdateSerializer(serializers.Serializer):
             validate_membership_warehouse_ids,
         )
 
-        validate_membership_warehouse_ids(role, warehouse_ids, org)
+        validate_membership_warehouse_ids(
+            role, warehouse_ids, org,
+            demandeur=self.context.get('demandeur'),
+            actuels=list(
+                membership.assigned_warehouses.filter(is_deleted=False)
+                .values_list('id', flat=True)
+            ),
+        )
         return attrs
 
 

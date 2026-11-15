@@ -56,6 +56,14 @@ class Warehouse(TenantSoftDeleteModel):
                 condition=models.Q(is_deleted=False),
                 name='unique_warehouse_code_per_org'
             ),
+            # UN principal par établissement : c'est lui qu'on donne d'office à
+            # un membre nouveau. Le désigner passe par `designer_principal`, qui
+            # retire le titre aux autres AVANT de le poser.
+            models.UniqueConstraint(
+                fields=['organization'],
+                condition=models.Q(is_default=True, is_deleted=False),
+                name='un_seul_entrepot_principal_par_org',
+            ),
         ]
 
     def __str__(self):
@@ -251,6 +259,29 @@ class Stock(TenantModel):
             F('quantity') * cls.unit_cost_expression(),
             output_field=DecimalField(max_digits=24, decimal_places=4),
         )
+
+    @classmethod
+    def valeur_par_entrepot(cls):
+        """
+        La valeur du stock d'un entrepôt, en sous-requête à poser sur `Warehouse`.
+
+        ⚠ La liste des entrepôts hydratait chaque ligne de stock de chaque
+        entrepôt pour sommer en Python : quinze mille objets pour 5 000
+        articles sur trois dépôts, à chaque ouverture de la page Stock. Même
+        règle que `total_value_for`, en une seule requête pour toute la liste.
+        """
+        from django.db.models import DecimalField, OuterRef, Subquery, Sum, Value
+        from django.db.models.functions import Coalesce
+
+        par_entrepot = (
+            cls.objects.filter(warehouse=OuterRef('pk'))
+            .order_by()
+            .values('warehouse')
+            .annotate(v=Sum(cls.total_value_expression()))
+            .values('v')
+        )
+        sortie = DecimalField(max_digits=24, decimal_places=4)
+        return Coalesce(Subquery(par_entrepot, output_field=sortie), Value(Decimal('0')), output_field=sortie)
 
     @classmethod
     def total_value_for(cls, queryset):

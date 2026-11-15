@@ -25,13 +25,18 @@ def entrepot_principal(organization):
     """
     L'entrepôt à donner par défaut : ``is_default``, sinon le premier actif.
 
-    Rend ``None`` quand l'organisation n'en a aucun - une jeune organisation,
-    ou une configuration à reprendre. On ne fabrique rien dans ce cas.
+    Rend ``None`` quand l'organisation n'a aucun entrepôt ACTIF - une jeune
+    organisation, ou une configuration à reprendre. On ne fabrique rien.
+
+    ⚠ JAMAIS UN ENTREPÔT DÉSACTIVÉ : le donner à un membre nouveau le ferait
+    naître dans un entrepôt où il ne peut rien faire, et il lirait « votre
+    entrepôt est désactivé » au premier écran.
     """
-    qs = Warehouse.objects.filter(organization=organization, is_deleted=False)
+    qs = Warehouse.objects.filter(
+        organization=organization, is_deleted=False, is_active=True,
+    )
     return (
         qs.filter(is_default=True).order_by('name').first()
-        or qs.filter(is_active=True).order_by('name').first()
         or qs.order_by('name').first()
     )
 

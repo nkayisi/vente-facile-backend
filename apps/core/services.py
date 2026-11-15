@@ -177,7 +177,13 @@ class OrganizationService:
 
         org = organization or membership.organization
         validated = validate_membership_warehouse_ids(
-            membership.role, warehouse_ids, org
+            membership.role, warehouse_ids, org,
+            # ⚠ Les affectations en place restent permises, même sur un entrepôt
+            #   désactivé : seul un AJOUT de celui-ci est refusé.
+            actuels=list(
+                membership.assigned_warehouses.filter(is_deleted=False)
+                .values_list('id', flat=True)
+            ),
         )
         if membership.role == OrganizationMembership.Role.OWNER:
             membership.assigned_warehouses.clear()
@@ -359,7 +365,9 @@ class PermissionService:
             'categories.view', 'categories.create', 'categories.edit', 'categories.delete',
             # Stock
             'stock.view', 'stock.adjust',
-            'warehouses.view', 'warehouses.create', 'warehouses.edit',
+            # ⚠ Ni `.create` ni `.delete` : créer ou supprimer un entrepôt
+            # décide du périmètre de tous les membres, c'est au propriétaire.
+            'warehouses.view', 'warehouses.edit',
             'stock_movements.view', 'stock_movements.create',
             'stock_transfers.view', 'stock_transfers.create', 'stock_transfers.ship',
             'stock_transfers.receive', 'stock_transfers.cancel',
@@ -483,6 +491,13 @@ class PermissionService:
             return []
         role_perms = set(cls.get_role_permissions(membership.role))
         extra_perms = set(membership.extra_permissions or [])
+        # ⚠ UNE PERMISSION RÉSERVÉE ACCORDÉE AVANT LA RÈGLE N'OUVRE RIEN.
+        # `refuser_permissions_hors_portee` empêche désormais de l'accorder,
+        # mais un gérant qui l'avait reçue par `extra_permissions` la garderait
+        # en base, et créerait encore des entrepôts. On la lit ici, au seul
+        # point où tout contrôle de droit passe.
+        if membership.role != OrganizationMembership.Role.OWNER:
+            extra_perms -= PERMISSIONS_RESERVEES_PROPRIETAIRE
         return sorted(role_perms | extra_perms)
 
     @classmethod

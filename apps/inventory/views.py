@@ -94,6 +94,9 @@ class WarehouseViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, AuditMi
         'partial_update': 'warehouses.edit',
         'destroy': 'warehouses.delete',
         'stock_summary': 'stock.view',
+        # L'annuaire nomme les entrepôts, sans adresse ni stock : c'est la
+        # destination d'un transfert, qu'on choisit sans y travailler.
+        'directory': 'warehouses.view',
     }
 
     def get_serializer_class(self):
@@ -103,10 +106,115 @@ class WarehouseViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, AuditMi
             return WarehouseCreateSerializer
         return WarehouseDetailSerializer
 
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if self.action in ('list', 'retrieve'):
+            # ⚠ Une requête pour toute la liste, plus une par entrepôt : la
+            # valeur du stock se calculait en hydratant chaque ligne de stock.
+            queryset = queryset.annotate(_valeur_stock=Stock.valeur_par_entrepot())
+        return queryset
+
+    def create(self, request, *args, **kwargs):
+        """
+        Rend l'entrepôt AVEC son identifiant.
+
+        ⚠ Le sérialiseur d'écriture ne porte pas `id` : la page Stock ajoutait
+        l'entrepôt reçu à sa liste, et sa carte menait à « introuvable ».
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        entrepot = self.perform_create(serializer)
+        return Response(
+            WarehouseDetailSerializer(entrepot, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
+
     def perform_create(self, serializer):
+        from .entrepots import designer_principal
+
         organization = self.get_organization()
         SubscriptionService.assert_can_add_warehouse(organization)
-        return super().perform_create(serializer)
+        principal = serializer.validated_data.pop('is_default', False)
+        actif = serializer.validated_data.get('is_active', True)
+        entrepot = super().perform_create(serializer) or serializer.instance
+        # Le premier entrepôt d'un établissement en est le principal, d'office.
+        aucun_principal = not Warehouse.objects.filter(
+            organization=organization, is_default=True, is_deleted=False,
+        ).exclude(id=entrepot.id).exists()
+        if actif and (principal or aucun_principal):
+            designer_principal(entrepot)
+        return entrepot
+
+    def perform_update(self, serializer):
+        """
+        Le gérant renomme et réadresse SES entrepôts ; le reste est au propriétaire.
+
+        ┌──────────────────────────────────────────────────────────────────┐
+        │ ACTIVER, DÉSACTIVER ET DÉSIGNER LE PRINCIPAL PASSENT PAR LES     │
+        │ RÈGLES, JAMAIS PAR UN PATCH NU.                                  │
+        │                                                                  │
+        │ Un `is_active: false` posé directement fermait un entrepôt où    │
+        │ une caisse était ouverte, ou le seul entrepôt d'un caissier -    │
+        │ qui ne voyait alors plus rien. `inventory.entrepots` refuse en   │
+        │ nommant ce qui bloque.                                           │
+        └──────────────────────────────────────────────────────────────────┘
+        """
+        from apps.core.api_permissions import _get_membership
+        from apps.organizations.models import OrganizationMembership
+
+        from .entrepots import (
+            CHAMPS_DU_GERANT, EntrepotRefuse, ReserveAuProprietaire,
+            activer, designer_principal, desactiver,
+        )
+
+        entrepot = serializer.instance
+        changees = {
+            cle for cle, valeur in serializer.validated_data.items()
+            if getattr(entrepot, cle, None) != valeur
+        }
+        membre = _get_membership(self.request)
+        proprietaire = membre is not None and membre.role == OrganizationMembership.Role.OWNER
+        hors_droit = changees - CHAMPS_DU_GERANT
+        if hors_droit and not proprietaire:
+            raise ReserveAuProprietaire(sorted(hors_droit))
+
+        # Les deux champs de vie ne s'écrivent pas par le sérialiseur : ils
+        # passent par les règles, qui refusent en nommant ce qui bloque.
+        actif = serializer.validated_data.pop('is_active', entrepot.is_active)
+        principal = serializer.validated_data.pop('is_default', entrepot.is_default)
+        if entrepot.is_default and not principal:
+            raise EntrepotRefuse(
+                f"« {entrepot.name} » est l'entrepôt principal : désignez-en un autre, "
+                "il perdra ce titre de lui-même.",
+                code='entrepot_principal',
+            )
+        with transaction.atomic():
+            super().perform_update(serializer)
+            entrepot.refresh_from_db()
+            if actif and not entrepot.is_active:
+                activer(entrepot)
+            if principal and not entrepot.is_default:
+                designer_principal(entrepot)
+            if not actif and entrepot.is_active:
+                desactiver(entrepot)
+
+    def perform_destroy(self, instance):
+        from .entrepots import supprimer
+
+        supprimer(instance)
+
+    @action(detail=False, methods=['get'])
+    def directory(self, request):
+        """
+        `GET /warehouses/directory/` : tous les entrepôts de l'établissement,
+        nommés, pour choisir la DESTINATION d'un transfert.
+
+        ⚠ Ni adresse, ni stock, ni responsable : l'expéditeur choisit où livrer,
+        il n'obtient aucun accès à la boutique d'en face.
+        """
+        from .entrepots import annuaire
+
+        return Response(annuaire(self.get_organization()))
 
     @action(detail=True, methods=['get'], url_path='stock-summary')
     def stock_summary(self, request, pk=None):
@@ -157,13 +265,16 @@ class StockLocationViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, vie
     
     select_related_fields = ['warehouse', 'parent']
     
+    # ⚠ `warehouses.edit` et non `.create` / `.delete` : un emplacement se
+    #   range DANS un entrepôt, et le gérant, qui ne crée plus d'entrepôt,
+    #   doit continuer d'organiser les siens.
     action_permissions = {
         'list': 'warehouses.view',
         'retrieve': 'warehouses.view',
-        'create': 'warehouses.create',
+        'create': 'warehouses.edit',
         'update': 'warehouses.edit',
         'partial_update': 'warehouses.edit',
-        'destroy': 'warehouses.delete',
+        'destroy': 'warehouses.edit',
         'by_warehouse': 'warehouses.view',
     }
 
@@ -736,14 +847,28 @@ class TransitionActionMixin:
     #: publié - le changer casserait le back-office en silence.
     transition_serializer = None
 
-    def _transition(self, fonction, serialiser=False, cote=None, **extra):
+    #: Champ de l'entrepôt de la pièce, pour exiger qu'il soit ACTIF avant une
+    #: transition. Les transferts n'en ont pas besoin : le côté s'en charge.
+    transition_entrepot = None
+
+    def _transition(self, fonction, serialiser=False, cote=None, exiger_actif=True, **extra):
+        from apps.core.warehouse_scope import exiger_entrepot_actionnable
+
         from .services import TransitionRefusee
         objet = self.get_object()
+        membre = get_membership_for_request(self.request)
         if cote is not None:
             # Approuver, expédier et annuler appartiennent à la SOURCE ;
             # recevoir appartient à la DESTINATION. Le même contrôle vit dans
             # le journal du terminal (`_transition_transfert`).
-            exiger_cote_du_transfert(get_membership_for_request(self.request), objet, cote)
+            exiger_cote_du_transfert(membre, objet, cote)
+        elif self.transition_entrepot and membre is not None:
+            # Un entrepôt désactivé est fermé : ni ajustement appliqué ni
+            # inventaire avancé. Lever (rejeter, annuler) reste permis.
+            exiger_entrepot_actionnable(
+                membre, getattr(objet, self.transition_entrepot),
+                exiger_actif=exiger_actif,
+            )
         try:
             resultat = fonction(objet, self.request.user, **extra)
         except TransitionRefusee as exc:
@@ -879,6 +1004,8 @@ class StockAdjustmentViewSet(TransitionActionMixin, WarehouseScopedQuerysetMixin
     select_related_fields = ['warehouse', 'created_by', 'approved_by']
     prefetch_related_fields = ['items', 'items__product']
     
+    transition_entrepot = 'warehouse_id'
+
     action_permissions = {
         'list': 'stock_adjustments.view',
         'retrieve': 'stock_adjustments.view',
@@ -922,7 +1049,7 @@ class StockAdjustmentViewSet(TransitionActionMixin, WarehouseScopedQuerysetMixin
     def reject(self, request, pk=None):
         """Rejette un ajustement."""
         from .services import reject_adjustment
-        return self._transition(reject_adjustment)
+        return self._transition(reject_adjustment, exiger_actif=False)
 
 
 # =============================================================================
@@ -958,6 +1085,8 @@ class InventorySessionViewSet(ExportResponseMixin, TransitionActionMixin,
     select_related_fields = ['warehouse', 'created_by', 'validated_by']
     prefetch_related_fields = ['categories', 'products']
     
+    transition_entrepot = 'warehouse_id'
+
     action_permissions = {
         'list': 'inventory.view',
         'retrieve': 'inventory.view',
@@ -1053,7 +1182,7 @@ class InventorySessionViewSet(ExportResponseMixin, TransitionActionMixin,
         # puisque le rendu est la dernière étape : le stock était bel et bien
         # déverrouillé, et le gérant lisait un échec. C'est le défaut déjà
         # corrigé sur le chemin du JOURNAL, resté ouvert sur celui de la VUE.
-        return self._transition(cancel_inventory_session, serialiser=True)
+        return self._transition(cancel_inventory_session, serialiser=True, exiger_actif=False)
 
     @action(detail=True, methods=['get'])
     def counts(self, request, pk=None):

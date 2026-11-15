@@ -35,12 +35,20 @@ class WarehouseListSerializer(serializers.ModelSerializer):
         read_only_fields = ['id']
 
     def get_stock_value(self, obj):
-        """Calcule la valeur totale du stock."""
-        total = sum(
-            stock.quantity * (stock.avg_cost if stock.avg_cost > 0 else (stock.product.cost_price or 0))
-            for stock in obj.stocks.select_related('product').all()
-        )
-        return str(total)
+        return valeur_du_stock(obj)
+
+
+def valeur_du_stock(entrepot):
+    """
+    La valeur du stock d'un entrepôt : l'annotation de la vue quand elle est là
+    (une requête pour toute la liste), sinon le même calcul en base.
+    """
+    from .models import Stock
+
+    valeur = getattr(entrepot, '_valeur_stock', None)
+    if valeur is None:
+        valeur = Stock.total_value_for(Stock.objects.filter(warehouse=entrepot))
+    return str(valeur)
 
 
 class WarehouseDetailSerializer(serializers.ModelSerializer):
@@ -62,12 +70,7 @@ class WarehouseDetailSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
     def get_stock_value(self, obj):
-        """Calcule la valeur totale du stock."""
-        total = sum(
-            stock.quantity * (stock.avg_cost if stock.avg_cost > 0 else (stock.product.cost_price or 0))
-            for stock in obj.stocks.select_related('product').all()
-        )
-        return str(total)
+        return valeur_du_stock(obj)
 
     def get_locations(self, obj):
         return StockLocationSerializer(

@@ -748,7 +748,7 @@ def stock_adjustment_create(ctx, payload):
     }
 
 
-def _transition_ajustement(ctx, payload, fonction):
+def _transition_ajustement(ctx, payload, fonction, exiger_actif=True):
     from apps.inventory.models import StockAdjustment
     from apps.inventory.serializers import StockAdjustmentDetailSerializer
 
@@ -757,6 +757,7 @@ def _transition_ajustement(ctx, payload, fonction):
         StockAdjustment, ctx, payload['adjustment'], 'Cet ajustement',
         borner=_borne_par(ctx, 'warehouse_id'),
         entrepot_de=lambda a: a.warehouse_id,
+        exiger_actif=exiger_actif,
     )
     _refus_si_impossible(fonction, ajustement, ctx.user)
     ajustement.refresh_from_db()
@@ -775,7 +776,8 @@ def stock_adjustment_approve(ctx, payload):
 @handler('stock_adjustment.reject', permission='stock_adjustments.approve')
 def stock_adjustment_reject(ctx, payload):
     from apps.inventory.services import reject_adjustment
-    return _transition_ajustement(ctx, payload, reject_adjustment)
+    # Rejeter ne touche pas au stock : permis sur un entrepôt désactivé.
+    return _transition_ajustement(ctx, payload, reject_adjustment, exiger_actif=False)
 
 
 # ------------------------------------------------------------ retours et devis
@@ -930,20 +932,19 @@ def _membership_du_contexte(ctx):
 # donc par le journal, et leurs corps sont ceux du back-office.
 
 
-def _transition_inventaire(ctx, payload, fonction, serialiser=True, **extra):
+def _transition_inventaire(ctx, payload, fonction, serialiser=True, exiger_actif=True, **extra):
     from apps.inventory.models import InventorySession
     from apps.inventory.serializers import InventorySessionDetailSerializer
 
     _require(payload, 'session')
-    # ⚠ L'entrepôt n'est PAS exigé actif : annuler un inventaire est ce qui
-    #   permet de fermer l'entrepôt, et un inventaire en cours y interdit la
-    #   désactivation, donc la session d'un entrepôt inactif ne se fait que
-    #   lever, jamais avancer (le service refuse les autres transitions).
+    # ⚠ Seule l'ANNULATION passe sur un entrepôt désactivé : c'est ce qui lève
+    #   un inventaire resté ouvert et permet de fermer l'entrepôt. Démarrer,
+    #   compter, soumettre et valider y sont refusés, comme au back-office.
     session = _objet_actionnable(
         InventorySession, ctx, payload['session'], "Cette session d'inventaire",
         borner=_borne_par(ctx, 'warehouse_id'),
         entrepot_de=lambda s: s.warehouse_id,
-        exiger_actif=False,
+        exiger_actif=exiger_actif,
     )
 
     resultat = _refus_si_impossible(fonction, session, ctx.user, **extra)
@@ -1030,7 +1031,7 @@ def inventory_session_cancel(ctx, payload):
     un dictionnaire.
     """
     from apps.inventory.services import cancel_inventory_session
-    return _transition_inventaire(ctx, payload, cancel_inventory_session)
+    return _transition_inventaire(ctx, payload, cancel_inventory_session, exiger_actif=False)
 
 
 # --------------------------------------------------------------- catalogue

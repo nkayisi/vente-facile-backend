@@ -876,12 +876,30 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         return OrganizationMembershipSerializer
 
     def get_queryset(self):
+        from apps.core.warehouse_scope import membership_targets_q, nature_de_la_requete
+
         queryset = super().get_queryset()
         organization = self.get_organization()
         if organization:
             queryset = queryset.filter(organization=organization).prefetch_related(
                 'assigned_warehouses'
             )
+        # ┌──────────────────────────────────────────────────────────────────┐
+        # │ UN GÉRANT NE GÈRE QUE SON ÉQUIPE.                                │
+        # │                                                                  │
+        # │ Il voyait, modifiait et désactivait les membres de toutes les    │
+        # │ boutiques. Il ne voit plus que ceux qui partagent un de ses      │
+        # │ entrepôts, plus le propriétaire ; en lecture, la case « consulter│
+        # │ tous les entrepôts » lui ouvre l'équipe entière. Le prédicat est │
+        # │ celui du sélecteur d'équipe : un seul corps, deux emplois.       │
+        # └──────────────────────────────────────────────────────────────────┘
+        demandeur = _get_membership(self.request)
+        if demandeur is not None:
+            cibles = membership_targets_q(
+                demandeur, nature=nature_de_la_requete(self.request),
+            )
+            if cibles is not None:
+                queryset = queryset.filter(cibles).distinct()
         return queryset
 
     def _check_role_hierarchy(self, request, target_role):
@@ -909,7 +927,7 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         organization = self.get_organization()
         serializer = MembershipCreateSerializer(
             data=request.data,
-            context={'organization': organization},
+            context={'organization': organization, 'demandeur': _get_membership(request)},
         )
         serializer.is_valid(raise_exception=True)
         
@@ -989,7 +1007,7 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         organization = self.get_organization()
         serializer = MemberCreateWithUserSerializer(
             data=request.data,
-            context={'organization': organization},
+            context={'organization': organization, 'demandeur': _get_membership(request)},
         )
         serializer.is_valid(raise_exception=True)
         
@@ -1066,6 +1084,7 @@ class OrganizationMembershipViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             context={
                 'organization': organization,
                 'membership': membership,
+                'demandeur': _get_membership(request),
             },
         )
         serializer.is_valid(raise_exception=True)
