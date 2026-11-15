@@ -163,8 +163,7 @@ class GoodsReceiptStockService:
         Annule l'incrément de stock effectué par ``apply_increment`` : crée
         des mouvements ``return_out`` et décrémente ``Stock.quantity``.
 
-        Lève ``ValidationError`` si le stock résultant deviendrait négatif et
-        que ``warehouse.allow_negative_stock`` est ``False``.
+        Lève ``StockInsuffisant`` si le stock résultant deviendrait négatif.
 
         Ne fait rien si le stock n'avait pas été incrémenté.
         """
@@ -176,8 +175,6 @@ class GoodsReceiptStockService:
 
         warehouse = grn.warehouse
         org = grn.organization
-        allow_negative = getattr(warehouse, 'allow_negative_stock', False)
-
         for item in grn.items.select_related('product', 'variant').all():
             if not item.quantity_accepted or item.quantity_accepted <= 0:
                 continue
@@ -193,16 +190,9 @@ class GoodsReceiptStockService:
                 continue
 
             quantity_before = stock.quantity
-            new_quantity = quantity_before - item.quantity_accepted
-
-            if new_quantity < 0 and not allow_negative:
-                raise ValidationError({
-                    'items': (
-                        f"Impossible d'annuler la réception : stock insuffisant pour "
-                        f"{item.product.name}. Disponible: {quantity_before}, "
-                        f"à retirer: {item.quantity_accepted}."
-                    )
-                })
+            PackagingService.exiger_disponible(
+                stock, item.product, item.quantity_accepted, 'retirer',
+            )
 
             # Symétrique exact de l'entrée : on retire du vrac ce qui y était
             # entré, le reste des contenants repart scellé.
@@ -502,6 +492,7 @@ def approuver_retour(purchase_return, user=None):
             continue
 
         quantity_before = stock.quantity
+        PackagingService.exiger_disponible(stock, item.product, item.quantity, 'rendre')
         # ⚠ On ne touche PAS `stock.quantity` directement : cela rongeait
         # silencieusement le nombre de contenants scellés. Retirer des unités
         # puise d'abord dans le vrac, puis ouvre un contenant - on ne rescelle

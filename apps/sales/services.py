@@ -7,12 +7,16 @@ et SaleViewSet.cancel.
 """
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
 from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 from apps.core.bulk import bulk_update_rows
+from apps.core.exceptions import StockInsuffisant
+
+logger = logging.getLogger(__name__)
 
 
 TWO_PLACES = Decimal('0.01')
@@ -32,12 +36,37 @@ class SaleStockService:
         ).exists()
 
     @staticmethod
+    def decrement_au_reglement(sale, user):
+        """
+        Le décrément différé d'une ANCIENNE vente à crédit, quand son solde est payé.
+
+        ┌──────────────────────────────────────────────────────────────────┐
+        │ UN RÈGLEMENT NE SE REFUSE PAS POUR UN RAYON VIDE.                │
+        │                                                                  │
+        │ Depuis le 20 octobre 2026, une vente sort son stock à l'émission │
+        │ (`apply_decrement` sort alors sur `is_committed`). Seules les    │
+        │ ventes à crédit d'avant attendent encore le leur, qui part au    │
+        │ paiement du solde. La marchandise est chez le client depuis des  │
+        │ semaines : refuser son argent parce que le rayon ne la compte    │
+        │ plus serait pire que l'écart. Le décrément est alors abandonné,  │
+        │ NOMMÉ au journal, et `verifier_deploiement` compte ces ventes.   │
+        └──────────────────────────────────────────────────────────────────┘
+        """
+        try:
+            with transaction.atomic():
+                SaleStockService.apply_decrement(sale, user)
+        except StockInsuffisant as exc:
+            logger.warning(
+                "Vente %s réglée sans sortie de stock : %s", sale.reference, exc,
+            )
+
+    @staticmethod
     @transaction.atomic
     def apply_decrement(sale, user):
         """
         Décrémente le stock pour chaque item de la vente (avec FIFO sur les lots
-        si le produit a un suivi de stock). Respecte `Warehouse.allow_negative_stock`
-        au moment de la décrémentation (re-vérification après lock).
+        si le produit a un suivi de stock). Refuse toute ligne au-delà du stock
+        (`exiger_disponible`, re-vérifié sous le verrou).
 
         Idempotent : ne fait rien si `is_committed(sale)` est True.
         """
@@ -80,7 +109,7 @@ class SaleStockService:
                 use_fefo=getattr(item.product, 'has_expiry_date', False),
             )
 
-            # Stock agrégé : lock + re-check allow_negative + décrément
+            # Stock agrégé : verrou, contrôle du disponible, décrément
             product_cost = item.product.cost_price or Decimal('0.00')
             cost = item.cost_price if item.cost_price and item.cost_price > 0 else product_cost
             stock, created = Stock.objects.select_for_update().get_or_create(
@@ -116,16 +145,8 @@ class SaleStockService:
                     reference_type='sale', reference_id=sale.id,
                 )
 
-            new_quantity = quantity_before - item.quantity
-            allow_negative = getattr(warehouse, 'allow_negative_stock', False)
-            if new_quantity < 0 and not allow_negative:
-                # Rollback de toute la transaction via raise
-                raise ValidationError({
-                    'items': (
-                        f"Stock insuffisant pour {item.product.name} dans l'entrepôt "
-                        f"{warehouse.name}. Disponible: {quantity_before}, demandé: {item.quantity}."
-                    )
-                })
+            # Toute la transaction se défait si une ligne manque de stock.
+            PackagingService.exiger_disponible(stock, item.product, item.quantity, 'vendre')
 
             # Les deux canaux se décrémentent séparément, chacun dans son
             # compteur : la vente en gros retire des conditionnements scellés,
@@ -166,9 +187,8 @@ class SaleStockService:
 
         Incrémente ``Stock.reserved_quantity`` pour chaque item, sous lock.
         Marque ``sale.stock_reserved = True`` pour rendre l'opération
-        idempotente. Lève ``ValidationError`` si la quantité disponible
-        (``quantity - reserved_quantity``) est insuffisante et que
-        ``warehouse.allow_negative_stock`` est ``False``.
+        idempotente. Lève ``StockInsuffisant`` si la quantité disponible
+        (``quantity - reserved_quantity``) est insuffisante.
 
         À appeler à la conversion d'un Quotation → Sale, pour empêcher
         qu'un autre cashier ne vende les mêmes unités pendant la fenêtre
@@ -184,7 +204,6 @@ class SaleStockService:
             return
 
         org = sale.organization
-        allow_negative = getattr(warehouse, 'allow_negative_stock', False)
 
         for item in sale.items.select_related('product', 'variant').order_by('product_id'):
             if not item.product.track_inventory:
@@ -198,24 +217,18 @@ class SaleStockService:
             ).first()
 
             if stock is None:
-                if allow_negative:
-                    continue
-                raise ValidationError({
-                    'items': (
-                        f"Stock indisponible pour {item.product.name} "
-                        f"dans l'entrepôt {warehouse.name}."
-                    )
-                })
+                raise StockInsuffisant(
+                    f"Stock indisponible pour {item.product.name} "
+                    f"dans l'entrepôt {warehouse.name}."
+                )
 
             available = stock.quantity - stock.reserved_quantity
-            if item.quantity > available and not allow_negative:
-                raise ValidationError({
-                    'items': (
-                        f"Stock disponible insuffisant pour {item.product.name}. "
-                        f"Disponible (hors réservations) : {available}, "
-                        f"demandé : {item.quantity}."
-                    )
-                })
+            if item.quantity > available:
+                raise StockInsuffisant(
+                    f"Stock disponible insuffisant pour {item.product.name}. "
+                    f"Disponible (hors réservations) : {available}, "
+                    f"demandé : {item.quantity}."
+                )
 
             stock.reserved_quantity = stock.reserved_quantity + item.quantity
             stock.save()
@@ -717,7 +730,7 @@ def register_sale_debt(sale, user, notes=''):
 
     if became_complete:
         if sale.warehouse:
-            SaleStockService.apply_decrement(sale, user)
+            SaleStockService.decrement_au_reglement(sale, user)
         from apps.settings.services import LoyaltyService
         LoyaltyService.award_for_sale(sale, user=user)
 
@@ -903,7 +916,7 @@ def apply_payment_to_sale(sale_id, user, *, payment_method_id=None,
                 sale.warehouse = default_wh
                 sale.save(update_fields=['warehouse'])
 
-        SaleStockService.apply_decrement(sale, user)
+        SaleStockService.decrement_au_reglement(sale, user)
 
         if award_loyalty and sale.customer:
             from apps.settings.services import LoyaltyService

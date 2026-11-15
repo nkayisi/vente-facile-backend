@@ -41,7 +41,10 @@ class Warehouse(TenantSoftDeleteModel):
     is_default = models.BooleanField(default=False)
     is_active = models.BooleanField(default=True)
     
-    allow_negative_stock = models.BooleanField(default=False)
+    # ⚠ Ne décide plus rien : aucun entrepôt ne vend à découvert. La colonne
+    # reste le temps que les terminaux ne la lisent plus (lot E10), forcée à
+    # faux par `inventory/0021` et fermée à toute écriture.
+    allow_negative_stock = models.BooleanField(default=False, editable=False)
 
     objects = TenantSoftDeleteManager()
 
@@ -317,23 +320,34 @@ class Stock(TenantModel):
                 'quantity', 'package_quantity', 'loose_quantity',
             }
 
-        # Filet de sécurité : tout point d'entrée qui descend Stock.quantity
-        # sous zéro doit avoir vérifié warehouse.allow_negative_stock au
-        # préalable. Cette validation rejette les chemins qui auraient sauté
-        # la vérification (signal mort, import direct, script externe).
+        # ┌──────────────────────────────────────────────────────────────┐
+        # │ FILET : AUCUNE BAISSE NE PASSE SOUS ZÉRO.                    │
+        # │                                                              │
+        # │ Chaque sortie contrôle son stock (`exiger_disponible`) ; ce   │
+        # │ filet rattrape celle qui l'aurait sauté. Il levait une        │
+        # │ `ValidationError` Django, qui n'est pas une erreur DRF : 500  │
+        # │ au back-office. `StockInsuffisant` est un 400 nommé.          │
+        # │                                                              │
+        # │ ⚠ IL NE REFUSE QU'UNE BAISSE. Un rayon déjà négatif, laissé   │
+        # │ par l'ancien découvert, doit pouvoir remonter : sinon ni une  │
+        # │ réception ni la reprise (`reparer_stocks_negatifs`) n'y       │
+        # │ feraient plus rien entrer. La quantité précédente n'est relue │
+        # │ que dans ce cas anormal, jamais sur le chemin ordinaire.      │
+        # └──────────────────────────────────────────────────────────────┘
         if self.quantity < 0:
-            allow_neg = (
-                bool(getattr(self.warehouse, 'allow_negative_stock', False))
-                if self.warehouse_id else False
-            )
-            if not allow_neg:
-                raise ValidationError({
-                    'quantity': (
-                        f"Stock négatif interdit pour {self.product_id} dans "
-                        f"l'entrepôt {self.warehouse_id}. Pour autoriser, "
-                        f"activer Warehouse.allow_negative_stock."
-                    )
-                })
+            precedente = None
+            if self.pk is not None and not self._state.adding:
+                precedente = (
+                    type(self)._base_manager.filter(pk=self.pk)
+                    .values_list('quantity', flat=True).first()
+                )
+            if precedente is None or self.quantity < precedente:
+                from apps.core.exceptions import StockInsuffisant
+
+                raise StockInsuffisant(
+                    f"Stock insuffisant pour {self.product.name} dans l'entrepôt "
+                    f"{self.warehouse.name} : la sortie dépasse ce que le rayon contient."
+                )
 
         if self.reserved_quantity < 0:
             raise ValidationError({

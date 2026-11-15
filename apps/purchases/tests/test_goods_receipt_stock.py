@@ -11,7 +11,7 @@ from datetime import date
 from decimal import Decimal
 
 from django.test import TestCase
-from rest_framework.exceptions import ValidationError
+from apps.core.exceptions import StockInsuffisant
 
 from apps.contacts.models import Supplier
 from apps.inventory.models import Stock, StockMovement
@@ -168,9 +168,9 @@ class GoodsReceiptStockServiceTests(_GoodsReceiptSetup):
             warehouse=self.warehouse,
         ).update(quantity=Decimal('0.000'))
 
-        # Tenter de revert sans allow_negative_stock → ValidationError
-        self.assertFalse(self.warehouse.allow_negative_stock)
-        with self.assertRaises(ValidationError):
+        # Le retrait ferait passer le rayon sous zéro : refusé, sur tout entrepôt,
+        # par le contrôle qui dit ce qui reste (pas seulement par le filet).
+        with self.assertRaisesMessage(StockInsuffisant, 'Disponible'):
             GoodsReceiptStockService.revert(self.grn, self.owner)
 
 
@@ -288,5 +288,5 @@ class SaleStockReservationTests(TestCase):
             warehouse=self.warehouse,
         ).update(reserved_quantity=Decimal('8.000'))
 
-        with self.assertRaises(ValidationError):
+        with self.assertRaises(StockInsuffisant):
             SaleStockService.reserve_stock(self.sale, self.owner)

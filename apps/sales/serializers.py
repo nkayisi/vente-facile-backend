@@ -1221,29 +1221,45 @@ class SaleCreateSerializer(CagnotteLegacyMixin, serializers.ModelSerializer):
             from apps.inventory.models import Stock
             from apps.inventory.packaging import PackagingService
 
-            # Le découvert se décide au niveau de l'ENTREPÔT, comme partout en
-            # aval (`assert_sealed_available`, `ensure_loose_available`,
-            # `Stock.save`). Lire ici `product.allow_negative_stock` faisait
-            # sauter ce pré-contrôle courtois sur une configuration divergente,
-            # et la vente tombait alors sur la `ValidationError` Django de
-            # `Stock.save()`, qui n'est pas une erreur DRF : 500 au lieu de 400.
-            allow_negative = getattr(warehouse, 'allow_negative_stock', False)
+            # ┌──────────────────────────────────────────────────────────────┐
+            # │ LE DISPONIBLE D'UNE LIGNE, LE MÊME SUR LES TROIS SURFACES.   │
+            # │                                                              │
+            # │ Σ (quantité − réservé) des rayons de l'article, pour la      │
+            # │ VARIANTE de la ligne (aucune pour une vente sans variante),  │
+            # │ dans l'entrepôt de la vente, tous emplacements confondus. Le │
+            # │ terminal relit ce disponible dans ses tables tirées : une    │
+            # │ règle différente ici, et il imprimerait un ticket refusé.    │
+            # │                                                              │
+            # │ ⚠ CUMULÉ PAR ARTICLE : deux lignes de 3 sur un rayon de 5    │
+            # │ passaient chacune ce contrôle, et la seconde tombait au      │
+            # │ décrément, sous un autre message.                            │
+            # │                                                              │
+            # │ Aucun entrepôt ne vend plus à découvert : le contrôle vaut   │
+            # │ pour tous, et son code (`stock_insuffisant`) remonte au      │
+            # │ premier niveau de la réponse, où les deux clients le lisent. │
+            # └──────────────────────────────────────────────────────────────┘
+            from django.db.models import Sum
+
+            demandes = {}
             for item in items:
                 product = item['product']
-                if product.track_inventory and not allow_negative:
-                    stock = Stock.objects.filter(
-                        product=product,
-                        variant=item.get('variant'),
-                        warehouse=warehouse
-                    ).first()
-
-                    available = stock.available_quantity if stock else 0
+                if product.track_inventory:
+                    variante = item.get('variant')
+                    cle = (product.id, getattr(variante, 'id', None))
+                    demandes[cle] = demandes.get(cle, Decimal('0')) + item['quantity']
+                    rayons = Stock.objects.filter(
+                        product=product, variant=variante, warehouse=warehouse,
+                    )
+                    cumul = rayons.aggregate(
+                        quantite=Sum('quantity'), reserve=Sum('reserved_quantity'),
+                        vrac=Sum('loose_quantity'),
+                    )
+                    available = (cumul['quantite'] or 0) - (cumul['reserve'] or 0)
                     package_quantity = item.get('package_quantity') or 0
 
-                    if item['quantity'] > available:
+                    if demandes[cle] > available:
                         readable = PackagingService.format_quantity(
-                            product, available,
-                            stock.loose_quantity if stock else 0,
+                            product, max(available, 0), cumul['vrac'] or 0,
                         )
                         message = (
                             f"Stock insuffisant pour {product.name}. "
@@ -1255,11 +1271,14 @@ class SaleCreateSerializer(CagnotteLegacyMixin, serializers.ModelSerializer):
                             message += (
                                 f" Vous pouvez vendre ce qu'il reste au détail."
                             )
-                        raise serializers.ValidationError({'items': message})
+                        raise serializers.ValidationError({'items': serializers.ErrorDetail(
+                            message, code='stock_insuffisant',
+                        )})
 
                     # Vente en gros : on ne reconditionne pas des unités déjà
                     # sorties de leur emballage.
-                    if package_quantity > 0 and stock is not None:
+                    stock = rayons.first() if package_quantity > 0 else None
+                    if stock is not None:
                         PackagingService.assert_sealed_available(
                             stock, product, package_quantity
                         )

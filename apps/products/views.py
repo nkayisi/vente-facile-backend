@@ -395,7 +395,12 @@ class ProductViewSet(ExportableListMixin, TenantViewSetMixin, AuditMixin,
     queryset = Product.objects.all()
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['category', 'brand', 'is_active', 'is_featured', 'track_inventory']
+    filterset_fields = [
+        'category', 'brand', 'is_active', 'is_featured', 'track_inventory',
+        # Le comptoir ne montre que le vendable : un consommable a du stock
+        # et n'a rien à faire sur la grille de la caisse.
+        'is_sellable',
+    ]
     search_fields = ['name', 'sku', 'barcode', 'short_description']
     ordering_fields = ['name', 'sku', 'selling_price', 'created_at']
     ordering = ['name']
@@ -523,7 +528,10 @@ class ProductViewSet(ExportableListMixin, TenantViewSetMixin, AuditMixin,
         action = getattr(self, 'action', None)
 
         apply_row_scope = True
-        if action == 'list':
+        if action in ('list', 'search_barcode'):
+            # Le comptoir vend tout le catalogue : un code-barres scanné doit
+            # trouver l'article même sans stock dans les dépôts du membre,
+            # comme la grille avec `full_catalog=true`.
             apply_row_scope = not _truthy_query_param(
                 self.request.query_params.get('full_catalog')
             )
@@ -535,7 +543,6 @@ class ProductViewSet(ExportableListMixin, TenantViewSetMixin, AuditMixin,
             'destroy',
             'bulk_update',
             'bulk_delete',
-            'search_barcode',
         ):
             apply_row_scope = True
 

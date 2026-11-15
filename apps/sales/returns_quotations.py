@@ -15,6 +15,8 @@ from decimal import Decimal
 from django.db import transaction
 from django.utils import timezone
 
+from apps.core.exceptions import StockInsuffisant
+
 
 class TransitionRefusee(Exception):
     """Refus métier déterministe : à ne JAMAIS réessayer."""
@@ -165,15 +167,17 @@ def convert_quotation(quotation, user, warehouse, perimetre_borne=False):
     # échouer laisserait un devis converti sur une vente impossible à servir.
     if warehouse:
         for item in quotation.items.all():
-            if item.product.track_inventory and not item.product.allow_negative_stock:
+            # Aucun article n'échappe au contrôle : `product.allow_negative_stock`
+            # en dispensait celui qui le portait, et il ne décide plus rien.
+            if item.product.track_inventory:
                 stock = Stock.objects.filter(
                     product=item.product, variant=item.variant, warehouse=warehouse,
                 ).first()
                 available = stock.available_quantity if stock else 0
                 if item.quantity > available:
-                    raise TransitionRefusee(
+                    raise StockInsuffisant(
                         f"Stock insuffisant pour {item.product.name}. "
-                        f"Disponible: {available}"
+                        f"Disponible : {available}."
                     )
 
     with transaction.atomic():

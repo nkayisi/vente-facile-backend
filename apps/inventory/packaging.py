@@ -52,6 +52,8 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
+from apps.core.exceptions import StockInsuffisant
+
 
 logger = logging.getLogger(__name__)
 
@@ -525,6 +527,37 @@ class PackagingService:
     # -- Mutations (le lock est pris par l'appelant) ------------------------
 
     @staticmethod
+    def exiger_disponible(stock, product, quantite, action_label='sortir'):
+        """
+        Refuse toute sortie qui ferait passer le rayon sous zéro.
+
+        ┌──────────────────────────────────────────────────────────────────┐
+        │ LE STOCK NÉGATIF N'EXISTE PLUS, POUR AUCUN ENTREPÔT.             │
+        │                                                                  │
+        │ `Warehouse.allow_negative_stock` ne décide plus rien : un rayon  │
+        │ qui annonce une marchandise partie fausse la caisse, le          │
+        │ réassort et l'inventaire suivant. Le contrôle porte sur la       │
+        │ quantité TOTALE, comme le décrément d'une vente l'a toujours     │
+        │ fait : la réservation d'un devis converti est libérée avant.     │
+        └──────────────────────────────────────────────────────────────────┘
+
+        ``stock`` doit être verrouillé par l'appelant. Lève `StockInsuffisant`
+        (400 `stock_insuffisant` au back-office, `rejected` au journal).
+        """
+        quantite = Decimal(quantite or 0)
+        if quantite <= 0:
+            return
+        disponible = Decimal(stock.quantity or 0)
+        if quantite <= disponible:
+            return
+        raise StockInsuffisant(
+            f"Stock insuffisant pour {product.name} dans l'entrepôt "
+            f"{stock.warehouse.name}. Disponible : "
+            f"{PackagingService.format_base_total(product, max(disponible, ZERO))} ; "
+            f"à {action_label} : {PackagingService.format_base_total(product, quantite)}."
+        )
+
+    @staticmethod
     def assert_sealed_available(stock, product, package_quantity, action_label='vendre'):
         """
         Refuse une sortie en gros quand les conditionnements scellés manquent.
@@ -534,8 +567,7 @@ class PackagingService:
         seule issue réelle pour l'opérateur ; ``action_label`` accorde le verbe
         au chemin appelant (vendre, transférer…).
 
-        Sans objet quand l'entrepôt autorise le stock négatif : y imposer ce
-        contrôle retirerait une possibilité qui existe aujourd'hui.
+        Lève `StockInsuffisant` : aucun entrepôt ne vend plus à découvert.
         """
         package_quantity = Decimal(package_quantity or 0)
         if package_quantity <= 0:
@@ -543,10 +575,6 @@ class PackagingService:
 
         factor = PackagingService.factor(product)
         if factor is None:
-            return
-
-        warehouse = stock.warehouse
-        if getattr(warehouse, 'allow_negative_stock', False):
             return
 
         sealed, loose = PackagingService.available_split(stock, factor)
@@ -560,16 +588,14 @@ class PackagingService:
         available_base = max(
             Decimal(stock.quantity) - Decimal(stock.reserved_quantity), ZERO
         )
-        raise ValidationError({
-            'items': (
-                f"{product.name} : seulement {sealed} "
-                f"{_plural(PackagingService.package_unit_label(product), sealed)} "
-                f"en stock, {_fmt_number(package_quantity)} {package_label} demandés. "
-                f"Les {retail_label} déjà sorties d'un emballage ne peuvent pas y être "
-                f"remises. Vous pouvez {action_label} jusqu'à {_fmt_number(available_base)} "
-                f"{retail_label} au détail."
-            )
-        })
+        raise StockInsuffisant(
+            f"{product.name} : seulement {sealed} "
+            f"{_plural(PackagingService.package_unit_label(product), sealed)} "
+            f"en stock, {_fmt_number(package_quantity)} {package_label} demandés. "
+            f"Les {retail_label} déjà sorties d'un emballage ne peuvent pas y être "
+            f"remises. Vous pouvez {action_label} jusqu'à {_fmt_number(available_base)} "
+            f"{retail_label} au détail."
+        )
 
     @staticmethod
     def ensure_loose_available(
@@ -631,14 +657,11 @@ class PackagingService:
         if packages_to_open <= 0:
             return 0, None
 
-        allow_negative = getattr(stock.warehouse, 'allow_negative_stock', False)
-        if packages_to_open > sealed and not allow_negative:
-            raise ValidationError({
-                'items': (
-                    f"{product.name} : stock insuffisant pour servir "
-                    f"{_fmt_number(needed_loose)} {retail_label}."
-                )
-            })
+        if packages_to_open > sealed:
+            raise StockInsuffisant(
+                f"{product.name} : stock insuffisant pour servir "
+                f"{_fmt_number(needed_loose)} {retail_label}."
+            )
 
         # Transfert pur d'un compteur vers l'autre : le scellé descend, le vrac
         # monte d'autant d'unités. `quantity` ne bouge pas, un déconditionnement
@@ -804,7 +827,8 @@ class PackagingService:
         ouvert : on casse des scellés pour le combler, dans ce sens uniquement.
         Ce qui reste en déficit est porté par le vrac plutôt que par un nombre
         de conditionnements négatif, qui n'aurait aucun sens à l'écran - et ne
-        subsiste que sur un entrepôt tolérant le découvert.
+        subsiste que sur un rayon déjà négatif, que `reparer_stocks_negatifs`
+        remet à zéro.
         """
         packages = Decimal(stock.package_quantity or 0)
         loose = Decimal(stock.loose_quantity or 0)

@@ -137,6 +137,11 @@ def _ecrire_mouvement(serializer, *, organization, user, request=None, **extra):
     if not cree and stock.avg_cost == 0 and cout_catalogue > 0:
         stock.avg_cost = cout_catalogue
 
+    # Une sortie ne passe jamais sous zéro : refusée AVANT de consommer les
+    # lots, avec un motif qui nomme l'article et l'entrepôt.
+    if data['quantity'] < 0:
+        PackagingService.exiger_disponible(stock, produit, -data['quantity'])
+
     lot = data.get('batch')
     if data['quantity'] > 0 and type_mouvement in STOCK_IN_MOVEMENT_TYPES:
         lot = FIFOService.add_to_batch(

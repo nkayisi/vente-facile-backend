@@ -340,7 +340,9 @@ class Product(TenantSyncableModel):
     is_taxable = models.BooleanField(default=True)
     
     track_inventory = models.BooleanField(default=True)
-    allow_negative_stock = models.BooleanField(default=False)
+    # ⚠ Ne décide plus rien (voir `Warehouse.allow_negative_stock`) : forcée à
+    # faux par `products/0015`, fermée à toute écriture.
+    allow_negative_stock = models.BooleanField(default=False, editable=False)
     has_expiry_date = models.BooleanField(
         default=False,
         help_text="Indique si ce produit est périssable et nécessite un suivi des dates d'expiration"

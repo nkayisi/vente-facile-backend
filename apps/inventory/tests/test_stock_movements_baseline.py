@@ -154,22 +154,21 @@ class StockOutgoingBaselineTests(_StockMovementSetup):
 
     def test_sortie_superieure_au_stock_refusee(self):
         """
-        Le filet de sécurité de ``Stock.save()`` empêche le stock négatif.
+        Une sortie au-delà du stock est refusée, en 400 nommé.
 
-        Défaut connu épinglé ici : ``Stock.save()`` lève une
-        ``django.core.exceptions.ValidationError`` que DRF ne mappe pas en 400,
-        d'où un **500**. Ce qui compte pour la non-régression, c'est que la
-        transaction soit annulée et le stock intact - pas le code HTTP, qui est
-        un travers préexistant.
+        Ce test épinglait un **500** : le refus venait de la ``ValidationError``
+        Django de ``Stock.save()``, que DRF ne traduit pas. Depuis le lot E3, la
+        sortie est contrôlée avant d'écrire (``exiger_disponible``) et le refus
+        est ``StockInsuffisant`` : 400 ``stock_insuffisant``. La transaction
+        reste annulée et le stock intact.
         """
         self._post_movement(quantity='2.000', unit_cost='6000.00')
 
         response = self._post_movement(
             movement_type='damage', quantity='5.000', unit_cost='0.00'
         )
-        self.assertEqual(
-            response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+        self.assertEqual(response.json()['code'], 'stock_insuffisant')
         self.assertEqual(self._stock().quantity, Decimal('2.000'))
         self.assertFalse(
             StockMovement.objects.filter(movement_type='damage').exists()

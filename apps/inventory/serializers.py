@@ -86,7 +86,7 @@ class WarehouseCreateSerializer(serializers.ModelSerializer):
         model = Warehouse
         fields = [
             'name', 'code', 'branch', 'address', 'manager',
-            'is_default', 'is_active', 'allow_negative_stock'
+            'is_default', 'is_active',
         ]
 
     def validate_code(self, value):

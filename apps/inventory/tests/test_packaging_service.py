@@ -9,6 +9,7 @@ from decimal import Decimal
 from django.test import TestCase
 from rest_framework.exceptions import ValidationError
 
+from apps.core.exceptions import StockInsuffisant
 from apps.inventory.models import Stock, StockMovement
 from apps.inventory.packaging import PackagingService
 from apps.products.models import Product, Unit
@@ -432,7 +433,7 @@ class EnsureLooseAvailableTests(_PackagingSetup):
     def test_refuse_si_pas_assez_de_paquets_a_ouvrir(self):
         stock = self._stock(quantity='5.000', loose='5.000')
 
-        with self.assertRaises(ValidationError):
+        with self.assertRaises(StockInsuffisant):
             PackagingService.ensure_loose_available(
                 stock, self.product, Decimal('20'), user=self.owner
             )
@@ -457,19 +458,21 @@ class AssertSealedAvailableTests(_PackagingSetup):
         """30 bouteilles en vrac ne font pas 2 paquets."""
         stock = self._stock(quantity='30.000', loose='30.000')
 
-        with self.assertRaises(ValidationError) as ctx:
+        with self.assertRaises(StockInsuffisant) as ctx:
             PackagingService.assert_sealed_available(stock, self.product, Decimal('2'))
 
         message = str(ctx.exception)
         self.assertIn('ne peuvent pas y être remises', message)
         self.assertIn('au détail', message, "le message doit proposer une issue")
 
-    def test_ignore_si_entrepot_autorise_le_stock_negatif(self):
+    def test_le_drapeau_de_decouvert_ne_dispense_plus_de_rien(self):
+        # Il dispensait ce contrôle : aucun entrepôt ne vend plus à découvert.
         self.warehouse.allow_negative_stock = True
         self.warehouse.save()
         stock = self._stock(quantity='0.000', loose='0.000')
 
-        PackagingService.assert_sealed_available(stock, self.product, Decimal('2'))
+        with self.assertRaises(StockInsuffisant):
+            PackagingService.assert_sealed_available(stock, self.product, Decimal('2'))
 
     def test_produit_simple_ignore(self):
         stock = self._stock(quantity='0.000', product=self.simple_product)

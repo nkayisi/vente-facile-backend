@@ -1271,6 +1271,13 @@ class InventorySessionViewSet(ExportResponseMixin, TransitionActionMixin,
         organization = self.get_organization()
         m = get_membership_for_request(request)
         wh_scope = entrepots_lisibles(m) if m else None
+        # `?warehouse=` : les verrous de la CAISSE, et d'elle seule. Montrer
+        # au comptoir l'inventaire d'un autre dépôt griserait des articles
+        # qu'il peut vendre. Un entrepôt hors périmètre de lecture LÈVE.
+        caisse = request.query_params.get('warehouse')
+        if caisse:
+            exiger_entrepot_lisible_requete(request, caisse)
+            wh_scope = [caisse]
         if wh_scope is not None and not wh_scope:
             return Response({
                 'locked_product_ids': [],

@@ -470,6 +470,9 @@ def ship_transfer(transfer, user):
             loose_shipped = PackagingService.loose_share(
                 item.product, item.quantity_requested, item.loose_quantity
             )
+            PackagingService.exiger_disponible(
+                stock, item.product, item.quantity_requested, 'transférer',
+            )
             PackagingService.assert_sealed_available(
                 stock, item.product, item.package_quantity,
                 action_label='transférer',

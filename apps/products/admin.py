@@ -65,7 +65,7 @@ class ProductAdmin(admin.ModelAdmin):
             'fields': ('cost_price', 'selling_price', 'wholesale_price', 'tax_rate', 'is_taxable')
         }),
         ('Inventory', {
-            'fields': ('track_inventory', 'allow_negative_stock', 'min_stock_level', 
+            'fields': ('track_inventory', 'min_stock_level', 
                       'max_stock_level', 'reorder_point', 'reorder_quantity')
         }),
         ('Tracking', {

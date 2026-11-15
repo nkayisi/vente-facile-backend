@@ -209,12 +209,136 @@ def configuration():
     return constats
 
 
+def _compte(n, singulier, pluriel):
+    return f"{n} {singulier if n < 2 else pluriel}"
+
+
+def stocks_negatifs():
+    """
+    Un rayon négatif ne vend plus rien : toute sortie y est refusée.
+
+    Ces quatre contrôles de données sont des AVERTISSEMENTS : chacun se répare
+    par une commande nommée, et la répétition sur une copie
+    (`scripts/repetition_migrations.sh`) doit pouvoir passer avant qu'on les lance.
+    """
+    from apps.inventory.models import Stock
+
+    n = Stock.objects.filter(quantity__lt=0).count()
+    if not n:
+        return [Constat(OK, 'stock', "Aucun rayon négatif.")]
+    return [Constat(
+        AVERTISSEMENT, 'stock',
+        f"{_compte(n, 'rayon négatif', 'rayons négatifs')} : plus aucune sortie n'y "
+        "passe. Lancez `reparer_stocks_negatifs`.",
+    )]
+
+
+def entrepots_principaux():
+    """Un membre nouveau reçoit le principal : sans lui, il naît sans entrepôt."""
+    from django.db.models import Exists, OuterRef
+
+    from apps.inventory.models import Warehouse
+    from apps.organizations.models import Organization
+
+    actifs = Warehouse.objects.filter(
+        organization=OuterRef('pk'), is_deleted=False, is_active=True,
+    )
+    n = (
+        Organization.objects.filter(Exists(actifs))
+        .exclude(Exists(actifs.filter(is_default=True)))
+        .count()
+    )
+    if not n:
+        return [Constat(OK, 'entrepôts', "Chaque établissement a un entrepôt principal actif.")]
+    return [Constat(
+        AVERTISSEMENT, 'entrepôts',
+        f"{_compte(n, 'établissement', 'établissements')} sans entrepôt principal actif : "
+        "un membre nouveau y naîtrait sans entrepôt. Au propriétaire d'en désigner un.",
+    )]
+
+
+def membres_sans_entrepot():
+    """Un membre borné sans entrepôt actif ne lit rien et n'ouvre aucune caisse."""
+    from django.db.models import Count, Q
+
+    from apps.organizations.models import OrganizationMembership
+
+    membres = (
+        OrganizationMembership.objects.filter(is_active=True)
+        .exclude(role=OrganizationMembership.Role.OWNER)
+        .annotate(
+            _vivants=Count(
+                'assigned_warehouses',
+                filter=Q(assigned_warehouses__is_deleted=False), distinct=True,
+            ),
+            _actifs=Count(
+                'assigned_warehouses',
+                filter=Q(
+                    assigned_warehouses__is_deleted=False,
+                    assigned_warehouses__is_active=True,
+                ),
+                distinct=True,
+            ),
+        )
+        .filter(_actifs=0)
+    )
+    sans = membres.filter(_vivants=0).count()
+    fermes = membres.filter(_vivants__gt=0).count()
+    if not (sans or fermes):
+        return [Constat(OK, 'membres', "Chaque membre a un entrepôt actif.")]
+    constats = []
+    if sans:
+        constats.append(Constat(
+            AVERTISSEMENT, 'membres',
+            f"{_compte(sans, 'membre', 'membres')} sans aucun entrepôt : "
+            "lancez `reparer_membres_sans_entrepot`.",
+        ))
+    if fermes:
+        constats.append(Constat(
+            AVERTISSEMENT, 'membres',
+            f"{_compte(fermes, 'membre', 'membres')} affecté{'' if fermes < 2 else 's'} "
+            "seulement à des entrepôts désactivés : au propriétaire de les affecter ailleurs.",
+        ))
+    return constats
+
+
+def ventes_sans_sortie_de_stock():
+    """Une vente émise dont le stock suivi n'est jamais sorti : le rayon ment."""
+    from django.db.models import Exists, OuterRef
+
+    from apps.inventory.models import StockMovement
+    from apps.sales.models import Sale, SaleItem
+
+    n = (
+        Sale.objects.exclude(status__in=('draft', 'cancelled'))
+        .filter(warehouse__isnull=False)
+        .filter(Exists(SaleItem.objects.filter(
+            sale=OuterRef('pk'), product__track_inventory=True,
+        )))
+        .exclude(Exists(StockMovement.objects.filter(
+            reference_type='sale', movement_type='sale', reference_id=OuterRef('pk'),
+        )))
+        .count()
+    )
+    if not n:
+        return [Constat(OK, 'ventes', "Toute vente émise a sorti son stock.")]
+    return [Constat(
+        AVERTISSEMENT, 'ventes',
+        f"{_compte(n, 'vente émise', 'ventes émises')} sans sortie de stock : "
+        "lancez `rattraper_stock_ventes --dry-run`, puis sans l'option.",
+    )]
+
+
 VERIFICATIONS = (
     migrations_en_attente,
     modeles_sans_migration,
     administrateurs,
     taches_planifiees,
     configuration,
+    stocks_negatifs,
+    entrepots_principaux,
+    membres_sans_entrepot,
+    ventes_sans_sortie_de_stock,
 )
 
 
