@@ -693,8 +693,14 @@ PULL_TABLES = (
     # sans les connaître. `consult_all_warehouses` y ferait échouer le tirage
     # de la table. Le périmètre s'applique au SERVEUR, le terminal n'en a pas
     # besoin en colonne : il le lit dans sa charge de réveil.
+    #
+    # ⚠ ET JAMAIS `organization_id` : `ALL` l'écarte (`NEVER_SENT`), donc AUCUN
+    # terminal ne l'a dans son schéma. La première version figée le nommait, et
+    # le tirage de `memberships` et `quotations` échouait sur tout terminal
+    # (« table has no column named organization_id »).
+    # `test_manifeste_colonnes` refuse une liste figée plus large que `ALL`.
     PullTable('memberships', 'organizations.OrganizationMembership',
-              fields=('id', 'created_at', 'updated_at', 'user_id', 'organization_id', 'role', 'is_active', 'invited_by_id', 'joined_at', 'extra_permissions')),
+              fields=('id', 'created_at', 'updated_at', 'user_id', 'role', 'is_active', 'invited_by_id', 'joined_at', 'extra_permissions')),
 
     # -- les gens
     #
@@ -794,7 +800,7 @@ PULL_TABLES = (
     # l'organisation. ⚠ Colonnes FIGÉES : `warehouse_id` n'est pas exposé (un
     # terminal ancien échouerait à l'insérer) ; il borne au serveur.
     PullTable('quotations', 'sales.Quotation', soft_delete=True,
-              fields=('id', 'created_at', 'updated_at', 'organization_id', 'is_deleted', 'deleted_at', 'reference', 'customer_id', 'status', 'subtotal', 'tax_amount', 'discount_amount', 'total', 'valid_until', 'notes', 'terms', 'created_by_id', 'converted_sale_id'),
+              fields=('id', 'created_at', 'updated_at', 'is_deleted', 'deleted_at', 'reference', 'customer_id', 'status', 'subtotal', 'tax_amount', 'discount_amount', 'total', 'valid_until', 'notes', 'terms', 'created_by_id', 'converted_sale_id'),
               warehouse_path='warehouse_id', warehouse_include_null=True,
               author_field='created_by', children=QUOTATION_CHILDREN, revision=1),
 

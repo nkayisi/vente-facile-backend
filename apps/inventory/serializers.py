@@ -30,7 +30,7 @@ class WarehouseListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'code', 'branch', 'branch_name',
             'address', 'manager', 'manager_name', 'is_default', 'is_active',
-            'allow_negative_stock', 'stock_value'
+            'stock_value'
         ]
         read_only_fields = ['id']
 
@@ -64,7 +64,7 @@ class WarehouseDetailSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'code', 'branch', 'branch_name',
             'address', 'manager', 'manager_name',
-            'is_default', 'is_active', 'allow_negative_stock',
+            'is_default', 'is_active',
             'stock_value', 'locations', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
