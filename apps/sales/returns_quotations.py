@@ -16,6 +16,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from apps.core.exceptions import StockInsuffisant
+from apps.inventory.verrous import exiger_hors_inventaire
 
 
 class TransitionRefusee(Exception):
@@ -180,6 +181,14 @@ def convert_quotation(quotation, user, warehouse, perimetre_borne=False):
                         f"Disponible : {available}."
                     )
 
+    # La conversion SORT le stock (voir plus bas) : sur un rayon en cours
+    # d'inventaire, elle fausserait le comptage exactement comme une vente, qui
+    # est refusée dans ce cas. Même verrou, et AVANT toute écriture.
+    if warehouse:
+        suivis = [i.product_id for i in quotation.items.all() if i.product.track_inventory]
+        if suivis:
+            exiger_hors_inventaire(quotation.organization, warehouse.id, suivis)
+
     with transaction.atomic():
         sale = Sale.objects.create(
             organization=quotation.organization,
@@ -218,14 +227,24 @@ def convert_quotation(quotation, user, warehouse, perimetre_borne=False):
         quotation.converted_sale = sale
         quotation.save()
 
-        # Réserver immédiatement : sans quoi un autre caissier vendrait les
-        # mêmes unités pendant la fenêtre conversion → encaissement.
+        # ┌────────────────────────────────────────────────────────────────┐
+        # │ LA VENTE SORT SON STOCK DÈS LA CONVERSION, crédit ou pas.      │
+        # │                                                                │
+        # │ Un devis converti est une facture émise : le client repart     │
+        # │ avec la marchandise. On se contentait de la RÉSERVER, et elle  │
+        # │ ne sortait du rayon qu'au paiement complet - donc jamais si la │
+        # │ facture restait due. C'est le défaut corrigé le 2026-10-20 sur │
+        # │ la vente à crédit (`SaleCreateSerializer.create`), resté       │
+        # │ ouvert sur ce chemin jusqu'au 2026-11-16. `apply_decrement`    │
+        # │ refuse toute ligne au-delà du stock, sous verrou : l'`atomic`  │
+        # │ annule alors la conversion entière.                            │
+        # └────────────────────────────────────────────────────────────────┘
         if sale.warehouse:
-            SaleStockService.reserve_stock(sale, user)
+            SaleStockService.apply_decrement(sale, user)
 
-        # APRÈS la réservation : si une avance solde entièrement la facture,
-        # `register_sale_debt` enchaîne sur le décrément, dans le même ordre
-        # réservation → décrément que le chemin `add_payment`.
+        # APRÈS la sortie : si une avance solde entièrement la facture,
+        # `register_sale_debt` enchaîne sur le décrément, qui ne fait alors
+        # plus rien (`is_committed`) - il ne sort jamais deux fois.
         if sale.customer and sale.amount_due > 0:
             register_sale_debt(
                 sale, user,
