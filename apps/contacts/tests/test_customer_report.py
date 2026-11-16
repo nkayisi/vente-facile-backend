@@ -115,7 +115,7 @@ class PerimetreDeRoleTests(_RapportBaseTest):
         rapport = self._rapport(self.cashier_a)
         self.assertEqual(rapport.data['sales']['count'], nb)
 
-    def test_UN_CAISSIER_A_QUI_ON_ACCORDE_view_all_VOIT_TOUT(self):
+    def test_UN_CAISSIER_A_QUI_ON_ACCORDE_view_all_ELARGIT_SUR_DEMANDE(self):
         """
         ⚠ C'EST LE CAS QUI SÉPARE LES DEUX RÈGLES, et le seul.
 
@@ -124,6 +124,10 @@ class PerimetreDeRoleTests(_RapportBaseTest):
         accorde ce droit par `extra_permissions` voit donc deux chiffres
         contradictoires sur la même page si le rapport emploie la première. Le
         rapport reprend les deux pièces de `/sales/`, exactement.
+
+        Depuis le 2026-11-16, le droit OUVRE un choix, il ne change pas le
+        défaut : sans rien demander, le caissier ne lit que ses ventes ; il lit
+        celles de ses collègues en demandant « Tous les utilisateurs ».
         """
         self._create_sale()            # cashier_a
         self._vente_de(self.cashier_b)  # un collègue
@@ -134,16 +138,22 @@ class PerimetreDeRoleTests(_RapportBaseTest):
         membre.extra_permissions = ['sales.view_all']
         membre.save(update_fields=['extra_permissions'])
 
+        def compte_liste(**params):
+            liste = self.client.get(
+                f'/api/v1/customers/{self.customer.id}/sales/', params, **self._headers(),
+            )
+            return liste.data.get('count', len(liste.data.get('results', liste.data)))
+
         r = self._rapport(self.cashier_a)
         self.assertEqual(r.status_code, status.HTTP_200_OK, r.data)
-        # Les deux ventes : c'est ce que `/sales/` lui montrerait.
-        self.assertEqual(r.data['sales']['count'], 2)
+        # Par défaut, ses seules ventes : c'est ce que `/sales/` lui montre.
+        self.assertEqual(r.data['sales']['count'], 1)
+        self.assertEqual(compte_liste(), 1, "La liste et le rapport ne disent pas la même chose.")
 
-        liste = self.client.get(
-            f'/api/v1/customers/{self.customer.id}/sales/', **self._headers(),
-        )
-        nb = liste.data.get('count', len(liste.data.get('results', liste.data)))
-        self.assertEqual(nb, 2, "La liste et le rapport ne disent pas la même chose.")
+        # Élargi, les deux - et la liste dit la même chose.
+        r = self._rapport(self.cashier_a, all_users='1')
+        self.assertEqual(r.data['sales']['count'], 2)
+        self.assertEqual(compte_liste(all_users='1'), 2)
 
     def test_un_caissier_sans_droit_client_est_refuse(self):
         # `customers.view` est accordé au caissier ; c'est un rôle SANS ce

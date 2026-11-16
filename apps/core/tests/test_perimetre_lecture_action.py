@@ -96,31 +96,99 @@ class _Perimetre(APITestCase):
     def _h(self):
         return {'HTTP_X_ORGANIZATION_ID': str(self.org.id)}
 
-    def _references(self, utilisateur, chemin):
+    def _references(self, utilisateur, chemin, **params):
         self.client.force_authenticate(user=utilisateur)
-        reponse = self.client.get(chemin, {'page_size': 100}, **self._h())
+        reponse = self.client.get(chemin, {'page_size': 100, **params}, **self._h())
         self.assertEqual(reponse.status_code, status.HTTP_200_OK, reponse.data)
         return {ligne['reference'] for ligne in reponse.data['results']}
 
 
 class MatriceDesVentesTests(_Perimetre):
 
-    def test_chaque_membre_lit_ce_que_la_matrice_lui_donne(self):
+    def test_chaque_membre_voit_son_defaut(self):
+        """
+        Décision du 2026-11-16 : sans filtre, le propriétaire voit tout, le
+        gérant ses entrepôts, le caissier SES ventes - quelles que soient ses
+        cases. La case « Consulter tous » ne change pas le défaut.
+        """
         attendus = {
             'proprietaire': (self.owner, {'VT-A1', 'VT-A2', 'VT-B1'}),
             'gerant de A': (self.manager, {'VT-A1', 'VT-A2'}),
             'caissier de A': (self.cashier_a, {'VT-A1'}),
-            'caissier « Voir tout »': (self.voit_tout, {'VT-A1', 'VT-A2'}),
-            'gerant « Consulter tous »': (self.consulte_tout, {'VT-A1', 'VT-A2', 'VT-B1'}),
+            'caissier « Voir tout »': (self.voit_tout, set()),
+            'gerant « Consulter tous »': (self.consulte_tout, {'VT-A1', 'VT-A2'}),
             'caissier de B': (self.caissier_b, {'VT-B1'}),
         }
         for nom, (utilisateur, attendu) in attendus.items():
             with self.subTest(nom):
                 self.assertEqual(self._references(utilisateur, '/api/v1/sales/'), attendu)
 
+    def test_voir_tout_elargit_sur_demande(self):
+        self.assertEqual(
+            self._references(self.voit_tout, '/api/v1/sales/', all_users='1'),
+            {'VT-A1', 'VT-A2'},
+        )
+        self.assertEqual(
+            self._references(self.voit_tout, '/api/v1/sales/', user=str(self.cashier_b.id)),
+            {'VT-A2'},
+        )
+
     def test_voir_tout_ne_franchit_pas_ses_entrepots(self):
         """La case ouvre les COLLÈGUES, jamais la boutique d'en face."""
-        self.assertNotIn('VT-B1', self._references(self.voit_tout, '/api/v1/sales/'))
+        refs = self._references(
+            self.voit_tout, '/api/v1/sales/', all_users='1', all_warehouses='1',
+        )
+        self.assertNotIn('VT-B1', refs)
+
+    def test_consulter_tous_elargit_sur_demande(self):
+        self.assertEqual(
+            self._references(self.consulte_tout, '/api/v1/sales/', all_warehouses='1'),
+            {'VT-A1', 'VT-A2', 'VT-B1'},
+        )
+        self.assertEqual(
+            self._references(
+                self.consulte_tout, '/api/v1/sales/', warehouse=str(self.depot_b.id),
+            ),
+            {'VT-B1'},
+        )
+
+    def test_le_choix_tous_passe_par_le_meme_parametre(self):
+        """
+        Le back-office envoie « Tous » en `*` dans `warehouse` / `user`, les seules
+        clés que ses actions connaissent ; `ChoixTousMiddleware` en fait
+        `all_warehouses` / `all_users`. Sans lui, un `FilterSet` lirait `*` comme
+        un UUID et répondrait 400.
+        """
+        self.assertEqual(
+            self._references(self.voit_tout, '/api/v1/sales/', user='*'),
+            {'VT-A1', 'VT-A2'},
+        )
+        self.assertEqual(
+            self._references(self.consulte_tout, '/api/v1/sales/', warehouse='*'),
+            {'VT-A1', 'VT-A2', 'VT-B1'},
+        )
+
+    def test_sans_case_rien_ne_s_elargit(self):
+        """Le DROIT tient : un caissier sans case qui demande « tous » reste seul."""
+        self.assertEqual(
+            self._references(
+                self.cashier_a, '/api/v1/sales/', all_users='1', all_warehouses='1',
+            ),
+            {'VT-A1'},
+        )
+
+    def test_une_fiche_s_ouvre_dans_tout_le_lisible(self):
+        """
+        ⚠ Ce qu'on voit dans une liste élargie s'ouvre : la fiche se cherche dans
+        tout ce qui est lisible, pas dans le défaut.
+        """
+        self.client.force_authenticate(user=self.voit_tout)
+        reponse = self.client.get(f'/api/v1/sales/{self.vente_a2.id}/', **self._h())
+        self.assertEqual(reponse.status_code, status.HTTP_200_OK, reponse.data)
+        # Et le droit tient : sans case, la vente d'un collègue reste introuvable.
+        self.client.force_authenticate(user=self.cashier_a)
+        reponse = self.client.get(f'/api/v1/sales/{self.vente_a2.id}/', **self._h())
+        self.assertEqual(reponse.status_code, status.HTTP_404_NOT_FOUND)
 
 
 class ConsultationSeuleTests(_Perimetre):
@@ -176,9 +244,15 @@ class DepensesParAuteurTests(_Perimetre):
         self.assertEqual(self._references(self.cashier_a, '/api/v1/expenses/'), {'DEP-A1'})
 
     def test_voir_tout_ouvre_ses_collegues_de_sa_boutique(self):
-        """La règle d'auteur suit la PERMISSION : elle bornait la caisse par le RÔLE."""
+        """
+        La règle d'auteur suit la PERMISSION : elle bornait la caisse par le RÔLE.
+        Par défaut il ne voit que les siennes ; « Tous les utilisateurs » ouvre
+        celles de ses collègues, jamais celles de l'autre boutique.
+        """
+        self.assertEqual(self._references(self.voit_tout, '/api/v1/expenses/'), set())
         self.assertEqual(
-            self._references(self.voit_tout, '/api/v1/expenses/'), {'DEP-A1', 'DEP-A2'},
+            self._references(self.voit_tout, '/api/v1/expenses/', all_users='1'),
+            {'DEP-A1', 'DEP-A2'},
         )
 
 

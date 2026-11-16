@@ -24,8 +24,9 @@ from apps.core.api_mixins import (
 )
 from apps.core.warehouse_scope import (
     LECTURE,
+    TOUT,
     entrepots_du_perimetre,
-    entrepots_lisibles,
+    etendue_de_la_requete,
     exiger_entrepot_lisible_requete,
     filter_products_by_warehouse_ids,
     filter_queryset_by_warehouse_ids,
@@ -175,7 +176,12 @@ class CategoryViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
                 product__is_deleted=False,
             )
         else:
-            wh_ids = entrepots_lisibles(membership) if membership else None
+            wh_ids = (
+                entrepots_du_perimetre(
+                    membership, LECTURE, etendue_de_la_requete(self.request)
+                )
+                if membership else None
+            )
             stock_qs = Stock.objects.filter(
                 product__organization=organization,
                 product__category_id=OuterRef('pk'),
@@ -195,7 +201,11 @@ class CategoryViewSet(TenantViewSetMixin, AuditMixin, viewsets.ModelViewSet):
         category = self.get_object()
 
         m = get_membership_for_request(request)
-        wh_ids = entrepots_lisibles(m) if m else None
+        # Les articles d'une catégorie sont une LISTE : le défaut du membre.
+        wh_ids = (
+            entrepots_du_perimetre(m, LECTURE, etendue_de_la_requete(request))
+            if m else None
+        )
 
         base_qs = Product.objects.filter(
             organization=category.organization,
@@ -515,7 +525,12 @@ class ProductViewSet(ExportableListMixin, TenantViewSetMixin, AuditMixin,
         # modification d'un article qui n'est stocké que dans un autre dépôt.
         m = get_membership_for_request(self.request)
         wh_ids = (
-            entrepots_du_perimetre(m, nature_de_la_requete(self.request)) if m else None
+            entrepots_du_perimetre(
+                m,
+                nature_de_la_requete(self.request),
+                TOUT if self.detail else etendue_de_la_requete(self.request),
+            )
+            if m else None
         )
         warehouse_param = self.request.query_params.get('warehouse')
         effective_wh_ids = wh_ids
@@ -580,6 +595,7 @@ class ProductViewSet(ExportableListMixin, TenantViewSetMixin, AuditMixin,
         if m:
             stocks = filter_queryset_by_warehouse_ids(
                 stocks, m, 'warehouse_id', nature=LECTURE,
+                etendue=etendue_de_la_requete(request),
             )
         
         data = [
@@ -603,7 +619,10 @@ class ProductViewSet(ExportableListMixin, TenantViewSetMixin, AuditMixin,
         """Retourne les produits en stock bas avec pagination."""
         organization = self.get_organization()
         m = get_membership_for_request(request)
-        wh_ids = entrepots_lisibles(m) if m else None
+        wh_ids = (
+            entrepots_du_perimetre(m, LECTURE, etendue_de_la_requete(request))
+            if m else None
+        )
 
         products_qs = Product.objects.filter(
             organization=organization,

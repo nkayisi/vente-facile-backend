@@ -59,6 +59,7 @@ from rest_framework.views import APIView
 from apps.core.api_permissions import IsTenantMember, _get_membership
 from apps.core.warehouse_scope import (
     LECTURE,
+    TOUT,
     borner_visibilite,
     empreinte_perimetre,
     entrepots_lisibles,
@@ -365,10 +366,23 @@ def _scope_to_warehouses(queryset, table, membership):
     if membership is None:
         return queryset
 
+    # ┌──────────────────────────────────────────────────────────────────┐
+    # │ LE TIRAGE LIT `TOUT`, PAS LE DÉFAUT.                             │
+    # │                                                                  │
+    # │ Le défaut d'une liste (un caissier ne voit que ses ventes, la    │
+    # │ case « consulter tous » ne montre que ses entrepôts) est appliqué │
+    # │ par le TERMINAL, sur sa base locale : c'est ce qui permet à ses   │
+    # │ filtres d'élargir hors ligne. Le tirage descend donc tout ce que  │
+    # │ le membre a le DROIT de lire, ni plus ni moins.                   │
+    # └──────────────────────────────────────────────────────────────────┘
     if table.scope == 'transfer':
-        return filter_stock_transfer_queryset(queryset, membership, nature=LECTURE)
+        return filter_stock_transfer_queryset(
+            queryset, membership, nature=LECTURE, etendue=TOUT
+        )
     if table.scope == 'cash_movement':
-        return filter_cash_movement_queryset(queryset, membership, nature=LECTURE)
+        return filter_cash_movement_queryset(
+            queryset, membership, nature=LECTURE, etendue=TOUT
+        )
     if table.warehouse_path is None and not table.author_field:
         return queryset
 
@@ -383,6 +397,7 @@ def _scope_to_warehouses(queryset, table, membership):
         queryset,
         membership,
         nature=LECTURE,
+        etendue=TOUT,
         warehouse_field=champ_entrepot,
         author_field=table.author_field,
         include_null_warehouse=table.warehouse_include_null,

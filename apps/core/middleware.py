@@ -152,3 +152,38 @@ class SubscriptionMiddleware(MiddlewareMixin):
             response['X-Subscription-Status'] = status.get('status', 'expired')
             response['X-Subscription-Blocked'] = 'true'
         return response
+
+
+class ChoixTousMiddleware:
+    """
+    `?warehouse=*` et `?user=*` : le choix explicite « Tous », normalisé.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ ÉLARGIR EST UN CHOIX, ET IL PASSE PAR LE MÊME PARAMÈTRE QUE LES AUTRES. │
+    │                                                                          │
+    │ Une liste part du défaut du membre (voir `apps.core.warehouse_scope`).   │
+    │ Le filtre du back-office envoie `warehouse` et `user` à travers une      │
+    │ trentaine d'actions qui ne connaissent que ces deux clés ; plutôt que de │
+    │ leur en apprendre deux autres, « Tous » voyage en `*` dans les mêmes, et │
+    │ c'est ici, une seule fois, qu'il devient `all_warehouses=1` /            │
+    │ `all_users=1`. Plus rien en aval ne voit `*` : un `FilterSet` qui        │
+    │ l'attendrait comme un UUID répondrait 400.                               │
+    └──────────────────────────────────────────────────────────────────────────┘
+    """
+
+    _CLES = (('warehouse', 'all_warehouses'), ('user', 'all_users'))
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        get = request.GET
+        if any(get.get(cle) == '*' for cle, _ in self._CLES):
+            copie = get.copy()
+            for cle, drapeau in self._CLES:
+                if copie.get(cle) == '*':
+                    del copie[cle]
+                    copie[drapeau] = '1'
+            copie._mutable = False
+            request.GET = copie
+        return self.get_response(request)

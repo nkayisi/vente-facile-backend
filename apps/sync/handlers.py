@@ -10,6 +10,7 @@ C'est tout l'objet du lot : il n'y a plus qu'un chemin d'écriture.
 from apps.core.warehouse_scope import (
     ACTION,
     LECTURE,
+    TOUT,
     borner_visibilite,
     entrepots_actionnables,
     exiger_cote_du_transfert,
@@ -602,6 +603,8 @@ def _borne_par(ctx, warehouse_field, *, author_field=None, include_null=False):
     def borner(qs, nature):
         return borner_visibilite(
             qs, ctx.membership, nature=nature,
+            # Une pièce qu'on désigne se cherche dans tout ce qui est lisible.
+            etendue=TOUT,
             warehouse_field=warehouse_field, author_field=author_field,
             include_null_warehouse=include_null,
         )
@@ -681,7 +684,7 @@ def _transition_transfert(ctx, payload, fonction, cote, **extra):
     transfert = _objet_actionnable(
         StockTransfer, ctx, payload['transfer'], 'Ce transfert',
         borner=lambda qs, nature: filter_stock_transfer_queryset(
-            qs, ctx.membership, nature=nature,
+            qs, ctx.membership, nature=nature, etendue=TOUT,
         ) if ctx.membership else qs,
         # Le côté est contrôlé juste après : il porte aussi l'entrepôt actif.
         entrepot_de=lambda t: None,
@@ -1417,7 +1420,7 @@ def cash_movement_cancel(ctx, payload):
     mouvement = _objet_actionnable(
         CashMovement, ctx, payload['movement'], 'Ce mouvement de caisse',
         borner=lambda qs, nature: filter_cash_movement_queryset(
-            qs, ctx.membership, nature=nature,
+            qs, ctx.membership, nature=nature, etendue=TOUT,
         ),
         entrepot_de=_entrepot_du_mouvement,
     )

@@ -33,7 +33,8 @@ from apps.core.api_permissions import IsTenantMember, HasActiveSubscription, Has
 from apps.core.warehouse_scope import (
     LECTURE,
     borner_visibilite,
-    entrepots_lisibles,
+    entrepots_du_perimetre,
+    etendue_de_la_requete,
     assert_user_allowed_for_request,
     filter_cash_movement_queryset,
     exiger_entrepot_lisible_requete,
@@ -187,15 +188,18 @@ class StatisticsViewSet(ExportResponseMixin, ActionPaginationMixin,
     }
     
     def _accessible_warehouse_ids(self, request):
-        """Renvoie ``None`` (tout) ou les entrepôts que le membre peut LIRE.
+        """Renvoie ``None`` (tout) ou les entrepôts que le rapport MONTRE.
 
-        Un rapport est une lecture : la case « consulter tous les entrepôts »
-        l'ouvre à toute l'organisation.
+        Un rapport est une lecture, à l'étendue de la requête : la case
+        « consulter tous les entrepôts » ne l'ouvre à toute l'organisation que
+        si la requête le demande (`all_warehouses` ou un entrepôt précis).
         """
         membership = get_membership_for_request(request)
         if not membership:
             return None
-        return entrepots_lisibles(membership)
+        return entrepots_du_perimetre(
+            membership, LECTURE, etendue_de_la_requete(request)
+        )
 
     def _borner(self, qs, request, *, warehouse_field, author_field, include_null=False):
         """
@@ -216,6 +220,9 @@ class StatisticsViewSet(ExportResponseMixin, ActionPaginationMixin,
             qs,
             get_membership_for_request(request),
             nature=LECTURE,
+            # Un rapport part du DÉFAUT du membre : un caissier n'y voit que
+            # ses ventes tant qu'il ne choisit pas un collègue ou « tous ».
+            etendue=etendue_de_la_requete(request),
             warehouse_field=warehouse_field,
             author_field=author_field,
             include_null_warehouse=include_null,
@@ -325,7 +332,8 @@ class StatisticsViewSet(ExportResponseMixin, ActionPaginationMixin,
         └──────────────────────────────────────────────────────────────────┘
         """
         qs = filter_cash_movement_queryset(
-            qs, get_membership_for_request(request), nature=LECTURE
+            qs, get_membership_for_request(request), nature=LECTURE,
+            etendue=etendue_de_la_requete(request),
         )
         # Le filtre VOLONTAIRE, lui, reste sans clause `isnull` : un apport sans
         # pièce apparaîtrait sinon sous chaque dépôt, et la somme des dépôts

@@ -49,7 +49,7 @@ def _premier_du_mois_recule(jour, mois):
     return date(rang // 12, rang % 12 + 1, 1)
 
 
-def _cle_de_perimetre(membership, entrepot_voulu, utilisateur_voulu):
+def _cle_de_perimetre(membership, entrepot_voulu, utilisateur_voulu, etendue):
     """
     L'empreinte du périmètre EFFECTIF, pour la clé de cache du tableau de bord.
 
@@ -64,10 +64,18 @@ def _cle_de_perimetre(membership, entrepot_voulu, utilisateur_voulu):
     """
     from hashlib import blake2s
 
-    from apps.core.warehouse_scope import empreinte_perimetre, entrepots_lisibles
+    from apps.core.warehouse_scope import (
+        LECTURE,
+        auteur_borne,
+        empreinte_perimetre,
+        entrepots_du_perimetre,
+    )
 
     role = membership.role if membership else 'anonyme'
-    ids = entrepots_lisibles(membership) if membership else []
+    # Le périmètre EFFECTIF, étendue comprise : le défaut d'un membre
+    # « consulter tous » n'est pas « tous », et un caissier qui demande « Tous
+    # les utilisateurs » ne lit pas le même total que sans rien demander.
+    ids = entrepots_du_perimetre(membership, LECTURE, etendue) if membership else []
     # `None` (aucune restriction) et `[]` (aucun accès) sont deux situations
     # opposées : les écrire pareil ferait servir la réponse du propriétaire à
     # un membre qui n'a droit à rien.
@@ -75,12 +83,13 @@ def _cle_de_perimetre(membership, entrepot_voulu, utilisateur_voulu):
     # Un membre borné par AUTEUR l'est par son identité : sans elle dans la
     # clé, deux caissiers du même dépôt partageraient un total.
     qui = str(membership.user_id) if membership else ''
+    borne = '1' if membership and auteur_borne(membership, LECTURE, etendue) else '0'
     # L'empreinte porte la case « consulter tous » et les permissions : sans
     # elle, cocher « Voir tout » servirait 60 s le total d'avant.
     empreinte = empreinte_perimetre(membership) if membership else ''
 
     brut = (
-        f"{role}|{portee}|{qui}|{empreinte}"
+        f"{role}|{portee}|{qui}|{borne}|{empreinte}"
         f"|{entrepot_voulu or ''}|{utilisateur_voulu or ''}"
     )
     return blake2s(brut.encode('utf-8'), digest_size=8).hexdigest()
@@ -394,6 +403,7 @@ class OrganizationViewSet(viewsets.ModelViewSet):
             LECTURE,
             assert_user_allowed_for_membership,
             borner_visibilite,
+            etendue_de_la_requete,
             exiger_entrepot_lisible,
             filter_queryset_by_warehouse_ids,
             membership_for_organization,
@@ -430,6 +440,9 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         if entrepot_voulu:
             exiger_entrepot_lisible(membership, entrepot_voulu)
         assert_user_allowed_for_membership(membership, utilisateur_voulu)
+        # Le DÉFAUT du membre, sauf ce que la requête élargit : un caissier ne
+        # voit que ses ventes, un membre « consulter tous » que ses entrepôts.
+        etendue = etendue_de_la_requete(request)
 
         def borner_ventes(queryset):
             """Périmètre du rôle, puis filtre volontaire. Dans cet ordre."""
@@ -437,6 +450,7 @@ class OrganizationViewSet(viewsets.ModelViewSet):
                 queryset,
                 membership,
                 nature=LECTURE,
+                etendue=etendue,
                 warehouse_field='warehouse_id',
                 author_field='sold_by',
                 # Même tolérance que `SaleViewSet` pour les ventes anciennes sans
@@ -459,7 +473,7 @@ class OrganizationViewSet(viewsets.ModelViewSet):
             d'un autre écran a traîné, ce qui se lit comme une perte de données.
             """
             queryset = filter_queryset_by_warehouse_ids(
-                queryset, membership, nature=LECTURE
+                queryset, membership, nature=LECTURE, etendue=etendue
             )
             if entrepot_voulu:
                 queryset = queryset.filter(warehouse_id=entrepot_voulu)
@@ -481,7 +495,7 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         # └──────────────────────────────────────────────────────────────────┘
         cache_key = (
             f"vf:dash:{organization.id}:{period}:"
-            f"{_cle_de_perimetre(membership, entrepot_voulu, utilisateur_voulu)}"
+            f"{_cle_de_perimetre(membership, entrepot_voulu, utilisateur_voulu, etendue)}"
         )
         cached_payload = cache.get(cache_key)
         if cached_payload is not None:

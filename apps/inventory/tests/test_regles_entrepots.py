@@ -339,6 +339,19 @@ class AnnuaireTests(_Entrepots):
         for entree in reponse.data:
             self.assertEqual(set(entree), {'id', 'name', 'is_active'})
 
+    def test_un_caissier_lit_aussi_l_annuaire(self):
+        # Le filtre « Entrepôt » d'un caissier « Consulter tous » le lit : il
+        # n'a pas `warehouses.view`, et le terminal le reçoit déjà au réveil.
+        self.client.force_authenticate(user=self.cashier_a)
+        reponse = self.client.get('/api/v1/warehouses/directory/', **self._h())
+        self.assertEqual(reponse.status_code, status.HTTP_200_OK, reponse.data)
+        self.assertEqual(
+            {e['name'] for e in reponse.data}, {self.depot_a.name, 'Boutique B'},
+        )
+        # Mais toujours les noms seuls.
+        for entree in reponse.data:
+            self.assertEqual(set(entree), {'id', 'name', 'is_active'})
+
     def test_le_reveil_du_terminal_porte_l_annuaire(self):
         from apps.users.devices import build_session_payload
 

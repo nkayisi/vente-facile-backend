@@ -34,11 +34,40 @@ Périmètre entrepôt d'un membre : ce qu'il peut LIRE, ce qu'il peut FAIRE.
 │ de session) : les cacher le ferait ressaisir ce qu'il a déjà saisi.          │
 └──────────────────────────────────────────────────────────────────────────────┘
 
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ CE QU'ON PEUT LIRE N'EST PAS CE QU'UNE LISTE MONTRE PAR DÉFAUT (2026-11-16).│
+│                                                                              │
+│ Une LISTE (et tout ce qui agrège : rapports, tableau de bord, exports) part  │
+│ du DÉFAUT du membre :                                                        │
+│                                                                              │
+│ - le propriétaire voit tout l'établissement ;                               │
+│ - le gérant et le magasinier, toutes les données de leurs entrepôts ;       │
+│ - le caissier, SES données seulement.                                       │
+│                                                                              │
+│ Les deux cases n'élargissent que sur demande EXPLICITE de la requête         │
+│ (l'`Etendue`) : `?warehouse=<id>` ou `?all_warehouses=1` pour la case        │
+│ « Consulter tous les entrepôts », `?user=<id>` ou `?all_users=1` pour le     │
+│ caissier qui a l'une des deux cases. Sans rien de cela, un caissier qui a    │
+│ « Voir tout dans son entrepôt » ne voit que ses ventes, partout - y compris │
+│ sur les écrans qui n'ont pas de filtre.                                      │
+│                                                                              │
+│ ⚠ L'OBJET QU'ON OUVRE N'EST PAS UNE LISTE. Une fiche (`get_object`) se       │
+│ cherche dans tout ce qui est LISIBLE (`TOUT`) : un membre qui a élargi sa    │
+│ liste doit pouvoir ouvrir la vente qu'il y voit. Le tirage du terminal lit  │
+│ aussi `TOUT` : c'est le terminal qui applique le défaut sur sa base locale,  │
+│ pour que ses filtres marchent hors ligne.                                    │
+│                                                                              │
+│ ⚠ EN LECTURE, L'ÉTENDUE EST OBLIGATOIRE. Une lecture sans étendue lève       │
+│ `TypeError` et un garde-fou AST l'exige : un site qui l'oublierait montrerait│
+│ tout par défaut, c'est-à-dire le défaut même qu'on ferme ici.                │
+└──────────────────────────────────────────────────────────────────────────────┘
+
 Convention des listes : `None` = aucune restriction (propriétaire, ou case
-« consulter tous » en lecture) ; `[]` = aucun accès, partout `.none()`.
+« consulter tous » élargie) ; `[]` = aucun accès, partout `.none()`.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional
 from uuid import UUID
 
@@ -97,6 +126,54 @@ def membership_for_organization(request, organization):
     from apps.core.api_permissions import exiger_etablissement_actif
 
     return exiger_etablissement_actif(request, getattr(request, cache_key))
+
+
+# ─── L'étendue d'une lecture ──────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class Etendue:
+    """Ce qu'une lecture ÉLARGIT au-delà du défaut du membre."""
+
+    #: Un entrepôt précis, ou « Tous les entrepôts ».
+    entrepots: bool
+    #: Un utilisateur précis, ou « Tous les utilisateurs ».
+    auteurs: bool
+
+
+#: Le défaut : une liste qui ne demande rien de plus.
+DEFAUT = Etendue(entrepots=False, auteurs=False)
+#: Tout ce qui est lisible : une fiche qu'on ouvre, le tirage, un contrôle d'existence.
+TOUT = Etendue(entrepots=True, auteurs=True)
+
+_VRAI = frozenset({'1', 'true', 'oui', 'yes', 'on'})
+
+
+def _drapeau(valeur) -> bool:
+    return str(valeur or '').strip().lower() in _VRAI
+
+
+def etendue_de_la_requete(request) -> Etendue:
+    """
+    L'étendue que la requête DEMANDE.
+
+    Un `?warehouse=` précis élargit aussi : un membre « consulter tous » qui vise
+    l'entrepôt d'en face doit le lire, et son défaut ne contient que les siens.
+    """
+    params = getattr(request, 'query_params', None)
+    if params is None:
+        params = getattr(request, 'GET', {}) or {}
+    return Etendue(
+        entrepots=bool(params.get('warehouse')) or _drapeau(params.get('all_warehouses')),
+        auteurs=bool(params.get('user')) or _drapeau(params.get('all_users')),
+    )
+
+
+def _verifier_etendue(nature, etendue):
+    if nature == LECTURE and not isinstance(etendue, Etendue):
+        raise TypeError(
+            'Une lecture exige son étendue : `etendue=etendue_de_la_requete(request)` '
+            'pour une liste, `etendue=TOUT` pour une fiche ou le tirage.'
+        )
 
 
 # ─── La nature d'une requête ──────────────────────────────────────────────────
@@ -175,10 +252,21 @@ def entrepots_actionnables(membership) -> Optional[list[UUID]]:
     return entrepots_affectes(membership)
 
 
-def entrepots_du_perimetre(membership, nature: str) -> Optional[list[UUID]]:
+def entrepots_du_perimetre(
+    membership, nature: str, etendue: Optional[Etendue] = None
+) -> Optional[list[UUID]]:
+    """
+    Les entrepôts d'une requête. En LECTURE, l'étendue décide : par DÉFAUT, un
+    membre « consulter tous » ne voit que ses entrepôts, et il ne voit les
+    autres que s'il les demande.
+    """
     _verifier_nature(nature)
     if nature == LECTURE:
-        return entrepots_lisibles(membership)
+        _verifier_etendue(nature, etendue)
+        ids = entrepots_lisibles(membership)
+        if ids is None and not etendue.entrepots and not _est_proprietaire(membership):
+            return entrepots_affectes(membership)
+        return ids
     return entrepots_actionnables(membership)
 
 
@@ -195,11 +283,12 @@ def permissions_effectives(membership) -> frozenset[str]:
 
 def est_borne_par_auteur(membership, nature: str) -> bool:
     """
-    Le membre ne voit-il, ou ne touche-t-il, que SES propres lignes ?
+    Le membre ne PEUT-il voir, ou toucher, que SES propres lignes ?
 
     Faux pour le propriétaire ; faux en LECTURE pour la case « consulter
     tous » (elle ouvre tous les auteurs) ; sinon, faux seulement avec
-    `sales.view_all`.
+    `sales.view_all`. C'est un DROIT : ce qu'une liste montre par défaut se
+    décide dans `auteur_borne`.
     """
     _verifier_nature(nature)
     if membership is None or _est_proprietaire(membership):
@@ -207,6 +296,25 @@ def est_borne_par_auteur(membership, nature: str) -> bool:
     if nature == LECTURE and consulte_tout(membership):
         return False
     return PERMISSION_VOIR_TOUT not in permissions_effectives(membership)
+
+
+def auteur_borne(membership, nature: str, etendue: Optional[Etendue] = None) -> bool:
+    """
+    La requête ne montre-t-elle que SES propres lignes ?
+
+    Le droit d'abord (`est_borne_par_auteur`), puis le DÉFAUT : un caissier ne
+    voit que ses données tant qu'il ne demande pas un collègue ou « Tous les
+    utilisateurs », même s'il a l'une des deux cases.
+    """
+    if est_borne_par_auteur(membership, nature):
+        return True
+    if nature != LECTURE or membership is None:
+        return False
+    _verifier_etendue(nature, etendue)
+    return (
+        not etendue.auteurs
+        and membership.role == OrganizationMembership.Role.CASHIER
+    )
 
 
 def empreinte_perimetre(membership) -> str:
@@ -255,11 +363,12 @@ def filter_queryset_by_warehouse_ids(
     warehouse_field: str = 'warehouse_id',
     *,
     nature: str,
+    etendue: Optional[Etendue] = None,
 ) -> QuerySet:
     """Filtre direct sur un champ d'entrepôt, dans le périmètre de `nature`."""
     return _borner_entrepot(
         queryset,
-        entrepots_du_perimetre(membership, nature),
+        entrepots_du_perimetre(membership, nature, etendue),
         warehouse_field,
         include_null=False,
     )
@@ -272,6 +381,7 @@ def filter_queryset_by_related_warehouse(
     *,
     include_null: bool = False,
     nature: str,
+    etendue: Optional[Etendue] = None,
 ) -> QuerySet:
     """
     Filtre via une relation (``original_sale__warehouse_id``,
@@ -280,7 +390,7 @@ def filter_queryset_by_related_warehouse(
     """
     return _borner_entrepot(
         queryset,
-        entrepots_du_perimetre(membership, nature),
+        entrepots_du_perimetre(membership, nature, etendue),
         warehouse_field,
         include_null=include_null,
     )
@@ -294,6 +404,7 @@ def borner_visibilite(
     warehouse_field: Optional[str],
     author_field: Optional[str],
     include_null_warehouse: bool = False,
+    etendue: Optional[Etendue] = None,
 ) -> QuerySet:
     """
     Le périmètre complet d'une donnée qui a un AUTEUR : entrepôt, puis auteur.
@@ -305,11 +416,11 @@ def borner_visibilite(
     """
     if membership is None:
         return queryset
-    borne = bool(author_field) and est_borne_par_auteur(membership, nature)
+    borne = bool(author_field) and auteur_borne(membership, nature, etendue)
     if warehouse_field:
         queryset = _borner_entrepot(
             queryset,
-            entrepots_du_perimetre(membership, nature),
+            entrepots_du_perimetre(membership, nature, etendue),
             warehouse_field,
             include_null=include_null_warehouse or borne,
         )
@@ -327,8 +438,13 @@ def borner_visibilite_requete(
     author_field: Optional[str],
     include_null_warehouse: bool = False,
     nature: Optional[str] = None,
+    etendue: Optional[Etendue] = None,
 ) -> QuerySet:
-    """`borner_visibilite`, nature déduite de la requête sauf si elle est imposée."""
+    """
+    `borner_visibilite`, nature et étendue déduites de la requête sauf si elles
+    sont imposées. Ce corps sert des LISTES : l'étendue par défaut est celle que
+    la requête demande.
+    """
     return borner_visibilite(
         queryset,
         get_membership_for_request(request),
@@ -336,11 +452,16 @@ def borner_visibilite_requete(
         warehouse_field=warehouse_field,
         author_field=author_field,
         include_null_warehouse=include_null_warehouse,
+        etendue=etendue or etendue_de_la_requete(request),
     )
 
 
 def filter_stock_transfer_queryset(
-    queryset: QuerySet, membership: OrganizationMembership, *, nature: str
+    queryset: QuerySet,
+    membership: OrganizationMembership,
+    *,
+    nature: str,
+    etendue: Optional[Etendue] = None,
 ) -> QuerySet:
     """
     Transferts où la source OU la destination est dans le périmètre.
@@ -351,7 +472,7 @@ def filter_stock_transfer_queryset(
     peut faire QUOI sur un transfert (expédier côté source, recevoir côté
     destination) est tranché par `exiger_cote_du_transfert`.
     """
-    ids = entrepots_du_perimetre(membership, nature)
+    ids = entrepots_du_perimetre(membership, nature, etendue)
     if ids is None:
         return queryset
     if not ids:
@@ -366,6 +487,7 @@ def filter_product_queryset(
     membership: Optional[OrganizationMembership],
     *,
     nature: str,
+    etendue: Optional[Etendue] = None,
 ) -> QuerySet:
     """
     Le périmètre d'un ARTICLE : il se dérive de ses lignes de stock.
@@ -381,7 +503,7 @@ def filter_product_queryset(
     if membership is None:
         return queryset
     return filter_products_by_warehouse_ids(
-        queryset, entrepots_du_perimetre(membership, nature)
+        queryset, entrepots_du_perimetre(membership, nature, etendue)
     )
 
 
@@ -405,6 +527,7 @@ def filter_cash_movement_queryset(
     membership: Optional[OrganizationMembership],
     *,
     nature: str,
+    etendue: Optional[Etendue] = None,
 ) -> QuerySet:
     """
     Le périmètre d'un mouvement de caisse : il se DÉRIVE, par trois chemins
@@ -417,8 +540,8 @@ def filter_cash_movement_queryset(
     """
     if membership is None:
         return queryset
-    ids = entrepots_du_perimetre(membership, nature)
-    borne = est_borne_par_auteur(membership, nature)
+    ids = entrepots_du_perimetre(membership, nature, etendue)
+    borne = auteur_borne(membership, nature, etendue)
     if ids is not None:
         if not ids:
             return queryset.none()
@@ -613,7 +736,9 @@ def membership_targets_q(membership, *, nature: str = LECTURE):
         # Lui-même, et lui seul : il ne voit que son propre travail.
         return Q(user_id=membership.user_id)
 
-    ids = entrepots_du_perimetre(membership, nature)
+    # `TOUT` : on décide ici d'un DROIT (qui peut-on viser), pas de ce qu'une
+    # liste montre par défaut.
+    ids = entrepots_du_perimetre(membership, nature, TOUT)
     if ids is None:
         return None
 

@@ -213,7 +213,7 @@ class WarehouseScopedQuerysetMixin:
     actions_de_lecture = ()
     actions_preparatoires = ()
 
-    def _borner_au_perimetre(self, queryset, nature):
+    def _borner_au_perimetre(self, queryset, nature, etendue):
         from apps.core.warehouse_scope import (
             borner_visibilite,
             get_membership_for_request,
@@ -226,16 +226,34 @@ class WarehouseScopedQuerysetMixin:
             queryset,
             membership,
             nature=nature,
+            etendue=etendue,
             warehouse_field=getattr(self, 'warehouse_scope_field', 'warehouse_id'),
             author_field=getattr(self, 'author_scope_field', None),
             include_null_warehouse=getattr(self, 'warehouse_scope_include_null', False),
         )
 
+    def _etendue(self):
+        """
+        Une LISTE part du défaut du membre ; une FICHE se cherche dans tout ce
+        qui est lisible.
+
+        ⚠ Sans `TOUT` sur une route de détail, un caissier qui a élargi sa liste
+        à « Tous les utilisateurs » ouvrirait la vente d'un collègue qu'il a
+        sous les yeux et lirait « introuvable ».
+        """
+        from apps.core.warehouse_scope import TOUT, etendue_de_la_requete
+
+        if getattr(self, 'detail', False):
+            return TOUT
+        return etendue_de_la_requete(self.request)
+
     def get_queryset(self):
         from apps.core.warehouse_scope import nature_de_la_requete
 
         queryset = super().get_queryset()
-        return self._borner_au_perimetre(queryset, nature_de_la_requete(self.request))
+        return self._borner_au_perimetre(
+            queryset, nature_de_la_requete(self.request), self._etendue()
+        )
 
     def get_object(self):
         """
@@ -248,7 +266,7 @@ class WarehouseScopedQuerysetMixin:
         from django.http import Http404
 
         from apps.core.exceptions import ConsultationSeule
-        from apps.core.warehouse_scope import ACTION, LECTURE, nature_de_la_requete
+        from apps.core.warehouse_scope import ACTION, LECTURE, TOUT, nature_de_la_requete
 
         try:
             return super().get_object()
@@ -260,7 +278,7 @@ class WarehouseScopedQuerysetMixin:
             if valeur is None:
                 raise
             base = super(WarehouseScopedQuerysetMixin, self).get_queryset()
-            lisible = self._borner_au_perimetre(base, LECTURE).filter(
+            lisible = self._borner_au_perimetre(base, LECTURE, TOUT).filter(
                 **{self.lookup_field: valeur}
             ).exists()
             if lisible:

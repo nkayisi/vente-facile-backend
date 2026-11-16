@@ -95,3 +95,37 @@ class DoctrineDuPerimetreTests(SimpleTestCase):
         # Le compte d'abord : un balayage qui ne voit aucun appel ne prouve rien.
         self.assertGreater(vus, 15)
         self.assertEqual(fautes, [], '\n'.join(fautes))
+
+    def test_chaque_lecture_dit_son_etendue(self):
+        """
+        ⚠ Une lecture sans étendue montrerait TOUT par défaut : le caissier qui a
+        « Voir tout dans son entrepôt » verrait les ventes de ses collègues sur
+        un écran sans filtre, c'est-à-dire exactement ce que la règle du
+        2026-11-16 ferme. Seule une ACTION écrite en toutes lettres s'en passe.
+        """
+        fautes = []
+        vus = 0
+        for chemin in _fichiers():
+            if chemin.name == 'warehouse_scope.py' or '/tests/' in str(chemin):
+                continue
+            arbre = ast.parse(chemin.read_text(encoding='utf-8'))
+            for noeud in ast.walk(arbre):
+                if not isinstance(noeud, ast.Call):
+                    continue
+                nom = _nom_appele(noeud)
+                mots = {k.arg: k.value for k in noeud.keywords}
+                if nom in EXIGENT_NATURE:
+                    nature = mots.get('nature')
+                    a_etendue = 'etendue' in mots
+                elif nom == 'entrepots_du_perimetre':
+                    nature = noeud.args[1] if len(noeud.args) > 1 else mots.get('nature')
+                    a_etendue = len(noeud.args) > 2 or 'etendue' in mots
+                else:
+                    continue
+                vus += 1
+                if isinstance(nature, ast.Name) and nature.id == 'ACTION':
+                    continue
+                if not a_etendue:
+                    fautes.append(f'{chemin}:{noeud.lineno} {nom} lit sans `etendue=`')
+        self.assertGreater(vus, 20)
+        self.assertEqual(fautes, [], '\n'.join(fautes))

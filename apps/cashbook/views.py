@@ -517,10 +517,18 @@ class CashMovementViewSet(ExportResponseMixin, TenantViewSetMixin,
         seconde version, plus tolérante : deux soldes pour le même tiroir. Il
         vit désormais dans `apps.core.warehouse_scope`, que les deux appellent.
         """
+        from apps.core.warehouse_scope import TOUT, etendue_de_la_requete
+
         return filter_cash_movement_queryset(
             queryset,
             get_membership_for_request(self.request),
             nature=nature_de_la_requete(self.request),
+            # Une liste (et le solde qu'on en tire) part du défaut ; une fiche
+            # se cherche dans tout ce qui est lisible.
+            etendue=(
+                TOUT if getattr(self, 'detail', False)
+                else etendue_de_la_requete(self.request)
+            ),
         )
 
     # ------------------------------------------------------------------

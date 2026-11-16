@@ -102,6 +102,9 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    # Avant tout ce qui lit les paramètres : « Tous » (`*`) devient
+    # `all_warehouses` / `all_users`. Voir `ChoixTousMiddleware`.
+    'apps.core.middleware.ChoixTousMiddleware',
     'apps.core.middleware.TenantMiddleware',
     'apps.core.middleware.OrganizationHeaderMiddleware',
     'apps.core.middleware.SubscriptionMiddleware',

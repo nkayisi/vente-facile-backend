@@ -19,7 +19,9 @@ from rest_framework.exceptions import ValidationError as DRFValidationError
 from django.core.exceptions import ValidationError as DjangoValidationError
 from apps.core.warehouse_scope import (
     LECTURE,
-    entrepots_lisibles,
+    TOUT,
+    entrepots_du_perimetre,
+    etendue_de_la_requete,
     exiger_cote_du_transfert,
     exiger_entrepot_actionnable_requete,
     exiger_entrepot_de_destination,
@@ -96,7 +98,13 @@ class WarehouseViewSet(WarehouseScopedQuerysetMixin, TenantViewSetMixin, AuditMi
         'stock_summary': 'stock.view',
         # L'annuaire nomme les entrepôts, sans adresse ni stock : c'est la
         # destination d'un transfert, qu'on choisit sans y travailler.
-        'directory': 'warehouses.view',
+        #
+        # ⚠ OUVERT À TOUT MEMBRE (2026-11-16). Le réveil du terminal le porte
+        # déjà pour tous les rôles (`warehouse_directory`), et le back-office
+        # en a besoin pour le filtre « Entrepôt » d'un CAISSIER à qui la case
+        # « Consulter tous les entrepôts » est cochée : il lit tous les dépôts
+        # sans porter `warehouses.view`, et son filtre restait vide.
+        'directory': '*',
     }
 
     def get_serializer_class(self):
@@ -435,6 +443,7 @@ class StockViewSet(ExportResponseMixin, WarehouseScopedQuerysetMixin, TenantView
         if m:
             stocks = filter_queryset_by_warehouse_ids(
                 stocks, m, 'warehouse_id', nature=LECTURE,
+                etendue=etendue_de_la_requete(request),
             )
         
         page = self.paginate_queryset(stocks)
@@ -479,6 +488,7 @@ class StockViewSet(ExportResponseMixin, WarehouseScopedQuerysetMixin, TenantView
         if m:
             stocks = filter_queryset_by_warehouse_ids(
                 stocks, m, 'warehouse_id', nature=LECTURE,
+                etendue=etendue_de_la_requete(request),
             )
         
         page = self.paginate_queryset(stocks)
@@ -507,6 +517,7 @@ class StockViewSet(ExportResponseMixin, WarehouseScopedQuerysetMixin, TenantView
         if m:
             batches = filter_queryset_by_warehouse_ids(
                 batches, m, 'warehouse_id', nature=LECTURE,
+                etendue=etendue_de_la_requete(request),
             )
         
         page = self.paginate_queryset(batches)
@@ -538,6 +549,7 @@ class StockViewSet(ExportResponseMixin, WarehouseScopedQuerysetMixin, TenantView
             if m:
                 batches = filter_queryset_by_warehouse_ids(
                     batches, m, 'warehouse_id', nature=LECTURE,
+                    etendue=etendue_de_la_requete(request),
                 )
         
         if not include_empty:
@@ -921,6 +933,9 @@ class StockTransferViewSet(TransitionActionMixin, TenantViewSetMixin, AuditMixin
         if m:
             qs = filter_stock_transfer_queryset(
                 qs, m, nature=nature_de_la_requete(self.request),
+                # Une liste part du défaut ; une fiche se cherche dans tout ce
+                # qui est lisible (voir `WarehouseScopedQuerysetMixin._etendue`).
+                etendue=TOUT if self.detail else etendue_de_la_requete(self.request),
             )
         return qs
 
@@ -1270,7 +1285,10 @@ class InventorySessionViewSet(ExportResponseMixin, TransitionActionMixin,
         """
         organization = self.get_organization()
         m = get_membership_for_request(request)
-        wh_scope = entrepots_lisibles(m) if m else None
+        wh_scope = (
+            entrepots_du_perimetre(m, LECTURE, etendue_de_la_requete(request))
+            if m else None
+        )
         # `?warehouse=` : les verrous de la CAISSE, et d'elle seule. Montrer
         # au comptoir l'inventaire d'un autre dépôt griserait des articles
         # qu'il peut vendre. Un entrepôt hors périmètre de lecture LÈVE.

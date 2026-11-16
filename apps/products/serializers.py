@@ -3,7 +3,12 @@ Serializers DRF pour l'app Products.
 """
 from rest_framework import serializers
 from .models import Category, Brand, Unit, Product, ProductImage, ProductVariant, PriceList, ProductPrice
-from apps.core.warehouse_scope import entrepots_lisibles, get_membership_for_request
+from apps.core.warehouse_scope import (
+    LECTURE,
+    entrepots_du_perimetre,
+    etendue_de_la_requete,
+    get_membership_for_request,
+)
 
 
 # =============================================================================
@@ -575,9 +580,13 @@ class ProductDetailSerializer(serializers.ModelSerializer):
         if request:
             m = get_membership_for_request(request)
             if m:
-                # LECTURE : la case « consulter tous » montre la disponibilité
-                # des autres entrepôts.
-                wh_ids = entrepots_lisibles(m)
+                # LECTURE, à l'étendue de la requête : par défaut, les
+                # entrepôts du membre ; la case « consulter tous » montre la
+                # disponibilité des autres quand la requête vise un entrepôt
+                # (le comptoir envoie le sien) ou « tous ».
+                wh_ids = entrepots_du_perimetre(
+                    m, LECTURE, etendue_de_la_requete(request)
+                )
                 if wh_ids is not None:
                     stocks = stocks.filter(warehouse_id__in=wh_ids)
 
