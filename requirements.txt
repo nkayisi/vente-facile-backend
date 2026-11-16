@@ -10,7 +10,12 @@ djangorestframework-simplejwt>=5.3,<6.0
 psycopg2-binary>=2.9,<3.0
 
 # Async Tasks
-celery>=5.4,<6.0
+# Celery et kombu EXACTS, et pas une fourchette : le 2026-11-16, une reconstruction
+# a tiré celery 5.7.0, dont le kombu exige redis-py >= 6.1 alors que redis est
+# borné sous 6.0. Le worker sortait au démarrage (VersionMismatch) et redémarrait
+# en boucle. Ces deux versions sont celles du développement, où la suite passe.
+celery==5.6.3
+kombu==5.6.2
 redis>=5.0,<6.0
 django-celery-beat>=2.6,<3.0
 django-celery-results>=2.5,<3.0
