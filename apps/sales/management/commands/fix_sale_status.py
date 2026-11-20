@@ -111,7 +111,13 @@ class Command(BaseCommand):
                     sale.amount_due = (sale.total - sale.amount_paid).quantize(Decimal('0.01'))
                     
                     if sale.amount_paid >= sale.total:
-                        sale.change_amount = (sale.amount_paid - sale.total).quantize(Decimal('0.01'))
+                        # La monnaie est dans la devise des billets rendus, pas
+                        # dans celle de la facture : `amount_paid - total` la
+                        # posait en dollars sous l'étiquette du franc.
+                        from apps.sales.services import resolve_change
+                        sale.change_amount, sale.change_currency, _ = resolve_change(
+                            sale, sale.change_currency
+                        )
                         sale.amount_due = Decimal('0.00')
                     
                     # Mettre à jour le statut

@@ -173,10 +173,12 @@ class ExpenseViewSet(
     Workflow :
     1. Créer une dépense (draft)
     2. Soumettre pour approbation (pending)
-    3. Approuver (approved) → crée le mouvement de caisse
-    4. Marquer comme payée (paid)
-    
-    Ou directement : créer + payer en une fois (pour les petites dépenses).
+    3. Approuver (approved) : propriétaire ou gérant, jamais sur la sienne
+    4. Payer (paid) : l'auteur, le gérant ou le propriétaire. C'est ICI que
+       l'argent sort, du tiroir de celui qui paie s'il paie en espèces.
+
+    Ou directement : payer une dépense en brouillon ou en attente, ce qui vaut
+    une approbation (réservé à qui peut approuver).
     """
 
     queryset = Expense.objects.all()
@@ -219,7 +221,10 @@ class ExpenseViewSet(
         'submit': 'cashbook.create_expense',
         'approve': 'cashbook.approve_expense',
         'reject': 'cashbook.approve_expense',
-        'pay': 'cashbook.approve_expense',
+        # Le caissier paie SA dépense approuvée ; payer celle d'un autre, ou
+        # payer sans approbation, demande en plus le droit d'approuver, que
+        # le service vérifie (`DroitsDepense`).
+        'pay': 'cashbook.pay_expense',
         'cancel': 'cashbook.approve_expense',
         'stats': 'cashbook.view',
     }
@@ -321,7 +326,8 @@ class ExpenseViewSet(
     # │ terminal ne pouvait ni approuver ni payer une dépense, et les y      │
     # │ rejouer aurait demandé de les réécrire. Le CONTRAT DE RÉPONSE ne     │
     # │ bouge pas - `{'detail': ...}` en 400, la fiche détaillée en 200 - le │
-    # │ back-office y branchant déjà ses messages.                           │
+    # │ back-office y branchant déjà ses messages. `code` s'y ajoute : c'est │
+    # │ sur lui qu'un écran dit quoi faire (« ouvrez votre caisse »).        │
     # └──────────────────────────────────────────────────────────────────────┘
 
     def _transition(self, fonction, *args, **kwargs):
@@ -331,10 +337,16 @@ class ExpenseViewSet(
             fonction(expense, *args, **kwargs)
         except TransitionRefusee as exc:
             return Response(
-                {'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST
+                {'detail': str(exc), 'code': exc.code},
+                status=status.HTTP_400_BAD_REQUEST,
             )
         expense.refresh_from_db()
         return Response(ExpenseDetailSerializer(expense).data)
+
+    def _droits(self):
+        """Les droits de celui qui agit, calculés comme le journal les calcule."""
+        from .services import droits_depense
+        return droits_depense(get_membership_for_request(self.request))
 
     @action(detail=True, methods=['post'])
     def submit(self, request, pk=None):
@@ -344,23 +356,24 @@ class ExpenseViewSet(
 
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
-        """Approuver une dépense et créer le mouvement de caisse."""
+        """Approuver une dépense. L'argent ne sort qu'au paiement."""
         from .services import approve_expense
-        return self._transition(approve_expense, request.user)
+        return self._transition(approve_expense, request.user, droits=self._droits())
 
     @action(detail=True, methods=['post'])
     def reject(self, request, pk=None):
         """Rejeter une dépense."""
         from .services import reject_expense
         return self._transition(
-            reject_expense, request.data.get('reason', ''), request.user
+            reject_expense, request.data.get('reason', ''), request.user,
+            droits=self._droits(),
         )
 
     @action(detail=True, methods=['post'])
     def pay(self, request, pk=None):
         """
-        Marquer une dépense comme payée.
-        Si la dépense est en brouillon ou en attente, elle est automatiquement approuvée.
+        Payer une dépense : l'argent sort ici, du tiroir de celui qui paie.
+        En brouillon ou en attente, payer vaut une approbation.
         """
         from .services import pay_expense
         return self._transition(
@@ -368,6 +381,7 @@ class ExpenseViewSet(
             request.user,
             payment_method_id=request.data.get('payment_method'),
             payment_reference=request.data.get('payment_reference', ''),
+            droits=self._droits(),
         )
 
     @action(detail=True, methods=['post'])

@@ -206,6 +206,28 @@ class CurrencyService:
         )
     
     @classmethod
+    def taux_brut(cls, from_currency_code, to_currency_code, organization):
+        """
+        Unités de `to` pour une unité de `from`, SANS arrondi.
+
+        ⚠ `convert` rend un taux quantifié à six décimales (1 franc congolais
+        vaut 0,000435 $ au lieu de 0,000434782609) : bon pour un affichage,
+        faux dès qu'on le multiplie par un montant à sept chiffres. Un million
+        sept cent mille francs y valent 739,50 $ au lieu de 739,13.
+
+        `None` quand l'une des deux devises n'est pas active : l'appelant
+        choisit son repli, il ne reçoit pas une parité inventée.
+        """
+        if from_currency_code == to_currency_code:
+            return Decimal('1')
+        currencies = cls.get_org_currencies(organization)
+        source = currencies.get(from_currency_code)
+        target = currencies.get(to_currency_code)
+        if not source or not target or not target.exchange_rate:
+            return None
+        return Decimal(source.exchange_rate) / Decimal(target.exchange_rate)
+
+    @classmethod
     def convert(cls, amount, from_currency_code, to_currency_code, organization):
         """
         Convertit un montant d'une devise à une autre.

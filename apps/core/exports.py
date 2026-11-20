@@ -319,6 +319,9 @@ def format_cell(value: Any, kind: str, decimals: int) -> str:
             return str(value)
         return format_number(number, 0 if number == number.to_integral_value() else 2)
     if kind == KIND_DATE:
+        if isinstance(value, datetime) and timezone.is_aware(value):
+            # Un instant UTC de 23 h 30 est déjà le LENDEMAIN à Kinshasa.
+            value = timezone.localtime(value)
         return value.strftime('%d/%m/%Y') if isinstance(value, (date, datetime)) else str(value)
     if kind == KIND_DATETIME:
         if isinstance(value, datetime):

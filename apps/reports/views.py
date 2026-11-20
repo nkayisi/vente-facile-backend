@@ -27,6 +27,7 @@ from collections import defaultdict
 from datetime import timedelta
 from decimal import Decimal
 
+from apps.core.clock import heure_locale
 from apps.core.mixins import TenantQuerysetMixin
 from apps.core.api_mixins import ActionPaginationMixin, ExportResponseMixin
 from apps.core.api_permissions import IsTenantMember, HasActiveSubscription, HasPermission
@@ -1973,7 +1974,9 @@ class StatisticsViewSet(ExportResponseMixin, ActionPaginationMixin,
         return [
             {
                 'id': m.id,
-                'time': m.movement_date.time(),
+                # L'heure du MARCHAND : `.time()` d'un instant UTC rendait
+                # « 12:28 » une vente faite à 13 h 28 à Kinshasa.
+                'time': heure_locale(m.movement_date).time(),
                 'type': m.movement_type,
                 'type_display': m.get_movement_type_display(),
                 'description': m.description or '',

@@ -14,6 +14,7 @@ PERMISSION_CATALOG = frozenset(
         "cashbook.delete_expense",
         "cashbook.delete_movement",
         "cashbook.manage_categories",
+        "cashbook.pay_expense",
         "cashbook.view",
         "cashbook.view_reports",
         "categories.create",

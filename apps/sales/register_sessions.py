@@ -20,7 +20,7 @@ from decimal import Decimal
 from django.db.models import Q, Sum
 from django.db.models.functions import Coalesce
 from django.utils import timezone
-from apps.core.clock import maintenant
+from apps.core.clock import heure_locale, maintenant
 
 
 class TransitionRefusee(Exception):
@@ -48,7 +48,7 @@ class SessionDejaOuverte(TransitionRefusee):
         )
         super().__init__(
             f"Une session est déjà ouverte sur {session.register.name}, "
-            f"par {qui} le {session.opened_at:%d/%m à %H:%M}."
+            f"par {qui} le {heure_locale(session.opened_at):%d/%m à %H:%M}."
         )
 
 
@@ -70,7 +70,7 @@ class SessionPersonnelleOuverte(TransitionRefusee):
         self.session = session
         super().__init__(
             f"Vous avez déjà une session ouverte sur {session.register.name}, "
-            f"depuis le {session.opened_at:%d/%m à %H:%M}. Clôturez-la avant "
+            f"depuis le {heure_locale(session.opened_at):%d/%m à %H:%M}. Clôturez-la avant "
             "d'en ouvrir une autre."
         )
 
@@ -86,27 +86,28 @@ class NoteRequise(TransitionRefusee):
     """
 
 
-def close_register_session(session, user, donnees=None, ip=None, agent=None):
+def attendu_par_devise(session):
     """
-    Ferme la session et rend l'objet.
+    Ce que le tiroir d'une session doit contenir, PAR DEVISE.
 
-    ``donnees`` porte le comptage manuel : ``counted_balance`` (devise
-    principale, compatibilité) et/ou ``counted_balances`` (une entrée par
-    devise). Absent, le solde attendu fait foi.
+    ``{devise: {'opening', 'cash_in', 'cash_out', 'expected'}}`` : le fonds
+    d'ouverture, plus les règlements en espèces (montant REMIS, dans la devise
+    du billet), moins les sorties en espèces (monnaie rendue, dépenses,
+    retraits).
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ UN SEUL CALCUL, POUR LA CLÔTURE ET POUR CE QU'ON AFFICHE AVANT ELLE.     │
+    │                                                                          │
+    │ Le dialogue de clôture du back-office refaisait l'attendu à sa façon :   │
+    │ fonds + total des ventes, en devise principale. Une vente réglée en      │
+    │ francs y entrait comme des dollars, la monnaie rendue et les dépenses    │
+    │ n'en sortaient pas : vu au navigateur le 2026-11-20, « 2 347,4 $ »       │
+    │ attendus pour un tiroir qui contenait 1 760,40 $ et 1 322 501 FC.        │
+    └──────────────────────────────────────────────────────────────────────────┘
     """
     from apps.cashbook.models import CashMovement
 
-    from .models import Payment, RegisterSessionCurrencyBalance
-
-    donnees = donnees or {}
-
-    if session.status != 'open':
-        raise TransitionRefusee("Cette session est déjà fermée")
-
-    notes_input = (donnees.get('notes') or '').strip()
-
-    from apps.cashbook.models import CashMovement
-    from .models import RegisterSessionCurrencyBalance
+    from .models import Payment
 
     primary = session.organization.currency or 'CDF'
     TWO = Decimal('0.01')
@@ -147,6 +148,48 @@ def close_register_session(session, user, donnees=None, ip=None, agent=None):
         (r['currency'] or primary): (r['total'] or Decimal('0.00'))
         for r in cash_out_rows
     }
+
+    resultat = {}
+    for ccy in set(opening_by_ccy) | set(cash_in_by_ccy) | set(cash_out_by_ccy):
+        opening = opening_by_ccy.get(ccy, Decimal('0.00'))
+        cin = cash_in_by_ccy.get(ccy, Decimal('0.00'))
+        cout = cash_out_by_ccy.get(ccy, Decimal('0.00'))
+        resultat[ccy] = {
+            'opening': opening, 'cash_in': cin, 'cash_out': cout,
+            'expected': (opening + cin - cout).quantize(TWO),
+        }
+    return resultat
+
+
+def close_register_session(session, user, donnees=None, ip=None, agent=None):
+    """
+    Ferme la session et rend l'objet.
+
+    ``donnees`` porte le comptage manuel : ``counted_balance`` (devise
+    principale, compatibilité) et/ou ``counted_balances`` (une entrée par
+    devise). Absent, le solde attendu fait foi.
+    """
+    from apps.cashbook.models import CashMovement
+
+    from .models import Payment, RegisterSessionCurrencyBalance
+
+    donnees = donnees or {}
+
+    if session.status != 'open':
+        raise TransitionRefusee("Cette session est déjà fermée")
+
+    notes_input = (donnees.get('notes') or '').strip()
+
+    from apps.cashbook.models import CashMovement
+    from .models import RegisterSessionCurrencyBalance
+
+    primary = session.organization.currency or 'CDF'
+    TWO = Decimal('0.01')
+
+    attendu = attendu_par_devise(session)
+    opening_by_ccy = {d: v['opening'] for d, v in attendu.items()}
+    cash_in_by_ccy = {d: v['cash_in'] for d, v in attendu.items()}
+    cash_out_by_ccy = {d: v['cash_out'] for d, v in attendu.items()}
 
     # Comptage manuel par devise (+ compat scalaire = devise principale).
     counted_by_ccy = {}
@@ -274,6 +317,53 @@ def close_register_session(session, user, donnees=None, ip=None, agent=None):
 # ---------------------------------------------------------------------------
 
 
+def fonds_herite(caisse, principale):
+    """
+    Le fonds avec lequel la PROCHAINE session de cette caisse s'ouvrira si rien
+    n'est saisi : ce qui a été compté à la dernière clôture, devise par devise
+    (à défaut de comptage, l'attendu).
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ UN SEUL CALCUL, POUR L'OUVERTURE ET POUR CE QU'ON EN ANNONCE.            │
+    │                                                                          │
+    │ Le dialogue du back-office annonçait « solde d'ouverture à zéro » pendant│
+    │ que l'ouverture reprenait 1 772,40 $ de la veille : le caissier comptait │
+    │ son tiroir contre un chiffre faux, et le Z du soir le lui reprochait.    │
+    │ L'écran lit maintenant ce que l'ouverture appliquera, par cette fonction.│
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    Rend un dict ``{devise: Decimal}``, vide quand la caisse n'a jamais été
+    clôturée.
+    """
+    from .models import RegisterSession
+
+    herite = {}
+    precedente = (
+        RegisterSession.objects.filter(register=caisse, status='closed')
+        .order_by('-closed_at', '-opened_at')
+        .first()
+    )
+    if precedente is None:
+        return herite
+    for cb in precedente.currency_balances.all():
+        herite[cb.currency] = (
+            cb.counted_balance if cb.counted_balance is not None
+            else (cb.expected_balance or Decimal('0.00'))
+        )
+    if not herite:
+        # Session héritée sans ventilation par devise (legacy).
+        herite[principale] = (
+            precedente.counted_balance
+            if precedente.counted_balance is not None
+            else (
+                precedente.closing_balance
+                or precedente.expected_balance
+                or Decimal('0.00')
+            )
+        )
+    return herite
+
+
 def open_register_session(
     organization, register_id, user, *, opening_balance=None,
     opening_balances=None, session_id=None, request=None,
@@ -361,29 +451,7 @@ def open_register_session(
                 raise SessionPersonnelleOuverte(ailleurs)
 
             # Le fonds d'ouverture, hérité PAR DEVISE de la dernière clôture.
-            herite = {}
-            precedente = (
-                RegisterSession.objects.filter(register=caisse, status='closed')
-                .order_by('-closed_at', '-opened_at')
-                .first()
-            )
-            if precedente is not None:
-                for cb in precedente.currency_balances.all():
-                    herite[cb.currency] = (
-                        cb.counted_balance if cb.counted_balance is not None
-                        else (cb.expected_balance or Decimal('0.00'))
-                    )
-                if not herite:
-                    # Session héritée sans ventilation par devise (legacy).
-                    herite[principale] = (
-                        precedente.counted_balance
-                        if precedente.counted_balance is not None
-                        else (
-                            precedente.closing_balance
-                            or precedente.expected_balance
-                            or Decimal('0.00')
-                        )
-                    )
+            herite = fonds_herite(caisse, principale)
 
             # Le scalaire vise la devise PRINCIPALE, comme `counted_balance`
             # à la clôture. Il passe avant la liste : une surface qui enverrait

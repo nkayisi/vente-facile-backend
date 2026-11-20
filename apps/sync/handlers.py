@@ -1344,7 +1344,15 @@ def _refus_si_impossible_cashbook(fonction, *args, **kwargs):
     try:
         return fonction(*args, **kwargs)
     except TransitionRefusee as exc:
-        raise OperationRejected(str(exc), code='transition_refused')
+        # Le code du refus voyage : « Opérations à corriger » dit quoi faire
+        # d'un `caisse_fermee`, et rien d'un `transition_refused` générique.
+        raise OperationRejected(str(exc), code=getattr(exc, 'code', 'transition_refused'))
+
+
+def _droits_depense(ctx):
+    """Les droits sur les dépenses, calculés comme la vue les calcule."""
+    from apps.cashbook.services import droits_depense
+    return droits_depense(ctx.membership)
 
 
 def _transition_depense(ctx, payload, fonction, *args, **kwargs):
@@ -1376,24 +1384,33 @@ def expense_submit(ctx, payload):
 @handler('expense.approve', permission='cashbook.approve_expense')
 def expense_approve(ctx, payload):
     from apps.cashbook.services import approve_expense
-    return _transition_depense(ctx, payload, approve_expense, ctx.user)
+    return _transition_depense(
+        ctx, payload, approve_expense, ctx.user, droits=_droits_depense(ctx)
+    )
 
 
 @handler('expense.reject', permission='cashbook.approve_expense')
 def expense_reject(ctx, payload):
     from apps.cashbook.services import reject_expense
     return _transition_depense(
-        ctx, payload, reject_expense, payload.get('reason', ''), ctx.user
+        ctx, payload, reject_expense, payload.get('reason', ''), ctx.user,
+        droits=_droits_depense(ctx),
     )
 
 
-@handler('expense.pay', permission='cashbook.approve_expense')
+@handler('expense.pay', permission='cashbook.pay_expense')
 def expense_pay(ctx, payload):
+    """
+    Payer : l'argent sort ICI. En espèces, la caisse ouverte du payeur est
+    lue au rejeu : c'est pourquoi le terminal fait DÉPENDRE la clôture de sa
+    session des paiements encore en file.
+    """
     from apps.cashbook.services import pay_expense
     return _transition_depense(
         ctx, payload, pay_expense, ctx.user,
         payment_method_id=payload.get('payment_method'),
         payment_reference=payload.get('payment_reference', ''),
+        droits=_droits_depense(ctx),
     )
 
 

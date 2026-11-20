@@ -8,7 +8,7 @@ et SaleViewSet.cancel.
 from __future__ import annotations
 
 import logging
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
@@ -526,11 +526,19 @@ def resolve_tender(sale_currency, organization, tendered_amount, currency=None,
         rate = Decimal(exchange_rate)
         return (tendered_amount * rate).quantize(TWO_PLACES), currency, rate
 
+    # ⚠ Le taux ENREGISTRÉ doit être celui qui a servi : `resolve_change`
+    # recalcule le montant exact d'un règlement par `tendered × exchange_rate`.
+    # Le taux de `CurrencyService.convert`, quantifié à six décimales, y
+    # aurait ajouté des centaines de francs. Douze décimales : celles du champ.
     from apps.settings.services import CurrencyService
-    result = CurrencyService.convert(
-        tendered_amount, currency, sale_currency, organization
-    )
-    return result['converted_amount'], currency, result['exchange_rate']
+    rate = CurrencyService.taux_brut(currency, sale_currency, organization)
+    if rate is None:
+        result = CurrencyService.convert(
+            tendered_amount, currency, sale_currency, organization
+        )
+        return result['converted_amount'], currency, result['exchange_rate']
+    rate = rate.quantize(Decimal('0.000000000001'), rounding=ROUND_HALF_UP)
+    return (tendered_amount * rate).quantize(TWO_PLACES, rounding=ROUND_HALF_UP), currency, rate
 
 
 def create_payment(sale, user, *, payment_method=None, payment_method_id=None,
@@ -968,28 +976,101 @@ def apply_payment_to_sale(sale_id, user, *, payment_method_id=None,
     return sale, payment
 
 
+# Le plus grand écart qu'un arrondi au centime peut laisser sur UN règlement.
+_DEMI_CENTIME = Decimal('0.005')
+
+
+def _ecart_d_arrondi_des_reglements(sale):
+    """
+    Ce que les arrondis au centime de la devise de FACTURE ont retranché aux
+    règlements remis dans une autre devise.
+
+    `Payment.amount` est le montant remis converti puis ARRONDI au centime :
+    1 700 000 FC à 2 300 y valent 739,13 $ quand ils valent 739,1304 $. Cet
+    arrondi est juste pour l'encaissé (c'est lui qui solde la facture), faux
+    pour la monnaie, que le client compte en billets.
+
+    ⚠ UN ÉCART PLUS GRAND QU'UN DEMI-CENTIME N'EST PAS UN ARRONDI. C'est un
+    règlement dont le taux enregistré n'est pas celui qui a servi (les anciens
+    règlements convertis par le serveur gardaient un taux à six décimales).
+    Il est ignoré : mieux vaut la monnaie d'avant qu'une monnaie fausse de
+    plusieurs centaines de francs.
+    """
+    from apps.sales.models import Payment
+
+    ecart = Decimal('0')
+    reglements = (
+        sale.payments.exclude(status=Payment.Status.FAILED)
+        .exclude(currency=sale.currency)
+        .exclude(currency='')
+        .only('amount', 'tendered_amount', 'exchange_rate', 'currency')
+    )
+    for p in reglements:
+        if not p.tendered_amount or not p.exchange_rate:
+            continue
+        exact = Decimal(p.tendered_amount) * Decimal(p.exchange_rate) - Decimal(p.amount)
+        if abs(exact) <= _DEMI_CENTIME:
+            ecart += exact
+    return ecart
+
+
 def resolve_change(sale, change_currency=None):
     """
-    Calcule la monnaie à rendre à partir du surplus payé
-    (``amount_paid - total``, en devise de la vente), exprimée dans
-    ``change_currency`` (choix du caissier ; défaut = devise de la vente).
+    La monnaie à rendre, dans ``change_currency`` (choix du caissier ; défaut
+    = devise de la vente).
 
-    Retourne ``(change_amount, change_currency, exchange_rate_to_primary)`` où le
-    montant est exprimé dans ``change_currency``. ``(0, devise, 1)`` si pas de surplus.
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ DEPUIS LES BILLETS REMIS, AVEC UN SEUL ARRONDI.                         │
+    │                                                                          │
+    │ Le surplus était `amount_paid - total`, des montants déjà arrondis au   │
+    │ centime de la facture, puis reconverti et arrondi encore. Une vente de   │
+    │ 575 $ réglée 1 700 000 FC rendait 377 499 FC au lieu de 377 500 : un     │
+    │ centime de dollar vaut 23 francs, perdus par le client et gardés par le  │
+    │ tiroir. Le surplus reprend désormais l'écart d'arrondi de chaque         │
+    │ règlement étranger, se convertit au taux BRUT, et ne s'arrondit qu'une   │
+    │ fois, aux décimales de la devise rendue (le franc à l'unité).           │
+    │                                                                          │
+    │ C'est la règle de `monnaieARendre` (`@vente-facile/core/pos`), que       │
+    │ l'écran et le ticket du terminal appliquent avant la synchronisation :   │
+    │ `test_monnaie_exacte.py` porte LES MÊMES CAS que son test.               │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    La facture doit être couverte (``amount_paid >= total``, sommes arrondies,
+    comme le statut) : en deçà il reste à payer et rien n'est rendu.
+
+    Retourne ``(change_amount, change_currency, exchange_rate)``, le taux
+    menant de la devise de la vente à celle de la monnaie ;
+    ``(0, devise, 1)`` s'il n'y a rien à rendre.
     """
+    from apps.core.exports import currency_decimals
+
     change_currency = (change_currency or '').strip() or sale.currency
-    overpay = (sale.amount_paid - sale.total)
-    if overpay <= 0:
-        return Decimal('0.00'), change_currency, Decimal('1.000000')
+    rien = (Decimal('0.00'), change_currency, Decimal('1.000000'))
+    if sale.amount_paid < sale.total:
+        return rien
 
-    if change_currency == sale.currency:
-        return overpay.quantize(TWO_PLACES), change_currency, Decimal('1.000000')
+    surplus = sale.amount_paid - sale.total + _ecart_d_arrondi_des_reglements(sale)
+    if surplus <= 0:
+        return rien
 
-    from apps.settings.services import CurrencyService
-    result = CurrencyService.convert(
-        overpay, sale.currency, change_currency, sale.organization
-    )
-    return result['converted_amount'], change_currency, result['exchange_rate']
+    taux = Decimal('1')
+    if change_currency != sale.currency:
+        from apps.settings.services import CurrencyService
+        brut = CurrencyService.taux_brut(sale.currency, change_currency, sale.organization)
+        if brut is None:
+            # Devise de la monnaie inconnue de l'établissement : on garde le
+            # repli d'avant, plutôt que de rendre une parité inventée.
+            result = CurrencyService.convert(
+                surplus, sale.currency, change_currency, sale.organization
+            )
+            return result['converted_amount'], change_currency, result['exchange_rate']
+        taux = brut
+
+    pas = Decimal(1).scaleb(-currency_decimals(change_currency))
+    montant = (surplus * taux).quantize(pas, rounding=ROUND_HALF_UP)
+    if montant <= 0:
+        return rien
+    return montant.quantize(TWO_PLACES), change_currency, taux
 
 
 # ---------------------------------------------------------------------------

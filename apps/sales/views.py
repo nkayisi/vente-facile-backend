@@ -74,7 +74,10 @@ class RegisterViewSet(
     - DELETE /registers/{id}/ : Supprimer une caisse
     """
     
-    queryset = Register.objects.all()
+    # Ordonné ICI : `ordering` ci-dessous n'est lu que par `OrderingFilter`, que
+    # cette vue n'a pas, et une liste paginée sans ordre peut répéter ou sauter
+    # une caisse d'une page à l'autre (UnorderedObjectListWarning).
+    queryset = Register.objects.all().order_by('name', 'id')
     serializer_class = RegisterSerializer
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
@@ -82,7 +85,8 @@ class RegisterViewSet(
     search_fields = ['name', 'code']
     ordering = ['name']
     
-    select_related_fields = ['branch', 'warehouse']
+    # `organization` : le fonds hérité se range autour de la devise principale.
+    select_related_fields = ['branch', 'warehouse', 'organization']
 
     warehouse_scope_field = 'warehouse_id'
     warehouse_scope_include_null = False

@@ -652,44 +652,70 @@ class ProductViewSet(ExportableListMixin, TenantViewSetMixin, AuditMixin,
 
     @action(detail=False, methods=['get'], url_path='search-barcode')
     def search_barcode(self, request):
-        """Recherche un produit par code-barres (respecte le scope warehouse du membership)."""
-        barcode = request.query_params.get('barcode', None)
-        if not barcode:
+        """
+        L'article d'un code scanné, sous la forme d'une carte du comptoir.
+
+        ┌──────────────────────────────────────────────────────────────────────┐
+        │ LA RÉPONSE A LA FORME DE LA LISTE, PAS CELLE DE LA FICHE.            │
+        │                                                                      │
+        │ Elle rendait `ProductDetailSerializer`, qui ne porte AUCUN stock : le │
+        │ comptoir l'aurait lu « 0 en stock » et aurait fermé l'encaissement   │
+        │ sur un article bien présent. Elle rend `ProductListSerializer`,      │
+        │ annoté pour l'entrepôt de la caisse (`?warehouse=`) : l'article      │
+        │ scanné s'affiche exactement comme sa carte de la grille.             │
+        └──────────────────────────────────────────────────────────────────────┘
+
+        Ordre de recherche, le même que le terminal (`articleParCodeBarres`) :
+        code-barres exact, code-barres d'une variante, puis SKU exact - un QR
+        imprimé par le marchand porte souvent le SKU. Seuls les articles
+        ACTIFS sont rendus, et `sellable=true` écarte ce qui ne se vend pas.
+        """
+        code = (request.query_params.get('barcode') or '').strip()
+        if not code:
             return Response(
                 {'error': 'Le paramètre barcode est requis'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Chercher dans les produits via get_queryset() pour appliquer le scope warehouse
-        product = (
-            self.get_queryset()
-            .filter(barcode=barcode)
-            .select_related('category', 'brand', 'unit')
-            .first()
-        )
+        # `get_queryset()` porte le périmètre entrepôt (levé par
+        # `full_catalog=true`, comme la grille) et l'annotation du stock.
+        candidats = self.get_queryset().filter(is_active=True)
+        if _truthy_query_param(request.query_params.get('sellable')):
+            candidats = candidats.filter(is_sellable=True)
+        candidats = candidats.select_related('category', 'brand', 'unit').prefetch_related(
+            None
+        ).prefetch_related('stocks__warehouse', 'stocks__location')
 
+        def _carte(product, variante=None):
+            data = ProductListSerializer(
+                product, context=self.get_serializer_context()
+            ).data
+            if variante is not None:
+                data['selected_variant'] = ProductVariantSerializer(variante).data
+            return Response(data)
+
+        product = candidats.filter(barcode=code).first()
         if product:
-            serializer = ProductDetailSerializer(product, context=self.get_serializer_context())
-            return Response(serializer.data)
+            return _carte(product)
 
-        # Chercher dans les variantes ; vérifier que le produit parent est accessible
+        # Une variante : son article parent doit être dans le périmètre.
         organization = self.get_organization()
         variant = ProductVariant.objects.filter(
             organization=organization,
-            barcode=barcode,
+            barcode=code,
             is_deleted=False
         ).select_related('product').first()
-
         if variant:
-            parent = self.get_queryset().filter(id=variant.product_id).first()
+            parent = candidats.filter(id=variant.product_id).first()
             if parent:
-                serializer = ProductDetailSerializer(parent, context=self.get_serializer_context())
-                data = serializer.data
-                data['selected_variant'] = ProductVariantSerializer(variant).data
-                return Response(data)
+                return _carte(parent, variant)
+
+        product = candidats.filter(sku=code).first()
+        if product:
+            return _carte(product)
 
         return Response(
-            {'error': 'Produit non trouvé'},
+            {'detail': 'Aucun article ne porte ce code.', 'code': 'produit_introuvable'},
             status=status.HTTP_404_NOT_FOUND
         )
 

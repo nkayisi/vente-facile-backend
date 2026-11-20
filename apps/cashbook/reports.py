@@ -29,6 +29,7 @@ from apps.core.exports import (
     currency_decimals,
     format_number,
 )
+from apps.core.clock import heure_locale
 from apps.core.report_params import format_day, month_label
 
 ZERO = Decimal('0.00')
@@ -99,7 +100,7 @@ def build_daily_cash_report(
     """Le journal du jour, mouvement par mouvement, sur la JOURNÉE ENTIÈRE."""
     rows = [
         {
-            'time': m.movement_date.strftime('%H:%M') if m.movement_date else '',
+            'time': heure_locale(m.movement_date).strftime('%H:%M') if m.movement_date else '',
             'type': m.get_movement_type_display(),
             'description': m.description or m.reference or '-',
             'currency': m.currency,

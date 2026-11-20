@@ -109,3 +109,27 @@ def _retenir(quand):
     if quand > timezone.now() + AVANCE_TOLEREE:
         return None
     return quand
+
+
+def heure_locale(quand):
+    """
+    Un instant, à l'heure du MARCHAND (`TIME_ZONE`), pour être LU.
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ UNE HEURE IMPRIMÉE EST CELLE DE KINSHASA, JAMAIS CELLE DE GREENWICH.     │
+    │                                                                          │
+    │ Les instants sont stockés en UTC. Formatés tels quels, le rapport de     │
+    │ caisse du back-office imprimait « 12:28 » une vente faite à 13 h 28, et  │
+    │ une sortie de 00 h 32 apparaissait à « 23:32 », plus tard que toute la   │
+    │ journée qu'elle ouvre (vu au navigateur le 2026-11-20). Même défaut dans │
+    │ le rapport journalier des statistiques et dans le refus d'ouvrir une    │
+    │ seconde session (« ouverte le 20/11 à 12:23 »).                          │
+    └──────────────────────────────────────────────────────────────────────────┘
+
+    Un instant naïf est rendu tel quel : on ne devine pas son fuseau.
+    `apps/core/tests/test_heure_du_marchand.py` refuse toute heure formatée sans
+    passer par ici (ou par `timezone.localtime`).
+    """
+    if quand is None or not isinstance(quand, datetime) or timezone.is_naive(quand):
+        return quand
+    return timezone.localtime(quand)

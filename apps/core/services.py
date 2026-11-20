@@ -347,6 +347,7 @@ class PermissionService:
             'cashbook.view', 'cashbook.view_reports',
             'cashbook.create_movement', 'cashbook.cancel_movement', 'cashbook.delete_movement',
             'cashbook.create_expense', 'cashbook.approve_expense', 'cashbook.delete_expense',
+            'cashbook.pay_expense',
             'cashbook.manage_categories',
             # Dashboard
             'dashboard.view',
@@ -395,6 +396,7 @@ class PermissionService:
             'cashbook.view', 'cashbook.view_reports',
             'cashbook.create_movement', 'cashbook.cancel_movement',
             'cashbook.create_expense', 'cashbook.approve_expense',
+            'cashbook.pay_expense',
             'cashbook.manage_categories',
             # Dashboard
             'dashboard.view',
@@ -458,7 +460,9 @@ class PermissionService:
             # Livre de caisse : créer des entrées/sorties + dépenses, et
             # consulter SON rapport de caisse (auto-restreint à ses opérations
             # via la visibilité par rôle). Pas d'annulation/suppression.
-            'cashbook.view', 'cashbook.create_expense',
+            # Le caissier soumet sa dépense puis la PAIE une fois approuvée :
+            # les billets sortent de son tiroir, et figurent dans son Z.
+            'cashbook.view', 'cashbook.create_expense', 'cashbook.pay_expense',
             'cashbook.create_movement', 'cashbook.view_reports',
             # Dashboard
             'dashboard.view',

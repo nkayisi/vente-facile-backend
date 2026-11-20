@@ -620,7 +620,7 @@ def demande_approbation(
 
 def decision_prise(
     organization, *, quoi, reference, decidee_par, pour, approuvee,
-    entrepot=None, motif='', action_url='',
+    entrepot=None, motif='', suite='', action_url='',
 ):
     """
     « Votre demande a été tranchée. »
@@ -641,6 +641,9 @@ def decision_prise(
         message=(
             f"{_nom(decidee_par)} a {verdict} {quoi.lower()} {reference}."
             + (f" Motif : {motif}" if motif else "")
+            # Ce que la décision rend possible : une dépense approuvée se PAIE
+            # désormais par son auteur, et rien d'autre ne le lui dirait.
+            + (f" {suite}" if suite else "")
         ),
         data={
             'kind': 'approval_decision',

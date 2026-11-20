@@ -334,8 +334,10 @@ class ExpenseDetailSerializer(serializers.ModelSerializer):
         return None
 
     def get_cash_movements(self, obj):
-        movements = obj.cash_movements.filter(is_cancelled=False)
-        return CashMovementListSerializer(movements, many=True).data
+        movements = obj.cash_movements.filter(is_cancelled=False).select_related(
+            'created_by', 'payment_method', 'session__register',
+        )
+        return ExpenseCashMovementSerializer(movements, many=True).data
 
 
 class ExpenseUpdateSerializer(serializers.ModelSerializer):
@@ -423,6 +425,26 @@ class CashMovementListSerializer(serializers.ModelSerializer):
         if obj.created_by:
             return f"{obj.created_by.first_name} {obj.created_by.last_name}".strip() or obj.created_by.email
         return None
+
+
+class ExpenseCashMovementSerializer(CashMovementListSerializer):
+    """
+    La sortie d'argent d'une dépense, vue depuis sa fiche.
+
+    Elle porte de quoi réimprimer le reçu de dépense : `created_by_name` est le
+    PAYEUR, `movement_date` l'instant du paiement, et `register_name` la caisse
+    dont les billets sont sortis (vide pour un mobile money ou un virement, qui
+    ne touchent à aucun tiroir). Le champ n'est pas sur la liste des
+    mouvements : il y coûterait une jointure par ligne pour un usage qu'elle
+    n'a pas.
+    """
+
+    register_name = serializers.CharField(
+        source='session.register.name', read_only=True, default=None
+    )
+
+    class Meta(CashMovementListSerializer.Meta):
+        fields = CashMovementListSerializer.Meta.fields + ['register_name']
 
 
 class CashMovementCreateSerializer(serializers.ModelSerializer):

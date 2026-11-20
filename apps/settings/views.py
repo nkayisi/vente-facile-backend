@@ -409,9 +409,20 @@ class OrganizationSettingsViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
     serializer_class = OrganizationSettingsSerializer
     permission_classes = [IsAuthenticated, IsTenantMember, HasActiveSubscription, HasPermission]
     
+    # ┌──────────────────────────────────────────────────────────────────────┐
+    # │ LA LECTURE EST OUVERTE À TOUT MEMBRE : C'EST LE CAISSIER QUI IMPRIME.│
+    # │                                                                      │
+    # │ Ces réglages ne portent que ce que chaque ticket montre déjà au      │
+    # │ client : en-tête, pied, largeur du papier, affichage de la cagnotte, │
+    # │ plus le seuil d'alerte de stock. Réservés à `settings.view`, ils     │
+    # │ répondaient 403 au caissier : ses tickets du back-office sortaient   │
+    # │ sans l'en-tête ni le pied du marchand, en 58 mm par défaut, et sans  │
+    # │ bloc de cagnotte. Vu au navigateur le 2026-11-20. Le terminal, lui,  │
+    # │ les reçoit déjà avec sa session. L'ÉCRITURE reste au propriétaire.   │
+    # └──────────────────────────────────────────────────────────────────────┘
     action_permissions = {
-        'list': 'settings.view',
-        'retrieve': 'settings.view',
+        'list': '*',
+        'retrieve': '*',
         'create': 'settings.manage',
         'update': 'settings.manage',
         'partial_update': 'settings.manage',

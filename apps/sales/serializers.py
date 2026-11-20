@@ -30,6 +30,9 @@ class RegisterSerializer(serializers.ModelSerializer):
     branch_name = serializers.CharField(source='branch.name', read_only=True)
     warehouse_name = serializers.CharField(source='warehouse.name', read_only=True)
     current_session = serializers.SerializerMethodField()
+    # Le fonds que la prochaine ouverture reprendra si rien n'est saisi : voir
+    # `register_sessions.fonds_herite`, que l'ouverture applique elle-même.
+    inherited_opening_balances = serializers.SerializerMethodField()
     
     class Meta:
         model = Register
@@ -37,6 +40,7 @@ class RegisterSerializer(serializers.ModelSerializer):
             'id', 'name', 'code', 'branch', 'branch_name',
             'warehouse', 'warehouse_name', 'is_active',
             'receipt_header', 'receipt_footer', 'current_session',
+            'inherited_opening_balances',
             'created_at'
         ]
         read_only_fields = ['id', 'created_at']
@@ -99,6 +103,15 @@ class RegisterSerializer(serializers.ModelSerializer):
         attrs['branch'] = branch
         return attrs
 
+    def get_inherited_opening_balances(self, obj):
+        """``[{currency, amount}]``, la devise principale en tête."""
+        from .register_sessions import fonds_herite
+
+        principale = getattr(obj.organization, 'currency', None) or 'CDF'
+        herite = fonds_herite(obj, principale)
+        ordre = sorted(herite, key=lambda d: (d != principale, d))
+        return [{'currency': d, 'amount': str(herite[d])} for d in ordre]
+
     def get_current_session(self, obj):
         """Retourne la session active si elle existe."""
         session = obj.sessions.filter(status='open').first()
@@ -138,6 +151,10 @@ class RegisterSessionListSerializer(serializers.ModelSerializer):
     closed_by_name = serializers.CharField(source='closed_by.full_name', read_only=True)
     sales_count = serializers.SerializerMethodField()
     sales_total = serializers.SerializerMethodField()
+    # Ce que le tiroir d'une session OUVERTE doit contenir, par devise : le
+    # calcul même de la clôture (`register_sessions.attendu_par_devise`), pour
+    # que l'écran de clôture compare le comptage au bon chiffre.
+    expected_balances = serializers.SerializerMethodField()
     
     class Meta:
         model = RegisterSession
@@ -148,11 +165,32 @@ class RegisterSessionListSerializer(serializers.ModelSerializer):
             'closed_by', 'closed_by_name',
             'status', 'opening_balance', 'closing_balance',
             'expected_balance', 'difference',
-            'currency_balances',
+            'currency_balances', 'expected_balances',
             'opened_at', 'closed_at',
             'sales_count', 'sales_total'
         ]
         read_only_fields = ['id', 'opened_at']
+
+    def get_expected_balances(self, obj):
+        """``[{currency, opening, cash_in, cash_out, expected}]`` ; vide une fois close."""
+        if obj.status != 'open':
+            # Une session close porte son attendu FIGÉ dans `currency_balances`.
+            return []
+        from .register_sessions import attendu_par_devise
+
+        principale = obj.organization.currency or 'CDF'
+        attendu = attendu_par_devise(obj)
+        ordre = sorted(attendu, key=lambda d: (d != principale, d))
+        return [
+            {
+                'currency': d,
+                'opening': str(attendu[d]['opening']),
+                'cash_in': str(attendu[d]['cash_in']),
+                'cash_out': str(attendu[d]['cash_out']),
+                'expected': str(attendu[d]['expected']),
+            }
+            for d in ordre
+        ]
 
     def get_sales_count(self, obj):
         return obj.sales.filter(status='completed').count()
@@ -173,18 +211,32 @@ class RegisterSessionDetailSerializer(RegisterSessionListSerializer):
         fields = RegisterSessionListSerializer.Meta.fields + ['notes', 'payments_summary']
 
     def get_payments_summary(self, obj):
-        """Résumé des paiements par méthode."""
+        """
+        Encaissements par moyen ET par devise du billet : ce qui est entré.
+
+        ⚠ Le MONTANT REMIS (`tendered_amount`), dans la devise reçue, pas
+        `amount`, qui est exprimé dans la devise de la FACTURE. Le Z du
+        back-office imprimait « Espèces 739.13 » - sans symbole, et en
+        dollars - pour un tiroir qui avait reçu 1 700 000 FC (vu le
+        2026-11-20). Le terminal ventilait déjà ainsi.
+        """
         from django.db.models import Sum
-        
+        from django.db.models.functions import Coalesce
+
+        principale = obj.organization.currency or 'CDF'
         payments = Payment.objects.filter(
             sale__session=obj,
             status='completed'
-        ).values('payment_method__name').annotate(
-            total=Sum('amount')
-        )
-        
+        ).values('payment_method__name', 'currency').annotate(
+            total=Sum(Coalesce('tendered_amount', 'amount'))
+        ).order_by('payment_method__name', 'currency')
+
         return [
-            {'method': p['payment_method__name'], 'total': str(p['total'])}
+            {
+                'method': p['payment_method__name'],
+                'currency': p['currency'] or principale,
+                'total': str(p['total']),
+            }
             for p in payments
         ]
 

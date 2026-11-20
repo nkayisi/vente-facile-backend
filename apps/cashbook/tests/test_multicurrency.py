@@ -12,10 +12,12 @@ Règles vérifiées :
 """
 from decimal import Decimal
 
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
 from apps.cashbook.models import CashMovement, Expense, ExpenseCategory
+from apps.sales.models import RegisterSession
 from apps.settings.models import Currency, OrganizationCurrency
 from apps.settings.services import CurrencyService
 
@@ -51,6 +53,12 @@ class _BaseCashbookCurrencyTest(APITestCase):
 
         self.category = ExpenseCategory.objects.create(
             organization=self.org, name='Transport', is_active=True,
+        )
+        # Payer une dépense en espèces exige une caisse ouverte par celui qui
+        # paie : c'est elle qui reçoit la sortie, et le Z qui la compte.
+        RegisterSession.objects.create(
+            organization=self.org, register=self.register, opened_by=self.owner,
+            opening_balance=Decimal('0'), status='open', opened_at=timezone.now(),
         )
         self.client.force_authenticate(user=self.owner)
 
@@ -116,8 +124,13 @@ class ExpenseCurrencyTests(_BaseCashbookCurrencyTest):
         self.assertEqual(expense.currency, 'USD')
         self.assertEqual(expense.exchange_rate, self.RATE_USD)
 
-    def test_approved_usd_expense_creates_usd_cash_movement(self):
-        """La sortie de caisse hérite de la devise ET du taux de la dépense."""
+    def test_paid_usd_expense_creates_usd_cash_movement(self):
+        """
+        La sortie de caisse hérite de la devise ET du taux de la dépense.
+
+        Elle naît au PAIEMENT, plus à l'approbation : l'argent sort quand les
+        billets quittent un tiroir, et du tiroir de celui qui paie.
+        """
         self._create_expense('100.00', currency='USD')
         expense_id = self._last_expense().id
         self.client.post(
@@ -125,6 +138,12 @@ class ExpenseCurrencyTests(_BaseCashbookCurrencyTest):
         )
         resp = self.client.post(
             f'/api/v1/expenses/{expense_id}/approve/', {}, format='json', **self._headers()
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
+        self.assertFalse(CashMovement.objects.filter(expense_id=expense_id).exists())
+
+        resp = self.client.post(
+            f'/api/v1/expenses/{expense_id}/pay/', {}, format='json', **self._headers()
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
 
@@ -193,9 +212,10 @@ class ExpenseStatsCurrencyTests(_BaseCashbookCurrencyTest):
     def _paid_expense(self, amount, currency):
         self._create_expense(amount, currency=currency)
         expense_id = self._last_expense().id
-        self.client.post(
+        resp = self.client.post(
             f'/api/v1/expenses/{expense_id}/pay/', {}, format='json', **self._headers()
         )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.content)
         return expense_id
 
     def test_stats_split_by_currency_and_converted_total(self):
@@ -243,6 +263,10 @@ class MonoCurrencyRegressionTests(APITestCase):
         self.category = ExpenseCategory.objects.create(
             organization=self.org, name='Loyer', is_active=True,
         )
+        RegisterSession.objects.create(
+            organization=self.org, register=self.register, opened_by=self.owner,
+            opening_balance=Decimal('0'), status='open', opened_at=timezone.now(),
+        )
         self.client.force_authenticate(user=self.owner)
 
     def test_expense_and_stats_unchanged(self):
@@ -259,9 +283,10 @@ class MonoCurrencyRegressionTests(APITestCase):
         )
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.content)
         expense = Expense.objects.filter(organization=self.org).order_by('-created_at').first()
-        self.client.post(
+        paye = self.client.post(
             f'/api/v1/expenses/{expense.id}/pay/', {}, format='json', **headers
         )
+        self.assertEqual(paye.status_code, status.HTTP_200_OK, paye.content)
 
         stats = self.client.get('/api/v1/expenses/stats/', **headers)
         self.assertEqual(Decimal(stats.data['total']), Decimal('250000'))

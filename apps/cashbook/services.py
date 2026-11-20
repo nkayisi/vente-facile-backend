@@ -7,6 +7,7 @@ Multi-devise : chaque ``CashMovement`` porte sa ``currency`` et son
 solde courant ``balance_after`` est suivi INDÉPENDAMMENT PAR DEVISE, de sorte
 que le tiroir-caisse reflète la réalité physique (ex. USD et CDF côte à côte).
 """
+from dataclasses import dataclass
 from decimal import Decimal
 from django.db.models import Avg, DecimalField, F, Sum
 from django.db.models.functions import Coalesce
@@ -511,10 +512,82 @@ class TransitionRefusee(Exception):
     """
     Refus métier déterministe : à ne JAMAIS réessayer.
 
-    `_classify` le traduit en verdict `rejected`. Réessayer une approbation
-    déjà faite créerait un SECOND mouvement de caisse, et le tiroir sortirait
-    deux fois la même dépense.
+    `_classify` le traduit en verdict `rejected`. Réessayer un paiement déjà
+    fait créerait un SECOND mouvement de caisse, et le tiroir sortirait deux
+    fois la même dépense.
+
+    `code` voyage jusqu'aux deux clients (`{'detail', 'code'}` au back-office,
+    `errors.code` au journal) : c'est sur lui qu'un écran dit QUOI FAIRE, la
+    phrase n'étant faite que pour être lue.
     """
+
+    def __init__(self, message, code='transition_refused'):
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class DroitsDepense:
+    """
+    Ce que celui qui agit peut faire d'une dépense, au-delà du droit d'action.
+
+    La vue et le journal le calculent de la MÊME façon (`droits_depense`), à
+    partir des permissions effectives : le service n'a pas à lire une requête.
+    """
+
+    #: `cashbook.approve_expense` : approuver, rejeter, payer directement, et
+    #: payer la dépense d'un autre.
+    peut_approuver: bool
+    #: Le propriétaire approuve aussi ses propres dépenses : il n'a personne
+    #: au-dessus de lui.
+    proprietaire: bool
+
+
+def droits_depense(membership):
+    """Les droits d'un membre sur les dépenses, lus de ses permissions effectives."""
+    from apps.core.services import PermissionService
+    from apps.organizations.models import OrganizationMembership
+
+    if membership is None:
+        return DroitsDepense(peut_approuver=False, proprietaire=False)
+    permissions = PermissionService.get_effective_permissions(membership)
+    return DroitsDepense(
+        peut_approuver='cashbook.approve_expense' in permissions,
+        proprietaire=membership.role == OrganizationMembership.Role.OWNER,
+    )
+
+
+def _exiger_pas_sa_propre_depense(expense, user, droits, geste):
+    """
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │ ON N'APPROUVE JAMAIS SA PROPRE DÉPENSE, SAUF LE PROPRIÉTAIRE.        │
+    │                                                                      │
+    │ Le gérant approuvait la sienne : l'approbation ne contrôlait alors   │
+    │ rien. Sa dépense attend le propriétaire ou un autre gérant de son    │
+    │ entrepôt, à qui part déjà la demande (l'auteur en est exclu).        │
+    └──────────────────────────────────────────────────────────────────────┘
+    """
+    if droits.proprietaire:
+        return
+    if user is not None and expense.created_by_id == getattr(user, 'id', None):
+        raise TransitionRefusee(
+            f"Vous ne pouvez pas {geste} votre propre dépense : elle attend "
+            "le propriétaire ou un autre gérant.",
+            code='propre_depense',
+        )
+
+
+def _est_en_especes(methode):
+    """
+    Une dépense sans moyen de paiement sort des ESPÈCES du tiroir.
+
+    C'était déjà le cas : sa sortie de caisse a toujours été un mouvement
+    sans moyen. Lire « absent » comme « hors caisse » ferait sortir l'argent
+    du tiroir sans qu'aucun Z ne le compte.
+    """
+    from apps.sales.models import PaymentMethod
+
+    return methode is None or methode.method_type == PaymentMethod.MethodType.CASH
 
 
 def create_cash_movement_for_expense(expense, *, user=None, session=None):
@@ -577,23 +650,28 @@ def submit_expense(expense, user=None):
     return expense
 
 
-def approve_expense(expense, user):
+def approve_expense(expense, user, *, droits):
     """
-    Approuve une dépense ET fait sortir l'argent du tiroir.
+    Approuve une dépense. L'argent ne sort PAS ici, il sort au PAIEMENT.
 
-    L'approbation est le moment où la dépense devient une sortie réelle : c'est
-    `stats` du serveur qui le dit, en ne comptant que `approved` et `paid`.
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │ LA SORTIE ÉTAIT FAITE À L'APPROBATION, RATTACHÉE À L'APPROBATEUR.     │
+    │                                                                      │
+    │ Le propriétaire approuve sans tiroir ouvert : la sortie partait sans │
+    │ session, et quand le caissier payait ensuite, rien ne sortait de SON │
+    │ tiroir. Son Z annonçait un excédent égal à la dépense. Elle sort     │
+    │ désormais quand les billets quittent la caisse, et de la caisse de   │
+    │ celui qui les remet.                                                 │
+    └──────────────────────────────────────────────────────────────────────┘
     """
     if expense.status != 'pending':
         raise TransitionRefusee(
             "Seules les dépenses en attente peuvent être approuvées."
         )
+    _exiger_pas_sa_propre_depense(expense, user, droits, "approuver")
     expense.status = 'approved'
     expense.approved_by = user
     expense.save(update_fields=['status', 'approved_by', 'updated_at'])
-    create_cash_movement_for_expense(
-        expense, user=user, session=_session_pour(expense.organization, user)
-    )
 
     from apps.notifications.services import decision_prise
 
@@ -602,12 +680,13 @@ def approve_expense(expense, user):
         quoi='La dépense', reference=expense.reference,
         decidee_par=user, pour=expense.created_by, approuvee=True,
         entrepot=expense.warehouse_id,
+        suite="Vous pouvez maintenant la payer.",
         action_url='/dashboard/cashbook/expenses',
     )
     return expense
 
 
-def reject_expense(expense, reason='', user=None):
+def reject_expense(expense, reason='', user=None, *, droits):
     """
     Rejette une dépense. Le motif REJOINT les notes, il ne les écrase pas.
 
@@ -619,6 +698,7 @@ def reject_expense(expense, reason='', user=None):
         raise TransitionRefusee(
             "Seules les dépenses en attente peuvent être rejetées."
         )
+    _exiger_pas_sa_propre_depense(expense, user, droits, "rejeter")
     expense.status = 'rejected'
     if reason:
         expense.notes = f"{expense.notes}\n--- Rejet ---\n{reason}".strip()
@@ -636,17 +716,41 @@ def reject_expense(expense, reason='', user=None):
     return expense
 
 
-def pay_expense(expense, user, payment_method_id=None, payment_reference=''):
+def pay_expense(
+    expense, user, payment_method_id=None, payment_reference='', *, droits,
+):
     """
-    Marque une dépense payée, en l'approuvant au passage si besoin.
+    Paie une dépense : c'est ICI que l'argent sort du tiroir.
 
-    C'est le raccourci des petites dépenses : un caissier qui sort deux mille
-    francs pour du carburant n'ouvre pas un circuit d'approbation.
+    Deux chemins, deux règles :
 
-    ⚠ Le mouvement de caisse n'est créé QUE s'il n'en existe pas déjà un de
-    vivant. Sans ce contrôle, payer une dépense déjà approuvée ferait sortir
-    l'argent une seconde fois.
+    - **Une dépense approuvée** se paie par son auteur, ou par qui peut
+      approuver (le gérant de son entrepôt, le propriétaire). Le droit
+      d'action est `cashbook.pay_expense`, que le caissier a.
+    - **Payer directement** une dépense en brouillon ou en attente vaut une
+      approbation : réservé à qui peut approuver, et jamais sur la sienne
+      hors propriétaire. C'est le raccourci des petites dépenses.
+
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │ EN ESPÈCES, IL FAUT UNE CAISSE OUVERTE, POUR TOUT LE MONDE.          │
+    │                                                                      │
+    │ Les billets quittent un tiroir : la sortie est rattachée à la        │
+    │ session de celui qui paie, et figure dans SON Z. Sans caisse         │
+    │ ouverte elle ne figurerait dans aucun, et le comptage du soir ne     │
+    │ l'expliquerait pas. Un mobile money ou un virement ne touche à aucun │
+    │ tiroir : sa sortie n'a pas de session.                               │
+    └──────────────────────────────────────────────────────────────────────┘
+
+    ⚠ Le mouvement n'est créé QUE s'il n'en existe aucun de vivant : une
+    dépense approuvée avant que la sortie ne passe au paiement a déjà sorti
+    son argent à l'approbation, et la payer ne doit pas la sortir deux fois.
     """
+    if expense.status == 'rejected':
+        raise TransitionRefusee(
+            "Une dépense rejetée ne se paie pas. Créez-en une nouvelle si "
+            "elle est due.",
+            code='depense_rejetee',
+        )
     if expense.status in ('paid', 'cancelled'):
         raise TransitionRefusee(
             "Cette dépense ne peut pas être marquée comme payée."
@@ -654,12 +758,19 @@ def pay_expense(expense, user, payment_method_id=None, payment_reference=''):
 
     champs = ['status', 'paid_date', 'updated_at']
     if expense.status in ('draft', 'pending'):
+        if not droits.peut_approuver:
+            raise TransitionRefusee(
+                "Cette dépense doit d'abord être approuvée.",
+                code='approbation_requise',
+            )
+        _exiger_pas_sa_propre_depense(expense, user, droits, "payer directement")
         expense.approved_by = user
         champs.append('approved_by')
-        if not expense.cash_movements.filter(is_cancelled=False).exists():
-            create_cash_movement_for_expense(
-                expense, user=user, session=_session_pour(expense.organization, user)
-            )
+    elif not droits.peut_approuver and expense.created_by_id != getattr(user, 'id', None):
+        raise TransitionRefusee(
+            "Vous ne pouvez payer que vos propres dépenses.",
+            code='depense_d_un_autre',
+        )
 
     if payment_method_id:
         from apps.sales.models import PaymentMethod
@@ -675,8 +786,23 @@ def pay_expense(expense, user, payment_method_id=None, payment_reference=''):
         expense.payment_reference = payment_reference
         champs.append('payment_reference')
 
+    if not expense.cash_movements.filter(is_cancelled=False).exists():
+        session = None
+        if _est_en_especes(expense.payment_method):
+            session = _session_pour(expense.organization, user)
+            if session is None:
+                raise TransitionRefusee(
+                    "Ouvrez votre caisse pour payer en espèces, ou choisissez "
+                    "un autre moyen de paiement.",
+                    code='caisse_fermee',
+                )
+        create_cash_movement_for_expense(expense, user=user, session=session)
+
     expense.status = 'paid'
-    expense.paid_date = timezone.localdate()
+    # Le jour de l'ACTE, pas celui du rejeu : une dépense payée hors ligne et
+    # poussée le lendemain portait la date de la synchronisation, quand le
+    # reçu remis au bénéficiaire porte celle du paiement.
+    expense.paid_date = timezone.localdate(maintenant())
     expense.save(update_fields=champs)
     return expense
 
